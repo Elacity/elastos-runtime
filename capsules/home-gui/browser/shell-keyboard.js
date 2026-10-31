@@ -3,46 +3,48 @@ import {
   mountGlyph,
   trapTabWithin,
   launcher,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261030a";
 import {
   moveDesktopSelection,
-} from "./shell-surface.js?v=home-20260813a";
-import { toggleSpotlight } from "./shell-spotlight.js?v=home-20260813a";
+} from "./shell-surface.js?v=home-20261030a";
+import { toggleSpotlight } from "./shell-spotlight.js?v=home-20261030a";
 import {
   focusWindow,
   closeWindow,
   minimizeWindow,
   maximizeActiveWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20260813a";
+} from "./shell-windows.js?v=home-20261030a";
 import {
   applyWindowSnapState,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20261030a";
 import {
   closeExpose,
   isExposeOpen,
   toggleExpose,
-} from "./shell-expose.js?v=home-20260813a";
+} from "./shell-expose.js?v=home-20261030a";
 import {
   hideQuickLook,
   isQuickLookOpen,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260813a";
+} from "./shell-quicklook.js?v=home-20261030a";
 import {
   closeOtherShellPopovers,
   handleShellEscape,
+  LAYER_STATE,
   registerEscapeHandler,
   registerShellPopover,
+  registerStageLayer,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260813a";
+} from "./shell-popovers.js?v=home-20261030a";
 import {
   exitActiveFullscreenStage,
   flickStage,
   getActiveStageId,
   desktopStageId,
   isDesktopSpace,
-} from "./shell-stages.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261030a";
 
 /* Shell keyboard layer.
  *
@@ -259,6 +261,12 @@ export function bindShellKeyboard() {
     isActive: () => Boolean(shortcutsOverlay && !shortcutsOverlay.hidden),
     dismiss: () => hideShortcutsOverlay(),
   });
+  registerStageLayer("window-switcher", {
+    selector: "#window-switcher",
+    state: () => (switcherState.open === true ? LAYER_STATE.open : LAYER_STATE.closed),
+    close: () => closeSwitcher(),
+  });
+  registerStageLayer("shortcuts", { selector: "#shortcuts-overlay", close: () => hideShortcutsOverlay() });
   registerEscapeHandler("window-switcher", {
     priority: 85,
     isActive: () => switcherState.open === true,
@@ -297,7 +305,8 @@ export function bindShellKeyboard() {
       if (!homeGuiOwnsKeys()) {
         return;
       }
-      if (event.key === "Escape") {
+      // Escape from the Home welcome sheet or its card is the sheet's own Close.
+      if (event.key === "Escape" && !event.target?.closest?.("#setup-sheet")) {
         if (handleShellEscape()) {
           event.preventDefault();
           event.stopPropagation();

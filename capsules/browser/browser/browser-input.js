@@ -1,3 +1,7 @@
+// The datachannel has no guest ack. After a send drains locally, this delay is
+// how long the guest is given to apply it before dependent input proceeds.
+export const DATACHANNEL_INPUT_SETTLE_MS = 150;
+
 export function keysymForBrowserKey(key) {
   const named = {
     Enter: 65293,
@@ -70,6 +74,13 @@ export function selkiesMessagesForInput(event, currentView = null) {
     const x = Math.round(Number(event.x || 0));
     const y = Math.round(Number(event.y || 0));
     return [`m,${x},${y},0,0`, `m,${x},${y},1,0`, `m,${x},${y},0,0`];
+  }
+  if (event.type === "mouse") {
+    // A held primary button (buttons: 1) is how a drag selects text; the
+    // guest Selkies handler presses or releases on button-mask changes.
+    const x = Math.round(Number(event.x || 0));
+    const y = Math.round(Number(event.y || 0));
+    return [`m,${x},${y},${event.buttons === 1 ? 1 : 0},0`];
   }
   if (event.type === "wheel") {
     const magnitude = Math.max(1, Math.min(12, Math.ceil(Math.abs(Number(event.delta_y || 0)) / 80)));

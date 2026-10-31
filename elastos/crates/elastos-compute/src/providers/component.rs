@@ -147,7 +147,7 @@ impl Default for ComponentProvider {
 #[async_trait]
 impl ComputeProvider for ComponentProvider {
     async fn load(&self, path: &Path, manifest: CapsuleManifest) -> Result<CapsuleHandle> {
-        if !Self::is_component_manifest(&manifest) {
+        if manifest.validate().is_err() || !Self::is_component_manifest(&manifest) {
             return Err(ElastosError::Compute(
                 "ComponentProvider only accepts elastos.component/v1 manifests".into(),
             ));
@@ -212,12 +212,12 @@ impl ComputeProvider for ComponentProvider {
         let result = tokio::task::spawn_blocking(move || {
             Self::instantiate_component(&engine, &component, hostcall, capsule_id, principal_id)
         })
-        .await
-        .map_err(|err| ElastosError::Compute(format!("Component task join error: {err}")))?;
+        .await;
 
+        // Drop the activation entry when it finishes, including a failed or panicked host call.
         self.instances.write().await.remove(&handle.id);
 
-        result
+        result.map_err(|err| ElastosError::Compute(format!("Component task join error: {err}")))?
     }
 
     async fn stop(&self, handle: &CapsuleHandle) -> Result<()> {
@@ -430,6 +430,9 @@ mod tests {
         let provider = ComponentProvider::new();
         assert!(provider.supports(&CapsuleType::Wasm));
         assert!(!provider.supports(&CapsuleType::MicroVM));
+        assert!(!provider.supports(&CapsuleType::WebProjection));
+        assert!(!provider.supports(&CapsuleType::NativeProvider));
+        assert!(!provider.supports(&CapsuleType::NativeHost));
     }
 
     #[test]

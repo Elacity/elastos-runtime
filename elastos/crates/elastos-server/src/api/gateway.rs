@@ -30,9 +30,8 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use elastos_common::localhost::{
-    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
-    publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
-    publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
+    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_site_releases_dir,
+    rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
 use elastos_common::{CapsuleRole, CapsuleType};
 use elastos_identity::IdentityManager;
@@ -52,16 +51,23 @@ pub(crate) use gateway_browser::gateway_browser_operator::{
     register_browser_operator_sessions, BrowserOperatorService,
 };
 pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_browser_engine;
+pub(crate) use gateway_browser::gateway_browser_remote::provider_transport_ready as browser_remote_provider_transport_ready;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
 mod gateway_collaboration_presence;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
+#[path = "gateway_frontdoor.rs"]
+mod gateway_frontdoor;
 #[path = "gateway_home_agent.rs"]
 mod gateway_home_agent;
+#[path = "gateway_home_external_link.rs"]
+mod gateway_home_external_link;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
+#[path = "gateway_home_shared_content.rs"]
+mod gateway_home_shared_content;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
 #[path = "gateway_home_system_ai_provider.rs"]
@@ -70,6 +76,8 @@ mod gateway_home_system_ai_provider;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_update.rs"]
+mod gateway_home_update;
 #[path = "gateway_home_wallet_connector.rs"]
 mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
@@ -111,8 +119,10 @@ use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_collaboration_presence::*;
 use gateway_esp::*;
+use gateway_home_external_link::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+use gateway_home_shared_content::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
@@ -134,7 +144,7 @@ pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 pub(crate) use gateway_home_system::{
     authorize_home_engine_preparation_cancellation, authorize_home_service_engine,
-    authorize_home_service_exit, sync_runtime_services_mailboxes,
+    authorize_home_service_exit, carrier_source_is_contact_of, sync_runtime_services_mailboxes,
 };
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
@@ -143,7 +153,7 @@ pub(super) use gateway_home_token::home_session_cookie_name;
 pub(super) use gateway_home_token::HomeLaunchTokenContext;
 pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
-    home_launch_token_header, home_session_clear_cookie_header,
+    home_browser_origin, home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
     issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
     require_home_launch_token, require_home_launch_token_binding,
@@ -154,6 +164,7 @@ pub(super) use gateway_home_token::{
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+use gateway_home_update::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -174,12 +185,14 @@ use gateway_inspect_actions::*;
 use gateway_marketplace::*;
 use gateway_origin::*;
 use gateway_passkey_step_up::*;
-pub(super) use gateway_passkey_step_up::{
-    consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
-};
 #[cfg(test)]
 pub(crate) use gateway_passkey_step_up::{
-    issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
+    advance_passkey_step_up_clock_for_test, issue_passkey_step_up_token_at_for_test,
+    issue_passkey_step_up_token_for_test,
+};
+pub(super) use gateway_passkey_step_up::{
+    consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
+    require_hosted_step_up_launch,
 };
 #[cfg(test)]
 pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_test;
@@ -203,10 +216,19 @@ pub(super) use gateway_site::{content_type, validate_file_path};
 use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
+
+/// A capsule this Home does not offer is absent everywhere: not served, not
+/// launchable and not in the catalog. Services is hidden until sharing moves
+/// into People; WalletConnect waits for an operator-pinned config.
+pub(crate) fn capsule_is_offered(data_dir: &std::path::Path, name: &str) -> bool {
+    name != SERVICES_CAPSULE_ID && ensure_wallet_connector_configured(data_dir, name).is_ok()
+}
 pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
-/// Maximum size for a single file fetched through the gateway (100 MB).
+/// Largest single file the gateway serves or Library accepts (100 MiB). Gateway
+/// reads ask the local store for at most this, below the transfer ceiling.
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
+const _: () = assert!(MAX_GATEWAY_FILE_SIZE <= elastos_common::MAX_WHOLE_CONTENT_BYTES);
 const LIBRARY_UPLOAD_CHUNK_MAX_BYTES: usize = 768 * 1024;
 const BROWSER_FILE_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 const BROWSER_INPUT_BODY_MAX_BYTES: usize = (BROWSER_FILE_UPLOAD_BYTES.div_ceil(3) * 4) + 64 * 1024;
@@ -260,20 +282,12 @@ const PEOPLE_CAPSULE_ID: &str = "people";
 
 /// Announce this Home's people from the Runtime. See
 /// `gateway_collaboration_presence::publish_runtime_owned_presence`.
-pub fn publish_runtime_owned_presence(
+pub async fn publish_runtime_owned_presence(
     data_dir: &std::path::Path,
     port: &crate::collaboration_presence::CollaborationPresenceProductPort,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    >,
     now: u64,
 ) -> anyhow::Result<usize> {
-    gateway_collaboration_presence::publish_runtime_owned_presence(
-        data_dir,
-        port,
-        discovery_service,
-        now,
-    )
+    gateway_collaboration_presence::publish_runtime_owned_presence(data_dir, port, now).await
 }
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
@@ -533,46 +547,6 @@ pub fn gateway_router(state: GatewayState) -> Router {
     gateway_router_with_api_url(state, "http://localhost".to_string())
 }
 
-async fn capsule_origin_cors(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let origin = request.headers().get(axum::http::header::ORIGIN).cloned();
-    let allowed = origin
-        .as_ref()
-        .is_some_and(super::browser_capsules::is_allowed_capsule_origin);
-    let is_preflight = request.method() == axum::http::Method::OPTIONS
-        && request
-            .headers()
-            .contains_key(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD);
-
-    if allowed && is_preflight {
-        let requested_headers = request
-            .headers()
-            .get(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .cloned();
-        let mut response = StatusCode::NO_CONTENT.into_response();
-        apply_capsule_cors_headers(response.headers_mut(), origin.as_ref().unwrap());
-        response.headers_mut().insert(
-            axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-        );
-        if let Some(requested_headers) = requested_headers {
-            response.headers_mut().insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                requested_headers,
-            );
-        }
-        return response;
-    }
-
-    let mut response = next.run(request).await;
-    if allowed {
-        apply_capsule_cors_headers(response.headers_mut(), origin.as_ref().unwrap());
-    }
-    response
-}
-
 fn apply_capsule_cors_headers(headers: &mut HeaderMap, origin: &HeaderValue) {
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -587,8 +561,24 @@ fn apply_capsule_cors_headers(headers: &mut HeaderMap, origin: &HeaderValue) {
 }
 
 fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> Router {
-    Router::new()
+    let frontdoor = gateway_frontdoor::GatewayFrontDoor::load(&state.data_dir, &gateway_api_url)
+        .unwrap_or_default();
+    let admission_state = state.clone();
+    let user_content = Router::new()
         .route("/", get(serve_public_root))
+        .route("/s/:cid", get(redirect_cid_root))
+        .route("/s/:cid/", get(serve_cid_root))
+        .route("/s/:cid/*path", get(serve_cid_file))
+        .route("/content/:cid", get(serve_ipfs_cid_root))
+        // IPFS-compatible paths so install.sh can use this gateway like ipfs.io.
+        .route("/ipfs/:cid", get(serve_ipfs_cid_root))
+        .route("/ipfs/:cid/", get(serve_cid_root))
+        .route("/ipfs/:cid/*path", get(serve_cid_file))
+        .route("/*path", get(serve_public_site_path))
+        .layer(axum::middleware::map_response(sandbox_content_response));
+
+    Router::new()
+        .merge(user_content)
         .route("/healthz", get(healthz))
         .route(
             "/api/auth/evm/challenge",
@@ -649,11 +639,29 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route(
             "/api/auth/passkey/register/begin",
-            post(super::auth_gateway::passkey_register_begin),
+            post(super::auth_gateway::passkey_register_begin)
+                .layer(DefaultBodyLimit::max(96 * 1024)),
         )
         .route(
             "/api/auth/passkey/register/complete",
-            post(super::auth_gateway::passkey_register_complete),
+            post(super::auth_gateway::passkey_register_complete)
+                .layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey/add/begin",
+            post(super::auth_gateway::passkey_add_begin).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey/add/complete",
+            post(super::auth_gateway::passkey_add_complete).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/owner-recovery/begin",
+            post(super::auth_gateway::owner_recovery_begin),
+        )
+        .route(
+            "/api/auth/owner-recovery/complete",
+            post(super::auth_gateway::owner_recovery_complete),
         )
         .route(
             "/api/auth/passkey/authenticate/begin",
@@ -661,7 +669,8 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route(
             "/api/auth/passkey/authenticate/complete",
-            post(super::auth_gateway::passkey_authenticate_complete),
+            post(super::auth_gateway::passkey_authenticate_complete)
+                .layer(DefaultBodyLimit::max(96 * 1024)),
         )
         .route(
             "/api/auth/passkey-step-up/begin",
@@ -725,6 +734,18 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(gateway_carrier_bootstrap),
         )
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
+        .route(
+            "/api/apps/chat-room/contacts/request",
+            post(chat_room_contact_request),
+        )
+        .route(
+            "/api/apps/chat-room/contacts/profile-id",
+            post(chat_room_contact_profile_id),
+        )
+        .route(
+            "/api/apps/chat-room/community-presence/request",
+            post(chat_room_community_presence_request),
+        )
         .route("/artifacts/*path", get(serve_artifact_file))
         .route(
             "/api/apps/assistant/workspace",
@@ -750,7 +771,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                     gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
         )
-        .route("/api/apps/system/summary", get(system_summary))
+        .route(
+            "/api/apps/system/summary",
+            get(system_summary)
+                .post(system_update_apply)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/apps/system/appearance/preferences",
             post(system_appearance_preferences_update),
@@ -772,6 +798,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(system_guest_registration_update),
         )
         .route(
+            "/api/apps/system/community",
+            get(system_community_membership_get).post(system_community_membership_update),
+        )
+        .route(
+            "/api/apps/system/community/presence",
+            get(system_community_presence_get).post(system_community_presence_update),
+        )
+        .route(
             "/api/apps/system/ai-provider",
             get(gateway_home_system_ai_provider::system_ai_provider_get)
                 .post(gateway_home_system_ai_provider::system_ai_provider_save)
@@ -784,10 +818,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/ai-provider/staged",
             delete(gateway_home_system_ai_provider::system_ai_provider_discard_staged),
-        )
-        .route(
-            "/api/apps/system/approval-lens",
-            post(gateway_home_system_ai_provider::system_approval_lens_select),
         )
         .route(
             "/api/apps/system/approval-lens/revoke",
@@ -1026,6 +1056,15 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
+        .route("/api/apps/home/external-link", post(home_external_link))
+        .route(
+            "/api/apps/home/shared-content/check",
+            post(home_shared_content_check),
+        )
+        .route(
+            "/api/apps/home/shared-content/get",
+            post(home_shared_content_get),
+        )
         .route(
             "/api/apps/home-cli/terminal/contract",
             get(home_cli_terminal_contract),
@@ -1069,6 +1108,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
+        // Reachable only with a Services token, which Home stops issuing while
+        // Services is hidden (0.8.0; see capsule_is_offered). The share and
+        // request backend stays: Inbox approval, grant use and revocation run on
+        // it, its tests set up grants through these routes, and the 0.8.1 People
+        // rework reuses it.
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))
@@ -1084,8 +1128,8 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(people_discovery_request_create),
         )
         .route(
-            "/api/apps/home/collaboration/presence",
-            post(home_collaboration_presence),
+            "/api/apps/chat-room/presence",
+            post(chat_room_presence_heartbeat),
         )
         .route(
             "/api/apps/people/presence",
@@ -1095,6 +1139,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/people/contacts/remove",
             post(people_contact_remove),
+        )
+        .route(
+            "/api/apps/people/contacts/request",
+            post(people_contact_request_create),
         )
         .route("/api/apps/chat-room/summary", get(chat_room_summary))
         .route(
@@ -1167,6 +1215,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(room_service_objects_send),
         )
         .route(
+            "/api/apps/chat-room/attach-library",
+            post(chat_room_attach_library),
+        )
+        .route(
             "/api/apps/chat-room/upload/start",
             post(room_service_upload_start),
         )
@@ -1231,18 +1283,20 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/apps/:app/*path",
             get(super::browser_capsules::serve_browser_app_asset),
         )
-        .route("/s/:cid", get(redirect_cid_root))
-        .route("/s/:cid/", get(serve_cid_root))
-        .route("/s/:cid/*path", get(serve_cid_file))
-        .route("/content/:cid", get(serve_ipfs_cid_root))
-        // IPFS-compatible paths so install.sh can use this gateway like ipfs.io
-        .route("/ipfs/:cid", get(serve_ipfs_cid_root))
-        .route("/ipfs/:cid/", get(serve_cid_root))
-        .route("/ipfs/:cid/*path", get(serve_cid_file))
-        .route("/*path", get(serve_public_site_path))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
-        .layer(axum::middleware::from_fn(capsule_origin_cors))
+        .layer(Extension(ReleaseReadGate::new()))
+        .layer(axum::middleware::from_fn(refuse_content_api_resources))
+        .layer(axum::middleware::from_fn_with_state(
+            admission_state,
+            gateway_frontdoor::gateway_admission,
+        ))
+        .layer(Extension(frontdoor))
+        // Terminal policy also gates browser preflight before its early response.
+        .layer(axum::middleware::from_fn_with_state(
+            state.data_dir.clone(),
+            home_cli_terminal_access,
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,7 +1506,8 @@ fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode
         StatusCode::SERVICE_UNAVAILABLE
     } else if text.contains("not found") {
         StatusCode::NOT_FOUND
-    } else if text.contains("invalid")
+    } else if err.is::<crate::library::LibraryArchiveTooLarge>()
+        || text.contains("invalid")
         || text.contains("empty")
         || text.contains("must not")
         || text.contains("missing")
@@ -1470,6 +1525,7 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token")
+        || text.contains("admin passkey required")
         || text.contains("fresh passkey")
         || text.contains("passkey step-up")
         || text.contains("auth session is not active")
@@ -1477,7 +1533,9 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         || text.contains("belongs to a different principal")
     {
         StatusCode::FORBIDDEN
-    } else if profile_required.is_some() {
+    } else if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         StatusCode::CONFLICT
     } else if text.contains("service access request delivery failed") {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1548,7 +1606,9 @@ fn home_error_response(err: anyhow::Error) -> Response {
     if text.contains("share terms") || text.contains("hosted connection is required") {
         return (StatusCode::BAD_REQUEST, text).into_response();
     }
-    if profile_required.is_some() {
+    if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         return (StatusCode::CONFLICT, text).into_response();
     }
     if appearance_request.is_some() {

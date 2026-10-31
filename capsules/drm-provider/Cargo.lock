@@ -57,9 +57,10 @@ dependencies = [
 
 [[package]]
 name = "elastos-common"
-version = "0.7.1"
+version = "2.0.0"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -1,4 +1,5 @@
 const WHEEL_FLUSH_MS = 80;
+const MOUSE_DRAG_THRESHOLD_PX = 4;
 
 export function plainTextFromClipboardEvent(event) {
   const clipboardData = event?.clipboardData;
@@ -17,19 +18,26 @@ export function bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage,
+  getInputOwner,
+  sameInputOwner,
   getCurrentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText,
   remoteVideo,
   renderPanel,
+  releaseDragButton,
   sendBrowserInput,
   showStatus,
+  streamsPointerDrag = () => false,
   unlockRemoteAudioFromGesture,
+  requestAnimationFrameFn = globalThis.requestAnimationFrame?.bind(globalThis),
+  cancelAnimationFrameFn = globalThis.cancelAnimationFrame?.bind(globalThis),
 }) {
   let wheelTimer = 0;
   let wheelDelta = { x: 0, y: 0 };
   let touchPanState = null;
+  let mouseDragState = null;
   let suppressSyntheticClickUntil = 0;
   const hostModifierState = {
     control: false,
@@ -104,7 +112,7 @@ export function bindBrowserInputSurface({
     return true;
   }
 
-  function browserPointFromEvent(event) {
+  function browserPointFromEvent(event, clampToMedia = false) {
     const target = remoteVideo;
     if (!target || target.hidden) {
       return null;
@@ -119,7 +127,7 @@ export function bindBrowserInputSurface({
     }
     const x = ((event.clientX - contentRect.left) / contentRect.width) * width;
     const y = ((event.clientY - contentRect.top) / contentRect.height) * height;
-    if (x < 0 || y < 0 || x > width || y > height) {
+    if (!clampToMedia && (x < 0 || y < 0 || x > width || y > height)) {
       return null;
     }
     return {
@@ -326,6 +334,160 @@ export function bindBrowserInputSurface({
     }
   });
 
+  function sendMouseMove(state, point) {
+    sendBrowserInput(
+      { type: "mouse", x: point.x, y: point.y, buttons: 1 },
+      // The release goes straight to the channel; moves of an ended drag
+      // still waiting in the queue must not press the button again.
+      { history: "replace", isStale: () => state.ended },
+    ).catch((error) => {
+      showStatus(friendlyOpenError(error), { sticky: true });
+    });
+  }
+
+  // A drag belongs to the page it started on. Once that page is replaced the
+  // drag ends; nothing more is sent for it to the replacement.
+  function dragOwnerChanged(state) {
+    return !sameInputOwner(getInputOwner(), state.owner);
+  }
+
+  function flushMouseDragMove() {
+    if (!mouseDragState) {
+      return;
+    }
+    mouseDragState.frame = 0;
+    if (dragOwnerChanged(mouseDragState)) {
+      finishMouseDrag(null);
+      return;
+    }
+    const point = mouseDragState.pendingPoint;
+    mouseDragState.pendingPoint = null;
+    if (point) {
+      mouseDragState.lastPoint = point;
+      sendMouseMove(mouseDragState, point);
+    }
+  }
+
+  function finishMouseDrag(event) {
+    const state = mouseDragState;
+    mouseDragState = null;
+    if (!state?.dragging) {
+      return false;
+    }
+    state.ended = true;
+    if (state.frame) {
+      cancelAnimationFrameFn?.(state.frame);
+    }
+    if (renderPanel.hasPointerCapture?.(state.pointerId)) {
+      renderPanel.releasePointerCapture?.(state.pointerId);
+    }
+    const point =
+      (event && browserPointFromEvent(event, true)) ||
+      state.pendingPoint ||
+      state.lastPoint;
+    try {
+      releaseDragButton({ type: "mouse", x: point.x, y: point.y, buttons: 0 }, state.owner);
+    } catch (error) {
+      showStatus(friendlyOpenError(error), { sticky: true });
+    }
+    suppressSyntheticClickUntil = Date.now() + 700;
+    return true;
+  }
+
+  // A mouse press without movement stays the Runtime click (its completion
+  // orders following text). Movement past the threshold becomes a held-button
+  // drag over the Selkies datachannel, so the guest can select text.
+  renderPanel.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse") {
+      // A drag suppresses only its own trailing click, not the next press.
+      suppressSyntheticClickUntil = 0;
+    }
+    if (
+      event.pointerType !== "mouse" ||
+      event.button !== 0 ||
+      !getCurrentPage() ||
+      !streamsPointerDrag()
+    ) {
+      return;
+    }
+    const start = browserPointFromEvent(event);
+    if (!start) {
+      return;
+    }
+    mouseDragState = {
+      pointerId: event.pointerId,
+      owner: getInputOwner(),
+      clientX: event.clientX,
+      clientY: event.clientY,
+      start,
+      lastPoint: start,
+      pendingPoint: null,
+      dragging: false,
+      ended: false,
+      frame: 0,
+    };
+  });
+
+  renderPanel.addEventListener("pointermove", (event) => {
+    const state = mouseDragState;
+    if (!state || event.pointerId !== state.pointerId) {
+      return;
+    }
+    if (dragOwnerChanged(state)) {
+      finishMouseDrag(null);
+      return;
+    }
+    if (!state.dragging) {
+      const dx = event.clientX - state.clientX;
+      const dy = event.clientY - state.clientY;
+      if (Math.hypot(dx, dy) < MOUSE_DRAG_THRESHOLD_PX) {
+        return;
+      }
+      state.dragging = true;
+      unlockRemoteAudioFromGesture();
+      focusKeyboardCapture();
+      renderPanel.setPointerCapture?.(event.pointerId);
+      sendMouseMove(state, state.start);
+    }
+    event.preventDefault();
+    // Leaving the video still extends the selection to its edge.
+    const point = browserPointFromEvent(event, true);
+    if (!point) {
+      return;
+    }
+    state.pendingPoint = point;
+    if (!state.frame) {
+      state.frame = requestAnimationFrameFn
+        ? requestAnimationFrameFn(flushMouseDragMove)
+        : (flushMouseDragMove(), 0);
+    }
+  });
+
+  renderPanel.addEventListener("pointerup", (event) => {
+    if (mouseDragState?.pointerId !== event.pointerId) {
+      return;
+    }
+    if (finishMouseDrag(event)) {
+      event.preventDefault();
+    }
+  });
+
+  for (const type of ["pointercancel", "lostpointercapture"]) {
+    renderPanel.addEventListener(type, (event) => {
+      if (mouseDragState?.pointerId === event.pointerId) {
+        finishMouseDrag(null);
+      }
+    });
+  }
+  // Losing the window or tab mid-drag must still release the guest button.
+  window.addEventListener("blur", () => finishMouseDrag(null));
+  window.addEventListener("pagehide", () => finishMouseDrag(null));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      finishMouseDrag(null);
+    }
+  });
+
   renderPanel.addEventListener(
     "wheel",
     (event) => {
@@ -357,6 +519,20 @@ export function bindBrowserInputSurface({
     ) {
       event.preventDefault();
       copyRemoteClipboardToHost().catch((error) => {
+        showStatus(friendlyOpenError(error), { sticky: true });
+      });
+      return;
+    }
+    if (
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      event.key.toLowerCase() === "a"
+    ) {
+      event.preventDefault();
+      sendBrowserInput(
+        { type: "key_combo", keysyms: [65507, 97] },
+        { history: "replace" },
+      ).catch((error) => {
         showStatus(friendlyOpenError(error), { sticky: true });
       });
       return;

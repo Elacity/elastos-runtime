@@ -215,14 +215,49 @@ test("copy success is reported only after the matching Home request succeeds", a
   ]);
 });
 
-test("concurrent local copy intent is rejected without duplicate guest effects", async () => {
+test("a repeated copy while one is pending is ignored quietly without duplicate guest effects", async () => {
   const f = bridgeFixture();
   await f.bridge.copyRemoteClipboardToHost();
-  await assert.rejects(
-    f.bridge.copyRemoteClipboardToHost(),
-    /already pending/,
-  );
+  await f.bridge.copyRemoteClipboardToHost();
   assert.equal(f.sends.length, 1);
+  assert.deepEqual(f.statuses, []);
+});
+
+function upstreamClipboardMessage(content) {
+  // gstwebrtc_app.send_clipboard_data: {"type": "clipboard", "data": {"content": base64}}
+  return { type: "clipboard", data: { content } };
+}
+
+test("upstream Selkies clipboard reply completes a pending copy", async () => {
+  const f = bridgeFixture();
+  await beginCopy(f);
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("selected text ✓")));
+  assert.deepEqual(f.hostWrites, [["selected text ✓", { requestId: "copy:1" }]]);
+  assert.deepEqual(f.statuses, [["Copied from Browser.", { sticky: false }]]);
+});
+
+test("unsolicited upstream clipboard pushes are ignored", async () => {
+  const f = bridgeFixture();
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("monitor push")));
+  await f.bridge.copyRemoteClipboardToHost();
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("before the read")));
+  assert.deepEqual(f.hostWrites, []);
+  f.timers.fireDelay(150);
+  await Promise.resolve();
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("after the read")));
+  assert.deepEqual(f.hostWrites, [["after the read", { requestId: "copy:1" }]]);
+});
+
+test("oversized or malformed upstream clipboard replies are refused", async () => {
+  const f = bridgeFixture();
+  await beginCopy(f);
+  await deliver(f.bridge, upstreamClipboardMessage("A".repeat(MAX_CLIPBOARD_ENCODED_BYTES + 4)));
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("a".repeat(MAX_CLIPBOARD_TEXT_UTF8_BYTES + 1))));
+  await deliver(f.bridge, upstreamClipboardMessage("not base64!"));
+  await deliver(f.bridge, { type: "clipboard", data: {} });
+  assert.deepEqual(f.hostWrites, []);
+  await deliver(f.bridge, upstreamClipboardMessage(base64Text("ok")));
+  assert.deepEqual(f.hostWrites, [["ok", { requestId: "copy:1" }]]);
 });
 
 test("replacement page ownership rejects stale remote Clipboard content", async () => {

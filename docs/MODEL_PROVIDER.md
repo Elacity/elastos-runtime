@@ -5,7 +5,7 @@ not receive hosted-model credentials, provider endpoints, local model process
 access, or authority to choose a hidden alternate backend.
 
 This document defines the target contract needed by a durable Agent Host.
-Current implementation truth stays in [`state.md`](../state.md).
+Current implementation truth stays in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 ## Authority boundary
 
@@ -46,7 +46,7 @@ remote-model authorization path. The destination verifies the authenticated
 source endpoint and service grant, then constructs its own local provider binding
 for the consumer principal, capsule and run. `RuntimeCreateBinding` and
 `RuntimeAccessBinding` remain local-channel authority records. Installed
-acceptance and remaining remote-service work are recorded in [state.md](../state.md).
+acceptance and remaining remote-service work are recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
@@ -61,6 +61,38 @@ selected capability. Destination-owned grants authorize its use. The host Home,
 workspace, and other runs retain their separate access rules. Hosted credentials
 stay in the owning Runtime's secret store; local model artifacts stay in their
 owning boundaries.
+
+Marketplace compares each signed model's declared minimum memory with the
+device's effective physical or cgroup memory capacity before Get. This check
+describes the minimum requirement. Runtime checks the device's memory again
+before starting the engine for a reply.
+
+On Linux, Runtime verifies the visible cgroup v2 hierarchy and reads every
+ancestor's memory limit and current usage. Missing or unreadable required files
+make the observation unavailable. File cache credit is bounded by current
+usage; an unreadable cache statistic gives zero credit. An unavailable memory
+observation returns `model_memory_observation_unavailable` and asks the Home
+owner to check the memory limits before trying again.
+
+A local engine is admitted right before it starts: the device's room must cover
+the model weights, its KV cache at the configured context, batch scratch and
+headroom of max(10% of effective memory capacity, 1 GiB); otherwise the run fails with
+`model_memory_unavailable` before anything is spawned, and its message names the
+room Runtime saw and the model's need in GB. On Linux the room is `MemAvailable`
+capped by the cgroup limits above. On macOS it is a ceiling, not free memory:
+total memory less wired and compressor-occupied pages, which macOS fills by
+compressing other apps' memory or dropping file cache. A macOS critical memory
+pressure level, or an unreadable one, also refuses with `model_memory_unavailable`;
+warning pressure does not. While a model loads or generates, the provider reads
+the macOS pressure level about once a second; at critical it stops the run and
+its engine, which releases the weights Metal keeps wired, and the run fails with
+`model_memory_critical`. Each model-provider
+process runs one local engine at a time, stops it after 60 s without requests
+and starts it again on the next request. Runtime's host lock protects its Home
+data root. Distinct data roots use separate locks and providers, including
+under the same OS account. For supported Local AI operation, run one active
+Home per device. Each provider checks the device's memory when it starts its
+engine.
 
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
@@ -77,10 +109,10 @@ A hosted web API is a Runtime-owned HTTPS interoperability edge on the Home
 that stores the credential. Runtime checks the exact owner route and sends the
 selected destination and credential through its broker. The installed Mac path
 confines the provider's direct external sockets; Linux product confinement
-still needs proof. The temporary Mac operator route
-bypasses normal Inbox decision and grant checks when enabled. Runtime still
-selects its permitted destination and credential, and the owner can End that
-route. Permanent SEC1 acceptance remains open.
+still needs proof. Runtime requires the owner's exact Inbox decision for each
+hosted connection, including saved operator connections. End saves the owner's
+decision before Runtime cancels admitted sends. Saved connections and their
+credentials remain available for owner management.
 
 Mac Runtime to Carrier to a Jetson or seed Runtime, then
 to that Runtime's model provider and backend, is service use. Ordinary capsules
@@ -125,6 +157,18 @@ mandates.
 ## Request identity and session facts
 
 Runtime assigns or validates a durable request ID unique within the agent task.
+New preparation and inference requests use `model-v1:<issued_ms>:<nonce>`.
+The client creates a random nonce for each new action and retains that complete
+ID during recovery. Runtime and the provider look up retained bindings first,
+including legacy IDs. An unseen ID needs a valid timestamp within five minutes,
+with at most one minute of future clock skew. An expired or missing legacy ID
+receives the fixed `request_expired` refusal before new work starts.
+
+Retained bindings survive their complete freshness window. Before pruning a
+terminal result, its owner persists the maximum pruned issuance time. This
+floor also refuses the old ID after restart or a backwards clock change.
+Unresolved runs retain their binding. A new action needs a new request ID.
+
 The provider binds these facts before dispatch:
 
 - agent and Runtime session identifiers;
@@ -180,16 +224,56 @@ deduplicate them. Reconnection cannot dispatch the model request again.
 
 ## Cancellation, interruption, and resume
 
+New model runs use compact journals of at most 1 MiB, with a 32 KiB header
+and 4 KiB backend state. Admission allows at most 256 journal entries and
+64 MiB of charged growth. Active runs reserve at least 1 MiB each. Frozen
+terminal records, including unresolved outcomes, use their actual bounded
+size and still count toward the entry limit. Every terminal outcome, including
+`settlement_unknown`, stays truthful through its configured history window and
+the complete request replay window. Runtime commits a monotonic refusal floor
+before expired history is removed, so clock rollback cannot dispatch it again.
+Crash transaction files count toward the limits. Runtime checks
+these limits before it records a new run or dispatches inference.
+
+Recovery reads one record at a time, with ceilings of 512 entries, 32 MiB
+per legacy record and 128 MiB for the complete scan. Existing runs can settle
+with their original binding when new admission is full. An atomic replacement
+temporarily owns one extra file; failed writes remove only that owned file.
+At startup, the coordinator validates the complete bounded journal and
+committed request floor before it removes an abandoned transaction. Removal
+requires the exact private file and parent identities and a confirmed absent
+creator PID. Files with a live or unproven creator, invalid metadata, or changed
+identity remain in place for operator recovery.
+
+When legacy history exceeds the entry or aggregate ceiling, startup moves the
+exact private runs directory into one protected recovery archive and opens a
+fresh bounded journal. Startup preserves the archive without decoding every
+record. The existing run operations validate and read an exact archived record
+for its owner; an archived active run reports `settlement_unknown` without
+contacting its backend. Retained legacy and future-issued request identities
+still resolve before fresh request validation. Home starts with the archived
+facts available for owner inspection. Fresh inference stays gated while the
+owner uses Reclaim in System to retire the admitted local models, then uses them
+again. The active serialized coordinator saves an acknowledgement bound to the
+archive only after its owned execution, artifacts and workers are absent.
+Operator-configured hosted offers keep their configuration when an active
+coordinator receives trusted Init with the existing `owner_reclaim: true` flag;
+the same ownership checks apply. That provider operation remains an operator
+contract. A second recovery preserves the existing archive and requires operator
+recovery instead of replacing it.
+
 Cancellation is a request to stop backend work and settle the request as
 `cancelled`. The provider records the request before closing the backend stream.
 If the backend cannot confirm cancellation, the request enters reconciliation
 rather than being reported as safely cancelled.
 
-The managed local engine and hosted Chat Completions and Responses adapters
-settle cancellation as `settlement_unknown` once dispatch may have happened.
-Closing an HTTP stream does not confirm that the backend stopped. Their terminal
-result and events remain durable across replay and restart without redispatch.
-Installed cancellation and backend-stop proof remain open.
+The managed local engine holds its execution slot while Runtime closes its
+owned engine and process group. Confirmed closure settles the request as
+`cancelled`; an unresolved close settles as `settlement_unknown` and retains
+the engine ownership. Hosted Chat Completions and Responses cancellation settles
+as `settlement_unknown` after dispatch because stream closure alone cannot
+confirm backend stop. Terminal results and events keep their original identity
+across replay and restart. Installed acceptance stays with the owning issue.
 
 Interrupting the presentation layer does not cancel provider work by itself.
 The Agent Host can reconnect to the same request ID and recover durable events.
@@ -226,10 +310,13 @@ ordinary capsules.
 
 For a remote create, Runtime can return a request-bound
 `elastos.model.invocation-refusal/v1` assertion. It states that this invocation
-stopped before provider dispatch. The destination emits it, the consumer checks
+stopped before provider dispatch (`dispatch: not_started`). A closed provider
+`request_expired` fault has a separate phase, `dispatch: provider_refused`:
+provider validation ran and declined new inference. The destination emits it, the consumer checks
 the exact request, offer, input hash and remote binding, and the gateway returns
-HTTP 409. Assistant accepts it only for a fresh remote submission. A retained or
-pending request, provider error, malformed assertion or lost reply keeps its
+HTTP 409. The local gateway binds the same provider expiry fact to its normalized
+request. Assistant checks its fresh request identity, offer, operation and phase.
+A retained or pending request, generic provider error, malformed assertion or lost reply keeps its
 recovery or unknown status. Carrier tries another address after connection
 failure, but stops after a model create invocation error. This assertion settles
 the current invocation only; it does not settle earlier uncertain attempts.
@@ -255,14 +342,16 @@ reports it. The UI never shows the secret.
 
 Runtime validates the credential separately from a consented paid test.
 Validate requires Runtime-owned HTTPS authority to the pinned public host.
-The temporary Mac operator route has the bypass and End behavior described
-above. The Home can also use an owner-scoped
+Validation needs the same exact owner Inbox approval as every other hosted
+request, including saved operator connections; End stops its sends. The Home
+can also use an owner-scoped
 `providers/model-provider/validate-fixtures.json`. That file, when present,
 may bind validate HTTP only to `http://127.0.0.1` with an explicit port.
-Save stays private and publishes no service offer. A later Share action uses
-existing Marketplace, Services, grants, Carrier routing, and run journals.
-Services summary reports `share_enabled` on hosted cards. That field matches
-the stored share state. The key stays on the provider Home. Consumers see the
+Save stays private and publishes no service offer. Share uses grants, Carrier
+routing, and run journals. In 0.8.0 the Services app, where Share lived, is
+hidden: a hosted model shared by an earlier version stays shared, and each
+person's access ends when its grant expires, 6 hours after approval, or when
+the owner selects Revoke access in Inbox. The key stays on the provider Home. Consumers see the
 intermediary Home, the selected upstream processor (OpenRouter or Venice), and
 the payer. One
 connection budget covers that provider's private and shared offers, including
@@ -275,8 +364,8 @@ the generic model-provider capsule with repeatable owner-bound instances.
 Each instance has a stable offer identity, display name, adapter, selected
 model, Runtime secret reference, privacy and share policy, limits, and
 lifecycle. One Home can keep several instances of the same provider, for
-example Jev via OpenRouter, private DeepSeek via OpenRouter, and shared
-Venice. Private is the default. Changing or disconnecting one instance leaves
+example private DeepSeek and Qwen via OpenRouter, and shared Venice. Private is
+the default. Changing or disconnecting one instance leaves
 the others. Existing `model:openrouter` and `model:venice` offers migrate into
 named instances without losing secrets.
 
@@ -295,7 +384,7 @@ retains its original credential and journal binding. A failed provider refresh
 returns a pending state after saving configuration; the Home must retry activation
 or restart before claiming that configuration is active.
 
-For Decisions, Save binds the exact validated catalog entry's canonical model
+A Decisions offer binds the exact validated catalog entry's canonical model
 ID to the offer revision. This binding is part of the execution hash. The
 adapter checks the response against that ID before projecting `output.model`
 as the selected contract model. The terminal backend report retains the actual
@@ -311,19 +400,13 @@ selector, resolved model when the backend reports it, and explicit fallback
 policy. The secret stays in Runtime-owned storage on the provider Home. It
 does not enter catalogues, offers, logs, or a consumer Home.
 
-System Models owns the Approval Lens evaluator selection by saved instance ID.
-Renaming an instance preserves the selection. If that instance becomes
-unavailable, Runtime keeps human review required and Inbox remains the decision
-surface. Another configured evaluator becomes active only through an explicit
-selection.
-
-The labelled sample evaluates a fixed fictional weather request through the
-same Decisions contract and provider journal. The selected processor receives
-the sample and the Home pays for the evaluation. Advice changes no permission
-and dispatches no downstream weather request. A durable receipt binds the
-sample to its principal and evaluator; later checks read that same run. Lost
-responses or missing journal state retain unknown acceptance instead of
-dispatching another paid evaluation.
+System offers no decision models and no Approval Lens evaluator: OpenRouter
+discovery lists text models only, no screen selects an evaluator, and an
+instance's display name never selects one. Runtime asks no evaluator: an
+evaluator choice saved by an earlier release is ignored, and an Assistant
+hosted request needs only the hosted connection approval in Inbox. A decision
+model saved by an earlier release stays in System's Hosted list, without Use
+in Assistant, so it can be disconnected.
 
 ## Local content selection and retention
 
@@ -333,16 +416,16 @@ offer. Marketplace owns discovery and details; System owns model configuration
 and storage controls. Assistant selects an exact admitted or granted offer and
 keeps its typed run lifecycle. These surfaces share Runtime state.
 
-Marketplace separates verified local content, exact granted shared models, and
-contact access opportunities. The last group opens the existing Services card;
-the person requests access there and the provider Home decides in Inbox. After
-approval, Marketplace reads grant-scoped model offers and hands the selected
-offer to Assistant. Provider Home, processor, prompt destination, payer and
-reported limits use the same facts as Assistant. Discovery gives Marketplace
-read authority; Services and Runtime retain grant and inference authority.
+Marketplace separates verified local content and exact granted shared models.
+In 0.8.0 the Services app is hidden, so Marketplace no longer lists contacts' AI
+services and no new access can be requested. A model approved earlier stays
+listed until its grant expires, 6 hours after approval, and opens in Assistant.
+Provider Home, processor, prompt destination, payer and reported limits use the
+same facts as Assistant. Discovery gives Marketplace read authority; Runtime
+retains grant and inference authority.
 
 The installed small-model journey and its exact evidence scope are recorded in
-[state.md](../state.md). Acquisition, readiness, inference and warm reuse are
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
 separate checks. A local pin establishes a retained local copy; it does not
 establish global availability or exclusive custody.
 
@@ -372,7 +455,11 @@ artifact descriptor for the model provider. Source supports operator offers and
 admitted-content binding through the existing ProviderRegistry and run journal,
 while preserving other configured capabilities. An idle-safe provider refresh
 can expose the newly admitted local offer; a busy
-or unknown-settlement run prevents destructive reconfiguration and removal.
+run or retained unknown outcome prevents destructive reconfiguration and removal.
+The explicit owner Reclaim operation can retire a model while its unknown
+history stays retained, after owned execution closes. Expired history releases
+its model binding; live engine
+and worker ownership remain separate barriers.
 Content preparation status is distinct from a dispatched model run.
 
 Existing `offers_list`, `runs_create`, `runs_get`, `runs_events` and `runs_cancel`
@@ -386,7 +473,7 @@ model and provider are ready.
 Bounded transfer and manifest/inventory limits are in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 The current execution queue and proof dependencies are in
-[TASKS Now](../TASKS.md#now).
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Fresh-install acceptance must prove the compatible engine and its verified
 libraries are available, then select the real signed catalog entry with no
 pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact
@@ -422,7 +509,8 @@ pass installed lifecycle tests before it can be shared:
    This requires signed offer and grant admission plus bounded Carrier ingress.
    A Jetson deployment is a separate acceptance track.
 5. After each private connection exists, add an explicit owner-funded Share of
-   that exact provider and model through existing Services and Marketplace.
+   that exact provider and model. Services is hidden in 0.8.0; sharing returns
+   inside People.
    Qualify OpenRouter Terms 5.1–5.2 or Venice TOS 7.3, plus the selected model
    terms, before Share. Keep one connection budget across that provider's
    private and shared offers, with per-consumer limits. Commercial billing,
@@ -473,4 +561,3 @@ A conforming model provider must prove:
 - [Architecture](ARCHITECTURE.md)
 - [Human and agent architecture](AGENT_ARCHITECTURE.md)
 - [Interactive Runtime contract](INTERACTIVE_RUNTIME_CONTRACT.md)
-- [Current state](../state.md)

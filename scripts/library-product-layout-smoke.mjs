@@ -4,6 +4,12 @@ import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
+
+const PHONE_SCREENSHOT = "/tmp/library-phone-390x844.png";
+const PHONE_SEARCH_SCREENSHOT = "/tmp/library-phone-search-390x844.png";
+// Longer than the 160 ms search field width transition.
+const SEARCH_SETTLE_MS = 250;
 
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -11,6 +17,7 @@ const { chromium } = require("playwright");
 
 const capsuleRoot = path.resolve("capsules/library/browser");
 const homeClipboardClientPath = path.resolve("capsules/home/browser/home-clipboard-client.js");
+const homeNavigationClientPath = path.resolve("capsules/home/browser/home-navigation-client.js");
 const homeClipboardProtocolPath = path.resolve("capsules/home/browser/home-clipboard-protocol.js");
 const token = "library-product-layout-token";
 const principalRoot = "localhost://Users/layout";
@@ -67,6 +74,50 @@ function colorDistance(left, right, base = null) {
     + ((a[1] - b[1]) ** 2)
     + ((a[2] - b[2]) ** 2),
   );
+}
+
+function relativeLuminance([r, g, b]) {
+  const channel = (value) => {
+    const s = value / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return (0.2126 * channel(r)) + (0.7152 * channel(g)) + (0.0722 * channel(b));
+}
+
+// WCAG ratio of text over a surface that may be translucent over its base.
+function contrastRatio(text, surface, base) {
+  const back = flattenColor(surface, base);
+  const fore = back && flattenColor(text, `rgb(${back.join(", ")})`);
+  if (!fore) return 0;
+  const [light, dark] = [relativeLuminance(fore), relativeLuminance(back)].sort((a, b) => b - a);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+// The upload panel renders uploads.js rows; its text must read in either theme.
+async function assertUploadProgressReadable(page, label) {
+  const colors = await page.evaluate(async () => {
+    const panel = document.getElementById("upload-progress");
+    const { createLibraryUploads } = await import(new URL("./src/uploads.js", document.baseURI).href);
+    createLibraryUploads({
+      container: panel,
+      perf: { uploadRenderCount: 0, uploadRenderScheduledCount: 0 },
+      state: { uploads: [{ id: "contrast", name: "explorer-note.txt", status: "Complete", progress: 100 }] },
+    }).renderUploads();
+    const read = (selector) => getComputedStyle(document.querySelector(selector));
+    const result = {
+      base: read("body").backgroundColor,
+      surface: read("#upload-progress").backgroundColor,
+      name: read(".upload-name").color,
+      status: read(".upload-name + div").color,
+    };
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return result;
+  });
+  for (const key of ["name", "status"]) {
+    const ratio = contrastRatio(colors[key], colors.surface, colors.base);
+    assert(ratio >= 4.5, `${label}: upload ${key} contrast ${ratio.toFixed(2)}:1 is below 4.5:1 (${JSON.stringify(colors)}).`);
+  }
 }
 
 function object(uri, name, kind) {
@@ -147,6 +198,11 @@ function createAppServer() {
       return;
     }
 
+    if (url.pathname === "/apps/home/home-navigation-client.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeNavigationClientPath).pipe(res);
+      return;
+    }
     if (url.pathname === "/apps/home/home-clipboard-client.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
       createReadStream(homeClipboardClientPath).pipe(res);
@@ -218,12 +274,12 @@ async function readThemeSnapshot(page) {
       };
     };
     return {
-      activeTab: document.querySelector(".item-props-tab-selected")?.textContent?.trim() || "",
+      detailsOpen: document.querySelector(".item-props-details")?.open === true,
       body: read("body"),
       statusbar: read(".statusbar"),
       card: read(".window-item-properties"),
       title: read(".properties-window-title"),
-      panel: read(".item-props-tab-content-selected"),
+      panel: read(".item-props-body"),
       label: read(".item-prop-label"),
       value: read(".item-prop-val"),
       copyButton: read(".props-copy-btn"),
@@ -232,7 +288,6 @@ async function readThemeSnapshot(page) {
 }
 
 function assertReadableTheme(snapshot, label) {
-  assert(snapshot.activeTab.length > 0, `${label}: Properties tab did not stay selected.`);
   assert(
     colorDistance(snapshot.statusbar.backgroundColor, snapshot.statusbar.color, snapshot.body.backgroundColor) > 40,
     `${label}: footer text lost readable contrast.`,
@@ -386,25 +441,28 @@ async function run() {
 
     await openProperties(page, "Alpha.txt");
     const darkGeneral = await readThemeSnapshot(page);
-    assert(darkGeneral.activeTab === "General", "Properties must open on the General tab.");
+    assert(!darkGeneral.detailsOpen, "Properties must open with Details collapsed.");
     assertReadableTheme(darkGeneral, "dark general");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').waitFor();
-    const darkTechnical = await readThemeSnapshot(page);
-    assert(darkTechnical.activeTab === "Technical", "Properties must switch to the Technical tab.");
-    assertReadableTheme(darkTechnical, "dark technical");
+    await page.locator(".item-props-details > summary").click();
+    await page.locator(".item-props-details[open]").filter({ hasText: "Object URI" }).waitFor();
+    const darkDetails = await readThemeSnapshot(page);
+    assert(darkDetails.detailsOpen, "Properties Details must open on click.");
+    assertReadableTheme(darkDetails, "dark details");
     await page.evaluate(() => {
       document.documentElement.setAttribute("data-el-theme", "light");
     });
-    const lightTechnical = await readThemeSnapshot(page);
-    assertReadableTheme(lightTechnical, "light technical");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "General" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="general"]').waitFor();
+    const lightDetails = await readThemeSnapshot(page);
+    assertReadableTheme(lightDetails, "light details");
+    await page.locator(".item-props-details > summary").click();
     const lightGeneral = await readThemeSnapshot(page);
-    assert(lightGeneral.activeTab === "General", "Properties must return to the General tab.");
+    assert(!lightGeneral.detailsOpen, "Properties Details must close on a second click.");
     assertReadableTheme(lightGeneral, "light general");
     assert(darkGeneral.statusbar.backgroundColor !== lightGeneral.statusbar.backgroundColor, "Library footer must react to theme changes.");
     assert(darkGeneral.panel.backgroundColor !== lightGeneral.panel.backgroundColor, "Library Properties panel must react to theme changes.");
+    await assertUploadProgressReadable(page, "light");
+    await page.evaluate(() => document.documentElement.removeAttribute("data-el-theme"));
+    await assertUploadProgressReadable(page, "dark");
+    await page.evaluate(() => document.documentElement.setAttribute("data-el-theme", "light"));
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.fill("#search", "missing");
@@ -423,6 +481,62 @@ async function run() {
     }));
     assert(narrowState.resizerHidden, "Sidebar resizer must hide on narrow layouts.");
     assert(Number.parseFloat(narrowState.searchWidth) > 0, "Search must keep a bounded width on narrow layouts.");
+
+    await page.setViewportSize(PHONE_VIEWPORT);
+    await setPhoneFormFactor(page);
+    await page.locator("#search-toggle-button").click();
+    await page.locator("#toolbar-search:not(.open)").waitFor();
+    await page.waitForTimeout(SEARCH_SETTLE_MS);
+    await assertNoHorizontalOverflow(page, "phone list");
+    await page.screenshot({ path: PHONE_SCREENSHOT });
+    const phoneChrome = await page.evaluate(() => {
+      const rect = (node) => node.getBoundingClientRect();
+      const places = document.getElementById("places");
+      const chips = [...places.querySelectorAll(".place")].map(rect);
+      const controls = [...document.querySelectorAll(".toolbar .navbar-btn, .toolbar .layout-toggle-segment")]
+        .filter((node) => getComputedStyle(node).display !== "none")
+        .map((node) => ({ id: node.id, width: Math.round(rect(node).width), height: Math.round(rect(node).height) }));
+      return {
+        toolbarTop: Math.round(rect(document.querySelector(".toolbar")).top),
+        chipsTop: Math.round(rect(places).top),
+        toolbarBottom: Math.round(rect(document.querySelector(".toolbar")).bottom),
+        contentTop: Math.round(rect(document.getElementById("content")).top),
+        placesBottom: Math.round(rect(places).bottom),
+        chipRows: new Set(chips.map((chip) => Math.round(chip.top))).size,
+        chipHeight: Math.round(Math.min(...chips.map((chip) => chip.height))),
+        placesScrolls: getComputedStyle(places).overflowX === "auto",
+        controls,
+        visibleCrumbs: [...document.querySelectorAll("#breadcrumbs .crumb")].filter((node) => getComputedStyle(node).display !== "none").length,
+        rowHeight: Math.round(Math.min(...[...document.querySelectorAll('.content[data-view="list"] .item')].map((node) => rect(node).height))),
+      };
+    });
+    assert(
+      phoneChrome.toolbarTop === 0 && phoneChrome.chipsTop >= phoneChrome.toolbarBottom && phoneChrome.contentTop >= phoneChrome.placesBottom,
+      `Library phone: navigation row, then Favorites, then the list. Got ${JSON.stringify(phoneChrome)}`,
+    );
+    assert(
+      phoneChrome.contentTop <= 120 && phoneChrome.chipRows === 1 && phoneChrome.placesScrolls && phoneChrome.chipHeight >= 44,
+      `Library phone: Favorites must be one sliding row of 44 px chips and the list must start high. Got ${JSON.stringify(phoneChrome)}`,
+    );
+    assert(
+      phoneChrome.controls.every((control) => control.width >= 44 && control.height >= 44) && phoneChrome.visibleCrumbs === 1 && phoneChrome.rowHeight >= 48,
+      `Library phone: 44 px toolbar controls, 48 px rows, and the current folder as the title. Got ${JSON.stringify(phoneChrome)}`,
+    );
+
+    await page.locator("#search-toggle-button").click();
+    await page.locator("#toolbar-search.open").waitFor();
+    await page.waitForTimeout(SEARCH_SETTLE_MS);
+    await assertNoHorizontalOverflow(page, "phone search-open");
+    const phoneSearch = await page.evaluate(() => {
+      const search = document.getElementById("search");
+      return { width: Math.round(search.getBoundingClientRect().width), fontSize: getComputedStyle(search).fontSize };
+    });
+    await page.screenshot({ path: PHONE_SEARCH_SCREENSHOT });
+    assert(
+      phoneSearch.width >= 240 && phoneSearch.fontSize === "16px",
+      `Library phone: Search takes the navigation row at 16 px. Got ${JSON.stringify(phoneSearch)}`,
+    );
+    await setPhoneFormFactor(page, false);
 
     console.log("PASS Library product layout smoke");
   } finally {

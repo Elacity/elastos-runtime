@@ -5,27 +5,39 @@ import {
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
   renewHomeGuiBrowserWindowAuthority,
+  renewHomeGuiChatWindowAuthority,
   restoreHomeGuiSession,
   setHomeGuiMenuManifest,
   handleHomeGuiHomeNavigation,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260813a";
+} from "./home-gui.js?v=home-wallpaper-20261030a";
 import {
   acceptHomeBrowserContextId,
+  desktopBackdrop,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261030a";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260813a";
+} from "./home-gui-authority.js?v=home-20261030a";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261030a";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261030a";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261030a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
 const homeToken = fragment.get("home_token") || "";
 const homeOrigin = route.searchParams.get("home_origin") || "";
+const backgroundImage = createHomeBackgroundImage({ homeOrigin, homeToken,
+  apply: (url) => {
+    if (!desktopBackdrop) return;
+    if (url) desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${url}")`);
+    else desktopBackdrop.style.removeProperty("--desktop-wallpaper");
+  },
+});
 const pendingRequests = new Map();
 const HOME_GUI_REQUEST_TIMEOUT_MS = 30_000;
 const consumedAuthorizedAttachmentReceipts = new Set();
@@ -39,7 +51,7 @@ const AUTHORIZED_ATTACHMENT_TARGET_TITLES = Object.freeze({
   "wallet-unisat": "UniSat",
 });
 let currentSummary = null;
-let restoredSession = false;
+let sessionRestore = null;
 
 if (!homeToken || !homeOrigin || window.parent === window) {
   throw new Error("Home GUI requires an isolated Home launch");
@@ -131,20 +143,44 @@ async function applySummary(summary, options = {}) {
     homeGuiWasMounted: previous !== null,
     ...options,
   });
+  backgroundImage.update(summary?.authority?.signed_in === true
+    ? summary?.appearance?.background_image_url : "");
   await restoreSessionWhenReady();
   document.body.dataset.homeStatus = "ready";
 }
 
-async function restoreSessionWhenReady() {
+// Home is ready only once saved windows have reopened: every summary waits for
+// the one restore. A restore that fails is logged and Home opens without those
+// windows; it is never left booting or in error.
+function restoreSessionWhenReady() {
   if (
-    restoredSession ||
-    currentSummary?.authority?.signed_in !== true ||
-    !hasHomeBrowserContextId()
+    !sessionRestore &&
+    currentSummary?.authority?.signed_in === true &&
+    hasHomeBrowserContextId()
   ) {
+    sessionRestore = restoreHomeGuiSession().catch((error) => {
+      console.error("home-gui session restore failed", error);
+    });
+  }
+  return sessionRestore;
+}
+
+function acceptShellContext(browserContextId) {
+  if (!acceptHomeBrowserContextId(browserContextId) || sessionRestore) {
     return;
   }
-  restoredSession = true;
-  await restoreHomeGuiSession();
+  const restore = restoreSessionWhenReady();
+  // A summary applied before the context marked Home ready with nothing
+  // restored; readiness now waits for the restore that starts here.
+  if (!restore || document.body.dataset.homeStatus !== "ready") {
+    return;
+  }
+  document.body.dataset.homeStatus = "booting";
+  restore.then(() => {
+    if (document.body.dataset.homeStatus === "booting") {
+      document.body.dataset.homeStatus = "ready";
+    }
+  });
 }
 
 function handleGuiCommand(message) {
@@ -157,6 +193,23 @@ function handleGuiCommand(message) {
   }
   if (command === "renew-browser-authority") {
     return handleBrowserAuthorityRenewalCommand(message);
+  }
+  if (command === "renew-chat-authority") {
+    if (!hasExactKeys(message, ["type", "command", "requestId", "homeToken", "launched", "expiresAt", "phase"])
+      || !/^[A-Za-z0-9-]{1,64}$/.test(message.requestId)
+      || !Number.isSafeInteger(message.expiresAt) || !["prepare", "commit"].includes(message.phase)) return false;
+    const freshHomeToken = new URLSearchParams(new URL(message.launched?.route, homeOrigin).hash.slice(1)).get("home_token") || "";
+    if (message.phase === "commit") {
+      const ok = renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin);
+      postToHome({ type: "home:chat-authority-committed", requestId: message.requestId,
+        oldHomeToken: message.homeToken, freshHomeToken, ok });
+      return ok;
+    }
+    const ok = message.expiresAt > Date.now()
+      && renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin, false);
+    postToHome({ type: "home:chat-authority-renewed", requestId: message.requestId,
+      oldHomeToken: message.homeToken, freshHomeToken, ok });
+    return ok;
   }
   if (command === "open-target") {
     return openHomeGuiTarget(message.target, { query: message.query || {} });
@@ -356,16 +409,19 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (message.type === "home:shell-context") {
-    if (acceptHomeBrowserContextId(message.browserContextId)) {
-      restoreSessionWhenReady().catch((error) => {
-        document.body.dataset.homeStatus = "error";
-        console.error("home-gui session restore failed", error);
-      });
-    }
+    acceptShellContext(message.browserContextId);
     return;
   }
   if (message.type === "home:shell-response") {
     settleRequest(message);
+    return;
+  }
+  if (message.type === "home:keyboard-inset") {
+    relayKeyboardInset(message.inset);
+    return;
+  }
+  if (message.type === "home:link-status") {
+    applyHomeLinkStatus(message);
     return;
   }
   if (message.type === "home:shell-summary") {
@@ -386,6 +442,13 @@ window.addEventListener("message", (event) => {
         console.error("home-gui command failed", error);
       });
   }
+});
+
+// The host page owns the top-level viewport tag; it takes the phone variant
+// only while this shell's committed form factor is a phone (also at load:
+// the first commit happens when the interactions bind).
+window.addEventListener(FORM_FACTOR_EVENT, () => {
+  postToHome({ type: "home:form-factor", phone: isPhone() });
 });
 
 bindHomeGuiInteractions({

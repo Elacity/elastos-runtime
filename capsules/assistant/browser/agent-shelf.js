@@ -6,7 +6,7 @@
 import { registerEscapeHandler } from "./shell-popovers.js";
 import { sendToAgentHarness, stopAgentHarnessStream, abortAgentStreamNow } from "./agent-send.js";
 import { DICTATION_HYPOTHESIS_CAP } from "./agent-context.js";
-import { desktopStageId, setActiveStage } from "./harness-host.js";
+import { copyFromButton, desktopStageId, setActiveStage } from "./harness-host.js";
 import { selectedLiveOffer } from "./agent-live.js";
 
 let bound = false;
@@ -76,9 +76,10 @@ export function syncAgentSendButton(input = composerInput()) {
   }
   const hasText = hasMeaningfulComposerContent(input);
   btn.dataset.mode = "send";
-  btn.disabled = !hasText || !selectedLiveOffer();
+  const hasModel = Boolean(selectedLiveOffer());
+  btn.disabled = !hasText || !hasModel;
   btn.setAttribute("aria-label", "Send");
-  btn.title = hasText ? "Send" : "Enter a message to send";
+  btn.title = !hasModel ? "Get a model to start" : hasText ? "Send" : "Enter a message to send";
 }
 
 export function setAgentComposerProcessing(isProcessing) {
@@ -574,6 +575,10 @@ function pasteEditorEl() {
     }
   });
   el.querySelector("[data-paste-close]").addEventListener("click", () => closePasteEditor());
+  const copyButton = el.querySelector("[data-paste-copy]");
+  copyButton.addEventListener("click", () => {
+    void copyFromButton(copyButton, el.querySelector("[data-paste-body]").value);
+  });
   el.querySelector("[data-paste-save]").addEventListener("click", () => savePasteEditor());
   return el;
 }
@@ -751,20 +756,19 @@ function toggleVoiceDictation() {
   startVoiceDictation();
 }
 
+// Home frames apps without the microphone permission, so dictation can only
+// work where the embedding page grants it.
+function microphoneAllowed() {
+  const policy = document.permissionsPolicy || document.featurePolicy;
+  return policy?.allowsFeature?.("microphone") === true;
+}
+
 function bindVoiceDictation() {
   const btn = micButton();
-  const Ctor = speechRecognitionCtor();
-  if (!btn) {
+  if (!btn || !speechRecognitionCtor() || !microphoneAllowed()) {
     return;
   }
-  if (!Ctor) {
-    btn.disabled = true;
-    btn.setAttribute("aria-disabled", "true");
-    btn.title = "Voice dictation needs speech recognition in this browser";
-    btn.setAttribute("aria-label", "Voice dictation unavailable");
-    btn.dataset.dictationState = "error";
-    return;
-  }
+  btn.hidden = false;
   btn.disabled = false;
   btn.removeAttribute("aria-disabled");
   setDictationState("idle");

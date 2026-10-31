@@ -3,12 +3,13 @@ use anyhow::Context as _;
 use elastos_runtime::provider;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
@@ -21,6 +22,27 @@ const MODEL_PROVIDER_SECRETS_DIR_NAME: &str = "secrets";
 const HOSTED_DISPLAY_NAME_MAX_BYTES: usize = 80;
 const HOSTED_SECRET_REF_PREFIX: &str = "runtime:model-provider:";
 static MODEL_PROVIDER_CONFIG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) type HostedHomeGates = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+
+// Setup and decision transitions serialize within the Home that owns the
+// authority. An owned guard keeps its gate alive through cancellation/drain.
+pub(super) fn hosted_home_gate(
+    gates: &OnceLock<HostedHomeGates>,
+    data_dir: &Path,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = gates
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(gate) = gates.get(data_dir).and_then(Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(data_dir.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
 
 /// Loopback HTTP(S) URL accepted only from owner-scoped validate-fixtures.json.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +57,7 @@ impl LoopbackHttpUrl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostedValidateFixtures {
     pub openrouter_models_url: LoopbackHttpUrl,
+    pub openrouter_key_url: Option<LoopbackHttpUrl>,
     pub venice_rate_limits_url: LoopbackHttpUrl,
     pub venice_models_url: LoopbackHttpUrl,
     pub openrouter_chat_url: Option<LoopbackHttpUrl>,
@@ -46,6 +69,8 @@ pub(crate) struct HostedValidateFixtures {
 #[serde(deny_unknown_fields)]
 struct ValidateFixturesFile {
     openrouter_models_url: String,
+    #[serde(default)]
+    openrouter_key_url: Option<String>,
     venice_rate_limits_url: String,
     venice_models_url: String,
     #[serde(default)]
@@ -313,6 +338,7 @@ fn load_hosted_validate_fixtures_unlocked(
         .map_err(|_| anyhow::anyhow!("model-provider validate fixtures are invalid"))?;
     Ok(Some(HostedValidateFixtures {
         openrouter_models_url: parse_loopback_http_url(&file.openrouter_models_url)?,
+        openrouter_key_url: optional_loopback_http_url(file.openrouter_key_url.as_deref())?,
         venice_rate_limits_url: parse_loopback_http_url(&file.venice_rate_limits_url)?,
         venice_models_url: parse_loopback_http_url(&file.venice_models_url)?,
         openrouter_chat_url: optional_loopback_http_url(file.openrouter_chat_url.as_deref())?,
@@ -335,6 +361,19 @@ pub(crate) fn load_hosted_validate_fixtures(
 
 fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
+}
+
+/// Declare the installed component's engine read boundary for macOS startup.
+/// Activation still verifies its full receipt and payload closure before Init.
+#[cfg(target_os = "macos")]
+pub fn model_provider_engine_bundle(data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let bytes = super::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    )?;
+    let manifest = serde_json::from_slice(&bytes)?;
+    crate::setup::local_model_engine_confinement_bundle(data_dir, &manifest)
 }
 
 pub fn model_provider_bridge_config(
@@ -375,7 +414,10 @@ pub fn model_provider_bridge_config(
 pub async fn model_provider_config(
     data_dir: &Path,
     registry: &provider::ProviderRegistry,
-) -> anyhow::Result<(provider::BridgeProviderConfig, Option<fs::File>)> {
+) -> anyhow::Result<(
+    provider::BridgeProviderConfig,
+    Option<crate::host_lock::FileLock>,
+)> {
     let config = model_provider_bridge_config(data_dir)?;
     #[cfg(unix)]
     {
@@ -507,125 +549,6 @@ fn hosted_hint_from_offers(
     })
 }
 
-/// Resolve one saved decision instance without using its display name as authority.
-pub(super) fn decision_hosted_offer(data_dir: &Path, id: &str) -> Option<HostedModelOfferHint> {
-    let offers = load_model_provider_operator_offers(data_dir).ok()?;
-    let offer = offers
-        .iter()
-        .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(id))?;
-    if !operator_offer_enabled(offer)
-        || !operator_offer_has_key(offer)
-        || offer.get("operation").and_then(serde_json::Value::as_str)
-            != Some(elastos_model_contract::decisions::OPERATION)
-        || offer
-            .pointer("/adapter/kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("open_router_decisions")
-        || !offer
-            .pointer("/adapter/model")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|model| model.starts_with("typesafe/jev-"))
-    {
-        return None;
-    }
-    hosted_hint_from_offers(std::slice::from_ref(offer), id)
-}
-
-fn approval_lens_selection_path(data_dir: &Path) -> PathBuf {
-    model_provider_root_dir(data_dir).join("approval-lens.json")
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalLensSelection {
-    offer_id: String,
-}
-
-pub(crate) fn approval_lens_has_selection(data_dir: &Path) -> bool {
-    // A failed policy read or migration keeps human review required.
-    approval_lens_offer_id(data_dir)
-        .map(|id| id.is_some())
-        .unwrap_or(true)
-}
-
-fn store_approval_lens_selection(data_dir: &Path, id: &str) -> anyhow::Result<()> {
-    write_model_provider_config_atomic(
-        &approval_lens_selection_path(data_dir),
-        &serde_json::to_vec(&ApprovalLensSelection {
-            offer_id: id.to_string(),
-        })?,
-    )
-}
-
-pub(super) fn select_approval_lens(data_dir: &Path, id: &str) -> anyhow::Result<()> {
-    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    anyhow::ensure!(
-        decision_hosted_offer(data_dir, id).is_some(),
-        "configured decision model required"
-    );
-    store_approval_lens_selection(data_dir, id)
-}
-
-/// Read policy identity separately from availability. First legacy selection is
-/// migrated while holding the same lock as explicit selection and model edits.
-pub(super) fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<String>> {
-    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let path = approval_lens_selection_path(data_dir);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            validate_model_provider_private_directory(
-                &data_dir.join("providers"),
-                "model-provider config parent",
-            )?;
-            validate_model_provider_private_directory(
-                &model_provider_root_dir(data_dir),
-                "model-provider config root",
-            )?;
-            let bytes = read_model_provider_private_file(
-                &path,
-                &metadata,
-                4096,
-                "Approval Lens selection",
-            )?;
-            let selection: ApprovalLensSelection = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(
-                !selection.offer_id.is_empty() && selection.offer_id.len() <= 256,
-                "invalid evaluator selection"
-            );
-            Ok(Some(selection.offer_id))
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let offers = load_model_provider_operator_offers(data_dir)?;
-            let id = offers.iter().find_map(|offer| {
-                let id = offer.get("id")?.as_str()?;
-                (offer
-                    .get("title")?
-                    .as_str()?
-                    .trim()
-                    .eq_ignore_ascii_case("jev")
-                    && decision_hosted_offer(data_dir, id).is_some())
-                .then(|| id.to_string())
-            });
-            if let Some(id) = &id {
-                store_approval_lens_selection(data_dir, id)?;
-            }
-            Ok(id)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
-    let id = approval_lens_offer_id(data_dir).ok()??;
-    Some((id.clone(), decision_hosted_offer(data_dir, &id)?))
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AiProviderConnection {
     pub operation: String,
@@ -637,7 +560,6 @@ pub(crate) struct AiProviderConnection {
     pub processor_kind: String,
     pub selected_model: Option<String>,
     pub key_present: bool,
-    pub share_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub privacy: Option<String>,
 }
@@ -751,7 +673,6 @@ fn connection_from_offer(offer: &serde_json::Value) -> Option<AiProviderConnecti
         processor_kind: "external".to_string(),
         selected_model,
         key_present,
-        share_enabled: hosted_share_enabled(offer),
         privacy,
     })
 }
@@ -1018,13 +939,18 @@ pub(crate) fn discard_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyh
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    require_staged_hosted_key(data_dir, offer_id)?;
+    #[cfg(unix)]
+    super::model_provider_egress_decision::end_offer(data_dir, offer_id)?;
+    clear_staged_hosted_key(data_dir, offer_id)
+}
+
+pub(super) fn require_staged_hosted_key(data_dir: &Path, offer_id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         read_staged_hosted_key(data_dir, offer_id)?.is_some(),
         "staged hosted connection unavailable"
     );
-    #[cfg(unix)]
-    super::model_provider_egress_decision::end_offer(data_dir, offer_id)?;
-    clear_staged_hosted_key(data_dir, offer_id)
+    Ok(())
 }
 
 fn write_hosted_secret(data_dir: &Path, offer_id: &str, api_key: &str) -> anyhow::Result<()> {
@@ -1214,8 +1140,8 @@ pub(super) fn archive_hosted_egress_decision(
         );
         let volume = unsafe { volume.assume_init() };
         anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
-            "hosted egress history disk reserve reached"
+            u128::from(volume.f_bavail) * u128::from(volume.f_frsize) >= bytes.len() as u128,
+            "not enough free space for the hosted egress history entry"
         );
     }
     let stage = directory.join(format!(
@@ -1434,6 +1360,12 @@ fn materialize_provider_offer(
         // a named offer and requests each external effect through Runtime.
         adapter.remove("api_key");
         adapter.remove("bearer_token");
+        if let Some(hosted) = adapter
+            .get_mut("hosted")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            hosted.remove("egress_contract");
+        }
     }
     apply_fixture_chat_url(fixtures, &mut offer);
     offer
@@ -1464,6 +1396,11 @@ fn normalize_display_name(value: &str, fallback: &str) -> anyhow::Result<String>
         anyhow::bail!("invalid hosted instance name");
     }
     Ok(name.to_string())
+}
+
+/// True for a hosted AI offer id (named provider or saved hosted instance).
+pub(crate) fn is_hosted_offer_id(offer_id: &str) -> bool {
+    validate_hosted_instance_id(offer_id).is_ok()
 }
 
 fn validate_hosted_instance_id(offer_id: &str) -> anyhow::Result<()> {
@@ -1726,7 +1663,33 @@ pub(crate) async fn save_hosted_offer(
     ai_provider_status(data_dir)
 }
 
+#[cfg(test)]
 pub(crate) async fn remove_hosted_offer(
+    data_dir: &Path,
+    registry: Option<&provider::ProviderRegistry>,
+    offer_id: &str,
+) -> anyhow::Result<AiProviderStatus> {
+    remove_hosted_offer_configuration(data_dir, offer_id)?;
+    finish_hosted_offer_removal(data_dir, registry, offer_id).await
+}
+
+pub(super) fn remove_hosted_offer_configuration(
+    data_dir: &Path,
+    offer_id: &str,
+) -> anyhow::Result<()> {
+    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    validate_hosted_instance_id(offer_id)?;
+    let offers = load_model_provider_operator_offers(data_dir)?
+        .into_iter()
+        .filter(|offer| !is_same_hosted_instance(offer, offer_id))
+        .collect::<Vec<_>>();
+    persist_model_provider_operator_offers(data_dir, offers)
+}
+
+pub(super) async fn finish_hosted_offer_removal(
     data_dir: &Path,
     registry: Option<&provider::ProviderRegistry>,
     offer_id: &str,
@@ -1736,12 +1699,6 @@ pub(crate) async fn remove_hosted_offer(
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        validate_hosted_instance_id(offer_id)?;
-        let offers = load_model_provider_operator_offers(data_dir)?
-            .into_iter()
-            .filter(|offer| !is_same_hosted_instance(offer, offer_id))
-            .collect::<Vec<_>>();
-        persist_model_provider_operator_offers(data_dir, offers)?;
         delete_hosted_secret(data_dir, offer_id)?;
         clear_staged_hosted_key(data_dir, offer_id)?;
     }
@@ -1830,14 +1787,121 @@ fn read_model_provider_private_file(
     Ok(bytes)
 }
 
+#[cfg(all(test, unix))]
+mod hosted_decision_write_fault_tests {
+    #[tokio::test]
+    async fn decision_writer_reports_post_rename_durability_failure() {
+        const CHILD: &str = "ELASTOS_TEST_HOSTED_POST_RENAME_FAULT";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "decision_writer_reports_post_rename_durability_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated post-rename control failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct RestoreDescriptorLimit(libc::rlimit);
+        impl Drop for RestoreDescriptorLimit {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        super::seed_model_provider_operator_offers_for_test(dir.path(), vec![]).unwrap();
+        super::write_hosted_egress_decisions(dir.path(), b"before").unwrap();
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let limit = libc::rlimit {
+            rlim_cur: original.rlim_cur.min(64),
+            rlim_max: original.rlim_max,
+        };
+        let restore = RestoreDescriptorLimit(original);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut files = Vec::new();
+        let exhausted = loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => {
+                    files.push(file);
+                    assert!(files.len() <= 64, "descriptor fault control stays bounded");
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(exhausted.raw_os_error(), Some(libc::EMFILE));
+        drop(files.pop().unwrap()); // Leave one slot for the staged file.
+        let result = super::write_hosted_egress_decisions(dir.path(), b"after");
+        drop(files);
+        drop(restore);
+        let error = result.unwrap_err();
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EMFILE)
+        );
+        // Record the existing boundary: replacement is visible while the
+        // directory sync could not confirm durability. Security review owns
+        // the commit/uncertainty result before the writer contract changes.
+        assert_eq!(
+            super::read_hosted_egress_decisions(dir.path())
+                .unwrap()
+                .unwrap(),
+            b"after"
+        );
+    }
+}
+
 #[cfg(test)]
 mod hosted_hint_tests {
     use super::{
-        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer, named_jev_hosted_offer,
-        seed_model_provider_operator_offers_for_test, set_hosted_offer_share, status_from_offers,
-        HostedAiProvider,
+        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer,
+        materialize_provider_offer, seed_model_provider_operator_offers_for_test,
+        set_hosted_offer_share, status_from_offers, HostedAiProvider,
     };
     use serde_json::json;
+
+    #[test]
+    fn provider_init_omits_runtime_egress_contract() {
+        let offer = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Fixture",
+            "fixture/model",
+            None,
+        );
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+        let projected = materialize_provider_offer(offer.clone(), None);
+        assert!(projected
+            .pointer("/adapter/hosted/egress_contract")
+            .is_none());
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+    }
 
     #[test]
     fn hosted_hint_omits_urls_and_keys() {
@@ -1925,7 +1989,7 @@ mod hosted_hint_tests {
     }
 
     #[test]
-    fn named_jev_requires_a_decision_model_and_stays_private() {
+    fn decision_model_stays_private() {
         let dir = tempfile::tempdir().unwrap();
         let mut offer = hosted_offer(
             HostedAiProvider::OpenRouter,
@@ -1935,8 +1999,7 @@ mod hosted_hint_tests {
             None,
         );
         offer["adapter"]["api_key"] = serde_json::json!("fixture-secret");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer.clone()]).unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_some());
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
         assert!(hosted_model_share_cards(dir.path()).unwrap().is_empty());
         assert!(set_hosted_offer_share(
             dir.path(),
@@ -1945,64 +2008,6 @@ mod hosted_hint_tests {
             Some(HostedAiProvider::OpenRouter.share_terms_ack())
         )
         .is_err());
-        offer["adapter"]["model"] = serde_json::json!("other/model");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-    }
-
-    #[test]
-    fn approval_lens_selection_survives_rename_and_never_substitutes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut first = hosted_offer(
-            HostedAiProvider::OpenRouter,
-            "model:first",
-            "Jev",
-            "typesafe/jev-1.13",
-            None,
-        );
-        first["adapter"]["api_key"] = json!("fixture-secret");
-        let mut second = first.clone();
-        second["id"] = json!("model:second");
-        seed_model_provider_operator_offers_for_test(
-            dir.path(),
-            vec![first.clone(), second.clone()],
-        )
-        .unwrap();
-        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
-        first["title"] = json!("My reviewer");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![first, second.clone()])
-            .unwrap();
-        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![second.clone()]).unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-        assert!(super::approval_lens_has_selection(dir.path()));
-        super::select_approval_lens(dir.path(), "model:second").unwrap();
-        assert_eq!(
-            named_jev_hosted_offer(dir.path()).unwrap().0,
-            "model:second"
-        );
-        second["enabled"] = json!(false);
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![second]).unwrap();
-        assert!(super::select_approval_lens(dir.path(), "model:second").is_err());
-        assert!(super::select_approval_lens(dir.path(), "model:foreign").is_err());
-    }
-
-    #[test]
-    fn approval_lens_policy_read_error_keeps_review_required() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut offer = hosted_offer(
-            HostedAiProvider::OpenRouter,
-            "model:first",
-            "Jev",
-            "typesafe/jev-1.13",
-            None,
-        );
-        offer["adapter"]["api_key"] = json!("fixture-secret");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
-        std::fs::create_dir(super::approval_lens_selection_path(dir.path())).unwrap();
-        assert!(super::approval_lens_offer_id(dir.path()).is_err());
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-        assert!(super::approval_lens_has_selection(dir.path()));
     }
 
     #[test]
@@ -2149,7 +2154,7 @@ mod hosted_hint_tests {
     }
 
     #[tokio::test]
-    async fn editing_jev_preserves_evaluator_selection_and_other_instances() {
+    async fn editing_jev_keeps_other_instances() {
         let dir = tempfile::tempdir().unwrap();
         let first = "model:hosted-0123456789abcdef0123456789abcdef";
         let second = "model:hosted-1123456789abcdef0123456789abcdef";
@@ -2181,7 +2186,6 @@ mod hosted_hint_tests {
         assert!(offers[1]["adapter"]
             .get("expected_response_model")
             .is_none());
-        assert_eq!(super::named_jev_hosted_offer(dir.path()).unwrap().0, first);
         assert_eq!(
             offers[0]["adapter"]["expected_response_model"],
             "typesafe/jev-1.13-20260917"

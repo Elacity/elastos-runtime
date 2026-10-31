@@ -15,11 +15,21 @@ import { bindAssistantModes } from "./assistant-modes.js";
                                                    Sent on every leave, also one this capsule
                                                    asked for — the room never lowers on its
                                                    own request, so both paths are one morph
-     capsule → Home   home-agent:ready             module booted, frame can be shown
+     capsule → Home   home-agent:hello {docId}     this document started (sent first)
+                      home-agent:ready {docId}     workspace loaded, frame can be shown
                       home-agent:shelf-metrics     composer pill size, so Home's pill matches
                       home-agent:close             user asks to leave from inside (Home, Esc)
                       home-agent:open-viewer       artifact to show in Documents
-                      home-agent:open-browser      web link to open in Browser */
+                      home-agent:open-browser      web link to open in Browser
+
+   Copy goes to Home itself (the top document), not to Home GUI: this frame is
+   opaque-sandboxed with no clipboard permission, so Home writes the text after
+   its own visible confirmation, through the shared Home Clipboard client. */
+
+import {
+  createHomeClipboardClient,
+  MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 import { bindAgentShelf, raiseComposerFace, agentShelfFaceActive, composerInput } from "./agent-shelf.js";
 import {
@@ -30,9 +40,22 @@ import {
   applyAgentWorkspaceSnapshot,
 } from "./agent-harness.js";
 import { handleShellEscape } from "./shell-popovers.js";
-import { postToHome, loadAgentWorkspace, bindWorkspaceApply, scheduleAgentWorkspacePersist } from "./harness-host.js";
+import {
+  postToHome,
+  loadAgentWorkspace,
+  bindWorkspaceApply,
+  scheduleAgentWorkspacePersist,
+  getHomeGuiLaunchToken,
+  homeOrigin,
+  bindHomeCopy,
+} from "./harness-host.js";
+import { createHomeMessageGate } from "./home-agent-gate.js";
 
 const HOME_MESSAGE_TYPES = new Set(["home-agent:open", "home-agent:shelf-handover", "home-agent:close"]);
+/* One id per document, so Home can tell this document's ready from one sent
+   by the document it replaced. */
+const DOC_ID = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+postToHome({ type: "home-agent:hello", docId: DOC_ID });
 
 function fromHome(event) {
   return event.source === window.parent && event.source !== window;
@@ -121,14 +144,7 @@ function reportShelfMetrics() {
   });
 }
 
-window.addEventListener("message", (event) => {
-  if (!fromHome(event)) {
-    return;
-  }
-  const message = event.data;
-  if (!message || typeof message !== "object" || !HOME_MESSAGE_TYPES.has(message.type)) {
-    return;
-  }
+function applyHomeMessage(message) {
   if (message.type === "home-agent:open") {
     applyLaunchQuery(message.query);
     if (!agentShelfFaceActive() || !agentHarnessActive()) {
@@ -145,6 +161,19 @@ window.addEventListener("message", (event) => {
     setHandover(false);
     lowerRoom();
   }
+}
+
+const homeMessages = createHomeMessageGate({ apply: applyHomeMessage, composer: composerInput() });
+
+window.addEventListener("message", (event) => {
+  if (!fromHome(event)) {
+    return;
+  }
+  const message = event.data;
+  if (!message || typeof message !== "object" || !HOME_MESSAGE_TYPES.has(message.type)) {
+    return;
+  }
+  homeMessages.receive(message);
 });
 
 /* Escape rides the same popover stack Home used; when nothing inside claims
@@ -163,6 +192,24 @@ document.addEventListener(
   },
   true,
 );
+
+const homeClipboard = createHomeClipboardClient({
+  targetId: "assistant",
+  homeOrigin: homeOrigin(),
+  homeToken: getHomeGuiLaunchToken(),
+});
+homeClipboard.start();
+
+/* A copy Home would refuse for its size is refused here, by name, before Home
+   is asked to confirm it. */
+bindHomeCopy((text) => {
+  if (new TextEncoder().encode(text).byteLength > MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES) {
+    const error = new Error("Text is too long for the Home clipboard.");
+    error.code = "too_large";
+    return Promise.reject(error);
+  }
+  return homeClipboard.writeText(text, { purpose: "message.text" });
+});
 
 bindAgentShelf();
 bindAgentHarness();
@@ -195,5 +242,6 @@ loadAgentWorkspace()
     notice.textContent = "Your workspace could not be loaded. Reload to retry; existing work is unchanged.";
   })
   .finally(() => {
-    postToHome({ type: "home-agent:ready" });
+    homeMessages.initialized();
+    postToHome({ type: "home-agent:ready", docId: DOC_ID });
   });

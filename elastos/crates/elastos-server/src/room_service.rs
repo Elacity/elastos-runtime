@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Seek, SeekFrom};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +14,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use url::Url;
+
+use crate::host_lock::FileLock;
 
 const STATE_SCHEMA: &str = "elastos.room.state.v1";
 const ROOM_SLUG: &str = "chat-room";
@@ -50,6 +50,8 @@ const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_OBJECTS: usize = 500;
 pub(crate) const MAX_OBJECT_BODY_LEN: usize = 2_000;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// What Chat says when someone tries to send an empty file.
+pub(crate) const EMPTY_FILE_REFUSAL: &str = "Empty files can't be sent.";
 pub const ATTACHMENT_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 pub const ROOM_ACCESS_CAPABILITY: &str = "room.access";
 
@@ -82,6 +84,10 @@ pub struct RoomSummary {
     pub browser_access_block_reason: Option<String>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    /// Sequence number of the newest room object, so Home can signal new
+    /// messages without reading them.
+    #[serde(default)]
+    pub latest_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +98,10 @@ pub struct BrowserAccessRequestOutput {
     pub requested_at: u64,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Browser-held secret that authorizes status reads. Never serialized:
+    /// the gateway delivers it only as an HttpOnly cookie.
+    #[serde(skip)]
+    pub status_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +149,14 @@ pub struct SessionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationObjectView {
     pub seq: u64,
+    /// The verified Community envelope id (`sha256:…`). Present only on
+    /// Community rows; local-room rows have no envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// The Community conversation the row belongs to; a link opened from the
+    /// row cites it with `message_id`. Present only on Community rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub sender: String,
     /// Profile attribution for collaboration senders. `Some(true)`: the
     /// sender's verified device is bound to an accepted signed Profile head
@@ -162,6 +180,24 @@ pub struct ConversationObjectView {
     #[serde(default)]
     pub attachment: Option<AttachmentView>,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<CommunityDeliveryState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunityDeliveryState {
+    Sending,
+    /// A verified remote receipt exists; other participants may still be pending.
+    Accepted,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityDeliveryView {
+    pub seq: u64,
+    pub state: CommunityDeliveryState,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +361,14 @@ pub struct RoomPollView {
     pub objects: Vec<ConversationObjectView>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    #[serde(default)]
+    pub own_delivery: Vec<CommunityDeliveryView>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoomHistoryView {
+    pub status: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -333,8 +377,12 @@ pub struct RoomTransportView {
     pub configured: bool,
     #[serde(default)]
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_joined: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<RoomHistoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -714,6 +762,9 @@ struct BrowserAccessRequestRecord {
     session_token: Option<String>,
     #[serde(default)]
     session_expires_at: Option<u64>,
+    /// SHA-256 of the status secret; requests without one cannot be read.
+    #[serde(default)]
+    status_secret_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,6 +816,8 @@ struct ConversationObjectRecord {
     #[serde(default)]
     attachment: Option<AttachmentView>,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_state: Option<CommunityDeliveryState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,6 +923,7 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
             browser_access_allowed: true,
             browser_access_block_reason: None,
             transport: RoomTransportView::default(),
+            latest_seq: state.next_seq.saturating_sub(1),
         })
     })
 }
@@ -1896,6 +1950,7 @@ pub fn request_browser_access(
     with_locked_state(data_dir, |_, state| {
         ensure_browser_access_allowed_for_member(state, host_member_did.as_deref())?;
         let now = now_ts();
+        let status_secret = random_hex(32);
         let request = BrowserAccessRequestRecord {
             request_id: random_hex(16),
             display_name,
@@ -1908,6 +1963,9 @@ pub fn request_browser_access(
             denial_reason: None,
             session_token: None,
             session_expires_at: None,
+            status_secret_sha256: Some(hex::encode(browser_request_status_secret_digest(
+                &status_secret,
+            ))),
         };
         let out = BrowserAccessRequestOutput {
             request_id: request.request_id.clone(),
@@ -1915,6 +1973,7 @@ pub fn request_browser_access(
             status: "pending".to_string(),
             requested_at: request.requested_at,
             capabilities,
+            status_secret,
         };
         state.pending_requests.push(request);
         Ok(out)
@@ -1924,6 +1983,7 @@ pub fn request_browser_access(
 pub fn browser_access_status(
     data_dir: &Path,
     request_id: &str,
+    status_secret: &str,
 ) -> anyhow::Result<BrowserAccessStatusOutput> {
     with_locked_state(data_dir, |_, state| {
         let request = state
@@ -1931,6 +1991,9 @@ pub fn browser_access_status(
             .iter()
             .find(|item| item.request_id == request_id)
             .ok_or_else(|| anyhow::anyhow!("web guest request not found"))?;
+        if !browser_request_status_secret_matches(request, status_secret) {
+            anyhow::bail!("web guest request is not bound to this browser");
+        }
 
         Ok(BrowserAccessStatusOutput {
             request_id: request.request_id.clone(),
@@ -1942,6 +2005,27 @@ pub fn browser_access_status(
             capabilities: request.capabilities.clone(),
         })
     })
+}
+
+fn browser_request_status_secret_digest(secret: &str) -> [u8; 32] {
+    sha2::Sha256::digest(format!("elastos.room.browser-request-status.v1:{secret}").as_bytes())
+        .into()
+}
+
+fn browser_request_status_secret_matches(
+    request: &BrowserAccessRequestRecord,
+    status_secret: &str,
+) -> bool {
+    use subtle::ConstantTimeEq as _;
+    let Some(expected) = request
+        .status_secret_sha256
+        .as_deref()
+        .and_then(|digest| hex::decode(digest).ok())
+    else {
+        return false;
+    };
+    let presented = browser_request_status_secret_digest(status_secret);
+    bool::from(expected.as_slice().ct_eq(&presented))
 }
 
 pub fn start_local_runtime_session(
@@ -2751,6 +2835,7 @@ pub fn room_poll(data_dir: &Path, token: &str, since: u64) -> anyhow::Result<Roo
             .map(|item| object_view_from_record(item, Some(&current_session)))
             .collect::<Vec<_>>();
         Ok(RoomPollView {
+            own_delivery: Vec::new(),
             room_slug,
             display_name,
             expires_at,
@@ -2791,6 +2876,7 @@ pub fn append_object_with_transport(
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id: new_object_event_id(),
                 collaboration_scope: None,
@@ -2815,6 +2901,15 @@ pub fn append_object_with_transport(
     })
 }
 
+/// Product direction is durable; the local session supplies only UI attribution.
+pub(crate) enum CollaborationTextOrigin<'a> {
+    Incoming,
+    Outgoing {
+        local_session_token: Option<&'a str>,
+    },
+}
+
+/// Outgoing rows keep delivery state independently of a local Chat session.
 pub(crate) fn project_collaboration_text(
     data_dir: &Path,
     scope: (&str, &str),
@@ -2822,28 +2917,23 @@ pub(crate) fn project_collaboration_text(
     sender_profile: &RoomProfileCardView,
     body: &str,
     issued_at: u64,
-    local_session_token: Option<&str>,
+    origin: CollaborationTextOrigin<'_>,
 ) -> anyhow::Result<ConversationObjectView> {
-    let scope = collaboration_object_scope(scope.0, scope.1)?;
-    let event_id = normalize_collaboration_envelope_sha256(envelope_sha256)?;
-    let sender_member_did = normalize_member_did(&sender_profile.profile_id)?;
-    if sender_profile.profile_id != sender_member_did {
-        anyhow::bail!("collaboration sender Profile DID is not canonical");
-    }
-    let sender = normalize_display_name(&sender_profile.display_name)?;
-    let sender_profile = RoomProfileCardView {
-        schema: sender_profile.schema.clone(),
-        profile_id: sender_member_did.clone(),
-        display_name: sender.clone(),
-        handle: sender_profile.handle.clone(),
-        updated_at: sender_profile.updated_at,
+    let (outgoing, local_session_token) = match origin {
+        CollaborationTextOrigin::Incoming => (false, None),
+        CollaborationTextOrigin::Outgoing {
+            local_session_token,
+        } => (true, local_session_token),
     };
-    let normalized_body = normalize_object_body(body)?;
-    if normalized_body != body {
-        anyhow::bail!("collaboration Chat body is not canonical");
-    }
-    let body = normalized_body;
-    with_locked_state(data_dir, |_, state| {
+    let CollaborationTextProjection {
+        scope,
+        event_id,
+        sender_member_did,
+        sender,
+        sender_profile,
+        body,
+    } = collaboration_text_projection(scope, envelope_sha256, sender_profile, body)?;
+    let object = with_locked_state(data_dir, |_, state| {
         let current_session = match local_session_token {
             Some(token) => {
                 let session = validate_session(state, token)?;
@@ -2859,9 +2949,8 @@ pub(crate) fn project_collaboration_text(
 
         if let Some(existing) = state
             .objects
-            .iter()
+            .iter_mut()
             .find(|object| object.event_id == event_id)
-            .cloned()
         {
             if existing.collaboration_scope.as_ref() != Some(&scope)
                 || existing.sender != sender
@@ -2876,12 +2965,19 @@ pub(crate) fn project_collaboration_text(
             {
                 anyhow::bail!("collaboration projection event conflicts with stored Chat object");
             }
-            return Ok(object_view_from_record(existing, current_session.as_ref()));
+            if outgoing && existing.delivery_state.is_none() {
+                existing.delivery_state = Some(CommunityDeliveryState::Sending);
+            }
+            return Ok(object_view_from_record(
+                existing.clone(),
+                current_session.as_ref(),
+            ));
         }
 
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: outgoing.then_some(CommunityDeliveryState::Sending),
                 seq: 0,
                 event_id,
                 collaboration_scope: Some(scope),
@@ -2901,6 +2997,162 @@ pub(crate) fn project_collaboration_text(
             },
         );
         Ok(object_view_from_record(object, current_session.as_ref()))
+    })?;
+    // Persist newly created Room ancestors before history or Core ACK advances.
+    // Retry also checks this boundary when the exact row already exists.
+    let paths = storage_paths(data_dir)?;
+    #[cfg(test)]
+    check_collaboration_projection_write_fault(
+        &paths.objects_path,
+        CollaborationProjectionWriteFault::BeforeAncestorSync,
+    )?;
+    let mut directory = paths.root_dir;
+    loop {
+        anyhow::ensure!(
+            directory.starts_with(data_dir),
+            "Room directory escaped its data root"
+        );
+        fs::File::open(&directory)?.sync_all()?;
+        if directory == data_dir {
+            break;
+        }
+        directory = directory
+            .parent()
+            .context("Room directory has no owned parent")?
+            .to_path_buf();
+    }
+    Ok(object)
+}
+
+struct CollaborationTextProjection {
+    scope: CollaborationObjectScope,
+    event_id: String,
+    sender_member_did: String,
+    sender: String,
+    sender_profile: RoomProfileCardView,
+    body: String,
+}
+
+/// Admission and projection share every deterministic Room input check.
+pub(crate) fn validate_collaboration_text(
+    scope: (&str, &str),
+    envelope_sha256: &str,
+    sender_profile: &RoomProfileCardView,
+    body: &str,
+) -> anyhow::Result<()> {
+    collaboration_text_projection(scope, envelope_sha256, sender_profile, body).map(|_| ())
+}
+
+fn collaboration_text_projection(
+    scope: (&str, &str),
+    envelope_sha256: &str,
+    sender_profile: &RoomProfileCardView,
+    body: &str,
+) -> anyhow::Result<CollaborationTextProjection> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let event_id = normalize_collaboration_envelope_sha256(envelope_sha256)?;
+    let sender_member_did = normalize_member_did(&sender_profile.profile_id)?;
+    if sender_profile.profile_id != sender_member_did {
+        anyhow::bail!("collaboration sender Profile DID is not canonical");
+    }
+    let sender = normalize_display_name(&sender_profile.display_name)?;
+    let sender_profile = RoomProfileCardView {
+        schema: sender_profile.schema.clone(),
+        profile_id: sender_member_did.clone(),
+        display_name: sender.clone(),
+        handle: sender_profile.handle.clone(),
+        updated_at: sender_profile.updated_at,
+    };
+    let normalized_body = normalize_object_body(body)?;
+    if normalized_body != body {
+        anyhow::bail!("collaboration Chat body is not canonical");
+    }
+    Ok(CollaborationTextProjection {
+        scope,
+        event_id,
+        sender_member_did,
+        sender,
+        sender_profile,
+        body: normalized_body,
+    })
+}
+
+/// Internal metadata reads use the exact Runtime-owned collaboration scope
+/// and verified Profile attribution. They leave the account's read state alone.
+pub(crate) fn collaboration_latest_remote_message_seq(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    reader_profile_did: &str,
+) -> anyhow::Result<u64> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.sender_member_did.as_deref() != Some(reader.as_str())
+                    && verified_collaboration_sender_profile(item).is_some()
+            })
+            .map(|item| item.seq)
+            .max()
+            .unwrap_or(0))
+    })
+}
+
+/// The verified people a configured Community poll lists, without a session,
+/// as (Profile DID, signed Profile display name): the people a Chat profile
+/// card can act on, named as the card names them.
+pub(crate) fn collaboration_verified_members(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(participant_views_from_state(state, None, Some(&scope))
+            .into_iter()
+            .filter_map(|participant| Some((participant.member_did?, participant.display_name)))
+            .collect())
+    })
+}
+
+/// One verified Community text row, found by its envelope id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollaborationTextRow {
+    pub(crate) sender_profile_did: String,
+    pub(crate) sender_display_name: String,
+    pub(crate) body: String,
+}
+
+/// The verified Community text row `message_id` in this scope, when one exists
+/// and its sender's Profile attribution verifies.
+pub(crate) fn collaboration_text_row(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Option<CollaborationTextRow>> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.event_id == message_id
+                    && item.kind == ConversationObjectKind::Text
+            })
+            .find_map(|item| {
+                let profile = verified_collaboration_sender_profile(item)?;
+                Some(CollaborationTextRow {
+                    sender_profile_did: item.sender_member_did.clone()?,
+                    sender_display_name: profile.display_name.clone(),
+                    body: item.body.clone()?,
+                })
+            }))
     })
 }
 
@@ -2912,37 +3164,190 @@ pub(crate) fn collaboration_room_poll(
     since: u64,
 ) -> anyhow::Result<RoomPollView> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
-    with_locked_state(data_dir, |_, state| {
-        let (display_name, expires_at, current_session) = {
-            let session = validate_session(state, token)?;
-            (
-                session.display_name.clone(),
-                session.expires_at,
-                current_session_identity(session),
-            )
-        };
-        let participants =
-            participant_views_from_state(state, Some(&current_session), Some(&scope));
-        let objects = state
-            .objects
+    with_expired_read_state(data_dir, |state| {
+        collaboration_poll_from_state(state, token, &scope, since)
+    })
+}
+
+/// Core records terminal outcomes before it prunes their signed evidence.
+/// Existing Chat rows keep those outcomes while Chat is closed or restarted.
+/// Matching Core originals also repair legacy rows with an empty delivery state.
+pub(crate) fn persist_collaboration_delivery(
+    data_dir: &Path,
+    scope: (&str, &str),
+    sender_profile_did: &str,
+    delivery: &[crate::collaboration_core::OutgoingChatDeliveryEvidence],
+    now: u64,
+) -> anyhow::Result<()> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let sender = normalize_member_did(sender_profile_did)?;
+    let paths = storage_paths(data_dir)?;
+    let lockfile = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let lock = lock_state_file(lockfile)?;
+    let result = (|| {
+        let mut state = load_state(&paths)?;
+        let evidence = delivery
             .iter()
-            .filter(|item| {
-                item.collaboration_scope.as_ref() == Some(&scope)
-                    && item.seq > since
-                    && verified_collaboration_sender_profile(item).is_some()
+            .map(|entry| (entry.envelope_sha256.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut needs_sync = false;
+        for object in &mut state.objects {
+            if object.collaboration_scope.as_ref() != Some(&scope)
+                || object.sender_member_did.as_deref() != Some(sender.as_str())
+                || verified_collaboration_sender_profile(object).is_none()
+            {
+                continue;
+            }
+            let next = match evidence.get(object.event_id.as_str()) {
+                Some(entry) if entry.accepted => CommunityDeliveryState::Accepted,
+                Some(entry) if entry.expires_at <= now => match object.delivery_state {
+                    Some(CommunityDeliveryState::Accepted) => CommunityDeliveryState::Accepted,
+                    _ => CommunityDeliveryState::Expired,
+                },
+                _ => continue,
+            };
+            object.delivery_state = Some(next);
+            // A prior poll may have written this outcome without syncing it.
+            // Its matching snapshot still needs durability before Core prune.
+            needs_sync = true;
+        }
+        if needs_sync {
+            write_json_atomic_with_sync(&paths.objects_path, &state.objects, true)?;
+        }
+        Ok(())
+    })();
+    unlock_state_file(lock)?;
+    result
+}
+
+/// Refresh only this authenticated Profile's original rows. The snapshot is
+/// independent of the feed cursor, so receipt/expiry changes preserve seq.
+pub(crate) fn collaboration_room_poll_with_delivery(
+    data_dir: &Path,
+    token: &str,
+    scope: (&str, &str),
+    since: u64,
+    reader_profile_did: &str,
+    delivery: &[crate::collaboration_core::OutgoingChatDeliveryEvidence],
+    now: u64,
+) -> anyhow::Result<RoomPollView> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    let paths = storage_paths(data_dir)?;
+    let lockfile = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)?;
+    let lock = lock_state_file(lockfile)?;
+    let result = (|| {
+        let mut state = load_state(&paths)?;
+        let _ = expire_state_in_place(&mut state);
+        let session = validate_session_for_read(&state, token)?;
+        if session.member_did.as_deref() != Some(reader.as_str()) {
+            anyhow::bail!("Chat delivery reader does not match the room Profile");
+        }
+        let evidence = delivery
+            .iter()
+            .map(|entry| (entry.envelope_sha256.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut changed = false;
+        for object in &mut state.objects {
+            if object.collaboration_scope.as_ref() != Some(&scope)
+                || object.sender_member_did.as_deref() != Some(reader.as_str())
+                || verified_collaboration_sender_profile(object).is_none()
+            {
+                continue;
+            }
+            let next = match evidence.get(object.event_id.as_str()) {
+                Some(entry) if entry.accepted => Some(CommunityDeliveryState::Accepted),
+                // Core evidence was read before this Room lock. Preserve the
+                // terminal outcome already saved by another poll or prune.
+                Some(_)
+                    if matches!(
+                        object.delivery_state,
+                        Some(CommunityDeliveryState::Accepted | CommunityDeliveryState::Expired)
+                    ) =>
+                {
+                    object.delivery_state
+                }
+                Some(entry) if entry.expires_at <= now => Some(CommunityDeliveryState::Expired),
+                Some(_) => Some(CommunityDeliveryState::Sending),
+                // An empty Core snapshot may precede this row's prepare or
+                // projection ACK. Only old, genuinely missing evidence can
+                // downgrade Sending after the signed Chat lifetime plus skew.
+                None
+                    if object.delivery_state == Some(CommunityDeliveryState::Sending)
+                        && object
+                            .created_at
+                            .saturating_add(crate::collaboration_product::CHAT_MESSAGE_TTL_SECS)
+                            .saturating_add(
+                                elastos_common::collaboration_protocol::MAX_COLLABORATION_CLOCK_SKEW_SECS,
+                            )
+                            < now =>
+                {
+                    Some(CommunityDeliveryState::Unknown)
+                }
+                None => object.delivery_state,
+            };
+            if object.delivery_state != next {
+                object.delivery_state = next;
+                changed = true;
+            }
+        }
+        if changed {
+            write_json_atomic(&paths.objects_path, &state.objects)?;
+        }
+        collaboration_poll_from_state(&state, token, &scope, since)
+    })();
+    unlock_state_file(lock)?;
+    result
+}
+
+fn collaboration_poll_from_state(
+    state: &RoomState,
+    token: &str,
+    scope: &CollaborationObjectScope,
+    since: u64,
+) -> anyhow::Result<RoomPollView> {
+    let session = validate_session_for_read(state, token)?;
+    let current_session = current_session_identity(session);
+    let participants = participant_views_from_state(state, Some(&current_session), Some(scope));
+    let scoped = state.objects.iter().filter(|item| {
+        item.collaboration_scope.as_ref() == Some(scope)
+            && verified_collaboration_sender_profile(item).is_some()
+    });
+    let own_delivery = scoped
+        .clone()
+        .filter(|item| item.sender_member_did.as_deref() == current_session.member_did.as_deref())
+        .filter_map(|item| {
+            item.delivery_state.map(|delivery| CommunityDeliveryView {
+                seq: item.seq,
+                state: delivery,
             })
-            .cloned()
-            .map(|item| object_view_from_record(item, Some(&current_session)))
-            .collect::<Vec<_>>();
-        Ok(RoomPollView {
-            room_slug: state.room_slug.clone(),
-            display_name,
-            expires_at,
-            latest_seq: objects.last().map(|item| item.seq).unwrap_or(since),
-            participants,
-            objects,
-            transport: RoomTransportView::default(),
         })
+        .collect();
+    let objects = scoped
+        .filter(|item| item.seq > since)
+        .cloned()
+        .map(|item| object_view_from_record(item, Some(&current_session)))
+        .collect::<Vec<_>>();
+    Ok(RoomPollView {
+        room_slug: state.room_slug.clone(),
+        display_name: session.display_name.clone(),
+        expires_at: session.expires_at,
+        latest_seq: objects.last().map(|item| item.seq).unwrap_or(since),
+        participants,
+        objects,
+        transport: RoomTransportView::default(),
+        own_delivery,
     })
 }
 
@@ -2991,6 +3396,7 @@ pub fn ingest_room_object_envelope(
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id,
                 collaboration_scope: None,
@@ -3063,7 +3469,7 @@ pub fn append_attachment_object_with_transport(
     let file_name = normalize_file_name(file_name);
     let mime_type = normalize_mime_type(mime_type);
     if bytes.is_empty() {
-        anyhow::bail!("attachment must not be empty");
+        anyhow::bail!(EMPTY_FILE_REFUSAL);
     }
     if bytes.len() > MAX_ATTACHMENT_BYTES {
         anyhow::bail!("attachment exceeds {} bytes", MAX_ATTACHMENT_BYTES);
@@ -3113,7 +3519,7 @@ pub fn start_attachment_upload(
     let file_name = normalize_file_name(file_name);
     let mime_type = normalize_mime_type(mime_type);
     if size_bytes == 0 {
-        anyhow::bail!("attachment must not be empty");
+        anyhow::bail!(EMPTY_FILE_REFUSAL);
     }
     if size_bytes > MAX_ATTACHMENT_BYTES as u64 {
         anyhow::bail!("attachment exceeds {} bytes", MAX_ATTACHMENT_BYTES);
@@ -3295,6 +3701,25 @@ fn validate_session<'a>(
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     ensure_session_actor_id(session);
+    if !session
+        .capabilities
+        .iter()
+        .any(|capability| capability == ROOM_ACCESS_CAPABILITY)
+    {
+        anyhow::bail!("session is not approved for room access");
+    }
+    Ok(session)
+}
+
+fn validate_session_for_read<'a>(
+    state: &'a RoomState,
+    token: &str,
+) -> anyhow::Result<&'a SessionRecord> {
+    let session = state
+        .sessions
+        .iter()
+        .find(|item| item.token == token && item.expires_at > now_ts())
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     if !session
         .capabilities
         .iter()
@@ -4166,6 +4591,7 @@ fn append_attachment_record(
     let object = push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4193,6 +4619,7 @@ fn push_system_object(
     push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4231,6 +4658,7 @@ fn push_member_system_object_for_actor(
     push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4301,9 +4729,24 @@ fn object_view_from_record(
     } else {
         object.sender_profile.as_ref().map(|_| true)
     };
+    let delivery_state = current_session
+        .filter(|session| {
+            session.member_did.is_some() && session.member_did == object.sender_member_did
+        })
+        .and(object.delivery_state);
+    let (message_id, conversation_id) = match &object.collaboration_scope {
+        Some(scope) => (
+            Some(object.event_id.clone()),
+            Some(scope.conversation_id.clone()),
+        ),
+        None => (None, None),
+    };
     ConversationObjectView {
+        delivery_state,
         sender_profile_verified,
         seq: object.seq,
+        message_id,
+        conversation_id,
         sender: verified_sender_profile
             .map(|profile| profile.display_name.clone())
             .unwrap_or(object.sender),
@@ -4364,22 +4807,20 @@ fn with_locked_state<T>(
     let paths = storage_paths(data_dir)?;
     fs::create_dir_all(&paths.root_dir)?;
 
-    let mut lockfile = fs::OpenOptions::new()
+    let lockfile = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-
-    flock_exclusive(&lockfile)?;
+    let lock = lock_state_file(lockfile)?;
 
     let mut state = load_state(&paths)?;
     prune_state(&paths, &mut state);
     let result = f(&paths, &mut state)?;
     save_state(&paths, &state)?;
-    unlock_file(&lockfile)?;
-    let _ = lockfile.seek(SeekFrom::Start(0));
+    unlock_state_file(lock)?;
     Ok(result)
 }
 
@@ -4403,14 +4844,12 @@ fn with_expired_read_state<T>(
                 .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))
         }
     };
-    if let Some(lockfile) = lockfile.as_ref() {
-        flock_exclusive(lockfile)?;
-    }
+    let lock = lockfile.map(lock_state_file).transpose()?;
     let mut state = load_state(&paths)?;
     let _ = expire_state_in_place(&mut state);
     let result = f(&state);
-    if let Some(lockfile) = lockfile.as_ref() {
-        unlock_file(lockfile)?;
+    if let Some(lock) = lock {
+        unlock_state_file(lock)?;
     }
     result
 }
@@ -4425,10 +4864,10 @@ fn with_read_state<T>(
         .write(true)
         .open(&paths.lock_path)
         .with_context(|| format!("failed to open lockfile {}", paths.lock_path.display()))?;
-    flock_exclusive(&lockfile)?;
+    let lock = lock_state_file(lockfile)?;
     let state = load_state(&paths)?;
     let result = f(&state);
-    unlock_file(&lockfile)?;
+    unlock_state_file(lock)?;
     result
 }
 
@@ -4496,7 +4935,9 @@ fn save_state(paths: &RoomPaths, state: &RoomState) -> anyhow::Result<()> {
     write_json_atomic(&paths.key_epochs_path, &state.key_epochs)?;
     write_json_atomic(&paths.pair_requests_path, &state.pending_requests)?;
     write_json_atomic(&paths.sessions_path, &state.sessions)?;
-    write_json_atomic(&paths.objects_path, &state.objects)?;
+    // Product history and handoff ACKs may advance only after these rows
+    // and their directory entry are durable, including an idempotent retry.
+    write_json_atomic_with_sync(&paths.objects_path, &state.objects, true)?;
     write_json_atomic(&paths.uploads_path, &state.uploads)?;
     Ok(())
 }
@@ -4588,6 +5029,16 @@ fn split_store_exists(paths: &RoomPaths) -> bool {
 }
 
 fn normalize_state_defaults(state: &mut RoomState) {
+    // Objects are durable before their Core ACK. Recover the cursor if a
+    // power loss kept older Room metadata beside those committed rows.
+    let retained_next_seq = state
+        .objects
+        .iter()
+        .map(|object| object.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    state.next_seq = state.next_seq.max(retained_next_seq);
     if state.control.created_at == 0 {
         state.control.created_at = now_ts();
     }
@@ -4647,7 +5098,70 @@ where
     serde_json::from_slice(&bytes).with_context(|| format!("invalid {}", path.display()))
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollaborationProjectionWriteFault {
+    BeforeFileSync,
+    AfterRename,
+    BeforeAncestorSync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COLLABORATION_PROJECTION_WRITE_FAULT: std::cell::RefCell<
+        Option<(PathBuf, CollaborationProjectionWriteFault, usize)>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_collaboration_projection_write_fault(
+    data_dir: &Path,
+    fault: CollaborationProjectionWriteFault,
+) -> anyhow::Result<()> {
+    inject_collaboration_projection_write_fault_after(data_dir, fault, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_collaboration_projection_write_fault_after(
+    data_dir: &Path,
+    fault: CollaborationProjectionWriteFault,
+    successful_writes: usize,
+) -> anyhow::Result<()> {
+    let path = storage_paths(data_dir)?.objects_path;
+    COLLABORATION_PROJECTION_WRITE_FAULT
+        .with(|slot| *slot.borrow_mut() = Some((path, fault, successful_writes)));
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_collaboration_projection_write_fault(
+    path: &Path,
+    fault: CollaborationProjectionWriteFault,
+) -> anyhow::Result<()> {
+    COLLABORATION_PROJECTION_WRITE_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((target, stage, remaining)) = slot.as_mut() {
+            if target == path && *stage == fault {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                } else {
+                    slot.take();
+                    anyhow::bail!("injected collaboration Room durability failure");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 fn write_json_atomic<T>(path: &Path, value: &T) -> anyhow::Result<()>
+where
+    T: Serialize,
+{
+    write_json_atomic_with_sync(path, value, false)
+}
+
+fn write_json_atomic_with_sync<T>(path: &Path, value: &T, durable: bool) -> anyhow::Result<()>
 where
     T: Serialize,
 {
@@ -4662,7 +5176,23 @@ where
             .unwrap_or("state")
     ));
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    if durable {
+        #[cfg(test)]
+        check_collaboration_projection_write_fault(
+            path,
+            CollaborationProjectionWriteFault::BeforeFileSync,
+        )?;
+        fs::File::open(&tmp)?.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    if durable {
+        #[cfg(test)]
+        check_collaboration_projection_write_fault(
+            path,
+            CollaborationProjectionWriteFault::AfterRename,
+        )?;
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -4700,8 +5230,10 @@ fn normalize_display_name(input: &str) -> anyhow::Result<String> {
     if trimmed.is_empty() {
         anyhow::bail!("display name must not be empty");
     }
-    if trimmed.chars().count() > 48 {
-        anyhow::bail!("display name must be 48 characters or fewer");
+    // Signed Profile names allow 64 bytes. Keep existing Room names readable
+    // and accept every valid Profile name, including at the byte limit.
+    if trimmed.chars().count() > 64 {
+        anyhow::bail!("display name must be 64 characters or fewer");
     }
     Ok(trimmed.to_string())
 }
@@ -5171,24 +5703,12 @@ fn browser_access_status_label(status: &BrowserAccessStatus) -> &'static str {
     }
 }
 
-fn flock_exclusive(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    unsafe {
-        if libc::flock(file.as_raw_fd(), libc::LOCK_EX) != 0 {
-            anyhow::bail!("failed to lock group chat state")
-        }
-    }
-    Ok(())
+fn lock_state_file(file: fs::File) -> anyhow::Result<FileLock> {
+    FileLock::exclusive(file).context("failed to lock group chat state")
 }
 
-fn unlock_file(file: &fs::File) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    unsafe {
-        if libc::flock(file.as_raw_fd(), libc::LOCK_UN) != 0 {
-            anyhow::bail!("failed to unlock group chat state")
-        }
-    }
-    Ok(())
+fn unlock_state_file(lock: FileLock) -> anyhow::Result<()> {
+    lock.release().context("failed to unlock group chat state")
 }
 
 #[cfg(test)]
@@ -5322,6 +5842,29 @@ mod tests {
         snapshot
     }
 
+    fn room_state_file_metadata(data_dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = storage_paths(data_dir).unwrap();
+        [
+            paths.room_meta_path,
+            paths.control_path,
+            paths.members_path,
+            paths.invites_path,
+            paths.key_epochs_path,
+            paths.pair_requests_path,
+            paths.sessions_path,
+            paths.objects_path,
+            paths.uploads_path,
+        ]
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).unwrap();
+            (path, metadata.ino(), metadata.modified().unwrap())
+        })
+        .collect()
+    }
+
     fn assert_meaningful_bootstrap_state_rejects_adoption(
         owner: &Path,
         join_token: &str,
@@ -5371,7 +5914,8 @@ mod tests {
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.pending_count, 1);
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "pending");
     }
 
@@ -5404,7 +5948,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(approved.request_id, second.request_id);
-        let first_status = browser_access_status(tmp.path(), &first.request_id).unwrap();
+        let first_status =
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret).unwrap();
         assert_eq!(first_status.status, "pending");
     }
 
@@ -5421,14 +5966,16 @@ mod tests {
         let _ = approve_request(tmp.path(), &second.request_id)
             .unwrap()
             .unwrap();
-        let first_token = browser_access_status(tmp.path(), &first.request_id)
-            .unwrap()
-            .token
-            .unwrap();
-        let second_token = browser_access_status(tmp.path(), &second.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let first_token =
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
+        let second_token =
+            browser_access_status(tmp.path(), &second.request_id, &second.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
 
         let revoked = revoke_session(tmp.path(), &first_token).unwrap().unwrap();
         assert_eq!(revoked.display_name, "Alice");
@@ -5436,13 +5983,13 @@ mod tests {
         assert_eq!(summary.active_session_count, 1);
         assert_eq!(summary.active_sessions[0].display_name, "Bob");
         assert_eq!(
-            browser_access_status(tmp.path(), &first.request_id)
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret)
                 .unwrap()
                 .status,
             "expired"
         );
         assert_eq!(
-            browser_access_status(tmp.path(), &second.request_id)
+            browser_access_status(tmp.path(), &second.request_id, &second.status_secret)
                 .unwrap()
                 .token,
             Some(second_token)
@@ -5515,6 +6062,24 @@ mod tests {
         assert!(paths.pair_requests_path.is_file());
         assert!(paths.sessions_path.is_file());
         assert!(paths.objects_path.is_file());
+    }
+
+    #[test]
+    fn refused_room_change_frees_its_lock_while_a_command_spawned_during_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = storage_paths(tmp.path()).unwrap().lock_path;
+        let mut command = None;
+        let refused = with_locked_state(tmp.path(), |_, _| -> anyhow::Result<()> {
+            command = Some(SpawnedWhileOpen::new(&lock_path));
+            anyhow::bail!("ElastOS user invites are disabled for this conversation")
+        });
+        assert!(refused.is_err());
+        assert!(
+            lock_is_free(&lock_path),
+            "the room must not stay locked by a command spawned during a refused change"
+        );
     }
 
     #[test]
@@ -6495,7 +7060,8 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         let token = status.token.unwrap();
         assert_eq!(status.status, "approved");
         assert_eq!(status.expires_at, Some(approved.expires_at));
@@ -6579,10 +7145,11 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Guest", "Browser", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let guest_token = browser_access_status(tmp.path(), &request.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let guest_token =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
 
         let poll = room_poll(tmp.path(), &guest_token, 0).unwrap();
         assert!(poll.participants.iter().any(
@@ -6690,6 +7257,7 @@ mod tests {
                 removed_by: None,
             });
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 1,
                 event_id: "evt-admin".to_string(),
                 collaboration_scope: None,
@@ -6705,6 +7273,7 @@ mod tests {
                 created_at: 10,
             });
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 2,
                 event_id: "evt-guest".to_string(),
                 collaboration_scope: None,
@@ -6793,7 +7362,7 @@ mod tests {
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -6817,7 +7386,7 @@ mod tests {
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -6978,7 +7547,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7005,7 +7574,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7032,7 +7601,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7065,7 +7634,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7105,7 +7674,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7133,7 +7702,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7144,7 +7713,8 @@ mod tests {
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "expired");
         assert!(status.token.is_none());
     }
@@ -7180,7 +7750,8 @@ mod tests {
             request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
         let denied = deny_next_request(tmp.path(), "No").unwrap().unwrap();
         assert_eq!(denied.display_name, "Bob");
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "denied");
         assert_eq!(status.denial_reason.as_deref(), Some("No"));
     }
@@ -7191,7 +7762,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let _token = browser_access_status(tmp.path(), &request.request_id)
+        let _token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7205,29 +7776,40 @@ mod tests {
     #[test]
     fn revoke_all_sessions_clears_room_and_appends_system_objects() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut request_ids = Vec::new();
+        let mut requests = Vec::new();
         for (display_name, device_label) in [("Alice", "Phone"), ("Bob", "Safari")] {
             let request = request_browser_access(
                 tmp.path(),
                 browser_request(display_name, device_label, None),
             )
             .unwrap();
-            request_ids.push(request.request_id.clone());
+            requests.push(request.clone());
             let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-            let _token = browser_access_status(tmp.path(), &request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
+            let _token =
+                browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
+                    .unwrap()
+                    .token
+                    .unwrap();
         }
 
         let revoked = revoke_all_sessions(tmp.path()).unwrap().unwrap();
         assert_eq!(revoked.revoked_count, 2);
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let first_status = browser_access_status(tmp.path(), &request_ids[0]).unwrap();
+        let first_status = browser_access_status(
+            tmp.path(),
+            &requests[0].request_id,
+            &requests[0].status_secret,
+        )
+        .unwrap();
         assert_eq!(first_status.status, "expired");
         assert!(first_status.token.is_none());
-        let second_status = browser_access_status(tmp.path(), &request_ids[1]).unwrap();
+        let second_status = browser_access_status(
+            tmp.path(),
+            &requests[1].request_id,
+            &requests[1].status_secret,
+        )
+        .unwrap();
         assert_eq!(second_status.status, "expired");
         assert!(second_status.token.is_none());
 
@@ -7258,7 +7840,7 @@ mod tests {
         let _ = approve_request(tmp.path(), &request.request_id)
             .unwrap()
             .unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7301,6 +7883,131 @@ mod tests {
     }
 
     #[test]
+    fn visible_community_read_clears_an_evicted_remote_row_without_own_send_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = room_test_profile(tmp.path(), 121, "Local", None);
+        let remote = room_test_profile(tmp.path(), 122, "Remote", None);
+        let port = crate::collaboration_product::test_chat_product_port(
+            tmp.path(),
+            "unread-network",
+            "unread-conversation",
+        );
+        let session =
+            start_local_runtime_session(tmp.path(), &local.profile_did, "Local", "Unread test")
+                .unwrap();
+        let card = |actor: &RoomTestActor| RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: actor.profile_did.clone(),
+            display_name: actor.profile.document().display_name.clone(),
+            handle: None,
+            updated_at: actor.profile.document().updated_at,
+        };
+        project_collaboration_text(
+            tmp.path(),
+            ("unread-network", "unread-conversation"),
+            &format!("sha256:{}", "e".repeat(64)),
+            &card(&remote),
+            "remote",
+            now_ts(),
+            CollaborationTextOrigin::Incoming,
+        )
+        .unwrap();
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let scope = collaboration_object_scope("unread-network", "unread-conversation").unwrap();
+        // Run the real bounded projection policy once, without 500 disk writes
+        // or relaxing the separate live send limit.
+        with_locked_state(tmp.path(), |_, state| {
+            for index in 0..MAX_OBJECTS {
+                push_object(
+                    state,
+                    ConversationObjectRecord {
+                        delivery_state: None,
+                        seq: 0,
+                        event_id: format!("sha256:{index:064x}"),
+                        collaboration_scope: Some(scope.clone()),
+                        sender: "Local".to_string(),
+                        sender_member_did: Some(local.profile_did.clone()),
+                        sender_profile: Some(card(&local)),
+                        sender_actor_id: String::new(),
+                        kind: ConversationObjectKind::Text,
+                        body: Some(format!("own {index}")),
+                        emoji: None,
+                        link: None,
+                        attachment: None,
+                        created_at: now_ts(),
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            collaboration_latest_remote_message_seq(
+                tmp.path(),
+                "unread-network",
+                "unread-conversation",
+                &local.profile_did
+            )
+            .unwrap(),
+            0
+        );
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let hidden = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                false,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(hidden.objects.len(), MAX_OBJECTS);
+        assert!(hidden
+            .objects
+            .iter()
+            .all(|object| object.sender_member_did.as_deref() == Some(local.profile_did.as_str())));
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let empty = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                u64::MAX,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let visible = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), MAX_OBJECTS);
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+    }
+
+    #[test]
     fn collaboration_text_projection_is_scoped_idempotent_and_presentation_only() {
         let tmp = tempfile::tempdir().unwrap();
         let local_actor = room_test_profile(tmp.path(), 118, "Local", Some("local"));
@@ -7333,7 +8040,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .unwrap();
         assert!(first.from_current_session);
@@ -7344,7 +8053,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .unwrap();
         assert_eq!(replay.seq, first.seq);
@@ -7356,7 +8067,7 @@ mod tests {
             &remote_profile,
             "other scoped message",
             1_800_000_001,
-            None,
+            CollaborationTextOrigin::Incoming,
         )
         .unwrap();
         assert!(!second.from_current_session);
@@ -7393,6 +8104,15 @@ mod tests {
         .unwrap();
         assert_eq!(second_feed.objects.len(), 1);
         assert_eq!(second_feed.objects[0].seq, second.seq);
+        // Community rows name their verified envelope; Chat links cite it.
+        assert_eq!(
+            second_feed.objects[0].message_id.as_deref(),
+            Some(second_hash.as_str())
+        );
+        assert_eq!(
+            second_feed.objects[0].conversation_id.as_deref(),
+            Some("conversation-two")
+        );
         assert_eq!(second_feed.objects[0].sender_profile_verified, Some(true));
         assert_eq!(second_feed.objects[0].sender, "Remote");
         assert_eq!(second_feed.participants.len(), 1);
@@ -7406,6 +8126,10 @@ mod tests {
 
         let legacy_feed = conversation_feed(tmp.path(), &session.token, 0).unwrap();
         assert_eq!(legacy_feed.objects.len(), 2);
+        assert!(legacy_feed
+            .objects
+            .iter()
+            .all(|object| object.message_id.is_none() && object.conversation_id.is_none()));
         assert!(legacy_feed
             .objects
             .iter()
@@ -7443,7 +8167,9 @@ mod tests {
             &local_profile,
             "changed",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .is_err());
         assert!(project_collaboration_text(
@@ -7453,7 +8179,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .is_err());
         assert_eq!(
@@ -7520,7 +8248,7 @@ mod tests {
             &remote_profile,
             "remote first message",
             1_800_000_002,
-            None,
+            CollaborationTextOrigin::Incoming,
         )
         .unwrap();
         let empty_state = load_state(&storage_paths(empty.path()).unwrap()).unwrap();
@@ -7528,6 +8256,214 @@ mod tests {
         assert!(empty_state.invites.is_empty());
         assert!(empty_state.sessions.is_empty());
         assert_eq!(empty_state.objects.len(), 1);
+    }
+
+    #[test]
+    fn durable_collaboration_rows_repair_stale_sequence_metadata_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = start_configured_collaboration_principal_session(
+            tmp.path(),
+            "did:key:z6configured",
+            "principal-one",
+            "Alice",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "did:key:z6configured".to_string(),
+            display_name: "Alice".to_string(),
+            handle: None,
+            updated_at: now_ts(),
+        };
+        let first = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &profile,
+            "durable first row",
+            now_ts(),
+            CollaborationTextOrigin::Incoming,
+        )
+        .unwrap();
+        let paths = storage_paths(tmp.path()).unwrap();
+        let mut stale: RoomMeta = read_json_or_default(&paths.room_meta_path).unwrap();
+        stale.next_seq = first.seq;
+        write_json_atomic(&paths.room_meta_path, &stale).unwrap();
+        // Reopening uses the durable objects to repair an older metadata cursor.
+        assert_eq!(load_state(&paths).unwrap().next_seq, first.seq + 1);
+        let second = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "d".repeat(64)),
+            &profile,
+            "new row after restart",
+            now_ts(),
+            CollaborationTextOrigin::Incoming,
+        )
+        .unwrap();
+        assert_eq!(second.seq, first.seq + 1);
+        let poll = collaboration_room_poll(
+            tmp.path(),
+            &session.token,
+            "network-one",
+            "conversation-one",
+            0,
+        )
+        .unwrap();
+        assert_eq!(poll.objects.len(), 2);
+        assert_eq!(poll.objects[0].seq, first.seq);
+        assert_eq!(poll.objects[1].seq, second.seq);
+        assert_eq!(poll.objects[0].body.as_deref(), Some("durable first row"));
+        assert_eq!(
+            poll.objects[1].body.as_deref(),
+            Some("new row after restart")
+        );
+        assert_eq!(poll.latest_seq, second.seq);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_preserves_store_bytes_and_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = start_configured_collaboration_principal_session(
+            tmp.path(),
+            "did:key:z6configured",
+            "principal-one",
+            "Alice",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "did:key:z6configured".to_string(),
+            display_name: "Alice".to_string(),
+            handle: None,
+            updated_at: now_ts(),
+        };
+        let object = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &profile,
+            "configured message",
+            now_ts(),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
+        )
+        .unwrap();
+        let before = room_state_snapshot(tmp.path());
+        let metadata_before = room_state_file_metadata(tmp.path());
+        assert_eq!(metadata_before.len(), 9);
+        // Keep the original inodes allocated while the poll runs.
+        let _retained_store_files = metadata_before
+            .iter()
+            .map(|(path, _, _)| fs::File::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        for _ in 0..8 {
+            let feed = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap();
+            assert_eq!(feed.display_name, "Alice");
+            assert_eq!(feed.expires_at, session.expires_at);
+            assert_eq!(feed.latest_seq, object.seq);
+            assert_eq!(feed.objects.len(), 1);
+            assert_eq!(feed.objects[0].body.as_deref(), Some("configured message"));
+            assert!(feed.objects[0].from_current_session);
+            assert_eq!(feed.participants.len(), 1);
+            assert_eq!(feed.participants[0].display_name, "Alice");
+        }
+
+        assert_eq!(room_state_snapshot(tmp.path()), before);
+        assert_eq!(room_state_file_metadata(tmp.path()), metadata_before);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_rechecks_session_authority_without_writes() {
+        for refusal in ["expired", "unapproved", "left"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = start_configured_collaboration_principal_session(
+                tmp.path(),
+                "did:key:z6configured",
+                "principal-one",
+                "Alice",
+                "ElastOS shell",
+            )
+            .unwrap();
+            assert!(collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .is_ok());
+            if refusal == "left" {
+                leave_configured_collaboration_principal_session(
+                    tmp.path(),
+                    "did:key:z6configured",
+                    "principal-one",
+                )
+                .unwrap();
+            } else {
+                with_locked_state(tmp.path(), |_, state| {
+                    let stored = state
+                        .sessions
+                        .iter_mut()
+                        .find(|item| item.token == session.token)
+                        .unwrap();
+                    if refusal == "expired" {
+                        stored.expires_at = now_ts();
+                    } else {
+                        stored.capabilities.clear();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let before = room_state_snapshot(tmp.path());
+            let metadata_before = room_state_file_metadata(tmp.path());
+            let error = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(if refusal == "unapproved" {
+                    "session is not approved for room access"
+                } else {
+                    "invalid or expired session"
+                }),
+                "{refusal}: {error}"
+            );
+            assert_eq!(room_state_snapshot(tmp.path()), before, "{refusal}");
+            assert_eq!(
+                room_state_file_metadata(tmp.path()),
+                metadata_before,
+                "{refusal}"
+            );
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(collaboration_room_poll(
+            empty.path(),
+            "unknown-token",
+            "network-one",
+            "conversation-one",
+            0,
+        )
+        .is_err());
+        assert!(!storage_paths(empty.path()).unwrap().root_dir.exists());
     }
 
     #[test]
@@ -7545,6 +8481,7 @@ mod tests {
         let scope = collaboration_object_scope("network-one", "conversation-one").unwrap();
         with_locked_state(tmp.path(), |_, state| {
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 2,
                 event_id: "evt-mismatch".to_string(),
                 collaboration_scope: Some(scope.clone()),
@@ -7588,6 +8525,7 @@ mod tests {
             scope: Option<CollaborationObjectScope>,
         ) -> ConversationObjectRecord {
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id,
                 collaboration_scope: scope,

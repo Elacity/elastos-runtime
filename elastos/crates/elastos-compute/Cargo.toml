@@ -11,7 +11,28 @@ elastos-guest = { path = "../elastos-guest" }
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread", "time"] }
-wasmtime = "36"
+# Wasmtime's default features minus `cache`: the engine never sets a compilation cache
+# (providers/component.rs), and `cache` is the only thing that pulls zstd into the build.
+wasmtime = { version = "36", default-features = false, features = [
+    "async",
+    "gc",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "threads",
+    "stack-switching",
+    "std",
+] }
 uuid = { version = "1.0", features = ["v4"] }
 tracing = "0.1"
 

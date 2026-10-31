@@ -14,10 +14,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ADAPTER_SCHEMA: &str = "elastos.webspace.operator-drive-adapter/v1";
 const TARGET_PREFIX: &str = "operator://drive";
 const PROVIDER_NAME: &str = "operator-drive-adapter";

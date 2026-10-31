@@ -7,6 +7,7 @@ import {
   isWebSpaceUri,
   isBlockedObject,
   isDirectory,
+  isProtectedContent,
   visibilityContract,
 } from "./model.js";
 
@@ -24,6 +25,7 @@ export function createLibraryRenderer({
   elements,
   isSelected,
   perf,
+  releaseHiddenTargets,
   selectedObjects,
   state,
   visibleObjects,
@@ -34,6 +36,7 @@ export function createLibraryRenderer({
     elements.content.dataset.view = state.view === "list" ? "list" : "grid";
     elements.sortSelect.value = state.sort;
     const objects = visibleObjects();
+    releaseHiddenTargets();
     if (!objects.length) {
       elements.content.dataset.empty = "true";
       const copy = emptyStateCopy(state);
@@ -148,7 +151,7 @@ export function createLibraryRenderer({
     const badges = [
       isBlockedObject(object) ? '<span class="badge badge-blocked">Blocked</span>' : "",
       inPublicFolder && !object.published ? '<span class="badge badge-public-folder">Public folder</span>' : "",
-      object.published ? '<span class="badge badge-published">Published</span>' : "",
+      object.published ? `<span class="badge badge-published">${isProtectedContent(object) ? "Published" : "Shared"}</span>` : "",
       inTrash(object) ? '<span class="badge badge-trash">Trash</span>' : "",
     ].join("");
     const badgesMarkup = badges ? `<span class="badges">${badges}</span>` : "";

@@ -1,3 +1,5 @@
+import { DATACHANNEL_INPUT_SETTLE_MS } from "./browser-input.js?v=browser-20261022b";
+
 export const MAX_CLIPBOARD_TEXT_UTF8_BYTES = 65_536;
 export const MAX_CLIPBOARD_ENCODED_BYTES =
   Math.ceil(MAX_CLIPBOARD_TEXT_UTF8_BYTES / 3) * 4;
@@ -307,6 +309,22 @@ export function createBrowserClipboardBridge({
       startRemoteClipboardAssembly(message);
       return;
     }
+    // Upstream Selkies answers `cr` (and its clipboard monitor pushes) with a
+    // single {type: "clipboard", data: {content: base64}} of UTF-8 text. It is
+    // consumed only while a copy has requested the read; otherwise ignored.
+    if (message.type === "clipboard") {
+      const content = message.data?.content;
+      if (
+        !pendingRemoteCopy?.remoteReadRequested ||
+        pendingRemoteCopy.hostPending ||
+        typeof content !== "string" ||
+        !content ||
+        content.length > MAX_CLIPBOARD_ENCODED_BYTES
+      ) {
+        return;
+      }
+      return consumeEncodedClipboard(content);
+    }
     if (message.type === "clipboard-msg-data") {
       appendRemoteClipboardChunk(message);
       return;
@@ -351,7 +369,8 @@ export function createBrowserClipboardBridge({
       return;
     }
     if (pendingRemoteCopy) {
-      throw new Error("A Browser copy is already pending.");
+      // A repeated Cmd+C joins the copy already in flight.
+      return;
     }
     const intent = {
       hostPending: false,
@@ -386,7 +405,7 @@ export function createBrowserClipboardBridge({
             showStatus(friendlyOpenError(error), { sticky: true });
           }
         });
-      }, 150);
+      }, DATACHANNEL_INPUT_SETTLE_MS);
     } catch (error) {
       if (pendingRemoteCopy === intent) {
         resetRemoteCopyIntent();

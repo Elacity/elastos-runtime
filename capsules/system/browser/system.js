@@ -4,6 +4,7 @@ import {
   provenanceView,
 } from "./esp-projections.mjs";
 import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261030a";
 
 const errorNode = document.querySelector(".system-error");
 const backgroundInput = document.querySelector("#background-input");
@@ -18,6 +19,13 @@ const overlayStatusNode = document.querySelector('[data-field="overlay-status"]'
 const settingsSearchInput = document.querySelector("#settings-search");
 const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
+const communitySection = document.querySelector("#community-membership");
+const communityButton = document.querySelector("#community-toggle");
+let communityMembership = null;
+let communityBusy = false;
+const communityPresenceRow = document.querySelector("#community-presence-row");
+const communityPresenceOptions = [...document.querySelectorAll("#community-presence [data-presence-mode]")];
+let communityPresenceBusy = false;
 const themeSegment = document.querySelector("#theme-segment");
 const accentPickerNode = document.querySelector("#accent-picker");
 const accentCustomPopover = document.querySelector("#accent-custom-popover");
@@ -27,6 +35,7 @@ const dockAutoHideInput = document.querySelector("#dock-autohide");
 const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
+const passkeyAddButton = document.querySelector("#passkey-add");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
 const recoveryProfileSetup = document.querySelector("#recovery-profile-setup");
 const recoveryProfileName = document.querySelector("#recovery-profile-name");
@@ -45,15 +54,15 @@ const recoveryCancelButton = document.querySelector("#recovery-cancel");
 const chainTableNode = document.querySelector("#chain-table");
 const activeShellOptions = document.querySelector("#active-shell-options");
 const activeShellStatusNode = document.querySelector('[data-field="active-shell-status"]');
-const capsuleCatalogNode = document.querySelector("#capsule-catalog");
-const capsuleCatalogStatusNode = document.querySelector("#capsule-catalog-status");
-const capsuleCatalogRefreshButton = document.querySelector("#capsule-catalog-refresh");
 const technicalDetailsNode = document.querySelector("#technical-details");
 const technicalInspectListNode = document.querySelector("#technical-inspect-list");
 const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
 const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
+const runtimeUpdateNode = document.querySelector("#runtime-update");
+const runtimeUpdateButton = document.querySelector("#runtime-update-apply");
+const runtimeUpdateStatusNode = document.querySelector("#runtime-update-status");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
@@ -104,7 +113,6 @@ let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
 let currentProfileName = "";
-let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
@@ -115,6 +123,25 @@ let accentCustomPicker = null;
 let accentCustomWriteTimer = 0;
 let deviceDidValue = "";
 let deviceDidCopyTimer = 0;
+let systemSummaryInFlight = null;
+let runtimeUpdate;
+let runtimeUpdatePending = null;
+let runtimeUpdateBusy = false;
+let runtimeUpdateActive = true;
+let runtimeUpdateTimer = 0;
+let runtimeUpdateReconnects = 0;
+// Set once this page has seen an update in progress (its own request accepted, or a controller phase
+// from staging to restarting). Home may finish restarting between two polls, so the page does not try
+// to observe the restart itself: after this, the update finishing or Home refusing this page's old
+// session reloads the page once. A reloaded page starts with it false, so it reloads at most once.
+let runtimeUpdateInProgressSeen = false;
+// Why this page's last Update did not start (cancelled, refused). It stays in place of the offer
+// text until the person selects Update again, so a refresh cannot replace it before it is read.
+let runtimeUpdateFeedback = "";
+const RUNTIME_UPDATE_RESTART_TEXT = "Restarting to finish the update. Home is usually back within two minutes.";
+// Polls are 2 s apart while Home restarts: 150 polls outlast the controller's 120 s restart budget with margin.
+const RUNTIME_UPDATE_RESTART_POLLS = 150;
+const runtimeUpdateRequests = new Set();
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -137,21 +164,13 @@ const READABLE_CHAIN_KINDS = new Set([
   "bitcoin_core_rpc",
   "bitcoin_rest",
 ]);
-const CATALOG_GROUPS = [
-  { role: "app", label: "Apps" },
-  { role: "viewer", label: "Viewers" },
-  { role: "content", label: "Content" },
-  { role: "provider", label: "Background services" },
-  { role: "shell", label: "Home views" },
-];
 const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   account: ["account", "passkey", "accounts", "credential", "signin", "sign in"],
   personalization: ["appearance", "theme", "accent", "background", "wallpaper", "dock", "sound"],
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
-  catalog: ["catalog", "apps", "services", "capsules"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
-  about: ["about", "device", "version", "source", "network", "did"],
+  about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
 const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
@@ -160,6 +179,14 @@ const homeClipboard = createHomeClipboardClient({
   targetId: "system",
   homeOrigin: homeParentOrigin,
   homeToken: frameHomeToken,
+});
+const backgroundImage = createHomeBackgroundImage({
+  homeOrigin: homeParentOrigin,
+  homeToken: frameHomeToken,
+  apply: (url) => {
+    if (backgroundPreview) backgroundPreview.style.backgroundImage = `url("${url || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+  },
+  onError: () => showBackgroundStatus("Home could not load the image. Close System and open it to retry.", "error"),
 });
 
 boot().catch((error) => {
@@ -179,14 +206,16 @@ async function boot() {
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureCommunityMembership();
+  configureCommunityPresence();
   configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
   configureChainAccess();
   configureActiveShell();
-  configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
+  configureRuntimeUpdate();
   initialRecoveryState = (async () => {
     await refreshSystemSummary();
     await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
@@ -202,10 +231,6 @@ async function boot() {
   }
   await initialRecoveryState;
   await refreshChainNetworks();
-  await refreshCapsuleCatalog().catch((error) => {
-    console.error("catalog refresh failed", error);
-    showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-  });
 }
 
 function configureHomeRecoverySave() {
@@ -299,6 +324,10 @@ function configureSettingsTabs() {
     document.querySelector(".settings-sidebar")?.classList.remove("active");
   });
   document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
+    // On the phone stage the shared push drawer (elastos-drawer.js) owns it.
+    if (document.documentElement.getAttribute("data-el-form-factor") === "phone") {
+      return;
+    }
     document.querySelector(".settings-sidebar")?.classList.toggle("active");
   });
 }
@@ -354,10 +383,23 @@ function hasShellAccess() {
 }
 
 async function refreshSystemSummary() {
-  const systemSummary = await fetchJson("/api/apps/system/summary", {
-    headers: shellHeaders(),
-  });
-  renderSystemSummary(systemSummary);
+  if (systemSummaryInFlight) return systemSummaryInFlight;
+  systemSummaryInFlight = (async () => {
+    let systemSummary;
+    try {
+      systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
+    } catch (error) {
+      if (runtimeUpdateActive) showCommunityUnavailable(error);
+      throw error;
+    }
+    if (runtimeUpdateActive) {
+      renderSystemSummary(systemSummary);
+      await refreshCommunityMembership();
+      await refreshCommunityPresence();
+    }
+  })();
+  try { await systemSummaryInFlight; }
+  finally { systemSummaryInFlight = null; }
 }
 
 async function fetchJson(url, init) {
@@ -365,7 +407,9 @@ async function fetchJson(url, init) {
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     const suffix = detail.trim() ? ` ${detail.trim()}` : ` ${response.statusText}`;
-    throw new Error(`request failed: ${response.status}${suffix}`);
+    const error = new Error(`request failed: ${response.status}${suffix}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -400,6 +444,7 @@ function renderSystemSummary(systemSummary) {
   acceptAppearance(appearance);
   setRuntimeState(runtime);
   setSourceState(source);
+  renderRuntimeUpdate(systemSummary.runtime_update);
 }
 
 function setField(field, value, emptyText, titleValue) {
@@ -660,6 +705,68 @@ function configureGuestAccess() {
   }
 }
 
+function configureCommunityMembership() {
+  if (communityButton) communityButton.addEventListener("click", updateCommunityMembership);
+}
+
+function renderCommunityMembership(membership) {
+  if (!membership || membership.schema !== "elastos.community-membership/v1"
+      || typeof membership.configured !== "boolean" || typeof membership.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  communityMembership = membership;
+  if (communitySection) communitySection.hidden = !membership.configured;
+  setTextFields("community-detail", readText(membership.detail));
+  if (communityButton) {
+    communityButton.textContent = membership.joined ? "Leave Community" : "Rejoin Community";
+    communityButton.disabled = communityBusy || !membership.configured
+      || currentAccess.role !== "admin" || !hasShellAccess();
+  }
+}
+
+async function refreshCommunityMembership() {
+  if (communityBusy) return;
+  try {
+    renderCommunityMembership(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community"));
+    setHiddenFields("community-status", true);
+  } catch (error) {
+    showCommunityUnavailable(error);
+  }
+}
+
+// A failed read is shown, not hidden: only a Home last confirmed without
+// Community keeps it hidden.
+function showCommunityUnavailable(error) {
+  if (communityMembership?.configured === false) return;
+  if (communityButton) communityButton.disabled = true;
+  if (communitySection) communitySection.hidden = false;
+  setTextFields("community-status", publicSystemError(error, "Community setting is unavailable."));
+  setHiddenFields("community-status", false);
+}
+
+async function updateCommunityMembership() {
+  if (communityBusy || !communityMembership?.configured || currentAccess.role !== "admin" || !hasShellAccess()) return;
+  communityBusy = true;
+  renderCommunityMembership(communityMembership);
+  setHiddenFields("community-status", true);
+  try {
+    const membership = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ joined: !communityMembership.joined }),
+    }, "/api/apps/system/community");
+    renderCommunityMembership(membership);
+    setTextFields("community-status", membership.joined ? "Community rejoined. Public keeps its saved setting." : "Community and Public stopped on this Home.");
+    setHiddenFields("community-status", false);
+  } catch (error) {
+    setTextFields("community-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-status", false);
+  } finally {
+    communityBusy = false;
+    renderCommunityMembership(communityMembership);
+  }
+}
+
 async function onGuestRegistrationChange() {
   if (!guestRegistrationInput || !hasShellAccess()) {
     return;
@@ -682,6 +789,77 @@ async function onGuestRegistrationChange() {
   }
 }
 
+function configureCommunityPresence() {
+  for (const option of communityPresenceOptions) {
+    option.addEventListener("click", () => updateCommunityPresence(option.dataset.presenceMode));
+  }
+}
+
+// Never shows as Hidden; requested, Later or no answer yet shows no choice.
+function communityPresenceMode(state) {
+  return state === "refused" ? "hidden" : state;
+}
+
+function setCommunityPresenceOptions(mode, disabled) {
+  for (const option of communityPresenceOptions) {
+    const current = option.dataset.presenceMode === mode;
+    option.classList.toggle("active", current);
+    option.setAttribute("aria-checked", current ? "true" : "false");
+    option.disabled = disabled;
+  }
+}
+
+// The calling person's own choice; nobody can set it for someone else.
+// Runtime returns the mode only, never the grant behind it.
+function renderCommunityPresence(presence) {
+  if (!presence || presence.schema !== "elastos.community-presence/v1"
+      || typeof presence.configured !== "boolean" || typeof presence.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  if (communityPresenceRow) communityPresenceRow.hidden = !presence.configured;
+  setCommunityPresenceOptions(
+    communityPresenceMode(presence.community_presence),
+    communityPresenceBusy || !presence.joined || !hasShellAccess(),
+  );
+}
+
+async function refreshCommunityPresence() {
+  if (communityPresenceBusy || communityPresenceOptions.length === 0) return;
+  if (communityMembership?.configured === false) return;
+  try {
+    renderCommunityPresence(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community/presence"));
+    setHiddenFields("community-presence-status", true);
+  } catch (error) {
+    setCommunityPresenceOptions(null, true);
+    if (communitySection) communitySection.hidden = false;
+    if (communityPresenceRow) communityPresenceRow.hidden = false;
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting is unavailable."));
+    setHiddenFields("community-presence-status", false);
+  }
+}
+
+async function updateCommunityPresence(mode) {
+  if (communityPresenceBusy || !hasShellAccess()) return;
+  const previous = communityPresenceOptions.find((option) => option.getAttribute("aria-checked") === "true");
+  communityPresenceBusy = true;
+  setCommunityPresenceOptions(mode, true);
+  setHiddenFields("community-presence-status", true);
+  try {
+    const presence = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ mode }),
+    }, "/api/apps/system/community/presence");
+    communityPresenceBusy = false;
+    renderCommunityPresence(presence);
+  } catch (error) {
+    communityPresenceBusy = false;
+    setCommunityPresenceOptions(previous?.dataset.presenceMode ?? null, !hasShellAccess());
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-presence-status", false);
+  }
+}
+
 function configureAiProvider() {
   const instancesNode = document.querySelector("#ai-provider-instances");
   const addButton = document.querySelector("#ai-provider-add");
@@ -693,7 +871,6 @@ function configureAiProvider() {
   const validateButton = document.querySelector("#ai-provider-validate");
   const saveButton = document.querySelector("#ai-provider-save");
   const cancelButton = document.querySelector("#ai-provider-cancel");
-  const veniceFact = document.querySelector("[data-ai-provider-venice-fact]");
   if (!instancesNode || !addButton || !formNode || !nameInput || !providerSelect || !keyInput || !modelSelect || !validateButton || !saveButton || !cancelButton) {
     return;
   }
@@ -706,10 +883,25 @@ function configureAiProvider() {
   const selectedProvider = () => (providerSelect.value === "venice" ? "venice" : "openrouter");
   let editingId = "";
   let latestStatus = null;
+  // Inbox decisions change hosted access while System is open; Home reports them as
+  // `inbox.changed`. Refresh then and when System is shown again, but never under the
+  // person's open form or while one of this page's own requests is in flight.
+  let hostedRequests = 0;
+  let statusReads = 0;
+  let liveRefreshWanted = false;
+  let liveRefreshTimer = 0;
+  const hostedFetch = async (url, init) => {
+    hostedRequests += 1;
+    try {
+      return await fetchJson(url, init);
+    } finally {
+      hostedRequests -= 1;
+      if (!hostedRequests && liveRefreshWanted) scheduleLiveRefresh();
+    }
+  };
   const updateValidationEnd = () => {
     const state = latestStatus?.validation_egress_approval_state?.[selectedProvider()];
-    validationEndButton.hidden = latestStatus?.hosted_external_https !== "operator_ready" && state !== "pending" && state !== "approved";
-    validationEndButton.textContent = latestStatus?.hosted_external_https === "operator_ready" ? "End hosted HTTPS" : "End key-check access";
+    validationEndButton.hidden = state !== "pending" && state !== "approved";
   };
   const setBusy = (busy) => {
     addButton.disabled = busy || !hasShellAccess();
@@ -722,12 +914,14 @@ function configureAiProvider() {
     saveButton.disabled = busy || !hasShellAccess();
     cancelButton.disabled = busy;
     cancelButton.textContent = latestStatus?.staged_connections?.some((entry) => entry.id === editingId)
-      ? "Close; keep staged key" : "Cancel";
+      ? "Close" : "Cancel";
     instancesNode.querySelectorAll("button").forEach((button) => {
       button.disabled = busy || !hasShellAccess() || button.dataset.egressPaused === "true";
     });
   };
+  let stateTone = "";
   const showState = (message, tone) => {
+    stateTone = message ? tone || "" : "";
     setTextFields("ai-provider-state", message);
     for (const node of document.querySelectorAll('[data-field="ai-provider-state"]')) {
       node.hidden = !message;
@@ -740,10 +934,6 @@ function configureAiProvider() {
     for (const node of document.querySelectorAll('[data-field="ai-provider-privacy"]')) {
       node.hidden = !text;
     }
-  };
-  const applyProviderChrome = () => {
-    if (veniceFact) veniceFact.hidden = selectedProvider() !== "venice";
-    updateValidationEnd();
   };
   const fillModels = (models, selected) => {
     const values = [];
@@ -774,40 +964,45 @@ function configureAiProvider() {
     formNode.hidden = true;
     instancesNode.hidden = false;
     document.querySelector("#local-models").hidden = false;
-    document.querySelector("#approval-lens").hidden = false;
     addButton.hidden = false;
     nameInput.value = "";
     keyInput.value = "";
     providerSelect.value = "openrouter";
     fillModels([], "");
-    applyProviderChrome();
+    updateValidationEnd();
     setBusy(false);
+    if (liveRefreshWanted) scheduleLiveRefresh();
   };
   const showForm = (instance) => {
     formNode.hidden = false;
     instancesNode.hidden = true;
     document.querySelector("#local-models").hidden = true;
-    document.querySelector("#approval-lens").hidden = true;
     addButton.hidden = true;
     editingId = instance && instance.id ? String(instance.id) : "";
     nameInput.value = instance && instance.name ? String(instance.name) : "";
     providerSelect.value = instance && instance.provider === "venice" ? "venice" : "openrouter";
     keyInput.value = "";
     fillModels([], instance && instance.selected_model ? instance.selected_model : "");
-    applyProviderChrome();
+    updateValidationEnd();
+    keyInput.placeholder = editingId ? "Leave blank to keep the stored key" : "";
+    showState("", "");
     document.querySelector("#ai-provider-form-title").textContent = editingId ? "Edit hosted model" : "Add hosted model";
     saveButton.textContent = "Save";
     keyInput.focus();
     setBusy(false);
   };
+  // Rebuilding the list keeps the disclosures the person opened and the control they focused.
+  const controlKey = (node) => [node.closest(".ai-provider-instance")?.dataset.offerId, node.tagName, node.textContent].join("\n");
   const renderInstances = (status) => {
     const connections = status && Array.isArray(status.connections) ? status.connections : [];
+    const opened = new Set([...instancesNode.querySelectorAll("details[open]")].map((node) => node.parentElement?.dataset.offerId));
+    const focused = instancesNode.contains(document.activeElement) ? controlKey(document.activeElement) : "";
     instancesNode.replaceChildren();
     for (const connection of connections) {
       if (!connection || connection.connected !== true) continue;
-      if (connection.operation === "decision.evaluate") continue;
       const card = document.createElement("div");
       card.className = "ai-provider-instance";
+      card.dataset.offerId = connection.id;
       const title = document.createElement("p");
       title.className = "pc2-card-label";
       title.textContent = readText(connection.name) || "Hosted model";
@@ -823,18 +1018,12 @@ function configureAiProvider() {
       useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
       useButton.disabled = connection.egress_state === "paused";
       useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
-      const shareButton = document.createElement("button");
-      shareButton.className = "pc2-btn pc2-btn-secondary";
-      shareButton.type = "button";
-      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
-      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
       const replaceButton = document.createElement("button");
       replaceButton.className = "pc2-btn pc2-btn-secondary";
       replaceButton.type = "button";
       replaceButton.textContent = "Edit";
       replaceButton.addEventListener("click", () => {
         showForm(connection);
-        showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
       });
       const disconnectButton = document.createElement("button");
       disconnectButton.className = "pc2-btn pc2-btn-secondary";
@@ -845,7 +1034,7 @@ function configureAiProvider() {
         setBusy(true);
         showState("", "");
         try {
-          latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+          latestStatus = await hostedFetch("/api/apps/system/ai-provider", {
             method: "DELETE",
             headers: shellHeaders({ "content-type": "application/json" }),
             body: JSON.stringify({ id: connection.id }),
@@ -861,39 +1050,33 @@ function configureAiProvider() {
       });
       const state = document.createElement("span");
       state.className = "ai-provider-state";
-      state.textContent = connection.egress_state === "operator_ready" ? "Hosted HTTPS active"
-        : connection.egress_state === "ready" ? "Hosted connection approved"
-        : connection.egress_state === "paused" && connection.egress_approval_state === "approved" ? "Route approval recorded · external HTTPS paused"
-        : connection.egress_approval_state === "pending" ? "Hosted connection needs Inbox review"
+      state.textContent = connection.egress_approval_state === "ended" ? "Hosted approval ended"
+        : connection.egress_state === "consent_required" || connection.egress_approval_state === "pending" ? "Needs Inbox review"
         : connection.egress_state === "paused" ? "External HTTPS paused"
-        : connection.approval_state === "approved" ? "Assistant access approved"
-        : connection.share_enabled ? "Shared" : "Private";
-      title.append(state);
+        : "";
+      if (state.textContent) title.append(state);
       const more = document.createElement("details");
       more.className = "ai-provider-details";
+      more.open = opened.has(connection.id);
       const summary = document.createElement("summary");
       summary.textContent = "Details and access";
-      const identity = document.createElement("p");
-      identity.className = "pc2-card-sublabel";
-      identity.textContent = `Instance: ${connection.id}`;
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
-      secondary.append(shareButton);
-      if (connection.egress_state === "operator_ready" || connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
+      if (connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
         const endApproval = document.createElement("button");
         endApproval.className = "pc2-btn pc2-btn-secondary";
         endApproval.type = "button";
-        endApproval.textContent = connection.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
+        endApproval.textContent = "End hosted approval";
         endApproval.addEventListener("click", async () => {
           if (!hasShellAccess()) return;
           endApproval.disabled = true;
           try {
-            await fetchJson("/api/apps/system/approval-lens/revoke", {
+            await hostedFetch("/api/apps/system/approval-lens/revoke", {
               method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
               body: JSON.stringify({ id: connection.id }),
             });
             await refreshStatus();
-            showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended. A later request needs Inbox review again.", "");
+            showState("Hosted approval ended. A later request needs Inbox review again.", "");
           } catch (error) {
             showState(publicSystemError(error, "Approval could not be ended."), "error");
             endApproval.disabled = false;
@@ -902,8 +1085,11 @@ function configureAiProvider() {
         secondary.append(endApproval);
       }
       secondary.append(disconnectButton);
-      more.append(summary, identity, secondary);
-      actions.append(useButton, replaceButton);
+      more.append(summary, secondary);
+      // A decision model saved by an earlier release cannot run Assistant
+      // prompts; it stays listed so it can be disconnected.
+      if (connection.operation === "decision.evaluate") actions.append(replaceButton);
+      else actions.append(useButton, replaceButton);
       card.append(title, detail, actions, more);
       instancesNode.append(card);
     }
@@ -911,6 +1097,7 @@ function configureAiProvider() {
       if (!staged || !/^model:hosted-[0-9a-f]{32}$/i.test(staged.id || "")) continue;
       const card = document.createElement("div");
       card.className = "ai-provider-instance";
+      card.dataset.offerId = staged.id;
       const detail = document.createElement("p");
       detail.className = "pc2-card-sublabel";
       detail.textContent = `${staged.provider} · ${staged.has_saved_model ? "Staged key change" : "Key check needed"}`;
@@ -921,7 +1108,6 @@ function configureAiProvider() {
       resume.addEventListener("click", () => {
         const saved = connections.find((entry) => entry.id === staged.id);
         showForm(saved || { id: staged.id, provider: String(staged.provider).toLowerCase() });
-        showState("This Home kept the staged key. Check it again, approve the connection in Inbox if asked, then choose a model.", "");
       });
       const discard = document.createElement("button");
       discard.className = "pc2-btn pc2-btn-secondary";
@@ -932,14 +1118,12 @@ function configureAiProvider() {
         discard.disabled = true;
         showState("Finishing any current key check, then removing the staged key.", "");
         try {
-          await fetchJson("/api/apps/system/ai-provider/staged", {
+          await hostedFetch("/api/apps/system/ai-provider/staged", {
             method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
             body: JSON.stringify({ id: staged.id }),
           });
           await refreshStatus();
-          showState(staged.has_saved_model
-            ? "Staged key removed. The saved model key remains. Check Inbox before its next request."
-            : "Staged key removed.", "success");
+          showState("Staged key removed.", "success");
         } catch (error) {
           showState(publicSystemError(error, "This Home could not discard the staged key."), "error");
           discard.disabled = false;
@@ -948,107 +1132,54 @@ function configureAiProvider() {
       card.append(detail, resume, discard);
       instancesNode.append(card);
     }
-  };
-  const lensModel = document.querySelector("#approval-lens-model");
-  const lensStatus = document.querySelector("#approval-lens-status");
-  const lensSelect = document.querySelector("#approval-lens-select");
-  const lensEdit = document.querySelector("#approval-lens-edit");
-  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
-  const lensEnd = document.createElement("button");
-  lensEnd.className = "pc2-btn pc2-btn-secondary";
-  lensEnd.type = "button";
-  lensEnd.textContent = "End hosted approval";
-  lensEnd.hidden = true;
-  lensDisconnect.after(lensEnd);
-  const updateLensEnd = () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    lensEnd.hidden = !connection || (connection.egress_state !== "operator_ready" && connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
-    lensEnd.textContent = connection?.egress_state === "operator_ready" ? "End hosted HTTPS" : "End hosted approval";
-    lensEnd.disabled = !hasShellAccess();
-  };
-  const renderLens = (status) => {
-    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
-    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
-    lensModel.replaceChildren();
-    for (const connection of decisions) {
-      const option = document.createElement("option"); option.value = connection.id;
-      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
-      lensModel.append(option);
+    if (focused) {
+      [...instancesNode.querySelectorAll("button, summary")].find((node) => controlKey(node) === focused)?.focus({ preventScroll: true });
     }
-    if (current) lensModel.value = current.id;
-    lensStatus.textContent = current && status.hosted_external_https === "paused"
-      ? `${current.name} selected · external HTTPS paused`
-      : current ? `Using ${current.name} · ${current.processor_label}`
-      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
-      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
-    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
-    updateLensEnd();
   };
-  lensModel.addEventListener("change", updateLensEnd);
-  lensEnd.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensEnd.disabled = true;
-    try {
-      await fetchJson("/api/apps/system/approval-lens/revoke", {
-        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      await refreshStatus();
-      showState(connection.egress_state === "operator_ready" ? "Hosted HTTPS ended for this Home." : "Hosted approval ended.", "");
-    } catch (error) {
-      showState(publicSystemError(error, "Approval could not be ended."), "error");
-      lensEnd.disabled = false;
-    }
-  });
-  lensEdit.addEventListener("click", () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection) return;
-    showForm(connection);
-    showState(`Edit ${readText(connection.name)}. Leave the API key blank to keep the stored key.`, "");
-  });
-  lensDisconnect.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensDisconnect.disabled = true;
-    try {
-      await fetchJson("/api/apps/system/ai-provider", {
-        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      hideForm();
-      await refreshStatus();
-      showState(`${readText(connection.name)} is disconnected.`, "");
-    } catch (error) {
-      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
-      lensDisconnect.disabled = false;
-    }
-  });
-  lensSelect.addEventListener("click", async () => {
-    lensSelect.disabled = true;
-    try {
-      await fetchJson("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
-      await refreshStatus();
-    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
-    finally { lensSelect.disabled = false; }
-  });
-  const refreshStatus = async () => {
-    latestStatus = await fetchJson("/api/apps/system/ai-provider", { headers: shellHeaders() });
-    document.querySelector("#ai-provider-egress-note").textContent = latestStatus.hosted_external_https === "operator_ready"
-      ? "Owner-authorized HTTPS is active for configured hosted models. This Home stores keys and pays for requests. End hosted HTTPS here at any time."
-      : latestStatus.hosted_external_https === "consent_required"
-        ? "This Home keeps provider keys. Approve each hosted connection in Inbox before its key check or model request."
-        : "External HTTPS is paused. Saved keys, models, and past results stay here.";
+  const applyStatus = (status) => {
+    latestStatus = status;
+    const egressNote = document.querySelector("#ai-provider-egress-note");
+    egressNote.hidden = latestStatus.hosted_external_https !== "paused";
+    egressNote.textContent = egressNote.hidden ? "" : "External HTTPS is paused on this Home.";
     renderInstances(latestStatus);
-    renderLens(latestStatus);
     updateValidationEnd();
+  };
+  const readStatus = () => {
+    statusReads += 1;
+    return hostedFetch("/api/apps/system/ai-provider", { headers: shellHeaders() });
+  };
+  const refreshStatus = async () => {
+    applyStatus(await readStatus());
     return latestStatus;
+  };
+  const liveRefreshBlocked = () => document.hidden || hostedRequests > 0 || !formNode.hidden;
+  const runLiveRefresh = async () => {
+    liveRefreshTimer = 0;
+    if (!liveRefreshWanted || !latestStatus || liveRefreshBlocked()) return;
+    liveRefreshWanted = false;
+    const read = statusReads + 1;
+    const status = await readStatus().catch(() => null);
+    // A read the page started since then is newer; it renders instead.
+    if (!status || read !== statusReads) return;
+    if (liveRefreshBlocked()) {
+      scheduleLiveRefresh();
+      return;
+    }
+    const cardsChanged = JSON.stringify(status) !== JSON.stringify(latestStatus);
+    applyStatus(status);
+    // An earlier action's success no longer describes cards a decision elsewhere changed.
+    if (cardsChanged && stateTone === "success") showState("", "");
+    setBusy(false);
+  };
+  const scheduleLiveRefresh = () => {
+    liveRefreshWanted = true;
+    if (!liveRefreshTimer) liveRefreshTimer = window.setTimeout(runLiveRefresh, 250);
   };
   validationEndButton.addEventListener("click", async () => {
     if (!hasShellAccess()) return;
     setBusy(true);
     try {
-      await fetchJson("/api/apps/system/approval-lens/revoke", {
+      await hostedFetch("/api/apps/system/approval-lens/revoke", {
         method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ id: `validation:${selectedProvider()}` }),
       });
@@ -1062,14 +1193,13 @@ function configureAiProvider() {
   });
   addButton.addEventListener("click", () => {
     showForm(null);
-    showState("Choose a host, enter its key, then check and choose a model. The name is optional.", "");
   });
   cancelButton.addEventListener("click", () => {
     hideForm();
     addButton.focus();
     showState("", "");
   });
-  providerSelect.addEventListener("change", applyProviderChrome);
+  providerSelect.addEventListener("change", updateValidationEnd);
   modelSelect.addEventListener("change", () => {
     const selectedOption = modelSelect.selectedOptions[0];
     showPrivacy(selectedOption ? selectedOption.dataset.privacy : "");
@@ -1078,20 +1208,46 @@ function configureAiProvider() {
     if (!hasShellAccess()) return;
     setBusy(true);
     showState("", "");
+    // The check sends the typed key, or with a blank field a key staged by an earlier check.
+    const checksStagedKey = Boolean(keyInput.value.trim())
+      || Boolean(latestStatus?.staged_connections?.some((entry) => entry.id === editingId));
+    let removalFailed = false;
     try {
       // Validation and Save use the same Runtime connection identity.
       if (!editingId) editingId = `model:hosted-${crypto.randomUUID().replaceAll("-", "")}`;
-      const result = await fetchJson("/api/apps/system/ai-provider/validate", {
+      const result = await hostedFetch("/api/apps/system/ai-provider/validate", {
         method: "POST",
         headers: shellHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ provider: selectedProvider(), api_key: keyInput.value, id: editingId }),
       });
       fillModels(Array.isArray(result.models) ? result.models : [], modelSelect.value);
-      showState("This key is valid.", "success");
     } catch (error) {
-      showState(hostedProviderValidationError(error), "error");
+      const message = hostedProviderValidationError(error);
+      showState(message, message === HOSTED_KEY_CHECK_PENDING ? "" : "error");
+      // Runtime stages the checked key before the provider answers. Remove a refused key
+      // the way Discard does, so a later Save with a blank field cannot send it; this also
+      // ends the connection's approval, so a saved connection needs Inbox review again.
+      if (message === HOSTED_KEY_REJECTED && checksStagedKey) {
+        try {
+          await hostedFetch("/api/apps/system/ai-provider/staged", {
+            method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
+            body: JSON.stringify({ id: editingId }),
+          });
+          // An unsaved connection starts its next check as a new one.
+          if (!latestStatus?.connections?.some((entry) => entry.id === editingId)) editingId = "";
+        } catch {
+          removalFailed = true;
+        }
+      }
     } finally {
-      await refreshStatus().catch(() => {});
+      const refreshed = await refreshStatus().then(() => true, () => false);
+      // The form's button reads Close and the list has the key's Discard card exactly when
+      // the shown status stages this connection; otherwise only a fresh status can show it.
+      if (removalFailed && latestStatus?.staged_connections?.some((entry) => entry.id === editingId)) {
+        showState("The rejected key could not be removed. Select Close, then Discard staged key on its card.", "error");
+      } else if (removalFailed && !refreshed) {
+        showState("The rejected key could not be removed. Reload Home, then select Discard staged key on its card.", "error");
+      }
       setBusy(false);
     }
   });
@@ -1110,7 +1266,7 @@ function configureAiProvider() {
         api_key: keyInput.value,
         model: modelSelect.value,
       };
-      latestStatus = await fetchJson("/api/apps/system/ai-provider", {
+      latestStatus = await hostedFetch("/api/apps/system/ai-provider", {
         method: "POST",
         headers: shellHeaders({ "content-type": "application/json" }),
         body: JSON.stringify(body),
@@ -1124,10 +1280,18 @@ function configureAiProvider() {
       const consentPending = String(error.message || error).includes("Approve this hosted connection in Inbox");
       showState(activationPending
         ? "This model is saved. Activation is waiting for current model work to finish. Select Save to try again."
-        : consentPending ? "The key is stored on this Home. Approve this connection in Inbox, then select Save again."
-        : publicSystemError(error, "This Home could not save that hosted model."), "error");
+        : consentPending ? "Approve this connection in Inbox, then select Save again."
+        : publicSystemError(error, "This Home could not save that hosted model."), consentPending ? "" : "error");
     } finally {
       setBusy(false);
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleLiveRefresh();
+  });
+  window.addEventListener("message", (event) => {
+    if (homeRuntimeEventsFrom(event)?.some((item) => item?.scope === "inbox" || item?.kind === "inbox.changed")) {
+      scheduleLiveRefresh();
     }
   });
   hideForm();
@@ -1139,7 +1303,6 @@ function configureAiProvider() {
         keyInput.value = "";
         formNode.hidden = true;
         addButton.hidden = true;
-        document.querySelector("#approval-lens").hidden = true;
         showState("Hosted model setup is not available for this account yet.", "error");
         return;
       }
@@ -1154,12 +1317,10 @@ function configurePasskeyAccess() {
     showPasskeyStatus("Not supported", "muted");
     return;
   }
-  refreshPasskeyStatus().catch(() => {
-    showPasskeyStatus("Not set", "muted");
-  });
   if (accountListNode) {
     accountListNode.addEventListener("click", onAccountListClick);
   }
+  passkeyAddButton?.addEventListener("click", onPasskeyAdd);
 }
 
 function configureRecoveryAccess() {
@@ -1204,21 +1365,6 @@ function configureActiveShell() {
       showActiveShellStatus(String(error.message || error), "error");
     });
   });
-}
-
-function configureCapsuleCatalog() {
-  if (!capsuleCatalogRefreshButton) {
-    return;
-  }
-  capsuleCatalogRefreshButton.disabled = !hasShellAccess();
-  if (hasShellAccess()) {
-    capsuleCatalogRefreshButton.addEventListener("click", () => {
-      refreshCapsuleCatalog().catch((error) => {
-        console.error("catalog refresh failed", error);
-        showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-      });
-    });
-  }
 }
 
 function configureTechnicalDetails() {
@@ -1436,7 +1582,7 @@ function applyAppearance(appearance) {
   window.elastosTheme?.setAccentCustom?.(appearance.accent_custom);
   window.elastosTheme?.setAccent?.(appearance.accent);
   if (backgroundPreview) {
-    backgroundPreview.style.backgroundImage = `url("${imageUrl || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+    backgroundImage.update(imageUrl);
     backgroundPreview.dataset.empty = imageUrl ? "false" : "true";
   }
   if (backgroundResetButton) {
@@ -2277,246 +2423,6 @@ function showTechnicalApprovalStatus(section, message, tone) {
   status.hidden = !text;
 }
 
-async function refreshCapsuleCatalog() {
-  if (!capsuleCatalogNode || !hasShellAccess()) {
-    return;
-  }
-  setCapsuleCatalogBusy(true);
-  showCapsuleCatalogStatus("Loading", "muted");
-  try {
-    const [catalog, interfaces] = await Promise.all([
-      fetchJson("/api/capsules/catalog", { headers: shellHeaders() }),
-      fetchJson("/api/capsules/interfaces", { headers: shellHeaders() }),
-    ]);
-    const entries = (Array.isArray(catalog.capsules) ? catalog.capsules : [])
-      .filter((entry) => entry && entry.installed !== false);
-    const interfaceEntries = Array.isArray(interfaces.interfaces) ? interfaces.interfaces : [];
-    renderCapsuleCatalog(entries, interfaceEntries);
-    showCapsuleCatalogStatus(`${entries.length} available`, "muted");
-  } finally {
-    setCapsuleCatalogBusy(false);
-  }
-}
-
-function renderCapsuleCatalog(entries, interfaceEntries) {
-  if (!capsuleCatalogNode) {
-    return;
-  }
-  capsuleCatalogNode.replaceChildren();
-  if (entries.length === 0) {
-    capsuleCatalogNode.append(catalogEmpty("No apps or services are installed."));
-    return;
-  }
-  const entriesByName = new Map(entries.map((entry) => [readText(entry.name), entry]));
-  const interfacesByCapsule = new Map();
-  for (const entry of interfaceEntries) {
-    const capsule = readText(entry && entry.capsule);
-    if (!capsule) {
-      continue;
-    }
-    const current = interfacesByCapsule.get(capsule) || [];
-    current.push(entry);
-    interfacesByCapsule.set(capsule, current);
-  }
-  for (const group of CATALOG_GROUPS) {
-    const members = entries
-      .filter((entry) => readText(entry.role) === group.role)
-      .sort((left, right) => catalogTitle(left).localeCompare(catalogTitle(right)));
-    if (members.length === 0) {
-      continue;
-    }
-    const section = document.createElement("section");
-    section.className = "catalog-group";
-    const heading = document.createElement("div");
-    heading.className = "catalog-group-heading";
-    const title = document.createElement("h2");
-    title.className = "catalog-group-title";
-    title.textContent = group.label;
-    const count = document.createElement("span");
-    count.className = "catalog-group-count";
-    count.textContent = String(members.length);
-    heading.append(title, count);
-    const list = document.createElement("div");
-    list.className = "catalog-list";
-    for (const entry of members) {
-      list.append(catalogRow(entry, entriesByName, interfacesByCapsule.get(readText(entry.name)) || []));
-    }
-    section.append(heading, list);
-    capsuleCatalogNode.append(section);
-  }
-}
-
-function catalogRow(entry, entriesByName, interfaceEntries) {
-  const row = document.createElement("article");
-  row.className = "catalog-row";
-  const body = document.createElement("div");
-  body.className = "catalog-row-body";
-  const title = document.createElement("h3");
-  title.textContent = catalogTitle(entry);
-  const summary = document.createElement("p");
-  summary.className = "catalog-summary";
-  summary.textContent = catalogSummary(entry);
-  body.append(title, summary);
-
-  const facts = catalogFacts(entry, entriesByName, interfaceEntries);
-  if (facts.length > 0) {
-    const list = document.createElement("dl");
-    list.className = "catalog-facts";
-    for (const [label, value] of facts) {
-      const item = document.createElement("div");
-      const key = document.createElement("dt");
-      key.textContent = label;
-      const text = document.createElement("dd");
-      text.textContent = value;
-      item.append(key, text);
-      list.append(item);
-    }
-    body.append(list);
-  }
-  row.append(body);
-
-  if (entry.launchable === true && readText(entry.launch_target)) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "pc2-btn pc2-btn-secondary catalog-open";
-    button.textContent = "Open";
-    button.addEventListener("click", () => openCapsuleTarget(readText(entry.launch_target)));
-    row.append(button);
-  }
-  return row;
-}
-
-function catalogFacts(entry, entriesByName, interfaceEntries) {
-  const facts = [];
-  const role = readText(entry.role);
-  if (role === "viewer") {
-    const accepts = acceptedContent(entry, interfaceEntries);
-    if (accepts.length > 0) {
-      facts.push(["Accepts", joinWords(accepts)]);
-    }
-  }
-  if (role === "content") {
-    const viewer = readText(entry.viewer_title) || catalogTitle(entriesByName.get(readText(entry.viewer)));
-    if (viewer) {
-      facts.push(["Opens with", viewer]);
-    }
-  }
-  const dependencies = (Array.isArray(entry.requires) ? entry.requires : [])
-    .map((requirement) => {
-      const name = readText(requirement && requirement.name);
-      const dependency = entriesByName.get(name);
-      return dependency ? catalogTitle(dependency) : "";
-    })
-    .filter(Boolean);
-  if (dependencies.length > 0) {
-    facts.push(["Needs", joinWords(dependencies)]);
-  }
-  const executable = executableActions(interfaceEntries)
-    .filter((action) => action !== "Open");
-  if (executable.length > 0) {
-    facts.push(["Available", joinWords(executable)]);
-  }
-  return facts;
-}
-
-function acceptedContent(entry, interfaceEntries) {
-  const content = (Array.isArray(entry.accepted_content) ? entry.accepted_content : [])
-    .map((item) => readText(item && item.title) || humanizeName(readText(item && item.name)))
-    .filter(Boolean);
-  const extensions = new Set();
-  for (const interfaceEntry of interfaceEntries) {
-    const methods = interfaceEntry && interfaceEntry.interface && Array.isArray(interfaceEntry.interface.methods)
-      ? interfaceEntry.interface.methods
-      : [];
-    for (const method of methods) {
-      const accepts = method && method.input_schema && Array.isArray(method.input_schema.accepts)
-        ? method.input_schema.accepts
-        : [];
-      for (const accepted of accepts) {
-        if (readText(accepted && accepted.mode) === "unsupported_family_diagnostic") {
-          continue;
-        }
-        for (const extension of Array.isArray(accepted && accepted.extensions) ? accepted.extensions : []) {
-          const value = readText(extension);
-          if (value) {
-            extensions.add(value);
-          }
-        }
-      }
-    }
-  }
-  if (extensions.size > 0) {
-    content.push(`${joinWords([...extensions])} files`);
-  }
-  return content;
-}
-
-function executableActions(interfaceEntries) {
-  const actions = [];
-  for (const interfaceEntry of interfaceEntries) {
-    for (const binding of Array.isArray(interfaceEntry && interfaceEntry.bindings) ? interfaceEntry.bindings : []) {
-      if (!binding || binding.executable !== true) {
-        continue;
-      }
-      const methodId = readText(binding.method);
-      if (methodId === "capsule.open") {
-        actions.push("Open");
-        continue;
-      }
-      const operation = methodId.split(".").filter(Boolean).at(-1);
-      if (operation) actions.push(humanizeName(operation));
-    }
-  }
-  return [...new Set(actions)];
-}
-
-function catalogSummary(entry) {
-  const title = catalogTitle(entry);
-  const role = readText(entry && entry.role);
-  if (role === "provider") {
-    return "Service for apps on this Home.";
-  }
-  if (role === "shell") {
-    return readText(entry && entry.name).endsWith("-cli")
-      ? "Use Home from a command line."
-      : "Use the Home desktop.";
-  }
-  if (readText(entry && entry.name) === "home") {
-    return "Keeps your selected Home view available.";
-  }
-  const description = readText(entry && entry.description)
-    .replace(/\s+through the ElastOS [^.]+ boundary/gi, "")
-    .replace(/\s+inside ElastOS/gi, "")
-    .replace(/\bcapsules\b/gi, "apps")
-    .replace(/\bproviders\b/gi, "services")
-    .replace(/\bruntime settings\b/gi, "settings");
-  if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capabilit(?:y|ies)|affordances?|host-loaded|frontend)\b/i.test(description)) {
-    return description;
-  }
-  if (role === "viewer") {
-    return `Open compatible content with ${title}.`;
-  }
-  return `${title} is available on this Home.`;
-}
-
-function catalogTitle(entry) {
-  const title = readText(entry && entry.title);
-  if (readText(entry && entry.role) === "provider") {
-    return serviceLabel(entry);
-  }
-  return title ? normalizeDisplayTitle(title) : humanizeName(readText(entry && entry.name));
-}
-
-function serviceLabel(entry) {
-  const title = readText(entry && entry.title) || humanizeName(readText(entry && entry.name));
-  return normalizeDisplayTitle(title.replace(/\s+(Provider|Adapter)$/i, ""));
-}
-
-function normalizeDisplayTitle(value) {
-  const acronyms = new Map([["Did", "DID"], ["Gba", "GBA"], ["Ipfs", "IPFS"], ["Cli", "CLI"], ["Gui", "GUI"]]);
-  return readText(value).split(/\s+/).map((part) => acronyms.get(part) || part).join(" ");
-}
-
 function humanizeName(value) {
   const acronyms = new Map([
     ["did", "DID"],
@@ -2546,40 +2452,6 @@ function joinWords(values) {
   return `${words.slice(0, -1).join(", ")} and ${words.at(-1)}`;
 }
 
-function catalogEmpty(message) {
-  const empty = document.createElement("div");
-  empty.className = "catalog-empty";
-  empty.textContent = message;
-  return empty;
-}
-
-function setCapsuleCatalogBusy(busy) {
-  if (capsuleCatalogRefreshButton) {
-    capsuleCatalogRefreshButton.disabled = busy || !hasShellAccess();
-  }
-}
-
-function showCapsuleCatalogStatus(message, tone) {
-  if (!capsuleCatalogStatusNode) {
-    return;
-  }
-  capsuleCatalogStatusNode.textContent = tone === "error"
-    ? publicSystemError(message, "Apps and services could not be loaded.")
-    : readText(message);
-  capsuleCatalogStatusNode.dataset.tone = tone;
-}
-
-async function refreshPasskeyStatus() {
-  if (!passkeyStatusNode || !window.PublicKeyCredential) {
-    return;
-  }
-  if (passkeyAuthorityActive) {
-    return;
-  }
-  const status = await fetchJson("/api/auth/passkey/status");
-  showPasskeyStatus(status.registered ? "" : "Not set", status.registered ? "muted" : "muted");
-}
-
 async function refreshAccountList() {
   if (!accountListNode || !hasShellAccess()) {
     return;
@@ -2603,7 +2475,12 @@ function renderAccounts(accounts) {
     accountListNode.append(empty);
     return;
   }
-  const adminCount = activeAccounts.filter((account) => readText(account.role) === "admin").length;
+  // Roles belong to accounts; one account may have several passkeys.
+  const adminPasskeyCount = activeAccounts.filter((account) => readText(account.role) === "admin").length;
+  const adminAccountCount = new Set(activeAccounts
+    .filter((account) => readText(account.role) === "admin")
+    .map((account) => readText(account.principal_id))).size;
+  const currentPrincipalId = readText(activeAccounts.find((account) => account.current)?.principal_id);
   const table = document.createElement("table");
   table.className = "account-table";
   table.innerHTML = `
@@ -2621,7 +2498,9 @@ function renderAccounts(accounts) {
   for (const account of activeAccounts) {
     body.append(accountRow(account, {
       activeCount: activeAccounts.length,
-      adminCount,
+      adminPasskeyCount,
+      adminAccountCount,
+      currentPrincipalId,
     }));
   }
   table.append(body);
@@ -2663,7 +2542,9 @@ function accountRow(passkey, listState = {}) {
 
   const passkeyRole = readText(passkey.role);
   const canManagePasskeyRoles = currentAccess.role === "admin";
-  const adminCount = Number(listState.adminCount);
+  const adminAccountCount = Number(listState.adminAccountCount);
+  const ownAccount = Boolean(listState.currentPrincipalId)
+    && readText(passkey.principal_id) === listState.currentPrincipalId;
   if (canManagePasskeyRoles && passkeyRole === "guest") {
     const promote = document.createElement("button");
     promote.className = "system-button system-button-secondary passkey-promote";
@@ -2673,14 +2554,14 @@ function accountRow(passkey, listState = {}) {
     promote.disabled = !promote.dataset.passkeyPromote || !hasShellAccess();
     actions.append(promote);
   }
-  if (canManagePasskeyRoles && passkeyRole === "admin" && !passkey.current) {
+  if (canManagePasskeyRoles && passkeyRole === "admin" && !passkey.current && !ownAccount) {
     const demote = document.createElement("button");
     demote.className = "system-button system-button-secondary passkey-demote";
     demote.type = "button";
     demote.textContent = "Make guest";
     demote.dataset.passkeyDemote = passkey.proof_binding_id || "";
-    demote.disabled = !demote.dataset.passkeyDemote || !hasShellAccess() || adminCount <= 1;
-    if (adminCount <= 1) {
+    demote.disabled = !demote.dataset.passkeyDemote || !hasShellAccess() || adminAccountCount <= 1;
+    if (adminAccountCount <= 1) {
       demote.title = "At least one admin must remain.";
     }
     actions.append(demote);
@@ -2693,7 +2574,7 @@ function accountRow(passkey, listState = {}) {
   remove.dataset.passkeyRevoke = passkey.proof_binding_id || "";
   remove.dataset.current = passkey.current ? "true" : "false";
   const protectsLastAdmin = readText(passkey.role) === "admin"
-    && Number(listState.adminCount) <= 1
+    && Number(listState.adminPasskeyCount) <= 1
     && Number(listState.activeCount) > 1;
   remove.disabled = !remove.dataset.passkeyRevoke || !hasShellAccess() || protectsLastAdmin;
   if (protectsLastAdmin) {
@@ -2763,12 +2644,10 @@ async function onAccountListClick(event) {
     });
     if (!promote && revokingCurrent) {
       apiHomeToken = "";
-      passkeyAuthorityActive = false;
       renderAccounts([]);
       showPasskeyStatus("Removed. Open Home to sign in.", "muted");
     } else {
       await refreshAccountList();
-      await refreshPasskeyStatus();
       showPasskeyStatus(promote || demote ? "Updated" : "Removed", "success");
     }
     notifyHomeSummaryChanged();
@@ -2776,6 +2655,67 @@ async function onAccountListClick(event) {
     showPasskeyStatus(String(error.message || error), "error");
     button.disabled = false;
   }
+}
+
+async function onPasskeyAdd() {
+  if (!passkeyAddButton || !hasShellAccess()) {
+    return;
+  }
+  passkeyAddButton.disabled = true;
+  showPasskeyStatus("Confirm with your current passkey, then create the new one.", "muted");
+  try {
+    await requestHomePasskeyAdd(apiHomeToken, homeParentOrigin);
+    await refreshAccountList();
+    showPasskeyStatus("Passkey added. You can sign in with it now.", "success");
+    notifyHomeSummaryChanged();
+  } catch (error) {
+    showPasskeyStatus(error, "error");
+  } finally {
+    passkeyAddButton.disabled = false;
+  }
+}
+
+// Passkeys can only be created by Home itself, never inside this frame.
+function requestHomePasskeyAdd(homeToken, parentOrigin) {
+  if (!homeToken || window.top === window || !parentOrigin) {
+    return Promise.reject(new Error("Open System from Home to add a passkey."));
+  }
+  const requestId = window.crypto?.randomUUID?.()
+    || `passkey-add-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    // Two passkey prompts, each up to two minutes.
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onResult);
+      reject(new Error("Adding the passkey timed out. Select Add passkey to try again."));
+    }, 300_000);
+    const onResult = (event) => {
+      if (event.source !== window.top || event.origin !== parentOrigin) {
+        return;
+      }
+      const result = event.data && typeof event.data === "object" ? event.data : null;
+      if (result?.type !== "elastos.home.passkey-add.result/v1" || result.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onResult);
+      const role = readText(result.role);
+      if (!hasExactKeys(result, role ? ["type", "requestId", "role"] : ["type", "requestId", "error"])) {
+        reject(new Error("Home did not add the passkey. Select Add passkey to try again."));
+        return;
+      }
+      if (role) {
+        resolve(role);
+        return;
+      }
+      reject(new Error(readText(result.error) || "Home did not add the passkey. Select Add passkey to try again."));
+    };
+    window.addEventListener("message", onResult);
+    window.top.postMessage({
+      type: "elastos.home.passkey-add.request/v1",
+      requestId,
+      homeToken,
+    }, parentOrigin);
+  });
 }
 
 async function refreshRecoveryStatus() {
@@ -2795,6 +2735,27 @@ async function refreshRecoveryStatus() {
   }
 }
 
+const RECOVERY_ROOT_CHECKED_SENTENCE = "No unencrypted file was found in your protected Home folders, and each file there is labelled for this Home's current key. Each file's contents are checked when you open it.";
+
+function recoveryAttentionNote(status) {
+  const notes = [];
+  if (status?.required_actions?.includes("finish_interrupted_principal_root_migration")) {
+    notes.push("An earlier encryption step did not finish. Home will not start again until it is finished or undone; reinstalling ElastOS does that, and your files are kept.");
+  }
+  if (status?.required_actions?.includes("migrate_declared_plaintext_objects")) {
+    const notStarting = status.protection_configured === true ? "; until they are, Home will not start again" : "";
+    notes.push(`Some files in your protected Home folders are not encrypted yet${notStarting}. Saving your Recovery Kit encrypts files of up to 16 MiB after you approve with your passkey; a larger file is named so you can move it out of your protected folders (Library takes uploads up to 100 MiB).`);
+  }
+  const count = Number(status?.objects_needing_attention_count) || 0;
+  const first = Array.isArray(status?.objects_needing_attention) ? status.objects_needing_attention[0] : null;
+  if (count > 0 && first) {
+    // The action already starts with the file's path.
+    const more = count > 1 ? ` And ${count - 1} more.` : "";
+    notes.push(`${count} file(s) in your protected Home folders need attention: ${readText(first.action)}${more}`);
+  }
+  return notes.join(" ");
+}
+
 function setRecoveryStatus(status) {
   if (recoveryProfileStatus === "unavailable") {
     showRecoveryStatus("Unavailable", "error");
@@ -2808,10 +2769,18 @@ function setRecoveryStatus(status) {
     setRecoveryButton("Create Profile and save kit", false);
     return;
   }
+  const attention = recoveryAttentionNote(status);
   if (status?.required_actions?.includes("download_recovery_kit_with_profile")) {
     showRecoveryStatus("Profile needs backup", "muted");
-    showRecoveryNote("Save a new kit that includes your Profile.", "muted");
+    showRecoveryNote(attention ? `Save a new kit that includes your Profile. ${attention}` : "Save a new kit that includes your Profile.", "muted");
     setRecoveryButton("Save complete Recovery Kit", false);
+    return;
+  }
+  if (attention) {
+    showRecoveryStatus("Needs attention", "muted");
+    showRecoveryNote(attention, "muted");
+    const exportReady = status.recovery_configured === true && status.recovery_download_available === true;
+    setRecoveryButton(exportReady ? "Download Recovery Kit" : "Create Recovery Kit", false);
     return;
   }
   const configured = status && status.recovery_configured === true;
@@ -2819,7 +2788,8 @@ function setRecoveryStatus(status) {
   const protectedRoot = status && status.protection_configured === true;
   if (configured && downloadAvailable) {
     showRecoveryStatus("", "success");
-    showRecoveryNote("Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.", "muted");
+    const checked = status.root_encrypted === true ? `${RECOVERY_ROOT_CHECKED_SENTENCE} ` : "";
+    showRecoveryNote(`${checked}Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.`, "muted");
     setRecoveryButton("Download Recovery Kit", false);
     return;
   }
@@ -2857,7 +2827,7 @@ async function onRecoveryDownload(options = {}) {
     if (!isActive()) return false;
     const bundle = await exportFullRecoveryBundle(status, isActive);
     if (!isActive()) return false;
-    downloadRecoveryKit(bundle);
+    const fileName = downloadRecoveryKit(bundle);
     if (recoveryPasswordInput) {
       recoveryPasswordInput.value = "";
     }
@@ -2865,14 +2835,14 @@ async function onRecoveryDownload(options = {}) {
     const peopleIdentity = bundle && bundle.included && bundle.included.people_identity;
     showRecoveryNote(
       peopleIdentity
-        ? "Recovery Kit downloaded. Store it offline; it includes your signed People identity."
-        : "Recovery Kit downloaded. Store it offline.",
+        ? `Recovery Kit downloaded as ${fileName}. Store it offline; it includes your signed People identity.`
+        : `Recovery Kit downloaded as ${fileName}. Store it offline.`,
       "success"
     );
     setRecoveryButton("Download Recovery Kit", false);
     notifyHomeSummaryChanged();
     await refreshSystemSummary().catch(() => {
-      showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
+      showRecoveryNote(`Recovery Kit downloaded as ${fileName}. Store it offline. Refresh System to update setup status.`, "success");
     });
     return true;
   } catch (error) {
@@ -3144,17 +3114,28 @@ function recoveryDownloadPassword() {
   return readText(recoveryPasswordInput && recoveryPasswordInput.value);
 }
 
+// The whole principal goes into the file name (no ellipsis), with characters
+// some file systems refuse replaced; the name is returned so System shows it.
+function recoveryKitFileName(kit) {
+  const principal = readText(kit && kit.principal_id)
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 128) || "principal";
+  return `elastos-recovery-${principal}.json`;
+}
+
 function downloadRecoveryKit(kit) {
-  const principal = shortText(readText(kit && kit.principal_id), 12) || "principal";
+  const fileName = recoveryKitFileName(kit);
   const blob = new Blob([JSON.stringify(kit, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `elastos-recovery-${principal}.json`;
+  anchor.download = fileName;
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+  return fileName;
 }
 
 function setRecoveryButton(label, disabled) {
@@ -3608,6 +3589,10 @@ function setAccessPolicy(access) {
     guest_registration_enabled: access && access.guest_registration_enabled === true,
   };
   setGuestRegistrationControlState();
+  // Only an owner (admin) adds passkeys; the server refuses anyone else.
+  if (passkeyAddButton) {
+    passkeyAddButton.hidden = !hasShellAccess() || currentAccess.role !== "admin";
+  }
 }
 
 function setGuestRegistrationControlState() {
@@ -3646,7 +3631,6 @@ function setPasskeyAuthority(authority) {
   if (!proofBinding || !proofBinding.startsWith("proof:passkey:")) {
     return;
   }
-  passkeyAuthorityActive = true;
   showPasskeyStatus("", "muted");
 }
 
@@ -3697,6 +3681,290 @@ function setSourceState(source) {
     "source-transport",
     sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
   );
+}
+
+function configureRuntimeUpdate() {
+  runtimeUpdateButton?.addEventListener("click", onRuntimeUpdateApply);
+  window.addEventListener("pagehide", () => {
+    runtimeUpdateActive = false;
+    window.clearTimeout(runtimeUpdateTimer);
+    for (const request of runtimeUpdateRequests) request.abort();
+  }, { once: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleRuntimeUpdateRefresh(0);
+  });
+  window.addEventListener("message", (event) => {
+    if (homeRuntimeEventsFrom(event)) scheduleRuntimeUpdateRefresh(0);
+  });
+  scheduleRuntimeUpdateRefresh();
+}
+
+// Events Home forwards from its Runtime event stream; null for any other message.
+function homeRuntimeEventsFrom(event) {
+  const message = event.data;
+  return event.source === window.top && event.origin === homeParentOrigin
+    && message?.type === "elastos:runtime-events"
+    && message?.schema === "elastos.home.runtime-events/v1"
+    && Array.isArray(message.events) ? message.events : null;
+}
+
+function renderRuntimeUpdate(update) {
+  runtimeUpdate = update && typeof update === "object" ? update : null;
+  if (!runtimeUpdateNode || !runtimeUpdateButton) return;
+  const configured = runtimeUpdate?.configured === true;
+  runtimeUpdateNode.hidden = !configured && !runtimeUpdatePending;
+  const controller = runtimeUpdate?.controller;
+  const phase = readText(controller?.phase);
+  // With a request of its own pending, only that request's result is this page's update finishing;
+  // a result left from an earlier update can still be on display before the controller takes it.
+  const finishes = ["updated", "restored"].includes(phase)
+    && (!runtimeUpdatePending || controller?.id === runtimeUpdatePending.intent.request_id);
+  if (runtimeUpdatePending && (controller?.id === runtimeUpdatePending.intent.request_id
+    && ["updated", "restored", "failed"].includes(phase))) {
+    runtimeUpdatePending = null;
+    runtimeUpdateReconnects = 0;
+  }
+  if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    // An update running now (from any page) replaces this page's older result.
+    runtimeUpdateFeedback = "";
+    markRuntimeUpdateInProgress();
+  }
+  // A failed update keeps the current Home and its assets: never reload for it.
+  if (phase === "failed") runtimeUpdateInProgressSeen = false;
+  if (runtimeUpdateInProgressSeen && finishes) {
+    // The new (or restored) Home serves different assets; load them instead of running stale code.
+    showRuntimeUpdateStatus(readText(controller.message) || "Home is back. Reloading System…");
+    reloadForRuntimeUpdate();
+    return;
+  }
+  const choice = runtimeUpdatePending?.intent || runtimeUpdate;
+  const inProgress = runtimeUpdatePending || ["staging", "downloading", "verifying", "restarting"].includes(phase);
+  setTextFields("update-current-version", readText(choice?.current_version) || readText(controller?.current_version));
+  setTextFields("update-new-version", readText(choice?.new_version) || readText(controller?.new_version));
+  const publisher = readText(runtimeUpdatePending?.publisher || runtimeUpdate?.publisher);
+  setTextFields("update-publisher", publisher);
+  setHiddenFields("update-publisher-row", !publisher);
+  const hideOffer = runtimeUpdate?.available !== true && !inProgress;
+  setHiddenFields("update-offer", hideOffer);
+  const notes = runtimeUpdatePending?.changes || runtimeUpdate?.changes;
+  const changes = Array.isArray(notes) ? notes.filter((note) => typeof note === "string")
+    .slice(0, 32).map((note) => readText(note)).filter(Boolean).join("\n") : "";
+  setHiddenFields("update-changes", hideOffer || (inProgress && !changes && runtimeUpdate?.available !== true));
+  setTextFields("update-changes", changes || "Publisher has not supplied change notes.");
+  const actionable = runtimeUpdateCanApply();
+  runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
+  runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
+  const progress = runtimeUpdateProgressPhase();
+  runtimeUpdateButton.textContent = runtimeUpdatePending
+    ? runtimeUpdatePending.dispatched ? "Update in progress" : "Waiting for update status"
+    : "Update and restart Home";
+  if (runtimeUpdatePending) {
+    showRuntimeUpdateStatus(runtimeUpdateBusy && !runtimeUpdatePending.stepUpToken
+      ? "Verify your passkey to start the update."
+      : progress === "restarting" ? RUNTIME_UPDATE_RESTART_TEXT
+        : ["downloading", "verifying"].includes(progress) ? readText(controller?.message)
+          || "Preparing the update. Home restarts when the update is ready."
+        : progress === "staging" ? "Checking the signed update. Keep Home open."
+          : progress === "queued" ? "The update is queued. Keep Home open."
+            : "Checking the update with Home. Keep Home open.");
+  } else if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    showRuntimeUpdateStatus(phase === "restarting"
+      ? RUNTIME_UPDATE_RESTART_TEXT : readText(controller?.message) || "Checking the signed update. Keep Home open.");
+  } else if (runtimeUpdateFeedback) {
+    showRuntimeUpdateStatus(runtimeUpdateFeedback);
+  } else if (phase === "updated" && systemReloadedForUpdate() && readText(controller.new_version)) {
+    showRuntimeUpdateStatus(`Updated to ${readText(controller.new_version)}. Reload Home to finish.`);
+  } else if (["updated", "restored", "failed"].includes(phase)) {
+    showRuntimeUpdateStatus(readText(controller.message) || "Check the update status again.");
+  } else {
+    showRuntimeUpdateStatus(runtimeUpdate?.available === true
+      ? "An update is available. Home will restart after your approval."
+      : readText(runtimeUpdate?.message) || "Update checks are unavailable on this Home.");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+function runtimeUpdateProgressPhase() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  if (!runtimeUpdatePending) return phase;
+  if (runtimeUpdate?.controller?.id === runtimeUpdatePending.intent.request_id
+    && ["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    runtimeUpdatePending.dispatched = true;
+    runtimeUpdatePending.phase = phase;
+  }
+  return runtimeUpdatePending.phase || "checking";
+}
+
+function markRuntimeUpdateInProgress() {
+  if (runtimeUpdateInProgressSeen) return;
+  // From here a lost Home is most likely its restart: it gets the full restart budget.
+  runtimeUpdateInProgressSeen = true;
+  runtimeUpdateReconnects = 0;
+  if (runtimeUpdatePending) runtimeUpdatePending.polls = 0;
+}
+
+// Only an update reloads this frame (reloadForRuntimeUpdate), so a reloaded System has just loaded
+// the updated code; opening System again is a new navigation. The Home page and the windows above
+// still run the code from before the update, and System cannot reload them: it sits inside the
+// Home shell frame, whose sandbox allows no top navigation, and a nested frame inherits that. So
+// System asks the person to reload Home.
+function systemReloadedForUpdate() {
+  return globalThis.performance?.getEntriesByType?.("navigation")?.[0]?.type === "reload";
+}
+
+function reloadForRuntimeUpdate() {
+  runtimeUpdateInProgressSeen = false;
+  runtimeUpdateActive = false;
+  window.clearTimeout(runtimeUpdateTimer);
+  window.location.reload();
+}
+
+function runtimeUpdatePollLimit() {
+  return runtimeUpdateInProgressSeen ? RUNTIME_UPDATE_RESTART_POLLS : 90;
+}
+
+function runtimeUpdateCanApply() {
+  return runtimeUpdate?.configured === true && runtimeUpdate.available === true
+    && runtimeUpdate.can_apply === true
+    && ["ready", "updated", "restored", "failed"].includes(readText(runtimeUpdate.controller?.phase))
+    && ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]
+      .every((field) => readText(runtimeUpdate[field]).length > 0);
+}
+
+function showRuntimeUpdateStatus(message) {
+  if (runtimeUpdateStatusNode) runtimeUpdateStatusNode.textContent = message;
+}
+
+function scheduleRuntimeUpdateRefresh(delay) {
+  window.clearTimeout(runtimeUpdateTimer);
+  if (!runtimeUpdateActive || (runtimeUpdate !== undefined && runtimeUpdate?.configured !== true && !runtimeUpdatePending)) return;
+  runtimeUpdateTimer = window.setTimeout(pollRuntimeUpdate,
+    document.hidden ? 30_000 : delay ?? (runtimeUpdate?.controller?.phase === "restarting"
+      || (runtimeUpdateInProgressSeen && runtimeUpdateReconnects > 0) ? 2_000 : 5_000));
+}
+
+async function pollRuntimeUpdate() {
+  if (!runtimeUpdateActive) return;
+  if (systemSummaryInFlight) {
+    scheduleRuntimeUpdateRefresh();
+    return;
+  }
+  if (runtimeUpdatePending && ++runtimeUpdatePending.polls >= runtimeUpdatePollLimit()) {
+    showRuntimeUpdateStatus(runtimeUpdatePending.dispatched
+      ? "Home has not completed the update. Open System from Home again to check its status."
+      : "Home has not confirmed the update. Open System from Home again to check its status.");
+    return;
+  }
+  try {
+    await refreshSystemSummary();
+    runtimeUpdateReconnects = 0;
+    const controller = runtimeUpdate?.controller;
+    if (runtimeUpdatePending && controller?.id === runtimeUpdatePending.intent.request_id
+      && ["staging", "downloading", "verifying"].includes(readText(controller.phase))) {
+      runtimeUpdatePending.polls = 0;
+    }
+  } catch (error) {
+    if (!runtimeUpdateActive) return;
+    if ((error.status === 401 || error.status === 403) && runtimeUpdateInProgressSeen) {
+      // The restarted Home no longer accepts this page's session token. A reload is a plain GET that
+      // asks Home for a fresh session (or its sign-in); no update request is replayed, and the next
+      // load starts with runtimeUpdateInProgressSeen false, so a second refusal stops below.
+      reloadForRuntimeUpdate();
+      return;
+    }
+    if (error.status === 401 || error.status === 403) {
+      runtimeUpdateButton.hidden = true;
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home access has changed. Open System from Home again to check the update.");
+      return;
+    }
+    if (++runtimeUpdateReconnects >= runtimeUpdatePollLimit()) {
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home has not reconnected. Open Home again to check the update.");
+      return;
+    }
+    showRuntimeUpdateStatus(runtimeUpdateInProgressSeen || runtimeUpdateProgressPhase() === "restarting"
+      ? RUNTIME_UPDATE_RESTART_TEXT
+      : runtimeUpdatePending?.dispatched ? "Waiting for Home to report update progress. Reconnecting…"
+        : runtimeUpdatePending ? "Waiting for Home to confirm the update. Reconnecting…"
+        : "Update status is unavailable. Reconnecting…");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+async function fetchRuntimeUpdateJson(init, url = "/api/apps/system/summary") {
+  const abort = new AbortController();
+  runtimeUpdateRequests.add(abort);
+  // Carrier admission includes connection, signed metadata checks and transport drain.
+  const timeout = window.setTimeout(() => abort.abort(), url === "/api/apps/system/summary" && init.method === "POST" ? 60_000 : 10_000);
+  try { return await fetchJson(url, { ...init, signal: abort.signal }); }
+  finally {
+    window.clearTimeout(timeout);
+    runtimeUpdateRequests.delete(abort);
+  }
+}
+
+async function onRuntimeUpdateApply() {
+  if (runtimeUpdateBusy || runtimeUpdatePending || !runtimeUpdateCanApply()) return;
+  runtimeUpdateFeedback = "";
+  const intent = { action: "apply", request_id: window.crypto.randomUUID().replaceAll("-", "") };
+  for (const field of ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]) {
+    intent[field] = runtimeUpdate[field];
+  }
+  const pending = { intent, stepUpToken: null, polls: 0, dispatched: false, phase: "checking",
+    publisher: runtimeUpdate.publisher, changes: runtimeUpdate.changes };
+  runtimeUpdatePending = pending;
+  runtimeUpdateBusy = true;
+  renderRuntimeUpdate(runtimeUpdate);
+  let feedback = "";
+  try {
+    pending.stepUpToken = await requestPasskeyStepUp("system.update.apply", intent);
+    if (!runtimeUpdateActive || runtimeUpdatePending !== pending) return;
+    const body = JSON.stringify({ ...intent, step_up_token: pending.stepUpToken });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const reply = await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body });
+        if (runtimeUpdatePending !== pending || !runtimeUpdateActive) return;
+        if (reply?.id !== intent.request_id || reply?.phase !== "queued") throw new Error("Update queue confirmation is unavailable.");
+        pending.dispatched = true;
+        markRuntimeUpdateInProgress();
+        if (pending.phase === "checking") pending.phase = "queued";
+        break;
+      } catch (error) {
+        if (!runtimeUpdateActive || (error.status >= 400 && error.status < 500) || attempt === 1) throw error;
+      }
+    }
+  } catch (error) {
+    if (runtimeUpdatePending !== pending) return;
+    if (!pending.stepUpToken || (error.status >= 400 && error.status < 500)) {
+      runtimeUpdatePending = null;
+      feedback = !pending.stepUpToken && (error.name === "NotAllowedError"
+        || /cancelled|canceled|timed out or was not allowed/i.test(readText(error.message)))
+        ? "You cancelled the update. Home is unchanged."
+        : error.status === 424
+          ? "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+        : error.status === 423
+          ? "Another update was started on this Home. Wait for it to finish, then check the update again."
+        : error.status === 410
+          ? "This approval is no longer valid. Check for the update again and approve it once more."
+        : error.status === 401 || error.status === 403
+          ? "Sign in as the Home owner to start the update."
+          : "The update could not start: the release was refused or verification failed. Select Update again.";
+      runtimeUpdateFeedback = feedback;
+    } else {
+      feedback = runtimeUpdateProgressPhase() === "restarting"
+        ? RUNTIME_UPDATE_RESTART_TEXT
+        : pending.dispatched ? "Waiting for Home to report update progress. Keep Home open."
+          : "Waiting for Home to confirm the update. Keep Home open.";
+    }
+  } finally {
+    runtimeUpdateBusy = false;
+    if (runtimeUpdateActive) {
+      renderRuntimeUpdate(runtimeUpdate);
+      if (feedback) showRuntimeUpdateStatus(feedback);
+      scheduleRuntimeUpdateRefresh(0);
+    }
+  }
 }
 
 function readQueryParam(key) {
@@ -3794,31 +4062,28 @@ function publicSystemError(value, fallback) {
   return message;
 }
 
+const HOSTED_KEY_CHECK_PENDING = "Approve this connection in Inbox, then check the key again.";
+const HOSTED_KEY_REJECTED = "The provider rejected this key.";
+const HOSTED_KEY_CHECK_OUTCOMES = [
+  // Runtime copy: api/gateway_home_system_ai_provider.rs and gateway.rs system_error_response.
+  [/Approve this hosted connection in Inbox/, HOSTED_KEY_CHECK_PENDING],
+  [/The hosted connection request was denied\./, "This connection was denied in Inbox. Try again later."],
+  [/Hosted access was denied or ended\./, "This connection was denied or ended. Review Inbox."],
+  [/Hosted HTTPS was ended on this Home\./, "Hosted access was ended. Check the key again to ask in Inbox."],
+  [/Runtime blocked this hosted route\./, "This Home blocked the route to the host."],
+  [/Hosted HTTPS could not reach the host\./, "Could not reach the host. Check the network and try again."],
+  [/Hosted external HTTPS is paused/, "External HTTPS is paused on this Home."],
+  [/^request failed: 400 invalid (OpenRouter|Venice) key$/i, HOSTED_KEY_REJECTED],
+  [/^request failed: 500 (OpenRouter|Venice) validation unavailable$/i, "The provider sent an unexpected response. Try again later."],
+  [/^request failed: 403 (admin passkey required|proof-bound passkey session required|.*fresh passkey|.*passkey step-up)/i, "Sign in with the Home admin passkey to check keys."],
+];
+
 function hostedProviderValidationError(value) {
   const message = readText(value && value.message ? value.message : value);
-  if (message.includes("Approve this hosted connection in Inbox")) {
-    return "The key is stored on this Home. Approve this connection in Inbox, then select Check key and load models again.";
+  for (const [pattern, text] of HOSTED_KEY_CHECK_OUTCOMES) {
+    if (pattern.test(message)) return text;
   }
-  for (const detail of [
-    "The hosted connection request was denied. Try again after the decision window.",
-    "Hosted access was denied or ended. Review Inbox.",
-    "Hosted HTTPS was ended on this Home. Start a new connection check in Inbox.",
-    "Runtime blocked this hosted route. Review the connection configuration.",
-    "Hosted HTTPS could not reach the host. Check the network and try again.",
-    "This Home could not check the hosted connection. Try again.",
-  ]) {
-    if (message.includes(detail)) return detail;
-  }
-  if (message.includes("Hosted external HTTPS is paused until Runtime network authority is available.")) {
-    return "External HTTPS is paused on this Home. The key has not been checked.";
-  }
-  if (/invalid (OpenRouter|Venice) key/i.test(message)) {
-    return "The provider could not validate this key.";
-  }
-  if (/^request failed: 403 admin passkey required$/i.test(message)) {
-    return "Sign in as the Home admin to check provider keys.";
-  }
-  return publicSystemError(value, "This Home could not check the key. Try again.");
+  return "This Home could not check the key. Try again.";
 }
 
 function showError(error) {

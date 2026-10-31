@@ -65,20 +65,20 @@ use super::{
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
     runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
-    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
-    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
-    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    InactiveCustodyProvider, MediaToolsTrust, RuntimeCustodyComposition,
+    RuntimeCustodyCompositionConfigFile, RuntimeCustodyLibraryPublishInput,
+    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
+    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
-    RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, CUSTODY_PROVIDER_OPERATIONS,
-    CUSTODY_PROVIDER_VERSION, MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1,
+    RuntimeLibraryMediaPreparation, SignedMediaToolDigests,
+    CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1, CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
+    CUSTODY_PROVIDER_OPERATIONS, MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1,
     MEDIA_PROVIDER_ID, MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
     PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
-    PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
-    PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT, PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS,
-    PROTECT_PROVIDER_PROCESS_ID, PROTECT_PROVIDER_VERSION,
+    PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT,
+    PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS, PROTECT_PROVIDER_PROCESS_ID,
     RUNTIME_CUSTODY_AVAILABILITY_UNAVAILABLE_MESSAGE, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
@@ -3776,7 +3776,8 @@ fn prepare_test_media_prerequisite(data_dir: &Path, root: &Path) {
     owner_only_dir(root);
     write_media_prerequisite(&root.join("ffmpeg"), b"ffmpeg-private-test", 0o700);
     write_media_prerequisite(&root.join("ffprobe"), b"ffprobe-private-test", 0o700);
-    prepare_runtime_media_provider_prerequisite(data_dir, root).unwrap();
+    prepare_runtime_media_provider_prerequisite(data_dir, root, MediaToolsTrust::MustMatch)
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -3798,12 +3799,14 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
         0o700,
     );
 
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
     let config_path = media_config_path(&data_dir);
     let original_config = fs::read(&config_path).unwrap();
     let original_ffmpeg =
         fs::read(data_dir.join("protected-content/media-provider/tools/ffmpeg")).unwrap();
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
 
     assert!(!marker.exists());
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -3847,28 +3850,112 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
     let bounded_bytes = serde_json::to_vec_pretty(&bounded).unwrap();
     fs::write(&config_path, &bounded_bytes).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
-    assert_eq!(fs::read(config_path).unwrap(), bounded_bytes);
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), bounded_bytes);
 
-    let imported_probe =
-        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap();
-    write_media_prerequisite(
-        &source.join("ffprobe"),
-        b"different supplied ffprobe",
-        0o700,
-    );
-    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
+    // A differing pair without signed provenance is refused with nothing changed.
+    let tools_dir = data_dir.join("protected-content/media-provider/tools");
+    let imported_ffmpeg = fs::read(tools_dir.join("ffmpeg")).unwrap();
+    let imported_probe = fs::read(tools_dir.join("ffprobe")).unwrap();
+    write_media_prerequisite(&source.join("ffmpeg"), b"upgraded ffmpeg", 0o700);
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    let unchanged = |config: &[u8]| {
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+        assert_eq!(fs::read(tools_dir.join("ffmpeg")).unwrap(), imported_ffmpeg);
+        assert_eq!(fs::read(tools_dir.join("ffprobe")).unwrap(), imported_probe);
+        assert_eq!(fs::read_dir(&tools_dir).unwrap().count(), 2);
+    };
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+            .unwrap_err();
     assert!(error
         .to_string()
         .contains("differ from the private imported pair"));
-    assert_eq!(
-        fs::read(media_config_path(&data_dir)).unwrap(),
-        bounded_bytes
-    );
-    assert_eq!(
-        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap(),
-        imported_probe
-    );
+    unchanged(&bounded_bytes);
+
+    // Bytes altered after the signed archive was verified are refused before any rename.
+    let signed = MediaToolsTrust::SignedRelease(SignedMediaToolDigests {
+        ffmpeg: sha2::Sha256::digest(b"upgraded ffmpeg").into(),
+        ffprobe: sha2::Sha256::digest(b"upgraded ffprobe").into(),
+    });
+    write_media_prerequisite(&source.join("ffprobe"), b"tampered ffprobe", 0o700);
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match the signed release media tools"));
+    unchanged(&bounded_bytes);
+
+    // A symlinked supplied tool is refused, whatever its target.
+    let linked = temp.path().join("linked-source");
+    owner_only_dir(&linked);
+    write_media_prerequisite(&linked.join("real-ffprobe"), b"upgraded ffprobe", 0o700);
+    std::os::unix::fs::symlink(linked.join("real-ffprobe"), linked.join("ffprobe")).unwrap();
+    fs::copy(source.join("ffmpeg"), linked.join("ffmpeg")).unwrap();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &linked, signed).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    unchanged(&bounded_bytes);
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    let linked_dir = temp.path().join("linked-dir");
+    std::os::unix::fs::symlink(&source, &linked_dir).unwrap();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &linked_dir, signed).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    unchanged(&bounded_bytes);
+    // Even a root-owned system link (macOS /tmp or /var) on a supplied path is refused.
+    if let Some(system_link) = ["/tmp", "/var", "/etc"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.file_type().is_symlink() && meta.uid() == 0)
+        })
+    {
+        let error = prepare_runtime_media_provider_prerequisite(
+            &data_dir,
+            &system_link.join("media-tools"),
+            signed,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        unchanged(&bounded_bytes);
+    }
+
+    // The signed release's pair is re-imported and tuned limits are kept.
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap();
+    let upgraded = || {
+        assert_eq!(fs::read(&config_path).unwrap(), bounded_bytes);
+        assert_eq!(
+            fs::read(tools_dir.join("ffmpeg")).unwrap(),
+            b"upgraded ffmpeg"
+        );
+        assert_eq!(
+            fs::read(tools_dir.join("ffprobe")).unwrap(),
+            b"upgraded ffprobe"
+        );
+        for name in ["ffmpeg", "ffprobe"] {
+            let metadata = fs::symlink_metadata(tools_dir.join(name)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o500);
+            assert_eq!(metadata.nlink(), 1);
+        }
+        assert_eq!(fs::read_dir(&tools_dir).unwrap().count(), 2);
+    };
+    upgraded();
+    let bridge = load_runtime_media_provider_bridge_config(&data_dir)
+        .unwrap()
+        .expect("upgraded config must survive restart validation");
+    assert_eq!(bridge.extra["timeout_ms"], 5_000);
+
+    // A pair left half-replaced by an interrupted run is repaired on rerun.
+    let probe = tools_dir.join("ffprobe");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&probe, &imported_probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o500)).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap();
+    upgraded();
 }
 
 #[cfg(unix)]
@@ -3879,7 +3966,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     let missing = temp.path().join("missing-tools");
     owner_only_dir(&missing);
     write_media_prerequisite(&missing.join("ffmpeg"), b"ffmpeg", 0o700);
-    let error = prepare_runtime_media_provider_prerequisite(&missing_data, &missing).unwrap_err();
+    let error = prepare_runtime_media_provider_prerequisite(
+        &missing_data,
+        &missing,
+        MediaToolsTrust::MustMatch,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("ffprobe"));
     assert!(!media_config_path(&missing_data).exists());
 
@@ -3888,12 +3980,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_tools);
     write_media_prerequisite(&unsafe_tools.join("ffmpeg"), b"ffmpeg", 0o720);
     write_media_prerequisite(&unsafe_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&unsafe_data, &unsafe_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &unsafe_data,
+        &unsafe_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
     assert!(!media_config_path(&unsafe_data).exists());
 
     let oversized_data = temp.path().join("oversized-data");
@@ -3907,12 +4001,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&oversized_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&oversized_data, &oversized_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds bounds")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &oversized_data,
+        &oversized_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("exceeds bounds"));
     assert!(!media_config_path(&oversized_data).exists());
 
     let non_file_data = temp.path().join("non-file-data");
@@ -3920,24 +4016,50 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&non_file_tools);
     owner_only_dir(&non_file_tools.join("ffmpeg"));
     write_media_prerequisite(&non_file_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&non_file_data, &non_file_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &non_file_data,
+        &non_file_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
 
     let unsafe_parent_data = temp.path().join("unsafe-parent-data");
     let unsafe_parent_tools = temp.path().join("unsafe-parent-tools");
     owner_only_dir(&unsafe_parent_tools);
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
-    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o770)).unwrap();
+    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
+    let refusal = prepare_runtime_media_provider_prerequisite(
+        &unsafe_parent_data,
+        &unsafe_parent_tools,
+        MediaToolsTrust::MustMatch,
+    )
+    .unwrap_err()
+    .to_string();
+    let fix = format!(
+        "chmod go-w '{}'",
+        fs::canonicalize(&unsafe_parent_tools).unwrap().display()
+    );
     assert!(
-        prepare_runtime_media_provider_prerequisite(&unsafe_parent_data, &unsafe_parent_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("prerequisite parent is unsafe")
+        refusal.contains("prerequisite parent is unsafe"),
+        "{refusal}"
+    );
+    assert!(refusal.contains(&fix), "{refusal}");
+    assert!(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&fix)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        fs::metadata(&unsafe_parent_tools)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
     );
 
     let linked_data = temp.path().join("linked-data");
@@ -3950,12 +4072,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&linked_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&linked_data, &linked_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &linked_data,
+        &linked_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
 }
 
 #[cfg(unix)]
@@ -4030,7 +4154,9 @@ fn media_prerequisite_conflict_cleans_only_files_created_by_that_attempt() {
     owner_only_dir(&tools);
     write_media_prerequisite(&tools.join("ffprobe"), b"preserved-conflict", 0o500);
 
-    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+            .unwrap_err();
 
     assert!(error.to_string().contains("ffprobe import conflicts"));
     assert_eq!(
@@ -4222,7 +4348,7 @@ impl ProtectedStartupProvider {
                 "status": "ok",
                 "data": {
                     "provider": PROTECT_PROVIDER_PROCESS_ID,
-                    "version": PROTECT_PROVIDER_VERSION,
+                    "version": "0.7.2-alpha.5",
                     "configured": true,
                     "supported_operations": PROTECT_PROVIDER_OPERATIONS,
                     "request_schema": PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
@@ -4233,7 +4359,7 @@ impl ProtectedStartupProvider {
                 "status": "ok",
                 "data": {
                     "provider": CUSTODY_PROVIDER_ID,
-                    "version": CUSTODY_PROVIDER_VERSION,
+                    "version": "0.7.2-alpha.5",
                     "configured": true,
                     "supported_operations": CUSTODY_PROVIDER_OPERATIONS,
                     "request_schema": CUSTODY_PROVIDER_REQUEST_SCHEMA_V1,
@@ -4283,8 +4409,7 @@ fn write_mock_custody_provider(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         request_log.display(),
         ProtectedStartupProvider::Custody.status(),
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4319,8 +4444,7 @@ fn write_mock_protected_startup_provider_with_shutdown(
         shutdown_response,
         status_response,
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4350,8 +4474,7 @@ fn write_blocking_protected_status_provider(
         status_release.display(),
         provider.status(),
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log, status_signal, status_release)
 }
 
@@ -4432,13 +4555,108 @@ fn protected_content_decrypt_provider_status() -> Value {
         "status": "ok",
         "data": {
             "provider": PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
-            "version": PROTECTED_CONTENT_DECRYPT_PROVIDER_VERSION,
+            "version": "0.7.2-alpha.5",
             "configured": true,
             "supported_operations": PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS,
             "request_schema": DECRYPT_PROVIDER_REQUEST_SCHEMA_V1,
             "response_schema": DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
         }
     })
+}
+
+// These fixtures represent frozen support files from a different Runtime release.
+#[cfg(unix)]
+mod provider_status_compatibility {
+    use super::*;
+
+    type StatusCheck = fn(&Value) -> anyhow::Result<()>;
+
+    fn cases() -> [(Value, StatusCheck, &'static str); 4] {
+        [
+            (
+                ProtectedStartupProvider::Protect.status(),
+                super::super::require_protect_provider_status,
+                "protect provider",
+            ),
+            (
+                ProtectedStartupProvider::Custody.status(),
+                super::super::require_inactive_custody_provider_status,
+                "inactive custody provider",
+            ),
+            (
+                protected_content_decrypt_provider_status(),
+                super::super::require_protected_content_decrypt_provider_status,
+                "protected-content decrypt provider",
+            ),
+            (
+                json!({
+                    "status": "ok",
+                    "data": {
+                        "provider": "media-provider",
+                        "protocol_version": "elastos.media-provider/v1",
+                        "version": "0.7.2-alpha.5",
+                        "configured": true,
+                        "supported_operations": ["status", "prepare"],
+                    }
+                }),
+                super::super::require_media_provider_status,
+                "media-provider",
+            ),
+        ]
+    }
+
+    #[test]
+    fn accepts_another_release_with_the_same_protocol() {
+        for (mut status, check, label) in cases() {
+            for version in ["0.7.2-alpha.5", "0.7.2-alpha.6", "0.1.0-dev"] {
+                status["data"]["version"] = json!(version);
+                check(&status).unwrap_or_else(|error| panic!("{label}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_incompatible_protocol_with_a_plain_message() {
+        for (status, check, label) in cases() {
+            let fields: &[&str] = if label == "media-provider" {
+                &["protocol_version"]
+            } else {
+                &["request_schema", "response_schema"]
+            };
+            for field in fields {
+                let mut incompatible = status.clone();
+                incompatible["data"][field] = json!("incompatible/v2");
+                let message = check(&incompatible).unwrap_err().to_string();
+                let expected = if label == "media-provider" {
+                    format!("{label} status has an unsupported protocol version")
+                } else {
+                    format!("{label} status has unsupported protocol schemas")
+                };
+                assert_eq!(message, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_missing_or_garbled_status() {
+        for (status, check, label) in cases() {
+            for version in [Value::Null, json!(42), json!(""), json!("garbled")] {
+                let mut invalid = status.clone();
+                invalid["data"]["version"] = version;
+                assert!(check(&invalid).is_err(), "{label}");
+            }
+            for field in status["data"].as_object().unwrap().keys() {
+                let mut missing = status.clone();
+                missing["data"].as_object_mut().unwrap().remove(field);
+                assert!(check(&missing).is_err(), "{label}: {field}");
+            }
+            assert!(check(&json!({"status": "ok"})).is_err(), "{label}");
+            assert!(
+                check(&json!({"status": "error", "data": status["data"]})).is_err(),
+                "{label}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -4458,8 +4676,7 @@ fn write_mock_protected_content_decrypt_provider(
         expected_issuer,
         status,
     );
-    fs::write(&binary, script).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_from_child(&binary, &script, 0o700);
     (binary, pid_file, request_log)
 }
 
@@ -4784,6 +5001,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_1
     ));
     assert!(matches!(
@@ -4791,6 +5009,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_2
     ));
 
@@ -4805,10 +5024,12 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_1.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_2.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );
@@ -4881,6 +5102,7 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: actual,
                 timeout_ms: None,
+                reply_wait_ms: None,
             }) if actual == peer_did
         ));
     }
@@ -4895,14 +5117,17 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[0].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[1].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[2].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );
@@ -5950,7 +6175,7 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
     .unwrap();
 
     assert_eq!(status["provider"], "custody");
-    assert_eq!(status["version"], CUSTODY_PROVIDER_VERSION);
+    assert!(semver::Version::parse(status["version"].as_str().unwrap()).is_ok());
     assert_eq!(status["configured"], Value::Bool(true));
     assert_eq!(
         status["supported_operations"],
@@ -7140,9 +7365,11 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     .unwrap();
     let decrypt = RuntimeDecryptRegistryAdapter::new(decrypt_registry.clone());
 
-    let audit_a = RuntimeReleaseAuditIdV1::new(digest(0xa1)).unwrap();
-    let audit_b = RuntimeReleaseAuditIdV1::new(digest(0xa2)).unwrap();
     let flow_now = crate::auth::now_ts();
+    let audit_a =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
+    let audit_b =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
     let prepare_issued_at = flow_now.saturating_sub(5);
     let prepare_expires_at = flow_now + 240;
     let prepared_a = prepare_recipient(
@@ -7156,6 +7383,18 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     )
     .await
     .unwrap();
+    let replayed_a = prepare_recipient(
+        &decrypt,
+        &preliminary_buy,
+        session_a,
+        audit_a,
+        runtime_operation_issuer_for_seed(0x21),
+        prepare_issued_at,
+        prepare_expires_at,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed_a, prepared_a);
     let prepared_b = prepare_recipient(
         &decrypt,
         &preliminary_buy,
@@ -7427,6 +7666,26 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     close_viewer_session(&decrypt, &session).await.unwrap();
     close_viewer_session(&decrypt, &session).await.unwrap();
     cancel_prepared_recipient(&decrypt, &prepared_a)
+        .await
+        .unwrap();
+    let audit_c =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
+    let prepared_c = prepare_recipient(
+        &decrypt,
+        &preliminary_buy,
+        session_a,
+        audit_c,
+        runtime_operation_issuer_for_seed(0x21),
+        prepare_issued_at,
+        prepare_expires_at,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        prepared_c.prepared_recipient_handle(),
+        session.viewer_session_handle()
+    );
+    cancel_prepared_recipient(&decrypt, &prepared_c)
         .await
         .unwrap();
 

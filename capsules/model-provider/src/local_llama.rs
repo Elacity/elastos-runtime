@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::sleep;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -22,18 +22,199 @@ const MAX_GUARD_CONFIG_BYTES: usize = 12 * 1024;
 #[cfg(not(test))]
 const GUARD_START_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARD_EXIT_GRACE: Duration = Duration::from_secs(1);
+/// An engine with no request for this long is stopped to give its memory back.
+const IDLE_RELEASE_DELAY: Duration = Duration::from_secs(60);
+/// How often a loading or generating model checks the host's memory pressure.
+const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const INTERNAL_GUARD_ARG: &str = "--internal-local-llama-guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalLlamaFault {
     Failed,
+    /// The engine could not be spawned or exited before it became ready.
+    StartFailed,
     Timeout,
+    /// The host's room does not cover this model; nothing was started. The
+    /// bytes of room the host had and the bytes the model needs.
+    MemoryUnavailable {
+        available: u64,
+        required: u64,
+    },
+    /// Runtime could not observe the host's memory limits; nothing was started.
+    MemoryObservationUnavailable,
+    /// macOS reported critical memory pressure; nothing was started.
+    MemoryPressureCritical,
+    /// macOS reported critical memory pressure while the model loaded or
+    /// generated. The caller stops the engine to release its memory.
+    StoppedForMemoryPressure,
 }
 
-#[derive(Clone, Default)]
+pub(crate) enum LocalTimingStage {
+    ArtifactValidationStarted,
+    ArtifactValidationCompleted,
+    GuardStarted,
+    GuardInitialized,
+    EngineReady,
+    EngineTimeout,
+    EngineFailed,
+    RunStarted,
+    InputTokensStarted,
+    InputTokensCompleted,
+    GenerationStarted,
+    FirstDelta,
+    StreamCompleted,
+    GenerationCompleted,
+    TerminalApplied,
+    RunTimeout,
+    RunFailed,
+}
+
+pub(crate) struct LocalTiming(Instant);
+
+impl LocalTiming {
+    fn enabled() -> bool {
+        std::env::var_os("ELASTOS_MODEL_TIMING_DIAGNOSTICS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    }
+
+    pub(crate) fn acknowledgement(&self, terminal: bool, outcome: &str, started: Instant) {
+        if Self::enabled() {
+            let kind = if terminal { "terminal" } else { "delta" };
+            let duration_ms = started.elapsed().as_millis();
+            let elapsed_ms = self.0.elapsed().as_millis();
+            eprintln!(
+                "[model-provider] local acknowledgement kind={kind} outcome={outcome} elapsed_ms={elapsed_ms} duration_ms={duration_ms}"
+            );
+        }
+    }
+
+    pub(crate) fn start() -> Self {
+        Self(Instant::now())
+    }
+
+    pub(crate) fn record(&self, stage: LocalTimingStage) {
+        if !Self::enabled() {
+            return;
+        }
+        let name = match stage {
+            LocalTimingStage::ArtifactValidationStarted => "artifact_validation_started",
+            LocalTimingStage::ArtifactValidationCompleted => "artifact_validation_completed",
+            LocalTimingStage::GuardStarted => "guard_started",
+            LocalTimingStage::GuardInitialized => "guard_initialized",
+            LocalTimingStage::EngineReady => "engine_ready",
+            LocalTimingStage::EngineTimeout => "engine_timeout",
+            LocalTimingStage::EngineFailed => "engine_failed",
+            LocalTimingStage::RunStarted => "run_started",
+            LocalTimingStage::InputTokensStarted => "input_tokens_started",
+            LocalTimingStage::InputTokensCompleted => "input_tokens_completed",
+            LocalTimingStage::GenerationStarted => "generation_started",
+            LocalTimingStage::FirstDelta => "first_delta",
+            LocalTimingStage::StreamCompleted => "stream_completed",
+            LocalTimingStage::GenerationCompleted => "generation_completed",
+            LocalTimingStage::TerminalApplied => "terminal_applied",
+            LocalTimingStage::RunTimeout => "run_timeout",
+            LocalTimingStage::RunFailed => "run_failed",
+        };
+        eprintln!(
+            "[model-provider] local timing stage={name} elapsed_ms={}",
+            self.0.elapsed().as_millis()
+        );
+    }
+}
+
+/// Local engines, at most one running at a time. Runs are serialized; an
+/// engine is stopped after `idle_delay` without a run and restarted on demand.
+#[derive(Clone)]
 pub(crate) struct LocalLlamaEngines {
     engines: Arc<Mutex<BTreeMap<String, RunningEngine>>>,
     runtime_sockets: Arc<RwLock<BTreeMap<String, String>>>,
+    execution: Arc<Semaphore>,
+    idle_release: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    idle_delay: Duration,
+    read_host_memory: crate::local_memory::HostMemoryReader,
+    read_memory_pressure: crate::local_memory::MemoryPressureReader,
+    pressure_interval: Duration,
+}
+
+impl Default for LocalLlamaEngines {
+    fn default() -> Self {
+        Self::with_runtime_sockets(BTreeMap::new())
+    }
+}
+
+/// Held for the whole of one local run. Dropping it arms the idle release.
+pub(crate) struct LocalRun {
+    engines: LocalLlamaEngines,
+    pressure: PressureWatch,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LocalRun {
+    /// The run's pressure watch, for its loading and generating waits.
+    pub(crate) fn pressure(&mut self) -> &mut PressureWatch {
+        &mut self.pressure
+    }
+}
+
+impl Drop for LocalRun {
+    fn drop(&mut self) {
+        self.engines.schedule_idle_release();
+    }
+}
+
+/// Checks the host's memory pressure for one local run: at its first wait,
+/// then about once per interval. The run owns it and no task runs it, so no
+/// check outlives the run.
+pub(crate) struct PressureWatch {
+    /// None once the platform has shown it reports no level.
+    read: Option<crate::local_memory::MemoryPressureReader>,
+    ticks: tokio::time::Interval,
+    due: bool,
+}
+
+impl PressureWatch {
+    fn new(read: crate::local_memory::MemoryPressureReader, interval: Duration) -> Self {
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            read: Some(read),
+            ticks,
+            due: true,
+        }
+    }
+
+    /// Resolves once the host reports critical pressure, never where the
+    /// platform reports no level. Cancel-safe: the only await is the tick, and
+    /// a select that drops it and calls it again keeps the interval.
+    pub(crate) async fn critical(&mut self) {
+        use crate::local_memory::MemoryPressure;
+        while let Some(read) = self.read {
+            if std::mem::take(&mut self.due) {
+                match read() {
+                    MemoryPressure::Critical => {
+                        self.due = true;
+                        return;
+                    }
+                    MemoryPressure::NotReported => {
+                        self.read = None;
+                        continue;
+                    }
+                    MemoryPressure::Normal | MemoryPressure::Warning => {}
+                }
+            }
+            self.ticks.tick().await;
+            self.due = true;
+        }
+        std::future::pending::<()>().await
+    }
+}
+
+/// Pending forever without a watch, so callers outside a run never stop on it.
+pub(crate) async fn critical_pressure(watch: Option<&mut PressureWatch>) {
+    match watch {
+        Some(watch) => watch.critical().await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,11 +257,93 @@ impl LocalLlamaEngines {
         Self {
             engines: Arc::new(Mutex::new(BTreeMap::new())),
             runtime_sockets: Arc::new(RwLock::new(sockets)),
+            execution: Arc::new(Semaphore::new(1)),
+            idle_release: Arc::new(std::sync::Mutex::new(None)),
+            idle_delay: IDLE_RELEASE_DELAY,
+            #[cfg(not(test))]
+            read_host_memory: crate::local_memory::host_memory,
+            #[cfg(test)]
+            read_host_memory: crate::local_memory::test_host_memory,
+            #[cfg(not(test))]
+            read_memory_pressure: crate::local_memory::memory_pressure,
+            #[cfg(test)]
+            read_memory_pressure: crate::local_memory::test_memory_pressure,
+            pressure_interval: PRESSURE_CHECK_INTERVAL,
         }
+    }
+
+    /// Engines whose runs watch `read` every `interval`.
+    #[cfg(test)]
+    pub(crate) fn with_memory_pressure(
+        mut self,
+        read: crate::local_memory::MemoryPressureReader,
+        interval: Duration,
+    ) -> Self {
+        self.read_memory_pressure = read;
+        self.pressure_interval = interval;
+        self
     }
 
     pub(crate) async fn update_runtime_sockets(&self, sockets: BTreeMap<String, String>) {
         *self.runtime_sockets.write().await = sockets;
+    }
+
+    /// Waits for the single local execution slot and cancels any pending idle
+    /// release, so the engine stays up for this run. The run's pressure watch
+    /// starts with it.
+    pub(crate) async fn begin_run(&self) -> Result<LocalRun, LocalLlamaFault> {
+        let permit = self
+            .execution
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| LocalLlamaFault::Failed)?;
+        self.cancel_idle_release();
+        Ok(LocalRun {
+            engines: self.clone(),
+            pressure: PressureWatch::new(self.read_memory_pressure, self.pressure_interval),
+            _permit: permit,
+        })
+    }
+
+    fn cancel_idle_release(&self) {
+        if let Some(task) = self
+            .idle_release
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    fn schedule_idle_release(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut idle_release = self
+            .idle_release
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(task) = idle_release.take() {
+            task.abort();
+        }
+        let engines = self.engines.clone();
+        let execution = self.execution.clone();
+        let delay = self.idle_delay;
+        *idle_release = Some(runtime.spawn(async move {
+            sleep(delay).await;
+            // A run that started meanwhile keeps its engine.
+            let Ok(_permit) = execution.try_acquire() else {
+                return;
+            };
+            let mut engines = engines.lock().await;
+            let ids: Vec<_> = engines.keys().cloned().collect();
+            for id in ids {
+                // An unconfirmed close keeps the child for the next exact retry.
+                let _ = close_engine(&mut engines, &id).await;
+            }
+        }));
     }
 
     pub(crate) async fn retains_artifacts(&self) -> bool {
@@ -97,10 +360,22 @@ impl LocalLlamaEngines {
         model: &LocalArtifactConfig,
         settings: &LocalLlamaSettings,
     ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
-        self.endpoint_with_timeout(offer_id, engine, model, settings, Duration::from_secs(30))
-            .await
+        self.endpoint_with_timeout(
+            offer_id,
+            engine,
+            model,
+            settings,
+            Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await
     }
 
+    /// Starts or reuses the offer's engine. `cancel` and `pressure` stop the
+    /// waits for it; after `StoppedForMemoryPressure` the caller closes the
+    /// offer, as after cancellation, so the engine's memory is released.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn endpoint_with_timeout(
         &self,
         offer_id: &str,
@@ -108,14 +383,56 @@ impl LocalLlamaEngines {
         model: &LocalArtifactConfig,
         settings: &LocalLlamaSettings,
         timeout: Duration,
+        cancel: Option<&mut watch::Receiver<bool>>,
+        pressure: Option<&mut PressureWatch>,
+    ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
+        let timing = LocalTiming::start();
+        let result = self
+            .endpoint_with_timing(
+                offer_id, engine, model, settings, timeout, &timing, cancel, pressure,
+            )
+            .await;
+        timing.record(match &result {
+            Ok(_) => LocalTimingStage::EngineReady,
+            Err(LocalLlamaFault::Timeout) => LocalTimingStage::EngineTimeout,
+            Err(_) => LocalTimingStage::EngineFailed,
+        });
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn endpoint_with_timing(
+        &self,
+        offer_id: &str,
+        engine: &LocalArtifactConfig,
+        model: &LocalArtifactConfig,
+        settings: &LocalLlamaSettings,
+        timeout: Duration,
+        timing: &LocalTiming,
+        mut cancel: Option<&mut watch::Receiver<bool>>,
+        mut pressure: Option<&mut PressureWatch>,
     ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
         let deadline = Instant::now() + timeout;
         let mut engines = tokio::time::timeout(timeout, self.engines.lock())
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
+        // One model engine at a time: opening another model stops the previous.
+        let others: Vec<_> = engines
+            .keys()
+            .filter(|id| id.as_str() != offer_id)
+            .cloned()
+            .collect();
+        for id in others {
+            close_engine(&mut engines, &id).await?;
+        }
         let stale = match engines.get_mut(offer_id) {
             Some(running) if running.closing => true,
-            Some(running) => match running_engine_is_ready(running, deadline).await? {
+            Some(running) => match tokio::select! {
+                biased;
+                _ = local_stop_requested(cancel.as_deref_mut()) => Err(LocalLlamaFault::Failed),
+                _ = critical_pressure(pressure.as_deref_mut()) => Err(LocalLlamaFault::StoppedForMemoryPressure),
+                ready = running_engine_is_ready(running, deadline) => ready,
+            }? {
                 true => return Ok(running.endpoint.clone()),
                 false => true,
             },
@@ -125,11 +442,19 @@ impl LocalLlamaEngines {
             close_engine(&mut engines, offer_id).await?;
         }
 
+        timing.record(LocalTimingStage::ArtifactValidationStarted);
         revalidate_local_artifact(engine, true, deadline).map_err(|_| deadline_fault(deadline))?;
         revalidate_local_artifact(model, false, deadline).map_err(|_| deadline_fault(deadline))?;
+        timing.record(LocalTimingStage::ArtifactValidationCompleted);
         if Instant::now() >= deadline {
             return Err(LocalLlamaFault::Timeout);
         }
+        crate::local_memory::admit(
+            std::path::Path::new(&model.path),
+            settings.context_size,
+            settings.parallel,
+            self.read_host_memory,
+        )?;
         let sockets = self.runtime_sockets.read().await;
         let (target, broker_socket) = if sockets.is_empty() {
             (EngineTarget::Tcp(reserve_loopback_port()?), None)
@@ -144,6 +469,9 @@ impl LocalLlamaEngines {
             )
         };
         drop(sockets);
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(LocalLlamaFault::Failed);
+        }
         if let EngineTarget::Unix(path) = &target {
             remove_stale_engine_socket(path)?;
         }
@@ -161,6 +489,7 @@ impl LocalLlamaEngines {
         let models_url = format!("{base_url}/v1/models");
         let (child, liveness, guard_group) =
             spawn_managed_engine(engine, model, settings, &target, &alias).await?;
+        timing.record(LocalTimingStage::GuardStarted);
         let health_timeout = Duration::from_millis(settings.health_timeout_ms)
             .min(deadline.saturating_duration_since(Instant::now()));
         let shutdown_timeout = Duration::from_millis(settings.shutdown_timeout_ms);
@@ -187,14 +516,21 @@ impl LocalLlamaEngines {
                 match initialized {
                     Err(fault) => Err(fault),
                     Ok(()) => {
-                        wait_until_healthy(
-                            &mut running.child,
-                            running.guard_group,
-                            &running.endpoint,
-                            &alias,
-                            health_timeout.min(deadline.saturating_duration_since(Instant::now())),
-                        )
-                        .await
+                        timing.record(LocalTimingStage::GuardInitialized);
+                        // The child is in the owned map before this cancellable
+                        // wait. Its close result below still owns settlement.
+                        tokio::select! {
+                            biased;
+                            _ = local_stop_requested(cancel) => Err(LocalLlamaFault::Failed),
+                            _ = critical_pressure(pressure) => Err(LocalLlamaFault::StoppedForMemoryPressure),
+                            healthy = wait_until_healthy(
+                                &mut running.child,
+                                running.guard_group,
+                                &running.endpoint,
+                                &alias,
+                                health_timeout.min(deadline.saturating_duration_since(Instant::now())),
+                            ) => healthy,
+                        }
                     }
                 }
             }
@@ -215,6 +551,7 @@ impl LocalLlamaEngines {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), LocalLlamaFault> {
+        self.cancel_idle_release();
         let mut engines = tokio::time::timeout(GUARD_EXIT_GRACE, self.engines.lock())
             .await
             .map_err(|_| LocalLlamaFault::Timeout)?;
@@ -226,6 +563,15 @@ impl LocalLlamaEngines {
             }
         }
         result
+    }
+}
+
+async fn local_stop_requested(cancel: Option<&mut watch::Receiver<bool>>) {
+    match cancel {
+        Some(cancel) => {
+            let _ = cancel.wait_for(|cancelled| *cancelled).await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -258,7 +604,7 @@ async fn spawn_managed_engine(
     {
         let mut command = Command::new(&engine.path);
         configure_tokio_engine_command(&mut command, &model.path, settings, target, alias);
-        let child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
+        let child = command.spawn().map_err(|_| LocalLlamaFault::StartFailed)?;
         Ok((child, None, None))
     }
 
@@ -322,7 +668,7 @@ fn spawn_guarded_engine(
         use std::os::unix::process::CommandExt as _;
         command.as_std_mut().process_group(0);
     }
-    let mut child = command.spawn().map_err(|_| LocalLlamaFault::Failed)?;
+    let mut child = command.spawn().map_err(|_| LocalLlamaFault::StartFailed)?;
     let guard_group = child.id().map(|pid| pid as libc::pid_t);
     let liveness = child.stdin.take();
     Ok((child, liveness, guard_group))
@@ -351,6 +697,27 @@ fn engine_arguments(
     target: &EngineTarget,
     alias: &str,
 ) -> Vec<OsString> {
+    engine_arguments_with_cpu_budget(
+        model_path,
+        settings,
+        target,
+        alias,
+        std::thread::available_parallelism().ok(),
+    )
+}
+
+fn engine_arguments_with_cpu_budget(
+    model_path: &str,
+    settings: &LocalLlamaSettings,
+    target: &EngineTarget,
+    alias: &str,
+    available_parallelism: Option<std::num::NonZeroUsize>,
+) -> Vec<OsString> {
+    // Runtime owns the saved thread ceilings. Reduce the actual worker count
+    // to this host's CPU budget without changing the activation binding.
+    let available_threads = available_parallelism
+        .map(|count| u32::try_from(count.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1);
     let mut args: Vec<OsString> = [
         "-m".into(),
         model_path.into(),
@@ -370,10 +737,21 @@ fn engine_arguments(
         "--no-context-shift".into(),
         "--parallel".into(),
         settings.parallel.to_string().into(),
+        "--batch-size".into(),
+        crate::local_memory::BATCH_SIZE.to_string().into(),
+        "--ubatch-size".into(),
+        crate::local_memory::UBATCH_SIZE.to_string().into(),
+        // Admission covers the live context only, without cached prompts.
+        "--cache-ram".into(),
+        "0".into(),
         "--threads".into(),
-        settings.threads.to_string().into(),
+        settings.threads.min(available_threads).to_string().into(),
         "--threads-batch".into(),
-        settings.batch_threads.to_string().into(),
+        settings
+            .batch_threads
+            .min(available_threads)
+            .to_string()
+            .into(),
         "--gpu-layers".into(),
         settings.gpu_layers.to_string().into(),
         "--alias".into(),
@@ -477,16 +855,17 @@ async fn wait_until_healthy(
     timeout: Duration,
 ) -> Result<(), LocalLlamaFault> {
     let client = health_client(endpoint.unix_socket.as_deref())?;
-    let deadline = Instant::now() + timeout;
+    // Tokio's clock, so tests can hold this deadline until a fixture engine has started.
+    let deadline = tokio::time::Instant::now() + timeout;
     let models_url = match endpoint.api_url.strip_suffix("/v1/chat/completions") {
         Some(base) => format!("{base}/v1/models"),
         None => return Err(LocalLlamaFault::Failed),
     };
     loop {
         if !managed_child_is_running(child, guard_group) {
-            return Err(LocalLlamaFault::Failed);
+            return Err(LocalLlamaFault::StartFailed);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(LocalLlamaFault::Timeout);
         }
@@ -504,7 +883,7 @@ async fn wait_until_healthy(
         }
         sleep(
             deadline
-                .saturating_duration_since(Instant::now())
+                .saturating_duration_since(tokio::time::Instant::now())
                 .min(HEALTH_POLL_INTERVAL),
         )
         .await;
@@ -745,15 +1124,18 @@ fn run_internal_guard() -> Result<(), ()> {
     let child_event_tx = event_tx.clone();
     if std::thread::Builder::new()
         .spawn(move || {
-            let event = match engine.wait() {
-                Ok(_) => GuardEvent::ChildExited,
-                Err(_) => GuardEvent::MonitorFailed,
+            let event = loop {
+                match child_exited_without_reaping(engine_pid) {
+                    Ok(true) => break GuardEvent::ChildExited,
+                    Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => break GuardEvent::MonitorFailed,
+                }
             };
             let _ = child_event_tx.send(event);
         })
         .is_err()
     {
-        kill_guard_process_group(guard_group);
+        reap_engine_and_kill_guard_group(&mut engine, guard_group);
     }
     if std::thread::Builder::new()
         .spawn(move || {
@@ -769,7 +1151,7 @@ fn run_internal_guard() -> Result<(), ()> {
         })
         .is_err()
     {
-        kill_guard_process_group(guard_group);
+        reap_engine_and_kill_guard_group(&mut engine, guard_group);
     }
 
     if matches!(event_rx.recv(), Ok(GuardEvent::ParentEof)) {
@@ -779,7 +1161,19 @@ fn run_internal_guard() -> Result<(), ()> {
             Ok(GuardEvent::ParentEof) => {}
         }
     }
-    kill_guard_process_group(guard_group);
+    reap_engine_and_kill_guard_group(&mut engine, guard_group);
+}
+
+#[cfg(unix)]
+fn reap_engine_and_kill_guard_group(
+    engine: &mut std::process::Child,
+    process_group: libc::pid_t,
+) -> ! {
+    // The monitor leaves the child unreaped, so its PID remains owned through
+    // kill and wait. Reap it before the guard kills itself with the group.
+    let _ = engine.kill();
+    let _ = engine.wait();
+    kill_guard_process_group(process_group);
 }
 
 #[cfg(unix)]
@@ -850,7 +1244,10 @@ fn child_exited_without_reaping(_pid: libc::pid_t) -> std::io::Result<bool> {
 mod tests {
     use super::*;
     use crate::config::{LocalArtifactConfig, LocalLlamaSettings};
-    use crate::test_support::{sha256_file, temp_root_path, write_fake_llama_server};
+    use crate::test_support::{
+        sha256_file, temp_root_path, write_fake_llama_server, FIXTURE_EVENT_TIMEOUT,
+    };
+    use std::future::Future;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt as _;
@@ -890,8 +1287,10 @@ mod tests {
                 threads: 1,
                 batch_threads: 1,
                 gpu_layers: 0,
-                health_timeout_ms: 2_000,
-                shutdown_timeout_ms: 250,
+                // Health and graceful exit end on the engine's own event; tests
+                // of the timeout paths set short windows explicitly.
+                health_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
+                shutdown_timeout_ms: FIXTURE_EVENT_TIMEOUT.as_millis() as u64,
                 enable_thinking: false,
             },
             events,
@@ -907,7 +1306,7 @@ mod tests {
     }
 
     fn wait_for_event(path: &std::path::Path, prefix: &str) {
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         while !event_lines(path)
             .iter()
             .any(|line| line.starts_with(prefix))
@@ -917,6 +1316,50 @@ mod tests {
                 "missing fake engine event {prefix}"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn event_count(path: &std::path::Path, prefix: &str) -> usize {
+        event_lines(path)
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .count()
+    }
+
+    /// Runs `work` while the test, not Tokio, moves the paused clock: each step
+    /// waits until the fake engine has recorded `count` events starting with
+    /// `prefix`, then advances the clock past `by`. The runtime stays busy
+    /// meanwhile, so Tokio never auto-advances while a real engine process
+    /// starts or exits. Only the real-time hang guard is timed.
+    async fn with_engine_clock<T>(
+        work: impl Future<Output = T>,
+        events: &std::path::Path,
+        steps: &[(&str, usize, Duration)],
+    ) -> T {
+        // Tokio rounds timer deadlines up to its next millisecond tick.
+        const TIMER_TICK: Duration = Duration::from_millis(1);
+        let hang_guard = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
+        let drive = async {
+            for &(prefix, count, by) in steps {
+                while event_count(events, prefix) < count {
+                    assert!(
+                        StdInstant::now() < hang_guard,
+                        "missing fake engine event {prefix}; events {:?}",
+                        event_lines(events)
+                    );
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(by + TIMER_TICK).await;
+            }
+            loop {
+                assert!(StdInstant::now() < hang_guard, "engine work did not finish");
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = work => result,
+            _ = drive => unreachable!(),
         }
     }
 
@@ -930,6 +1373,285 @@ mod tests {
 
     fn process_exists(pid: i32) -> bool {
         (unsafe { libc::kill(pid, 0) }) == 0
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn scarce_memory() -> Result<crate::local_memory::HostMemory, LocalLlamaFault> {
+        Ok(crate::local_memory::HostMemory {
+            total: 8 * GIB,
+            available: GIB,
+            pressure: crate::local_memory::MemoryPressure::NotReported,
+        })
+    }
+
+    fn critical_memory_with_room() -> Result<crate::local_memory::HostMemory, LocalLlamaFault> {
+        Ok(crate::local_memory::HostMemory {
+            total: 8 * GIB,
+            available: 8 * GIB,
+            pressure: crate::local_memory::MemoryPressure::Critical,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insufficient_free_memory_refuses_before_spawn() {
+        let (mut engines, engine, model, settings, events) = fixture("healthy");
+        engines.read_host_memory = scarce_memory;
+        let refused = engines.endpoint("offer", &engine, &model, &settings).await;
+        assert!(
+            matches!(
+                refused,
+                Err(LocalLlamaFault::MemoryUnavailable { available, required })
+                    if available == GIB && required > available
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(event_count(&events, "start:"), 0);
+        assert!(!engines.retains_artifacts().await);
+
+        engines.read_host_memory = critical_memory_with_room;
+        assert_eq!(
+            engines.endpoint("offer", &engine, &model, &settings).await,
+            Err(LocalLlamaFault::MemoryPressureCritical)
+        );
+        assert_eq!(event_count(&events, "start:"), 0);
+        assert!(!engines.retains_artifacts().await);
+
+        engines.read_host_memory = crate::local_memory::test_host_memory;
+        engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        assert_eq!(event_count(&events, "start:"), 1);
+        engines.shutdown().await.unwrap();
+    }
+
+    async fn answers(endpoint: &LocalLlamaEndpoint) -> bool {
+        reqwest::Client::new()
+            .post(&endpoint.api_url)
+            .json(&serde_json::json!({
+                "model": endpoint.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false},
+            }))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_engine_is_released_and_next_request_restarts_it() {
+        let (mut engines, engine, model, settings, events) = fixture("healthy");
+        engines.idle_delay = Duration::from_millis(50);
+        let run = engines.begin_run().await.unwrap();
+        let endpoint = engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        let first_pid = recorded_pid(&events);
+        // An active run keeps its engine past the idle delay.
+        engines.schedule_idle_release();
+        sleep(Duration::from_millis(200)).await;
+        assert!(process_exists(first_pid));
+        assert!(answers(&endpoint).await);
+        drop(run);
+
+        tokio::time::timeout(FIXTURE_EVENT_TIMEOUT, async {
+            while engines.retains_artifacts().await {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!process_exists(first_pid));
+
+        let _run = engines.begin_run().await.unwrap();
+        let endpoint = engines
+            .endpoint("offer", &engine, &model, &settings)
+            .await
+            .unwrap();
+        assert_eq!(event_count(&events, "start:"), 2);
+        assert!(answers(&endpoint).await);
+        engines.shutdown().await.unwrap();
+    }
+
+    const WATCH_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// The fake engine's pid once it has started, without blocking the
+    /// runtime that is starting it.
+    async fn started_pid(path: &std::path::Path) -> i32 {
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
+        loop {
+            if let Some(pid) = event_lines(path)
+                .into_iter()
+                .find_map(|line| line.strip_prefix("start:").and_then(|pid| pid.parse().ok()))
+            {
+                return pid;
+            }
+            assert!(StdInstant::now() < deadline, "missing fake engine start");
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn critical_pressure_while_loading_stops_the_engine() {
+        use crate::local_memory::MemoryPressure;
+        static CRITICAL: AtomicBool = AtomicBool::new(false);
+        fn pressure() -> MemoryPressure {
+            if CRITICAL.load(Ordering::SeqCst) {
+                MemoryPressure::Critical
+            } else {
+                MemoryPressure::Warning
+            }
+        }
+        // The engine starts but never reports healthy, so the run stays loading.
+        let (engines, engine, model, settings, events) = fixture("timeout");
+        let engines = engines.with_memory_pressure(pressure, WATCH_INTERVAL);
+        let mut run = engines.begin_run().await.unwrap();
+        let (stopped, pid) = tokio::join!(
+            engines.endpoint_with_timeout(
+                "offer",
+                &engine,
+                &model,
+                &settings,
+                Duration::from_secs(30),
+                None,
+                Some(run.pressure()),
+            ),
+            async {
+                // Warning pressure lets it load this far.
+                let pid = started_pid(&events).await;
+                CRITICAL.store(true, Ordering::SeqCst);
+                pid
+            }
+        );
+        assert_eq!(stopped, Err(LocalLlamaFault::StoppedForMemoryPressure));
+        // The load wait closed the engine itself: its memory is released.
+        assert_eq!(event_count(&events, "term"), 1);
+        assert!(!process_exists(pid));
+        assert!(!engines.retains_artifacts().await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressure_watch_reads_only_while_its_run_waits() {
+        use crate::local_memory::MemoryPressure;
+        use std::sync::atomic::AtomicUsize;
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn pressure() -> MemoryPressure {
+            READS.fetch_add(1, Ordering::SeqCst);
+            MemoryPressure::Warning
+        }
+        // Each health probe takes 225 ms, so loading spans several intervals.
+        let (engines, engine, model, settings, _events) = fixture("slow_health");
+        let engines = engines.with_memory_pressure(pressure, WATCH_INTERVAL);
+        let mut run = engines.begin_run().await.unwrap();
+        let endpoint = engines
+            .endpoint_with_timeout(
+                "offer",
+                &engine,
+                &model,
+                &settings,
+                Duration::from_secs(30),
+                None,
+                Some(run.pressure()),
+            )
+            .await
+            .unwrap();
+        // Warning pressure was read repeatedly and the engine loaded and answers.
+        assert!(READS.load(Ordering::SeqCst) > 1);
+        assert!(answers(&endpoint).await);
+        drop(run);
+        // No check outlives the run.
+        let reads = READS.load(Ordering::SeqCst);
+        sleep(WATCH_INTERVAL * 10).await;
+        assert_eq!(READS.load(Ordering::SeqCst), reads);
+        engines.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressure_watch_stops_reading_where_no_level_is_reported() {
+        use crate::local_memory::MemoryPressure;
+        use std::sync::atomic::AtomicUsize;
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn pressure() -> MemoryPressure {
+            READS.fetch_add(1, Ordering::SeqCst);
+            MemoryPressure::NotReported
+        }
+        let mut watch = PressureWatch::new(pressure, WATCH_INTERVAL);
+        assert!(tokio::time::timeout(WATCH_INTERVAL * 10, watch.critical())
+            .await
+            .is_err());
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_stop_on_a_warm_engine_then_idle_release_and_restart() {
+        use crate::local_memory::MemoryPressure;
+        static CRITICAL: AtomicBool = AtomicBool::new(false);
+        fn pressure() -> MemoryPressure {
+            if CRITICAL.load(Ordering::SeqCst) {
+                MemoryPressure::Critical
+            } else {
+                MemoryPressure::Warning
+            }
+        }
+        let (mut engines, engine, model, settings, events) = fixture("healthy");
+        engines.idle_delay = Duration::from_millis(50);
+        let engines = engines.with_memory_pressure(pressure, WATCH_INTERVAL);
+        async fn open(
+            engines: &LocalLlamaEngines,
+            (engine, model, settings): (
+                &LocalArtifactConfig,
+                &LocalArtifactConfig,
+                &LocalLlamaSettings,
+            ),
+            run: &mut LocalRun,
+        ) -> Result<LocalLlamaEndpoint, LocalLlamaFault> {
+            engines
+                .endpoint_with_timeout(
+                    "offer",
+                    engine,
+                    model,
+                    settings,
+                    Duration::from_secs(30),
+                    None,
+                    Some(run.pressure()),
+                )
+                .await
+        }
+        let artifacts = (&engine, &model, &settings);
+        let mut run = engines.begin_run().await.unwrap();
+        open(&engines, artifacts, &mut run).await.unwrap();
+        let first = started_pid(&events).await;
+        // Ending the run arms the idle release; the next run cancels it.
+        drop(run);
+
+        // Critical as the next run checks its warm engine: the caller owns the
+        // close, as after cancellation, while the run still holds the slot.
+        CRITICAL.store(true, Ordering::SeqCst);
+        let mut run = engines.begin_run().await.unwrap();
+        assert_eq!(
+            open(&engines, artifacts, &mut run).await,
+            Err(LocalLlamaFault::StoppedForMemoryPressure)
+        );
+        sleep(Duration::from_millis(200)).await;
+        assert!(process_exists(first), "idle release waits for the run");
+        engines.close_offer("offer").await.unwrap();
+        assert!(!process_exists(first));
+
+        // The idle release armed when the run ends finds nothing left to stop.
+        drop(run);
+        sleep(Duration::from_millis(200)).await;
+        assert!(!engines.retains_artifacts().await);
+
+        // The next run under warning pressure starts a fresh engine.
+        CRITICAL.store(false, Ordering::SeqCst);
+        let mut run = engines.begin_run().await.unwrap();
+        let endpoint = open(&engines, artifacts, &mut run).await.unwrap();
+        assert_eq!(event_count(&events, "start:"), 2);
+        assert!(answers(&endpoint).await);
+        drop(run);
+        engines.shutdown().await.unwrap();
     }
 
     #[test]
@@ -956,6 +1678,12 @@ mod tests {
             "--no-context-shift",
             "--parallel",
             "2",
+            "--batch-size",
+            "128",
+            "--ubatch-size",
+            "128",
+            "--cache-ram",
+            "0",
             "--threads",
             "3",
             "--threads-batch",
@@ -970,47 +1698,85 @@ mod tests {
         .collect();
 
         assert_eq!(
-            engine_arguments(
+            engine_arguments_with_cpu_budget(
                 "/models/model.gguf",
                 &settings,
                 &EngineTarget::Tcp(11434),
-                "private-alias"
+                "private-alias",
+                std::num::NonZeroUsize::new(8),
             ),
             expected
         );
-        let unix_args = engine_arguments(
+        let unix_args = engine_arguments_with_cpu_budget(
             "/models/model.gguf",
             &settings,
             &EngineTarget::Unix("/tmp/private-model.sock".into()),
             "private-alias",
+            std::num::NonZeroUsize::new(8),
         );
         assert_eq!(unix_args[3], OsString::from("/tmp/private-model.sock"));
         assert!(!unix_args.contains(&OsString::from("--port")));
     }
 
+    #[test]
+    fn engine_threads_stay_within_host_budget_and_runtime_ceilings() {
+        let mut settings = LocalLlamaSettings {
+            context_size: 256,
+            parallel: 1,
+            threads: 8,
+            batch_threads: 8,
+            gpu_layers: 99,
+            health_timeout_ms: 120_000,
+            shutdown_timeout_ms: 5_000,
+            enable_thinking: false,
+        };
+        for (requested, available, expected) in [
+            ((8, 8), Some(3), (3, 3)),
+            ((4, 4), Some(2), (2, 2)),
+            ((8, 8), Some(16), (8, 8)),
+            ((3, 4), Some(16), (3, 4)),
+            ((8, 8), None, (1, 1)),
+        ] {
+            (settings.threads, settings.batch_threads) = requested;
+            let args = engine_arguments_with_cpu_budget(
+                "/models/model.gguf",
+                &settings,
+                &EngineTarget::Tcp(11434),
+                "private-alias",
+                available.and_then(std::num::NonZeroUsize::new),
+            );
+            let value = |flag: &str| &args[args.iter().position(|arg| arg == flag).unwrap() + 1];
+            assert_eq!(value("--threads"), &OsString::from(expected.0.to_string()));
+            assert_eq!(
+                value("--threads-batch"),
+                &OsString::from(expected.1.to_string())
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn exact_close_reaps_only_selected_engine_and_repeats_safely() {
+    async fn opening_second_model_closes_first_and_close_repeats_safely() {
         let (engines, engine, model, settings, events) = fixture("healthy");
         let (_, other_engine, other_model, other_settings, other_events) = fixture("healthy");
         engines
             .endpoint("first", &engine, &model, &settings)
             .await
             .unwrap();
+        let first_pid = recorded_pid(&events);
         let other = engines
             .endpoint("second", &other_engine, &other_model, &other_settings)
             .await
             .unwrap();
-        let first_pid = recorded_pid(&events);
         let second_pid = recorded_pid(&other_events);
-        {
-            let mut owned = engines.engines.lock().await;
-            close_engine(&mut owned, "first").await.unwrap();
-            close_engine(&mut owned, "first").await.unwrap();
-            assert!(!owned.contains_key("first"));
-            assert!(owned.contains_key("second"));
-        }
         assert!(!process_exists(first_pid));
         assert!(process_exists(second_pid));
+        {
+            let mut owned = engines.engines.lock().await;
+            assert!(!owned.contains_key("first"));
+            close_engine(&mut owned, "first").await.unwrap();
+            close_engine(&mut owned, "first").await.unwrap();
+            assert!(owned.contains_key("second"));
+        }
         assert!(engines.retains_artifacts().await);
         assert_eq!(
             engines
@@ -1032,7 +1798,9 @@ mod tests {
             .await
             .unwrap();
         let pid = recorded_pid(&events);
-        let started = StdInstant::now();
+        // Measured on the paused Tokio clock, which moves only for timer waits.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
         {
             let mut owned = engines.engines.lock().await;
             owned.get_mut("offer").unwrap().shutdown_timeout = Duration::ZERO;
@@ -1045,7 +1813,16 @@ mod tests {
             assert!(retained.closing);
         }
         assert!(started.elapsed() < Duration::from_secs(1));
+        tokio::time::resume();
         assert!(engines.retains_artifacts().await);
+        assert!(matches!(
+            crate::adapters::cancel_local_execution(&engines, "offer").await,
+            crate::adapters::ReconcileResult::Terminal {
+                status: crate::contract::RunStatus::SettlementUnknown,
+                output: None,
+                ..
+            }
+        ));
         assert_eq!(
             engines.endpoint("offer", &engine, &model, &settings).await,
             Err(LocalLlamaFault::Timeout)
@@ -1078,7 +1855,7 @@ mod tests {
             .unwrap();
         let pid = recorded_pid(&events);
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         // Inject a real ECHILD wait failure by reaping outside Tokio's owner.
         // This is fault injection, not the production guard/group path.
         loop {
@@ -1176,7 +1953,7 @@ mod tests {
 
         let guard_exit = guard.kill().await; // Owned wait leaves child.id() == None.
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            FIXTURE_EVENT_TIMEOUT,
             finish_guard_shutdown(&mut guard, group, Duration::from_millis(100)),
         )
         .await;
@@ -1209,9 +1986,12 @@ mod tests {
             .unwrap();
         let pid = recorded_pid(&events);
         let owned = engines.engines.lock().await;
-        let started = StdInstant::now();
+        // Measured on the paused Tokio clock, which moves only for timer waits.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
         assert_eq!(engines.shutdown().await, Err(LocalLlamaFault::Timeout));
         assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::resume();
         assert_eq!(owned.get("offer").unwrap().child.id(), Some(pid as u32));
         drop(owned);
         engines.shutdown().await.unwrap();
@@ -1262,7 +2042,7 @@ mod tests {
 
         drop(engines);
 
-        let deadline = StdInstant::now() + Duration::from_secs(3);
+        let deadline = StdInstant::now() + FIXTURE_EVENT_TIMEOUT;
         while process_exists(pid) && StdInstant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1324,10 +2104,24 @@ mod tests {
         settings.health_timeout_ms = 300;
         settings.shutdown_timeout_ms = 100;
 
-        assert_eq!(
-            engines.endpoint("offer", &engine, &model, &settings).await,
-            Err(LocalLlamaFault::Timeout)
-        );
+        // The stale engine's readiness probe times out once its request hangs;
+        // the replacement's health times out only after it has started.
+        tokio::time::pause();
+        let replaced = with_engine_clock(
+            engines.endpoint("offer", &engine, &model, &settings),
+            &events,
+            &[
+                ("unresponsive", 1, HEALTH_REQUEST_TIMEOUT),
+                (
+                    "start:",
+                    2,
+                    Duration::from_millis(settings.health_timeout_ms),
+                ),
+            ],
+        )
+        .await;
+        tokio::time::resume();
+        assert_eq!(replaced, Err(LocalLlamaFault::Timeout));
 
         let pids: Vec<i32> = event_lines(&events)
             .into_iter()
@@ -1338,14 +2132,32 @@ mod tests {
         engines.shutdown().await.unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn health_timeout_forces_reap_when_child_ignores_termination() {
         let (engines, engine, model, mut settings, events) = fixture("timeout_ignore_term");
         settings.health_timeout_ms = 1_000;
         settings.shutdown_timeout_ms = 50;
 
+        // The engine ignores termination from its start record on: its health
+        // times out only then, and the forced reap follows the ignored signal.
         assert_eq!(
-            engines.endpoint("offer", &engine, &model, &settings).await,
+            with_engine_clock(
+                engines.endpoint("offer", &engine, &model, &settings),
+                &events,
+                &[
+                    (
+                        "start:",
+                        1,
+                        Duration::from_millis(settings.health_timeout_ms)
+                    ),
+                    (
+                        "term_ignored",
+                        1,
+                        Duration::from_millis(settings.shutdown_timeout_ms)
+                    ),
+                ],
+            )
+            .await,
             Err(LocalLlamaFault::Timeout)
         );
         let pid = recorded_pid(&events);
@@ -1422,12 +2234,14 @@ mod tests {
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
         let body = br#"{"object":"list","data":[{"id":"wrong-model"}]}"#;
-        write!(
+        // The readiness probe may give up first. Keep serving until stopped:
+        // a dead listener frees its port for another test's server, which the
+        // test's stop connect would then reach.
+        let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
-        .unwrap();
-        stream.write_all(body).unwrap();
+        .and_then(|()| stream.write_all(body));
     }
 }

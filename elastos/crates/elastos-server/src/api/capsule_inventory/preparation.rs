@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::future::Future;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{
@@ -14,6 +15,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::api::gateway::HomeLaunchTokenContext;
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
+use crate::host_lock::FileLock;
 
 mod storage;
 use storage::Inventory;
@@ -22,8 +24,13 @@ const SCHEMA: &str = "elastos.model.preparation-inventory/v1";
 const RESOURCE: &str = "elastos://capsules/*";
 const MAX_RECORDS: usize = 64;
 const RESERVATION_SECONDS: u64 = 3600;
+/// A finished attempt stays (status, request replay) at least this long
+/// before it may make room under `MAX_RECORDS`.
+const TERMINAL_HISTORY_SECONDS: u64 = 3600;
 const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CAPACITY_WINDOW_BYTES: u64 = 1024 * 1024;
+const ADMITTED_MODEL_CONTEXT_SIZE: u32 = 4096;
+const ACTIVATION_RETRY_SECONDS: u64 = 30;
 
 // Static checkpoints retain a useful cause after cleanup without retaining
 // provider text, host paths, credentials or media bytes in the inventory.
@@ -31,6 +38,12 @@ const CAPACITY_WINDOW_BYTES: u64 = 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 enum PreparationFailurePhase {
     Preparation,
+    Activation,
+    Interrupted,
+    StorageService,
+    CacheBudget,
+    MemoryBudget,
+    LocalStorage,
     Authority,
     Policy,
     Capacity,
@@ -59,16 +72,167 @@ impl PreparationFailurePhase {
             Self::Authority => "authorization_unavailable",
             Self::Policy => "policy_unavailable",
             Self::Capacity => "capacity_unavailable",
+            Self::Interrupted => "download_interrupted",
+            Self::StorageService => "storage_service_unavailable",
+            Self::CacheBudget => PreparationBudgetRefusal::Cache.public_class(),
+            Self::MemoryBudget => PreparationBudgetRefusal::Memory.public_class(),
             Self::MetadataRead | Self::WeightsRead => "content_unavailable",
-            Self::MetadataWrite | Self::MetadataSync | Self::WeightsWrite | Self::WeightsSync => {
-                "local_storage_unavailable"
-            }
+            Self::LocalStorage
+            | Self::MetadataWrite
+            | Self::MetadataSync
+            | Self::WeightsWrite
+            | Self::WeightsSync => "local_storage_unavailable",
             Self::MetadataIntegrity | Self::WeightsHeader | Self::WeightsIntegrity => {
                 "verification_failed"
             }
             Self::Preparation => "preparation_unavailable",
+            Self::Activation => "activation_unavailable",
         }
     }
+
+    /// The failure is about reaching the content or room for it, never about
+    /// the bytes already staged: a read answer is refused before it is
+    /// written, whether it failed in transit, was refused by the holder or
+    /// came back malformed. The next Use re-hashes the kept bytes and
+    /// continues after the last whole part.
+    fn keeps_stage(self) -> bool {
+        matches!(
+            self,
+            Self::MetadataRead
+                | Self::WeightsRead
+                | Self::Capacity
+                | Self::Interrupted
+                | Self::StorageService
+                | Self::CacheBudget
+                | Self::MemoryBudget
+        )
+    }
+}
+
+/// Runtime-owned budget facts contain no provider text or private paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::api) enum PreparationBudgetRefusal {
+    Cache,
+    Memory,
+}
+
+impl PreparationBudgetRefusal {
+    pub(in crate::api) fn public_class(self) -> &'static str {
+        match self {
+            Self::Cache => "cache_budget_unavailable",
+            Self::Memory => "memory_budget_unavailable",
+        }
+    }
+
+    pub(in crate::api) fn public_message(self) -> &'static str {
+        match self {
+            Self::Cache => "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry.",
+            Self::Memory => "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry.",
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationBudgetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.public_class())
+    }
+}
+
+impl std::error::Error for PreparationBudgetRefusal {}
+
+/// Device capacity is separate from the operator's approved model budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::api) enum PreparationMemoryRefusal {
+    Insufficient,
+    Unavailable,
+}
+
+impl PreparationMemoryRefusal {
+    pub(in crate::api) fn public_class(self) -> &'static str {
+        match self {
+            Self::Insufficient => "model_memory_insufficient",
+            Self::Unavailable => "model_memory_observation_unavailable",
+        }
+    }
+    pub(in crate::api) fn public_message(self) -> &'static str {
+        match self {
+            Self::Insufficient => {
+                "This device has less memory than this model requires. Choose a smaller model."
+            }
+            Self::Unavailable => {
+                elastos_model_contract::MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationMemoryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.public_class())
+    }
+}
+impl std::error::Error for PreparationMemoryRefusal {}
+
+#[derive(Debug)]
+pub(in crate::api) struct PreparationRequestExpired;
+
+impl PreparationRequestExpired {
+    pub(in crate::api) fn public_class(&self) -> &'static str {
+        elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE
+    }
+    pub(in crate::api) fn public_message(&self) -> &'static str {
+        elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+    }
+}
+
+impl std::fmt::Display for PreparationRequestExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.public_class())
+    }
+}
+
+impl std::error::Error for PreparationRequestExpired {}
+
+type MemoryReader = fn() -> std::io::Result<elastos_common::host_memory::HostMemory>;
+fn device_memory() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+    elastos_common::host_memory::observe_host_memory(std::env::consts::OS)
+}
+
+fn failure_phase(error: &anyhow::Error) -> PreparationFailurePhase {
+    if error.is::<PreparationStopped>() {
+        return PreparationFailurePhase::Interrupted;
+    }
+    if let Some(budget) = error.downcast_ref::<PreparationBudgetRefusal>() {
+        return match budget {
+            PreparationBudgetRefusal::Cache => PreparationFailurePhase::CacheBudget,
+            PreparationBudgetRefusal::Memory => PreparationFailurePhase::MemoryBudget,
+        };
+    }
+    if error.is::<elastos_common::NotEnoughFreeSpace>() {
+        return PreparationFailurePhase::Capacity;
+    }
+    error
+        .downcast_ref::<PreparationFailurePhase>()
+        .copied()
+        .unwrap_or(PreparationFailurePhase::Preparation)
+}
+
+fn backend_capacity_error(error: elastos_runtime::provider::ProviderError) -> anyhow::Error {
+    match error {
+        elastos_runtime::provider::ProviderError::NotEnoughFreeSpace(space) => {
+            anyhow::Error::new(space).context(PreparationFailurePhase::Capacity)
+        }
+        error => anyhow::Error::new(error).context(PreparationFailurePhase::StorageService),
+    }
+}
+
+fn runtime_capacity_error(error: anyhow::Error) -> anyhow::Error {
+    let phase = if error.is::<elastos_common::NotEnoughFreeSpace>() {
+        PreparationFailurePhase::Capacity
+    } else {
+        PreparationFailurePhase::LocalStorage
+    };
+    error.context(phase)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -106,6 +270,9 @@ struct PreparationRecord {
     activation: Option<ModelActivation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure_phase: Option<PreparationFailurePhase>,
+    /// When the attempt became Failed, Expired or Cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_at: Option<u64>,
     created_at: u64,
     expires_at: u64,
 }
@@ -124,8 +291,27 @@ struct PreparationInventory {
     records: Vec<PreparationRecord>,
     retention_claims: Vec<RetentionClaim>,
     #[serde(default)]
+    pruned_issued_floor_ms: u64,
+    #[serde(default)]
     retirement: Option<ModelRetirement>,
+    /// Staged bytes a failed preparation left for the next Use. That Use
+    /// continues them when they hold its signed package, else removes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kept_stage: Option<KeptStage>,
 }
+
+/// A kept stage stays charged against the cache budget at its size on disk
+/// until a preparation takes it over, Cancel discards it, or startup expires it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct KeptStage {
+    operation_id: String,
+    bytes: u64,
+    kept_at: u64,
+}
+
+/// Startup removes a kept stage older than this.
+const KEPT_STAGE_SECONDS: u64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +344,9 @@ impl Default for PreparationInventory {
             schema: SCHEMA.into(),
             records: Vec::new(),
             retention_claims: Vec::new(),
+            pruned_issued_floor_ms: 0,
             retirement: None,
+            kept_stage: None,
         }
     }
 }
@@ -392,6 +580,20 @@ impl PreparationInventory {
             );
         }
         ensure!(active <= 1, "multiple active preparations");
+        if let Some(kept) = &self.kept_stage {
+            ensure!(
+                kept.bytes <= MAX_PACKAGE_BYTES
+                    && self.records.iter().any(|record| {
+                        record.operation_id == kept.operation_id
+                            && record.admission_id == record.operation_id
+                            && matches!(
+                                record.state,
+                                PreparationState::Failed | PreparationState::Expired
+                            )
+                    }),
+                "kept stage has no failed owner"
+            );
+        }
         if let Some(retirement) = &self.retirement {
             let owner = self.records.iter().any(|record| {
                 record.operation_id == retirement.admission_id
@@ -464,6 +666,7 @@ impl PreparationInventory {
             {
                 record.state = PreparationState::Expired;
                 record.reserved_bytes = 0;
+                record.settled_at = Some(now);
                 changed = true;
             }
         }
@@ -476,8 +679,9 @@ fn reserve(
     caller: &PreparationCaller<'_>,
     request_id: &str,
     cid: &str,
+    read_memory: MemoryReader,
 ) -> anyhow::Result<PreparationRecord> {
-    reserve_at(data_dir, caller, request_id, cid, now()?)
+    reserve_at(data_dir, caller, request_id, cid, now()?, read_memory)
 }
 
 fn reserve_at(
@@ -486,6 +690,7 @@ fn reserve_at(
     request_id: &str,
     cid: &str,
     now: u64,
+    read_memory: MemoryReader,
 ) -> anyhow::Result<PreparationRecord> {
     authorize(caller, "use")?;
     ensure!(
@@ -494,6 +699,7 @@ fn reserve_at(
     );
     // Reclaimed requests are immutable history, even after catalog rotation.
     // They cannot become a fresh preparation or reactivate their old offer.
+    let mut pruned_issued_floor_ms = 0;
     match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
         Ok(_) => {
             let inventory = Inventory::open(data_dir, false)?;
@@ -576,7 +782,7 @@ fn reserve_at(
     .context("model memory overflow")?;
     ensure!(
         memory_bytes <= grant.max_model_memory_bytes,
-        "model exceeds local memory budget"
+        PreparationBudgetRefusal::Memory
     );
     ensure!(
         entry.size_bytes <= MAX_PACKAGE_BYTES - 65536,
@@ -585,11 +791,74 @@ fn reserve_at(
     let full_charge = preparation_charge(entry.size_bytes)?;
     ensure!(
         full_charge <= grant.max_cache_bytes,
-        "model exceeds local cache budget"
+        PreparationBudgetRefusal::Cache
     );
+    // Retained same-ID requests return their bound facts before observing a
+    // changing host. A fresh refusal creates neither inventory nor worker.
+    match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
+        Ok(_) => {
+            let inventory = Inventory::open(data_dir, false)?;
+            let mut state = inventory.load()?;
+            pruned_issued_floor_ms = state.pruned_issued_floor_ms;
+            if let Some(existing) = state.records.iter().find(|record| {
+                record.request_binding.principal == caller.context.principal_id
+                    && record.request_binding.capsule == caller.capsule
+                    && record.request_binding.request_id == request_id
+            }) {
+                let same_binding = existing.request_binding == request_binding
+                    && existing.catalog_head_cid == trust.head_cid
+                    && existing.total_bytes == entry.size_bytes;
+                let operation = existing.operation_id.clone();
+                // The retained owner keeps the observed expiry even when this
+                // retry presents a changed binding.
+                if state.expire(now) {
+                    inventory.save(&state)?;
+                }
+                ensure!(same_binding, "preparation request identity changed");
+                return Ok(state
+                    .records
+                    .iter()
+                    .find(|record| record.operation_id == operation)
+                    .unwrap()
+                    .clone());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let now_ms = now
+        .checked_mul(1000)
+        .context("preparation clock overflow")?;
+    elastos_model_contract::validate_new_model_request_id(
+        request_id,
+        now_ms,
+        pruned_issued_floor_ms,
+    )
+    .map_err(|_| PreparationRequestExpired)?;
+    match elastos_common::host_memory::model_memory_fit(
+        entry
+            .manifest
+            .model_content
+            .as_ref()
+            .unwrap()
+            .minimum_memory_mb,
+        read_memory().ok(),
+    ) {
+        elastos_common::host_memory::ModelMemoryFit::Fits => {}
+        elastos_common::host_memory::ModelMemoryFit::Insufficient => {
+            anyhow::bail!(PreparationMemoryRefusal::Insufficient)
+        }
+        elastos_common::host_memory::ModelMemoryFit::Unavailable => {
+            anyhow::bail!(PreparationMemoryRefusal::Unavailable)
+        }
+    }
     let inventory = Inventory::open(data_dir, true)?;
     let mut state = inventory.load()?;
-    let expired = state.expire(now);
+    // Persist expiry (and its settled_at) before any refusal below, so a
+    // refused Use does not restart an overdue attempt's history clock.
+    if state.expire(now) {
+        inventory.save(&state)?;
+    }
     if let Some(existing) = state.records.iter().find(|record| {
         record.request_binding.principal == caller.context.principal_id
             && record.request_binding.capsule == caller.capsule
@@ -601,11 +870,14 @@ fn reserve_at(
                 && existing.total_bytes == entry.size_bytes,
             "preparation request identity changed"
         );
-        if expired {
-            inventory.save(&state)?;
-        }
         return Ok(existing.clone());
     }
+    elastos_model_contract::validate_new_model_request_id(
+        request_id,
+        now_ms,
+        state.pruned_issued_floor_ms,
+    )
+    .map_err(|_| PreparationRequestExpired)?;
     ensure!(
         !state.retirement.as_ref().is_some_and(|retirement| {
             state.records.iter().any(|record| {
@@ -614,6 +886,25 @@ fn reserve_at(
         }),
         "model retirement pending"
     );
+    // The record cap bounds live work, not history: finished attempts that own
+    // nothing and settled over an hour ago make room for this one. Until then
+    // their status and request replay still answer.
+    while state.records.len() >= MAX_RECORDS {
+        let Some(oldest) = prunable_record(&state, now) else {
+            break;
+        };
+        if let Some(issued) = elastos_model_contract::model_request_issued_ms(
+            &state.records[oldest].request_binding.request_id,
+        ) {
+            if issued > state.pruned_issued_floor_ms {
+                state.pruned_issued_floor_ms = issued;
+                // Save while the old binding still exists. A later failed
+                // transaction preserves replay facts and the monotonic floor.
+                inventory.save(&state)?;
+            }
+        }
+        state.records.remove(oldest);
+    }
     ensure!(
         state.records.len() < MAX_RECORDS,
         "preparation inventory is full"
@@ -635,19 +926,33 @@ fn reserve_at(
         })
         .map(|r| r.operation_id.clone());
     let initial_charge = if reuse.is_some() { 0 } else { full_charge };
-    let reserved_bytes = state
-        .records
-        .iter()
-        .try_fold(initial_charge, |total, record| {
-            total
-                .checked_add(record.reserved_bytes)
-                .context("preparation byte accounting overflow")
-        })?;
-    let capacity_pending =
-        reserved_bytes > grant.max_cache_bytes || !inventory.space_fits(initial_charge)?;
+    let reserved_bytes =
+        state
+            .records
+            .iter()
+            .try_fold(budget_charge(&state, initial_charge), |total, record| {
+                total
+                    .checked_add(record.reserved_bytes)
+                    .context("preparation byte accounting overflow")
+            })?;
+    let unwritten = unwritten_charge(&inventory, &state, initial_charge)?;
+    let cache_pending = reserved_bytes > grant.max_cache_bytes;
+    let capacity_pending = cache_pending || !inventory.space_fits(unwritten)?;
     // Existing admissions already occupy disk. Charge only this new reservation
     // again against observed free space, while quota above counts every artifact.
-    inventory.require_space(if capacity_pending { 0 } else { initial_charge })?;
+    // A refusal names this model's whole unwritten size, not the zero-byte probe.
+    inventory
+        .require_space(if capacity_pending { 0 } else { unwritten })
+        .map_err(|error| {
+            if error.is::<elastos_common::NotEnoughFreeSpace>() {
+                elastos_common::NotEnoughFreeSpace {
+                    needed: u128::from(unwritten),
+                }
+                .into()
+            } else {
+                error
+            }
+        })?;
     let mut record = PreparationRecord {
         activation_pending: true,
         operation_id: String::new(),
@@ -666,7 +971,12 @@ fn reserve_at(
         cancel_requested: false,
         admission_id: String::new(),
         activation: None,
-        failure_phase: None,
+        failure_phase: if cache_pending {
+            Some(PreparationFailurePhase::CacheBudget)
+        } else {
+            None
+        },
+        settled_at: None,
         created_at: now,
         expires_at: now
             .checked_add(RESERVATION_SECONDS)
@@ -686,6 +996,46 @@ fn reserve_at(
     }
     inventory.save(&state)?;
     Ok(record)
+}
+
+/// The longest-settled Failed, Expired or Cancelled record that settled at
+/// least `TERMINAL_HISTORY_SECONDS` before `now` and owns nothing: no kept
+/// stage, no retirement, no other record's admission and no reclaimed history
+/// (which keeps a reclaimed request from becoming a fresh preparation). A
+/// pruned request ID is refused by its freshness window and durable floor.
+fn prunable_record(state: &PreparationInventory, now: u64) -> Option<usize> {
+    // Records written before `settled_at` existed ended by their deadline.
+    let settled = |record: &PreparationRecord| record.settled_at.unwrap_or(record.expires_at);
+    state
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            matches!(
+                record.state,
+                PreparationState::Failed | PreparationState::Expired | PreparationState::Cancelled
+            ) && now.saturating_sub(settled(record)) >= TERMINAL_HISTORY_SECONDS
+                && elastos_model_contract::model_request_replay_deadline_ms(
+                    &record.request_binding.request_id,
+                )
+                .is_none_or(|deadline| now.saturating_mul(1000) > deadline)
+                && state
+                    .kept_stage
+                    .as_ref()
+                    .is_none_or(|kept| kept.operation_id != record.operation_id)
+                && state.retirement.as_ref().is_none_or(|retirement| {
+                    retirement.operation_id != record.operation_id
+                        && retirement.admission_id != record.operation_id
+                })
+                && !state.records.iter().any(|other| {
+                    other.operation_id != record.operation_id
+                        && (other.admission_id == record.operation_id
+                            || (record.admission_id == other.operation_id
+                                && other.state == PreparationState::Reclaimed))
+                })
+        })
+        .min_by_key(|(_, record)| settled(record))
+        .map(|(index, _)| index)
 }
 
 fn set_retention(
@@ -786,16 +1136,28 @@ fn manage(
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
         "invalid preparation operation"
     );
+    let find = |state: &PreparationInventory| {
+        state
+            .records
+            .iter()
+            .position(|record| {
+                record.operation_id == operation_id
+                    && record.request_binding.principal == caller.context.principal_id
+            })
+            .context("preparation operation unavailable")
+    };
+    // A read that changes nothing answers from the last saved inventory, so a
+    // running download's lock never makes it wait or fail.
+    if !cancel {
+        let mut saved = storage::saved_inventory(data_dir)?;
+        let index = find(&saved)?;
+        if !saved.expire(now) && !saved.prune_retention() {
+            return Ok(saved.records.swap_remove(index));
+        }
+    }
     let inventory = Inventory::open(data_dir, false)?;
     let mut state = inventory.load()?;
-    let index = state
-        .records
-        .iter()
-        .position(|record| {
-            record.operation_id == operation_id
-                && record.request_binding.principal == caller.context.principal_id
-        })
-        .context("preparation operation unavailable")?;
+    let index = find(&state)?;
     let mut changed = state.expire(now);
     let retiring = state
         .retirement
@@ -805,12 +1167,24 @@ fn manage(
     if cancel && record.pre_dispatch() && !retiring {
         record.state = PreparationState::Cancelled;
         record.reserved_bytes = 0;
+        record.settled_at = Some(now);
         changed = true;
     } else if cancel && (record.active() || retiring) {
         record.cancel_requested = true;
         changed = true;
     }
     let result = record.clone();
+    // Cancel on a failed attempt discards the stage it kept and its charge.
+    if cancel
+        && state
+            .kept_stage
+            .as_ref()
+            .is_some_and(|kept| kept.operation_id == operation_id)
+    {
+        inventory.remove_stage()?;
+        state.kept_stage = None;
+        changed = true;
+    }
     changed |= state.prune_retention();
     if changed {
         inventory.save(&state)?;
@@ -865,14 +1239,48 @@ fn staging_charge(bytes: u64) -> anyhow::Result<u64> {
         .context("staging charge overflow")
 }
 
+/// Free space a new preparation still needs out of `charge`. The next
+/// preparation that owns the stage either continues a kept stage or removes
+/// it before its first read, so the bytes already on disk count toward it.
+fn unwritten_charge(
+    inventory: &Inventory,
+    state: &PreparationInventory,
+    charge: u64,
+) -> anyhow::Result<u64> {
+    if charge == 0 || state.kept_stage.is_none() {
+        return Ok(charge);
+    }
+    Ok(charge.saturating_sub(inventory.stage_bytes()?))
+}
+
+/// Cache budget taken by a kept stage and a new preparation's `charge`
+/// together. A non-shared preparation takes the stage over (or removes it),
+/// so its own charge replaces the stage's.
+fn budget_charge(state: &PreparationInventory, charge: u64) -> u64 {
+    let kept = state.kept_stage.as_ref().map_or(0, |kept| kept.bytes);
+    if charge == 0 {
+        kept
+    } else {
+        kept.max(charge)
+    }
+}
+
 pub(in crate::api) type Revalidate = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 /// The invocation route retains this single inventory worker. Status/cancel
 /// use short snapshot locks while the task retains exclusive worker ownership.
-#[derive(Default)]
 pub(in crate::api) struct PreparationOwner {
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stopping: Arc<AtomicBool>,
+    read_memory: MemoryReader,
+    activation_retry_after: Arc<Mutex<std::collections::BTreeMap<String, tokio::time::Instant>>>,
+    verified_packages: Arc<tokio::sync::Mutex<Vec<VerifiedModelPackage>>>,
+}
+
+impl Default for PreparationOwner {
+    fn default() -> Self {
+        Self::with_memory(device_memory)
+    }
 }
 
 impl Drop for PreparationOwner {
@@ -884,6 +1292,16 @@ impl Drop for PreparationOwner {
 }
 
 impl PreparationOwner {
+    fn with_memory(read_memory: MemoryReader) -> Self {
+        Self {
+            worker: Mutex::new(None),
+            stopping: Arc::new(AtomicBool::new(false)),
+            read_memory,
+            activation_retry_after: Arc::new(Mutex::new(Default::default())),
+            verified_packages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+
     pub(in crate::api) fn invoke(
         &self,
         data_dir: &Path,
@@ -935,7 +1353,7 @@ impl PreparationOwner {
                 registry
                     .as_ref()
                     .context("preparation backend unavailable")?;
-                reserve(data_dir, &caller, request_id, &input.cid)?
+                reserve(data_dir, &caller, request_id, &input.cid, self.read_memory)?
             }
             Some("reclaim") => {
                 let input: Use = serde_json::from_value(input.clone())?;
@@ -946,18 +1364,22 @@ impl PreparationOwner {
             }
             _ => anyhow::bail!("preparation method unavailable"),
         };
-        let kept = Inventory::open(data_dir, false)?
-            .load()?
+        let kept = storage::saved_inventory(data_dir)?
             .kept(&caller.context.principal_id, &record.package_cid);
         let project = |record: &PreparationRecord| {
             let mut value = record.projection();
             value["kept"] = serde_json::json!(kept);
             value
         };
-        let starting = record.pre_dispatch() && caller.method.operation.as_deref() == Some("use");
+        let starting = record.pre_dispatch()
+            && registry.is_some()
+            && matches!(caller.method.operation.as_deref(), Some("use" | "status"));
         let capacity_resume = record.state == PreparationState::CapacityPending;
         let activation_retry = record.state == PreparationState::Admitted
-            && caller.method.operation.as_deref() == Some("use");
+            && (caller.method.operation.as_deref() == Some("use")
+                || (record.activation_pending
+                    && registry.is_some()
+                    && caller.method.operation.as_deref() == Some("status")));
         if !record.active() && !starting && !activation_retry && !capacity_resume {
             return Ok(project(&record));
         }
@@ -968,10 +1390,31 @@ impl PreparationOwner {
         if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
             return Ok(project(&record));
         }
+        // Status observes a refusal without starting another multi-GB check
+        // on each poll. Explicit Use remains an immediate owner retry.
+        if activation_retry
+            && caller.method.operation.as_deref() == Some("status")
+            && self
+                .activation_retry_after
+                .lock()
+                .map_err(|_| anyhow::anyhow!("preparation retry unavailable"))?
+                .get(&record.admission_id)
+                .is_some_and(|after| tokio::time::Instant::now() < *after)
+        {
+            return Ok(project(&record));
+        }
         let registry = registry.context("preparation backend unavailable")?;
         let inventory = Inventory::open(data_dir, false)?;
         let worker_lock = inventory.worker_lock()?;
         let mut snapshot = inventory.load()?;
+        self.activation_retry_after
+            .lock()
+            .map_err(|_| anyhow::anyhow!("preparation retry unavailable"))?
+            .retain(|admission, _| {
+                snapshot.records.iter().any(|record| {
+                    record.state == PreparationState::Admitted && record.admission_id == *admission
+                })
+            });
         if starting || capacity_resume {
             current_entry(data_dir, &record)?;
         }
@@ -995,19 +1438,37 @@ impl PreparationOwner {
                 } else {
                     0
                 };
+                let unwritten = unwritten_charge(&inventory, &snapshot, charge)?;
+                let cache_pending = !cache_budget_fits(data_dir, &snapshot, charge)?;
                 capacity_pending = snapshot.retirement.is_some()
-                    || !cache_budget_fits(data_dir, &snapshot, charge)?
-                    || !inventory.space_fits(charge)?;
+                    || cache_pending
+                    || !inventory.space_fits(unwritten)?;
+                let cause = cache_pending.then_some(PreparationFailurePhase::CacheBudget);
+                if pending.failure_phase != cause {
+                    snapshot
+                        .records
+                        .iter_mut()
+                        .find(|r| r.operation_id == record.operation_id)
+                        .unwrap()
+                        .failure_phase = cause;
+                    inventory.save(&snapshot)?;
+                }
                 if capacity_pending {
                     if snapshot.retirement.is_none()
                         && retirement_candidate(data_dir, &snapshot)?.is_none()
                     {
-                        return Ok(project(pending));
+                        return Ok(project(
+                            snapshot
+                                .records
+                                .iter()
+                                .find(|r| r.operation_id == record.operation_id)
+                                .unwrap(),
+                        ));
                     }
                 } else {
                     // Pending intent acquires its full charge only under the existing
                     // worker lock, after both current quota and real headroom fit.
-                    inventory.require_space(charge)?;
+                    inventory.require_space(unwritten)?;
                     let pending = snapshot
                         .records
                         .iter_mut()
@@ -1015,6 +1476,7 @@ impl PreparationOwner {
                         .context("preparation disappeared")?;
                     pending.state = PreparationState::Reserved;
                     pending.reserved_bytes = charge;
+                    pending.failure_phase = None;
                 }
             }
         }
@@ -1036,18 +1498,27 @@ impl PreparationOwner {
         }
         let current = current.clone();
         if starting {
-            require_cache_budget(data_dir, &snapshot)?;
-            inventory.require_space(if current.admission_id == current.operation_id {
-                staging_charge(current.total_bytes)?
+            let owns_stage = current.admission_id == current.operation_id;
+            inventory.require_space(if owns_stage {
+                unwritten_charge(&inventory, &snapshot, staging_charge(current.total_bytes)?)?
             } else {
                 0
             })?;
+            if owns_stage {
+                // This preparation takes the kept stage over (or removes it);
+                // its own reservation now covers those bytes.
+                snapshot.kept_stage = None;
+            }
+            require_cache_budget(data_dir, &snapshot)?;
             inventory.save(&snapshot)?;
         }
         drop(inventory);
         let data = data_dir.to_path_buf();
         let stopping = self.stopping.clone();
         let operation = current.operation_id.clone();
+        let admission = current.admission_id.clone();
+        let retry_after = self.activation_retry_after.clone();
+        let verified_packages = self.verified_packages.clone();
         *worker = Some(tokio::spawn(async move {
             let starting = if capacity_pending {
                 match prepare_capacity(
@@ -1076,23 +1547,39 @@ impl PreparationOwner {
             let result = if activation_retry {
                 Ok(())
             } else if starting {
-                prepare(&data, &registry, &operation, &stopping, &revalidate).await
+                prepare_resuming(&data, &registry, &operation, &stopping, &revalidate).await
             } else {
                 reconcile(&data, &registry, &operation, &stopping, &revalidate).await
             };
             if let Err(error) = result {
-                let phase = error
-                    .downcast_ref::<PreparationFailurePhase>()
-                    .copied()
-                    .unwrap_or(PreparationFailurePhase::Preparation);
+                let phase = failure_phase(&error);
                 let recorded = update_operation(&data, &operation, |record| {
-                    record.failure_phase.get_or_insert(phase);
+                    if matches!(
+                        phase,
+                        PreparationFailurePhase::Interrupted
+                            | PreparationFailurePhase::CacheBudget
+                            | PreparationFailurePhase::MemoryBudget
+                            | PreparationFailurePhase::Capacity
+                            | PreparationFailurePhase::StorageService
+                    ) {
+                        record.failure_phase = Some(phase);
+                    } else {
+                        record.failure_phase.get_or_insert(phase);
+                    }
                 })
                 .is_ok();
                 // The serialized local barrier is required even after transport
                 // failure. Failed drain preserves all staged bytes and charges.
                 let drained = registry.prepare_local_ipfs_backend().await.is_ok();
-                let settled = settle_failure(&data, &operation, drained).is_ok();
+                // A read or capacity failure, a read that failed in transit, a
+                // stopping Home or a passed deadline says nothing against the
+                // bytes already staged, so the next Use continues from them.
+                // Cancel, integrity, local storage, authority, policy and other
+                // failures remove them.
+                let keep_stage = phase.keeps_stage()
+                    || transient_part_read_error(&error)
+                    || error.downcast_ref::<PreparationStopped>().is_some();
+                let settled = settle_failure(&data, &operation, drained, keep_stage).is_ok();
                 use elastos_runtime::provider::ProviderError;
                 let provider_error_kind =
                     error
@@ -1105,6 +1592,7 @@ impl PreparationOwner {
                             ProviderError::NoProvider(_) => "NoProvider",
                             ProviderError::Unavailable(_) => "Unavailable",
                             ProviderError::Io(_) => "Io",
+                            ProviderError::NotEnoughFreeSpace(_) => "NotEnoughFreeSpace",
                         });
                 tracing::warn!(operation_id = %operation, ?phase, ?provider_error_kind,
                     io_error_kind = ?error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
@@ -1112,17 +1600,43 @@ impl PreparationOwner {
             }
             // Admission and activation share this exact inventory worker guard.
             // Short snapshot locks remain available during provider I/O.
-            if let Err(error) = activate_admitted_model(
+            let mut verified = verified_packages.lock().await;
+            let activation = activate_admitted_model_cached(
                 &data,
                 &registry,
                 &operation,
                 &stopping,
                 &revalidate,
                 &worker_lock,
+                Some(&mut *verified),
             )
-            .await
-            {
-                tracing::debug!(?error, "private model activation pending");
+            .await;
+            drop(verified);
+            if let Ok(mut retries) = retry_after.lock() {
+                if activation.is_err() {
+                    retries.insert(
+                        admission,
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(ACTIVATION_RETRY_SECONDS),
+                    );
+                } else {
+                    retries.remove(&admission);
+                }
+            }
+            if let Err(error) = activation {
+                let phase = match error.downcast_ref::<PreparationBudgetRefusal>() {
+                    Some(PreparationBudgetRefusal::Cache) => PreparationFailurePhase::CacheBudget,
+                    Some(PreparationBudgetRefusal::Memory) => PreparationFailurePhase::MemoryBudget,
+                    None => PreparationFailurePhase::Activation,
+                };
+                let recorded = update_operation(&data, &operation, |record| {
+                    if record.state == PreparationState::Admitted && record.activation_pending {
+                        record.failure_phase = Some(phase);
+                    }
+                })
+                .is_ok();
+                tracing::info!(operation_id = %operation, reason = phase.public_class(), recorded,
+                    "private model activation pending");
             }
             drop(worker_lock);
         }));
@@ -1130,13 +1644,29 @@ impl PreparationOwner {
     }
 }
 
+#[cfg(test)]
 async fn activate_admitted_model(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    worker: &std::fs::File,
+    worker: &FileLock,
+) -> anyhow::Result<()> {
+    activate_admitted_model_cached(
+        data_dir, registry, operation, stopping, revalidate, worker, None,
+    )
+    .await
+}
+
+async fn activate_admitted_model_cached(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    operation: &str,
+    stopping: &AtomicBool,
+    revalidate: &Revalidate,
+    worker: &FileLock,
+    verified: Option<&mut Vec<VerifiedModelPackage>>,
 ) -> anyhow::Result<()> {
     let record = load_operation(data_dir, operation)?;
     if record.state != PreparationState::Admitted {
@@ -1151,7 +1681,7 @@ async fn activate_admitted_model(
     );
     current_entry(data_dir, &record)?;
     let mut config = crate::api::model_provider_bridge_config(data_dir)?;
-    append_admitted_model_offers_locked(data_dir, registry, &mut config, worker).await?;
+    append_admitted_model_offers_cached(data_dir, registry, &mut config, worker, verified).await?;
     preserve_active_model_offers(data_dir, registry, &mut config).await?;
     revalidate()?;
     ensure!(
@@ -1244,7 +1774,7 @@ fn set_activation_pending(data_dir: &Path, operation: &str, pending: bool) -> an
 fn require_cache_budget(data_dir: &Path, state: &PreparationInventory) -> anyhow::Result<()> {
     ensure!(
         cache_budget_fits(data_dir, state, 0)?,
-        "cache budget unavailable"
+        PreparationBudgetRefusal::Cache
     );
     Ok(())
 }
@@ -1264,7 +1794,9 @@ fn cache_budget_fits(
     let total = state
         .records
         .iter()
-        .try_fold(additional, |sum, r| sum.checked_add(r.reserved_bytes))
+        .try_fold(budget_charge(state, additional), |sum, r| {
+            sum.checked_add(r.reserved_bytes)
+        })
         .context("cache accounting overflow")?;
     Ok(total <= grant.max_cache_bytes)
 }
@@ -1437,6 +1969,7 @@ fn finish_model_retirement(data_dir: &Path) -> anyhow::Result<()> {
     {
         if record.cancel_requested {
             record.state = PreparationState::Cancelled;
+            record.settled_at = Some(now()?);
         }
     }
     state.expire(now()?);
@@ -1600,14 +2133,11 @@ async fn prepare_capacity(
     operation: &str,
     stopping: &AtomicBool,
     revalidate: &Revalidate,
-    _worker: &std::fs::File,
+    _worker: &FileLock,
 ) -> anyhow::Result<bool> {
     for _ in 0..=MAX_RECORDS {
         revalidate()?;
-        ensure!(
-            !stopping.load(Ordering::Acquire),
-            "model preparation stopped"
-        );
+        ensure!(!stopping.load(Ordering::Acquire), PreparationStopped);
         let live = registry.local_model_offers().await?;
         let retirement = {
             let inventory = Inventory::open(data_dir, false)?;
@@ -1636,7 +2166,20 @@ async fn prepare_capacity(
                 } else {
                     0
                 };
-                if cache_budget_fits(data_dir, &state, charge)? && inventory.space_fits(charge)? {
+                let cache_pending = !cache_budget_fits(data_dir, &state, charge)?;
+                let cause = cache_pending.then_some(PreparationFailurePhase::CacheBudget);
+                if record.failure_phase != cause {
+                    state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.operation_id == operation)
+                        .unwrap()
+                        .failure_phase = cause;
+                    inventory.save(&state)?;
+                }
+                if !cache_pending
+                    && inventory.space_fits(unwritten_charge(&inventory, &state, charge)?)?
+                {
                     let record = state
                         .records
                         .iter_mut()
@@ -1644,6 +2187,12 @@ async fn prepare_capacity(
                         .unwrap();
                     record.state = PreparationState::Preparing;
                     record.reserved_bytes = charge;
+                    record.failure_phase = None;
+                    if charge > 0 {
+                        // As at a normal start: this preparation takes the kept
+                        // stage over and its reservation covers those bytes.
+                        state.kept_stage = None;
+                    }
                     inventory.save(&state)?;
                     return Ok(true);
                 }
@@ -1713,10 +2262,6 @@ fn current_entry(
         &super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?,
     )?;
     let trust = config.model_catalog.context("catalog unavailable")?;
-    ensure!(
-        trust.head_cid == record.catalog_head_cid,
-        "catalog changed during preparation"
-    );
     let grant = trust.local_use.as_ref().context("local use revoked")?;
     let entry = super::verify_model_catalog(
         &trust,
@@ -1736,10 +2281,23 @@ fn current_entry(
         .as_ref()
         .context("model metadata unavailable")?;
     ensure!(
-        entry.size_bytes == record.total_bytes
-            && preparation_charge(entry.size_bytes)? <= grant.max_cache_bytes
-            && u64::from(model.minimum_memory_mb) * 1024 * 1024 <= grant.max_model_memory_bytes,
+        entry.size_bytes == record.total_bytes,
         "model policy changed"
+    );
+    ensure!(
+        preparation_charge(entry.size_bytes)? <= grant.max_cache_bytes,
+        PreparationBudgetRefusal::Cache
+    );
+    ensure!(
+        u64::from(model.minimum_memory_mb) * 1024 * 1024 <= grant.max_model_memory_bytes,
+        PreparationBudgetRefusal::Memory
+    );
+    // Only a model the current trusted catalogue still offers under the same
+    // package CID and grant reports a catalogue update; revocation, removal and
+    // policy changes fail above with their own errors.
+    ensure!(
+        trust.head_cid == record.catalog_head_cid,
+        crate::setup::LocalModelExecutionUnavailable::CatalogUpdated
     );
     Ok(entry)
 }
@@ -1771,6 +2329,19 @@ fn update_operation(
     inventory.save(&state)
 }
 
+/// The preparation is no longer active: cancelled, past its deadline, or
+/// Home is stopping. It says nothing against the bytes already staged.
+#[derive(Debug)]
+struct PreparationStopped;
+
+impl std::fmt::Display for PreparationStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("preparation stopped")
+    }
+}
+
+impl std::error::Error for PreparationStopped {}
+
 fn require_active(
     data_dir: &Path,
     id: &str,
@@ -1784,7 +2355,7 @@ fn require_active(
             && !record.cancel_requested
             && !stop.load(Ordering::Acquire)
             && now()? < record.expires_at,
-        "preparation stopped"
+        PreparationStopped
     );
     current_entry(data_dir, &record).context(PreparationFailurePhase::Policy)?;
     Ok(record)
@@ -1827,7 +2398,10 @@ async fn require_capacity(
         record.completed_bytes,
         record.index_bytes,
     )?;
-    let observed = registry.check_local_ipfs_capacity(backend).await?;
+    let observed = registry
+        .check_local_ipfs_capacity(backend)
+        .await
+        .map_err(backend_capacity_error)?;
     require_runtime_capacity(data_dir, record, observed.volume_id)?;
     Ok(observed.volume_id)
 }
@@ -1846,9 +2420,12 @@ async fn require_recovery_capacity(
     )?;
     let observed = registry
         .check_local_ipfs_capacity(outstanding_stage.max(1))
-        .await?;
+        .await
+        .map_err(backend_capacity_error)?;
     require_cache_budget(data_dir, &Inventory::open(data_dir, false)?.load()?)?;
-    Inventory::open(data_dir, false)?.require_space(outstanding_stage)?;
+    Inventory::open(data_dir, false)?
+        .require_space(outstanding_stage)
+        .map_err(runtime_capacity_error)?;
     Ok(observed.volume_id)
 }
 
@@ -1875,34 +2452,261 @@ fn require_runtime_capacity(
     let inventory = Inventory::open(data_dir, false)?;
     require_cache_budget(data_dir, &inventory.load()?)?;
     let required = runtime_capacity_charge(record, inventory.volume()? == backend_volume)?;
-    inventory.require_space(required)
+    inventory
+        .require_space(required)
+        .map_err(runtime_capacity_error)
 }
 
-// A bounded model read is not an effect. While it is in flight, cancel ends
+// A bounded model read is not an effect. While reads are in flight, cancel ends
 // the local wait within one poll. The worker then uses the existing backend
 // drain and settle_failure path. A provider subprocess still completes its own
 // bounded answer before that drain takes the bridge.
-async fn fetch_model_part_unless_cancelled(
+async fn unless_cancelled<T>(
     data_dir: &Path,
-    registry: &elastos_runtime::provider::ProviderRegistry,
     id: &str,
-    cid: &str,
-    path: &str,
-    range: Option<(u64, u64)>,
-) -> anyhow::Result<Vec<u8>> {
-    let fetch = crate::content::fetch_model_part(registry, cid, path, range);
-    tokio::pin!(fetch);
+    read: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(read);
     loop {
         tokio::select! {
             biased;
-            result = &mut fetch => return result,
+            result = &mut read => return result,
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                if load_operation(data_dir, id)?.cancel_requested {
-                    anyhow::bail!("preparation stopped");
+                // A busy inventory lock (a progress save in flight) only
+                // moves this check to the next poll; it is not a read failure.
+                match load_operation(data_dir, id) {
+                    Ok(record) if record.cancel_requested => {
+                        return Err(PreparationStopped.into());
+                    }
+                    Err(error) if !inventory_busy(&error) => return Err(error),
+                    _ => {}
                 }
             }
         }
     }
+}
+
+/// The inventory lock stayed taken past its bounded wait (storage `Inventory::open`).
+fn inventory_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// Each 64 KiB part pays one network round trip, so one preparation keeps this
+/// many part reads in flight across its package.
+const MODEL_PARTS_IN_FLIGHT: usize = 8;
+
+/// Each progress save fsyncs the inventory under its lock, so the download
+/// saves progress at most once per MiB or once per second, and at the end of
+/// each file. A resume reads completed bytes from the stage on disk, not from
+/// this saved count.
+struct ProgressSaves {
+    written: u64,
+    saved: u64,
+    saved_at: std::time::Instant,
+}
+
+impl ProgressSaves {
+    const BYTES: u64 = 1024 * 1024;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn new(written: u64, now: std::time::Instant) -> Self {
+        Self {
+            written,
+            saved: written,
+            saved_at: now,
+        }
+    }
+
+    /// Counts `bytes` written and returns the total to save when one is due.
+    fn written(&mut self, bytes: u64, file_end: bool, now: std::time::Instant) -> Option<u64> {
+        self.written += bytes;
+        if !file_end
+            && self.written - self.saved < Self::BYTES
+            && now.duration_since(self.saved_at) < Self::INTERVAL
+        {
+            return None;
+        }
+        self.saved = self.written;
+        self.saved_at = now;
+        Some(self.written)
+    }
+}
+
+/// Waits before each repeat of a part read that failed in transit. A holder
+/// that stalls once (for example behind its own serialized provider bridge)
+/// must not stop a download that is otherwise progressing.
+const MODEL_PART_RETRY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+];
+
+/// A part read that failed on its way to the holder and back: an answer
+/// deadline, a connect failure or a lost stream. Content types only those as
+/// I/O errors; refusals, malformed or oversized answers, integrity, authority
+/// and capacity failures are never repeated.
+fn transient_part_read_error(error: &anyhow::Error) -> bool {
+    use elastos_runtime::provider::ProviderError;
+    matches!(
+        error.downcast_ref::<ProviderError>(),
+        Some(ProviderError::Io(_))
+    )
+}
+
+/// Waits before each automatic resume of a Get whose content reads kept
+/// failing in transit, about four minutes in all.
+const MODEL_GET_RESUME_WAITS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(120),
+];
+
+/// A stopped attempt passed the backend drain barrier that settled cleanup
+/// requires, so its record may continue from the bytes on disk.
+struct DrainedAttempt(());
+
+/// `prepare`, resumed as Retry resumes (kept bytes re-hashed, a fresh read
+/// route, every authority and capacity check again) after a content read
+/// failed in transit. Cancel and a stopping Home end a wait within one poll.
+/// A stop after the last resume is an interrupted download that keeps its
+/// stage; refusals, integrity, budget and every other failure end at once.
+async fn prepare_resuming(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    id: &str,
+    stop: &AtomicBool,
+    revalidate: &Revalidate,
+) -> anyhow::Result<()> {
+    let mut waits = MODEL_GET_RESUME_WAITS.iter();
+    let mut drained = None;
+    loop {
+        let error = match prepare(data_dir, registry, id, stop, revalidate, drained.take()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if !matches!(
+            failure_phase(&error),
+            PreparationFailurePhase::MetadataRead | PreparationFailurePhase::WeightsRead
+        ) || !transient_part_read_error(&error)
+        {
+            return Err(error);
+        }
+        let Some(wait) = waits.next() else {
+            return Err(error.context(PreparationFailurePhase::Interrupted));
+        };
+        tracing::warn!(operation_id = %id, wait_s = wait.as_secs(),
+            error = %format_args!("{error:#}"),
+            "private model preparation resumes after a read failed in transit");
+        if registry.prepare_local_ipfs_backend().await.is_err() {
+            return Err(error);
+        }
+        let until = tokio::time::Instant::now() + *wait;
+        unless_cancelled(data_dir, id, async {
+            while tokio::time::Instant::now() < until {
+                ensure!(!stop.load(Ordering::Acquire), PreparationStopped);
+                let poll = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+                tokio::time::sleep_until(poll.min(until)).await;
+            }
+            Ok(())
+        })
+        .await?;
+        drained = Some(DrainedAttempt(()));
+    }
+}
+
+/// Outer result: the part's authority/capacity checks. Inner: its read.
+type PartOutcome = anyhow::Result<anyhow::Result<Vec<u8>>>;
+
+type ModelPartRead<'a> = std::pin::Pin<Box<dyn Future<Output = PartOutcome> + Send + 'a>>;
+
+struct InFlightPart<'a> {
+    length: u64,
+    read: ModelPartRead<'a>,
+    done: Option<PartOutcome>,
+}
+
+/// Checks that run right before each part read is sent (and before each
+/// repeat), one part at a time in package order. A refused check refuses every
+/// later read with the same failure phase, so no read is sent after authority,
+/// policy or capacity is lost.
+struct PartChecks {
+    backend_volume: u64,
+    refused: Option<PreparationFailurePhase>,
+}
+
+/// The serial preparation's checks for one part. `delivered` is the byte count
+/// of every earlier part, so capacity sees the same progress it did when parts
+/// were read one at a time.
+#[allow(clippy::too_many_arguments)]
+async fn check_part(
+    checks: &tokio::sync::Mutex<PartChecks>,
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    id: &str,
+    stop: &AtomicBool,
+    revalidate: &Revalidate,
+    delivered: u64,
+    backend_check: bool,
+) -> anyhow::Result<()> {
+    let mut checks = checks.lock().await;
+    if let Some(phase) = checks.refused {
+        // A stopped preparation stays recognisable as stopped, so its stage is kept.
+        require_active(data_dir, id, stop, revalidate)?;
+        return Err(anyhow::anyhow!("preparation stopped").context(phase));
+    }
+    let checked = async {
+        let mut record = require_active(data_dir, id, stop, revalidate)?;
+        record.completed_bytes = delivered;
+        if backend_check {
+            let volume = require_capacity(data_dir, registry, &record).await?;
+            require_active(data_dir, id, stop, revalidate)?;
+            anyhow::Ok(Some(volume))
+        } else {
+            require_runtime_capacity(data_dir, &record, checks.backend_volume)?;
+            Ok(None)
+        }
+    }
+    .await;
+    match checked {
+        Ok(volume) => {
+            if let Some(volume) = volume {
+                checks.backend_volume = volume;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            checks.refused = Some(failure_phase(&error));
+            Err(error)
+        }
+    }
+}
+
+/// Drive every in-flight read and yield the oldest one once it completes, so
+/// parts are written and hashed in package order. Later parts that finish
+/// first wait in the window, which never holds more than `MODEL_PARTS_IN_FLIGHT`.
+async fn next_part_in_order(
+    window: &mut VecDeque<InFlightPart<'_>>,
+) -> anyhow::Result<(u64, PartOutcome)> {
+    ensure!(!window.is_empty(), "no model part in flight");
+    std::future::poll_fn(|cx| {
+        for part in window.iter_mut().filter(|part| part.done.is_none()) {
+            if let std::task::Poll::Ready(result) = part.read.as_mut().poll(cx) {
+                part.done = Some(result);
+            }
+        }
+        if window.front().is_some_and(|part| part.done.is_some()) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    let part = window.pop_front().context("no model part in flight")?;
+    Ok((part.length, part.done.context("model part incomplete")?))
 }
 
 async fn prepare(
@@ -1911,6 +2715,7 @@ async fn prepare(
     id: &str,
     stop: &AtomicBool,
     revalidate: &Revalidate,
+    drained: Option<DrainedAttempt>,
 ) -> anyhow::Result<()> {
     let record = require_active(data_dir, id, stop, revalidate)?;
     let backend = registry.prepare_local_ipfs_backend().await;
@@ -1918,7 +2723,7 @@ async fn prepare(
         tracing::warn!(target: "elastos::model_index_read", stage = "ipfs_prepare",
             "model index read substage failed");
     }
-    backend.context(PreparationFailurePhase::MetadataRead)?;
+    backend.context(PreparationFailurePhase::StorageService)?;
     require_active(data_dir, id, stop, revalidate)?;
     let entry = current_entry(data_dir, &record)?;
     let closure = crate::content::parse_content_object_manifest(
@@ -1937,84 +2742,211 @@ async fn prepare(
         )
         .await;
     }
-    if record.index_bytes > 0 || record.completed_bytes > 0 {
+    if (record.index_bytes > 0 || record.completed_bytes > 0) && drained.is_none() {
         anyhow::bail!("interrupted partial preparation requires settled cleanup");
     }
-    let mut backend_volume = require_capacity(data_dir, registry, &record)
-        .await
-        .context(PreparationFailurePhase::Capacity)?;
+    // A stage kept by an earlier failure (or by this Get's stopped attempt)
+    // continues when it holds this signed package. Progress and capacity then
+    // start from the bytes on disk; without one they start over from zero.
+    let resumed = resume_kept_stage(data_dir, id, &entry, &closure, stop, revalidate).await?;
+    if resumed.is_none() && drained.is_some() {
+        update_operation(data_dir, id, |record| {
+            record.index_bytes = 0;
+            record.completed_bytes = 0;
+        })?;
+    }
+    let record = require_active(data_dir, id, stop, revalidate)?;
+    let resuming = resumed.is_some();
+    let resumed_bytes = record.completed_bytes;
+    if resuming {
+        tracing::info!(operation_id = %id, completed_bytes = resumed_bytes,
+            "private model preparation resumed");
+    }
+    let backend_volume = require_capacity(data_dir, registry, &record).await?;
     require_active(data_dir, id, stop, revalidate)?;
-    let index = fetch_model_part_unless_cancelled(
-        data_dir,
-        registry,
-        id,
-        &entry.cid,
-        "_elastos_object.json",
-        None,
-    )
-    .await
-    .context(PreparationFailurePhase::MetadataRead)?;
-    require_active(data_dir, id, stop, revalidate)?;
-    let object: serde_json::Value =
-        serde_json::from_slice(&index).context(PreparationFailurePhase::MetadataIntegrity)?;
-    ensure!(
-        object == entry.object_manifest,
-        anyhow::anyhow!("fetched index differs from signed catalog")
-            .context(PreparationFailurePhase::MetadataIntegrity)
-    );
-    let stage = Inventory::open(data_dir, false)?
-        .stage(true)
-        .context(PreparationFailurePhase::MetadataWrite)?;
-    let mut file = stage
-        .create_file("_elastos_object.json")
-        .context(PreparationFailurePhase::MetadataWrite)?;
-    file.write_all(&index)
-        .context(PreparationFailurePhase::MetadataWrite)?;
-    file.sync_all()
-        .context(PreparationFailurePhase::MetadataSync)?;
-    update_operation(data_dir, id, |record| {
-        record.index_bytes = index.len() as u64
-    })?;
-    // Backend identity/pressure is observed per byte window. Runtime floor and
-    // authority remain per read; the outstanding charge is not an OS reservation.
-    let mut window_bytes = index.len() as u64;
-    for expected in &closure.files {
-        let weights = expected.path == entry.manifest.entrypoint;
-        let write_phase = if weights {
-            PreparationFailurePhase::WeightsWrite
-        } else {
-            PreparationFailurePhase::MetadataWrite
-        };
-        let mut file = stage.create_file(&expected.path).context(write_phase)?;
-        let mut digest = Sha256::new();
-        let mut offset = 0u64;
-        while offset < expected.size {
-            let record = require_active(data_dir, id, stop, revalidate)?;
-            let length = (expected.size - offset).min(65536);
-            if window_bytes + length > CAPACITY_WINDOW_BYTES {
-                backend_volume = require_capacity(data_dir, registry, &record)
-                    .await
-                    .context(PreparationFailurePhase::Capacity)?;
-                window_bytes = 0;
-            } else {
-                require_runtime_capacity(data_dir, &record, backend_volume)
-                    .context(PreparationFailurePhase::Capacity)?;
-            }
-            require_active(data_dir, id, stop, revalidate)?;
-            let bytes = fetch_model_part_unless_cancelled(
+    // One route per package: after a local miss, later parts skip the local backend.
+    let reads = crate::content::ModelPartReads::default();
+    let ResumedStage {
+        stage,
+        complete,
+        mut partial,
+    } = match resumed {
+        Some(resumed) => resumed,
+        None => {
+            let index = unless_cancelled(
                 data_dir,
-                registry,
                 id,
-                &entry.cid,
-                &expected.path,
-                Some((offset, length)),
+                reads.fetch(registry, &entry.cid, "_elastos_object.json", None),
             )
             .await
-            .context(if weights {
-                PreparationFailurePhase::WeightsRead
-            } else {
-                PreparationFailurePhase::MetadataRead
+            .context(PreparationFailurePhase::MetadataRead)?;
+            require_active(data_dir, id, stop, revalidate)?;
+            let object: serde_json::Value = serde_json::from_slice(&index)
+                .context(PreparationFailurePhase::MetadataIntegrity)?;
+            ensure!(
+                object == entry.object_manifest,
+                anyhow::anyhow!("fetched index differs from signed catalog")
+                    .context(PreparationFailurePhase::MetadataIntegrity)
+            );
+            let stage = Inventory::open(data_dir, false)?
+                .stage(true)
+                .context(PreparationFailurePhase::MetadataWrite)?;
+            let mut file = stage
+                .create_file("_elastos_object.json")
+                .context(PreparationFailurePhase::MetadataWrite)?;
+            file.write_all(&index)
+                .context(PreparationFailurePhase::MetadataWrite)?;
+            file.sync_all()
+                .context(PreparationFailurePhase::MetadataSync)?;
+            update_operation(data_dir, id, |record| {
+                record.index_bytes = index.len() as u64
             })?;
+            ResumedStage {
+                stage,
+                complete: 0,
+                partial: None,
+            }
+        }
+    };
+    // Backend identity/pressure is observed per byte window. Runtime space and
+    // authority remain per read; the outstanding charge is not an OS reservation.
+    let mut window_bytes = load_operation(data_dir, id)?.index_bytes;
+    let resume_offset = partial.as_ref().map_or(0, |(_, _, offset)| *offset);
+    let weights_start = if closure
+        .files
+        .get(complete)
+        .is_some_and(|file| file.path == entry.manifest.entrypoint)
+    {
+        resume_offset
+    } else {
+        0
+    };
+    // Parts of every file in package order; the in-flight window runs across
+    // file boundaries so small files do not each pay a lone round trip.
+    let mut parts = closure
+        .files
+        .iter()
+        .enumerate()
+        .skip(complete)
+        .flat_map(move |(n, file)| {
+            let start = if n == complete { resume_offset } else { 0 };
+            (start..file.size)
+                .step_by(65536)
+                .map(move |offset| (file, offset, (file.size - offset).min(65536)))
+        });
+    let checks = tokio::sync::Mutex::new(PartChecks {
+        backend_volume,
+        refused: None,
+    });
+    let mut requested = record.completed_bytes;
+    let mut progress = ProgressSaves::new(record.completed_bytes, std::time::Instant::now());
+    let mut in_flight = VecDeque::with_capacity(MODEL_PARTS_IN_FLIGHT);
+    for expected in closure.files.iter().skip(complete) {
+        let weights = expected.path == entry.manifest.entrypoint;
+        let (read_phase, write_phase) = if weights {
+            (
+                PreparationFailurePhase::WeightsRead,
+                PreparationFailurePhase::WeightsWrite,
+            )
+        } else {
+            (
+                PreparationFailurePhase::MetadataRead,
+                PreparationFailurePhase::MetadataWrite,
+            )
+        };
+        let (mut file, mut digest, mut offset) = match partial.take() {
+            Some(kept) => kept,
+            None => (
+                stage.create_file(&expected.path).context(write_phase)?,
+                Sha256::new(),
+                0,
+            ),
+        };
+        while offset < expected.size {
+            while in_flight.len() < MODEL_PARTS_IN_FLIGHT {
+                let Some((part_file, part_offset, length)) = parts.next() else {
+                    break;
+                };
+                let backend_check = window_bytes + length > CAPACITY_WINDOW_BYTES;
+                if backend_check {
+                    window_bytes = 0;
+                }
+                window_bytes += length;
+                let (checks, reads, cid, delivered) = (&checks, &reads, &entry.cid, requested);
+                let first_remaining_weights = resuming
+                    && part_file.path == entry.manifest.entrypoint
+                    && part_offset == weights_start;
+                in_flight.push_back(InFlightPart {
+                    length,
+                    read: Box::pin(async move {
+                        check_part(
+                            checks,
+                            data_dir,
+                            registry,
+                            id,
+                            stop,
+                            revalidate,
+                            delivered,
+                            backend_check,
+                        )
+                        .await?;
+                        if first_remaining_weights {
+                            tracing::info!(operation_id = %id, completed_bytes = resumed_bytes,
+                                weights_offset = part_offset,
+                                "private model preparation remaining weights read");
+                        }
+                        // A repeat keeps this part's slot, so the window stays bounded.
+                        let mut backoff = MODEL_PART_RETRY_BACKOFF.iter();
+                        loop {
+                            let read = reads
+                                .fetch(registry, cid, &part_file.path, Some((part_offset, length)))
+                                .await;
+                            match (read, backoff.next()) {
+                                (Err(error), Some(wait)) if transient_part_read_error(&error) => {
+                                    tracing::warn!(target: "elastos::model_part_read",
+                                        offset = part_offset, wait_ms = wait.as_millis() as u64,
+                                        error = %format_args!("{error:#}"),
+                                        "model part read failed in transit; repeating");
+                                    tokio::time::sleep(*wait).await;
+                                    // A repeat passes the same checks as a first read:
+                                    // cancellation, expiry, authority, capacity and any
+                                    // refusal another part already met.
+                                    check_part(
+                                        checks, data_dir, registry, id, stop, revalidate,
+                                        delivered, false,
+                                    )
+                                    .await?;
+                                }
+                                (read, _) => return Ok(read),
+                            }
+                        }
+                    }),
+                    done: None,
+                });
+                requested += length;
+            }
+            let (length, checked) =
+                unless_cancelled(data_dir, id, next_part_in_order(&mut in_flight))
+                    .await
+                    .context(read_phase)?;
+            let bytes = match checked? {
+                Ok(bytes) => bytes,
+                Err(error) if transient_part_read_error(&error) => {
+                    // A refusal a later part already met outranks a failure in
+                    // transit, so an automatic resume never reads that part again.
+                    for part in in_flight.iter_mut() {
+                        match part.done.take() {
+                            Some(Err(refused)) => return Err(refused),
+                            Some(Ok(Err(refused))) if !transient_part_read_error(&refused) => {
+                                return Err(refused.context(read_phase));
+                            }
+                            done => part.done = done,
+                        }
+                    }
+                    return Err(error.context(read_phase));
+                }
+                Err(error) => return Err(error.context(read_phase)),
+            };
             require_active(data_dir, id, stop, revalidate)?;
             if weights && offset == 0 {
                 ensure!(
@@ -2031,8 +2963,10 @@ async fn prepare(
             file.write_all(&bytes).context(write_phase)?;
             digest.update(&bytes);
             offset += length;
-            update_operation(data_dir, id, |record| record.completed_bytes += length)?;
-            window_bytes += length;
+            let file_end = offset == expected.size;
+            if let Some(completed) = progress.written(length, file_end, std::time::Instant::now()) {
+                update_operation(data_dir, id, |record| record.completed_bytes = completed)?;
+            }
         }
         file.sync_all().context(if weights {
             PreparationFailurePhase::WeightsSync
@@ -2048,8 +2982,10 @@ async fn prepare(
             })
         );
     }
+    // Admission requires the complete count, so save it with Verifying.
     update_operation(data_dir, id, |record| {
-        record.state = PreparationState::Verifying
+        record.completed_bytes = progress.written;
+        record.state = PreparationState::Verifying;
     })?;
     finish_admission(
         data_dir,
@@ -2063,6 +2999,150 @@ async fn prepare(
     .await
 }
 
+/// Where a preparation continues inside a stage an earlier failure kept.
+struct ResumedStage {
+    stage: storage::Stage,
+    /// Leading package files already complete and re-hashed.
+    complete: usize,
+    /// The next file: its kept prefix (cut to a part boundary) for appending,
+    /// the running digest of that prefix, and its length.
+    partial: Option<(std::fs::File, Sha256, u64)>,
+}
+
+/// Take over the stage for this preparation. A stage that holds this signed
+/// package continues; any other stage, or one whose kept bytes do not match,
+/// is removed so the preparation starts over. Progress is set from disk,
+/// because the record is bumped before each part is synced.
+async fn resume_kept_stage(
+    data_dir: &Path,
+    id: &str,
+    entry: &super::VerifiedModelCatalogEntry,
+    closure: &crate::content::ContentObjectManifest,
+    stop: &AtomicBool,
+    revalidate: &Revalidate,
+) -> anyhow::Result<Option<ResumedStage>> {
+    // Hashing holds no inventory lock, so status and cancel stay available.
+    let stage = match Inventory::open(data_dir, false)?.stage(false) {
+        Ok(stage) => stage,
+        Err(err) if storage::missing(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let resumed = match stage.read_index() {
+        Ok(index)
+            if serde_json::from_slice::<serde_json::Value>(&index)
+                .is_ok_and(|object| object == entry.object_manifest) =>
+        {
+            adopt_stage(data_dir, id, stage, entry, closure, stop, revalidate)
+                .await?
+                .map(|(resumed, completed)| (resumed, index.len() as u64, completed))
+        }
+        _ => None,
+    };
+    match &resumed {
+        Some((_, index_bytes, completed_bytes)) => update_operation(data_dir, id, |record| {
+            record.index_bytes = *index_bytes;
+            record.completed_bytes = *completed_bytes;
+        })?,
+        None => Inventory::open(data_dir, false)?.remove_stage()?,
+    }
+    Ok(resumed.map(|(resumed, _, _)| resumed))
+}
+
+/// Re-hash the kept files in package order. Returns the resume point and the
+/// bytes it covers, or `None` when a kept file does not match the package.
+async fn adopt_stage(
+    data_dir: &Path,
+    id: &str,
+    stage: storage::Stage,
+    entry: &super::VerifiedModelCatalogEntry,
+    closure: &crate::content::ContentObjectManifest,
+    stop: &AtomicBool,
+    revalidate: &Revalidate,
+) -> anyhow::Result<Option<(ResumedStage, u64)>> {
+    let mut complete = 0;
+    let mut completed = 0u64;
+    let mut partial = None;
+    for expected in &closure.files {
+        require_active(data_dir, id, stop, revalidate)?;
+        let Some(file) = stage.open_partial(&expected.path)? else {
+            break;
+        };
+        let kept = file.metadata()?.len();
+        if kept > expected.size {
+            return Ok(None);
+        }
+        let length = if kept == expected.size {
+            kept
+        } else {
+            kept - kept % 65536
+        };
+        let weights = expected.path == entry.manifest.entrypoint;
+        let Some((file, digest)) =
+            tokio::task::spawn_blocking(move || hash_kept_prefix(file, length, weights)).await??
+        else {
+            return Ok(None);
+        };
+        stage.check_file(&expected.path, &file, length)?;
+        completed += length;
+        if length < expected.size {
+            partial = Some((file, digest, length));
+            break;
+        }
+        if hex::encode(digest.finalize()) != expected.sha256 {
+            return Ok(None);
+        }
+        complete += 1;
+    }
+    require_active(data_dir, id, stop, revalidate)?;
+    Ok(Some((
+        ResumedStage {
+            stage,
+            complete,
+            partial,
+        },
+        completed,
+    )))
+}
+
+/// Cut a kept file to `length` and hash what stays. `None` when kept
+/// weights do not start with a GGUF header.
+fn hash_kept_prefix(
+    mut file: std::fs::File,
+    length: u64,
+    weights: bool,
+) -> anyhow::Result<Option<(std::fs::File, Sha256)>> {
+    use std::io::{Read as _, Seek as _};
+    if file.metadata()?.len() != length {
+        file.set_len(length)?;
+        file.sync_all()?;
+    }
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut read = 0u64;
+    if weights && length > 0 {
+        let mut header = [0u8; 8];
+        if length < 8 {
+            return Ok(None);
+        }
+        file.read_exact(&mut header)?;
+        if &header[..4] != b"GGUF" || !matches!(u32::from_le_bytes(header[4..8].try_into()?), 2 | 3)
+        {
+            return Ok(None);
+        }
+        digest.update(header);
+        read = 8;
+    }
+    let mut buffer = vec![0u8; 1024 * 1024];
+    while read < length {
+        let limit = (length - read).min(buffer.len() as u64) as usize;
+        let count = file.read(&mut buffer[..limit])?;
+        ensure!(count > 0, "kept file is truncated");
+        digest.update(&buffer[..count]);
+        read += count as u64;
+    }
+    Ok(Some((file, digest)))
+}
+
 async fn reconcile(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
@@ -2073,7 +3153,10 @@ async fn reconcile(
     // Status/cancel never restart a transfer. Expiry bounds the network
     // attempt. A complete unrenamed stage is hashed in place after current
     // caller, catalog, and capacity checks, without rewriting the deadline.
-    registry.prepare_local_ipfs_backend().await?;
+    registry
+        .prepare_local_ipfs_backend()
+        .await
+        .context(PreparationFailurePhase::StorageService)?;
     let record = load_operation(data_dir, id)?;
     let renamed = record.admission_id == id
         && match Inventory::open(data_dir, false)?.admitted(id) {
@@ -2098,7 +3181,10 @@ async fn reconcile(
         )
         .await
     } else if record.cancel_requested {
-        settle_failure(data_dir, id, true)
+        update_operation(data_dir, id, |record| {
+            record.failure_phase = Some(PreparationFailurePhase::Interrupted)
+        })?;
+        settle_failure(data_dir, id, true, false)
     } else if let Some(closure) = complete_unrenamed_stage(data_dir, &record)? {
         finish_admission(
             data_dir,
@@ -2111,7 +3197,11 @@ async fn reconcile(
         )
         .await
     } else {
-        settle_failure(data_dir, id, true)
+        // An interrupted transfer keeps its stage for the next Use.
+        update_operation(data_dir, id, |record| {
+            record.failure_phase = Some(PreparationFailurePhase::Interrupted)
+        })?;
+        settle_failure(data_dir, id, true, true)
     }
 }
 
@@ -2212,8 +3302,7 @@ async fn finish_admission(
         AdmissionGate::RecoverComplete | AdmissionGate::RecoverRenamed => {
             require_recovery_capacity(data_dir, registry, &record).await
         }
-    }
-    .context(PreparationFailurePhase::Capacity)?;
+    }?;
     require_admission(data_dir, id, stop, revalidate, gate)?;
     verify_package_identity(registry, &stage, &record, &entry, closure).await?;
     require_admission(data_dir, id, stop, revalidate, gate)?;
@@ -2276,16 +3365,20 @@ async fn verify_package_identity(
 fn local_model_startup_profile(platform: &str) -> anyhow::Result<serde_json::Value> {
     // Runtime-owned profiles from verified local engine proofs. Catalog
     // metadata cannot tune execution. Other hosts require their own proof.
+    crate::setup::verify_arm64_model_host(platform)?;
     let (threads, gpu_layers) = match platform {
         // Apple silicon offloads every layer to Metal (local Qwen proof).
         "darwin-arm64" => (8, 99),
         // Linux x86-64 runs on a bounded CPU thread budget without GPU offload
         // (pinned SmolLM2 proof on the b10516 Ubuntu bundle).
         "linux-amd64" => (4, 0),
-        _ => anyhow::bail!("admitted model host profile is unavailable"),
+        // Jetson uses the pinned ARMv8.2 bundle on CPU. Runtime checks CPU
+        // features and host library loading before it admits the engine.
+        "linux-arm64" => (4, 0),
+        _ => anyhow::bail!(crate::setup::LocalModelExecutionUnavailable::UnsupportedHost),
     };
     Ok(serde_json::json!({
-        "context_size":4096, "parallel":1, "threads":threads, "batch_threads":threads,
+        "context_size":ADMITTED_MODEL_CONTEXT_SIZE, "parallel":1, "threads":threads, "batch_threads":threads,
         "gpu_layers":gpu_layers, "health_timeout_ms":120000,
         "shutdown_timeout_ms":5000, "enable_thinking":false
     }))
@@ -2340,6 +3433,16 @@ fn bound_model_offer(
 }
 
 impl ModelActivation {
+    fn engine_successor_of(&self, previous: &Self) -> bool {
+        let invariant = |activation: &Self| {
+            let mut offer = activation.offer.clone();
+            offer.as_object_mut().unwrap().remove("id");
+            offer["adapter"].as_object_mut().unwrap().remove("engine");
+            offer
+        };
+        self.entrypoint == previous.entrypoint && invariant(self) == invariant(previous)
+    }
+
     fn validate(&self, record: &PreparationRecord) -> anyhow::Result<()> {
         ensure!(
             serde_json::to_vec(self)?.len() <= 16 * 1024,
@@ -2442,7 +3545,8 @@ impl ModelActivation {
 }
 
 // The saved activation binds execution identity and policy. The live provider
-// owns wire-schema capabilities; old descriptors keep their original bytes.
+// owns wire-schema capabilities and reports context limits for that profile;
+// this wire-schema projection preserves the saved descriptor bytes.
 fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
     let mut identity = actual.clone();
     let Some(object) = identity.as_object_mut() else {
@@ -2466,6 +3570,18 @@ fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value)
             return false;
         }
     }
+    if let Some(context) = object.remove("context") {
+        // Every admitted startup profile has one slot. These public limits
+        // describe its settings without adding fields to the saved descriptor.
+        if context
+            != serde_json::json!({
+                "context_window_tokens":ADMITTED_MODEL_CONTEXT_SIZE,
+                "max_output_tokens":(ADMITTED_MODEL_CONTEXT_SIZE / 4).clamp(1, 1024)
+            })
+        {
+            return false;
+        }
+    }
     identity == *expected
 }
 
@@ -2473,7 +3589,7 @@ fn model_offer_matches(actual: &serde_json::Value, expected: &serde_json::Value)
 /// inventory and signed catalog remain the owners; this projection stores nothing.
 pub(in crate::api) fn unavailable_model_runtime_projection() -> serde_json::Value {
     serde_json::json!({"admitted":false,"kept":false,
-        "dispatch_ready":false,"offer_id":null,"preparation":null})
+        "dispatch_ready":false,"dispatch_unavailable_reason":null,"offer_id":null,"preparation":null})
 }
 
 #[derive(PartialEq)]
@@ -2495,33 +3611,48 @@ pub(in crate::api) async fn model_runtime_projection(
             context_is_bounded(context) && canonical_cid(cid, 0x70),
             "model selection unavailable"
         );
-        let inventory = Inventory::open(data_dir, false)?;
-        let state = inventory.snapshot()?;
-        let record = state
-            .records
-            .iter()
-            .filter(|r| {
-                r.request_binding.principal == context.principal_id
-                    && r.package_cid == cid
-                    && operation.is_none_or(|id| r.operation_id == id)
-            })
-            .max_by_key(|r| {
-                (
-                    r.state == PreparationState::Admitted,
-                    r.created_at,
-                    &r.operation_id,
-                )
-            });
-        let Some(record) = record else {
+        let select = |state: &PreparationInventory| -> Option<PreparationRecord> {
+            state
+                .records
+                .iter()
+                .filter(|r| {
+                    r.request_binding.principal == context.principal_id
+                        && r.package_cid == cid
+                        && operation.is_none_or(|id| r.operation_id == id)
+                })
+                .max_by_key(|r| {
+                    (
+                        r.state == PreparationState::Admitted,
+                        r.created_at,
+                        &r.operation_id,
+                    )
+                })
+                .cloned()
+        };
+        // Progress comes from the last saved inventory without the lock, so a
+        // running download never makes this read wait. Admitted readiness
+        // checks files and bindings under the lock.
+        let mut state = storage::saved_inventory(data_dir)?;
+        let mut inventory = None;
+        if select(&state).is_some_and(|r| r.state == PreparationState::Admitted) {
+            let locked = Inventory::open(data_dir, false)?;
+            state = locked.snapshot()?;
+            inventory = Some(locked);
+        }
+        let Some(record) = select(&state) else {
             return Ok((unavailable(), None));
         };
+        let record = &record;
         let mut projection = unavailable();
         projection["kept"] = serde_json::json!(state.kept(&context.principal_id, cid));
         projection["preparation"] = record.projection();
         if record.state != PreparationState::Admitted {
             return Ok((projection, None));
         }
-        let stage = inventory.admitted(&record.admission_id)?;
+        let stage = inventory
+            .as_ref()
+            .context("admitted readiness unavailable")?
+            .admitted(&record.admission_id)?;
         stage.check()?;
         projection["admitted"] = serde_json::json!(true);
         if state
@@ -2574,6 +3705,16 @@ pub(in crate::api) async fn model_runtime_projection(
             })
         })()
         .map_err(|error| {
+            if let Some(budget) = error.downcast_ref::<PreparationBudgetRefusal>() {
+                projection["dispatch_unavailable_reason"] =
+                    serde_json::json!(budget.public_class());
+            }
+            if let Some(reason) =
+                error.downcast_ref::<crate::setup::LocalModelExecutionUnavailable>()
+            {
+                projection["dispatch_unavailable_reason"] =
+                    serde_json::json!(reason.public_class());
+            }
             tracing::debug!(%error, "model readiness binding unavailable");
             error
         })
@@ -2608,6 +3749,7 @@ pub(in crate::api) async fn model_runtime_projection(
                 .collect();
             if matching.len() == 1 && model_offer_matches(matching[0], &expected.offer) {
                 projection["dispatch_ready"] = serde_json::json!(true);
+                projection["dispatch_unavailable_reason"] = serde_json::Value::Null;
                 projection["offer_id"] = expected.offer["id"].clone();
             } else {
                 tracing::debug!(matches = matching.len(), "model readiness offer differs");
@@ -2619,6 +3761,47 @@ pub(in crate::api) async fn model_runtime_projection(
     projection
 }
 
+/// Startup removes a kept stage once it is older than `KEPT_STAGE_SECONDS`
+/// or its model is no longer offered by the current trusted catalogue. The
+/// caller holds the worker lock, so no preparation is taking it over.
+fn expire_kept_stage(data_dir: &Path, now: u64) -> anyhow::Result<()> {
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut state = inventory.load()?;
+    let Some(kept) = &state.kept_stage else {
+        return Ok(());
+    };
+    let cid = &state
+        .records
+        .iter()
+        .find(|r| r.operation_id == kept.operation_id)
+        .context("kept stage owner unavailable")?
+        .package_cid;
+    let offered = || -> anyhow::Result<bool> {
+        let config: crate::setup::ComponentsManifest = serde_json::from_slice(
+            &super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?,
+        )?;
+        let trust = config.model_catalog.context("model catalog unavailable")?;
+        Ok(super::verify_model_catalog(
+            &trust,
+            &super::read_model_catalog_file(
+                data_dir,
+                super::MODEL_CATALOG_FILE,
+                super::MAX_MODEL_CATALOG_BYTES,
+            )?,
+            now,
+        )?
+        .iter()
+        .any(|entry| entry.cid == *cid))
+    };
+    let expired = now.saturating_sub(kept.kept_at) >= KEPT_STAGE_SECONDS;
+    if expired || !offered().unwrap_or(false) {
+        inventory.remove_stage()?;
+        state.kept_stage = None;
+        inventory.save(&state)?;
+    }
+    Ok(())
+}
+
 /// Compose admitted offers for Runtime-owned model-provider Init. This function
 /// has no capsule route; public inference still uses the existing model grant.
 /// The caller retains the returned worker guard through provider spawn/Init.
@@ -2626,7 +3809,7 @@ pub async fn append_admitted_model_startup_offers(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-) -> anyhow::Result<Option<std::fs::File>> {
+) -> anyhow::Result<Option<FileLock>> {
     // A Home without preparation inventory keeps its operator offers unchanged.
     match std::fs::symlink_metadata(data_dir.join("model-preparation")) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2634,6 +3817,9 @@ pub async fn append_admitted_model_startup_offers(
         Ok(_) => {}
     }
     let worker = Inventory::open(data_dir, false)?.worker_lock()?;
+    if let Err(error) = expire_kept_stage(data_dir, now()?) {
+        tracing::warn!(?error, "kept model preparation stage was not expired");
+    }
     let retirement = Inventory::open(data_dir, false)?.load()?.retirement;
     if retirement
         .as_ref()
@@ -2688,7 +3874,7 @@ pub async fn settle_pending_model_startup(
     data_dir: &Path,
     bridge: &elastos_runtime::provider::ProviderBridge,
     config: &elastos_runtime::provider::BridgeProviderConfig,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2750,7 +3936,7 @@ pub async fn settle_pending_model_startup(
 pub async fn complete_admitted_model_startup(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
-    worker: Option<&std::fs::File>,
+    worker: Option<&FileLock>,
 ) -> anyhow::Result<()> {
     if worker.is_none() {
         return Ok(());
@@ -2785,6 +3971,16 @@ pub async fn complete_admitted_model_startup(
             && ready.contains(&record.admission_id)
         {
             record.activation_pending = false;
+            if matches!(
+                record.failure_phase,
+                Some(
+                    PreparationFailurePhase::Activation
+                        | PreparationFailurePhase::CacheBudget
+                        | PreparationFailurePhase::MemoryBudget
+                )
+            ) {
+                record.failure_phase = None;
+            }
             changed = true;
         }
     }
@@ -2794,13 +3990,73 @@ pub async fn complete_admitted_model_startup(
     Ok(())
 }
 
+/// An owner-local verification receipt. Restart creates an empty cache. Reuse
+/// reopens private owned files and checks stamps and the exact index. Changed
+/// files require verification; unsafe paths and ownership remain refused.
+#[derive(PartialEq)]
+struct VerifiedModelPackage {
+    path: std::path::PathBuf,
+    admission_id: String,
+    package_cid: String,
+    entrypoint: String,
+    index: Vec<u8>,
+    files: Vec<storage::Stamp>,
+}
+
+impl VerifiedModelPackage {
+    fn inspect(
+        stage: &storage::Stage,
+        record: &PreparationRecord,
+        entry: &super::VerifiedModelCatalogEntry,
+        closure: &crate::content::ContentObjectManifest,
+    ) -> anyhow::Result<Self> {
+        let index = stage.read_index()?;
+        ensure!(
+            index.len() as u64 == record.index_bytes
+                && serde_json::from_slice::<serde_json::Value>(&index)? == entry.object_manifest,
+            "stored index differs from signed catalog"
+        );
+        Ok(Self {
+            path: stage.path.clone(),
+            admission_id: record.admission_id.clone(),
+            package_cid: record.package_cid.clone(),
+            entrypoint: entry.manifest.entrypoint.clone(),
+            index,
+            files: closure
+                .files
+                .iter()
+                .map(|file| stage.file_stamp(file))
+                .collect::<anyhow::Result<_>>()?,
+        })
+    }
+}
+
 async fn append_admitted_model_offers_locked(
     data_dir: &Path,
     registry: &elastos_runtime::provider::ProviderRegistry,
     config: &mut elastos_runtime::provider::BridgeProviderConfig,
-    _worker: &std::fs::File,
+    worker: &FileLock,
+) -> anyhow::Result<()> {
+    append_admitted_model_offers_cached(data_dir, registry, config, worker, None).await
+}
+
+async fn append_admitted_model_offers_cached(
+    data_dir: &Path,
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    config: &mut elastos_runtime::provider::BridgeProviderConfig,
+    _worker: &FileLock,
+    mut verified: Option<&mut Vec<VerifiedModelPackage>>,
 ) -> anyhow::Result<()> {
     let snapshot = Inventory::open(data_dir, false)?.load()?;
+    if let Some(cache) = &mut verified {
+        cache.retain(|package| {
+            snapshot.records.iter().any(|record| {
+                record.state == PreparationState::Admitted
+                    && record.admission_id == package.admission_id
+                    && record.package_cid == package.package_cid
+            })
+        });
+    }
     if !snapshot
         .records
         .iter()
@@ -2838,18 +4094,39 @@ async fn append_admitted_model_offers_locked(
         let entry = current_entry(data_dir, record)?;
         require_cache_budget(data_dir, &snapshot)?;
         let settings = local_model_startup_profile(&crate::setup::detect_platform())?;
-        let engine = crate::setup::verified_local_model_engine(data_dir, &manifest)?;
+        let engine = crate::setup::ensure_local_model_engine(data_dir, &manifest_bytes).await?;
         let stage = Inventory::open(data_dir, false)?.admitted(&record.admission_id)?;
         let closure = crate::content::parse_content_object_manifest(
             &entry.cid,
             &serde_json::to_vec(&entry.object_manifest)?,
         )?;
-        for file in &closure.files {
-            stage.verify_model_file(file, file.path == entry.manifest.entrypoint)?;
+        let observed = VerifiedModelPackage::inspect(&stage, record, &entry, &closure)?;
+        let reused = verified
+            .as_ref()
+            .is_some_and(|cache| cache.contains(&observed));
+        if !reused {
+            for file in &closure.files {
+                stage.verify_model_file(file, file.path == entry.manifest.entrypoint)?;
+            }
         }
         // The local verifier is lazy and may be cold after Runtime restart.
         registry.prepare_local_ipfs_backend().await?;
-        verify_package_identity(registry, &stage, record, &entry, &closure).await?;
+        if !reused {
+            verify_package_identity(registry, &stage, record, &entry, &closure).await?;
+        }
+        ensure!(
+            VerifiedModelPackage::inspect(&stage, record, &entry, &closure)? == observed,
+            "admitted package changed during activation verification"
+        );
+        if !reused {
+            if let Some(cache) = &mut verified {
+                cache.retain(|package| {
+                    package.path != observed.path || package.admission_id != observed.admission_id
+                });
+                ensure!(cache.len() < MAX_RECORDS, "activation cache exceeds bound");
+                cache.push(observed);
+            }
+        }
         current_entry(data_dir, record)?;
         ensure!(
             super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?
@@ -2897,10 +4174,14 @@ async fn append_admitted_model_offers_locked(
             .context("activation owner unavailable")?;
         activation.check_root(data_dir, owner)?;
         if let Some(previous) = &owner.activation {
+            previous.check_root(data_dir, owner)?;
             ensure!(
-                previous == &activation,
+                activation.engine_successor_of(previous),
                 "activation descriptor changed on retry"
             );
+            if previous != &activation {
+                pending.push((owner.operation_id.clone(), activation));
+            }
         } else {
             pending.push((owner.operation_id.clone(), activation));
         }
@@ -2924,13 +4205,10 @@ async fn append_admitted_model_offers_locked(
                 .iter_mut()
                 .find(|r| r.operation_id == owner_id)
                 .context("activation owner unavailable")?;
-            ensure!(
-                owner.activation.is_none(),
-                "activation descriptor changed before Init"
-            );
             owner.activation = Some(activation);
+            owner.activation_pending = true;
         }
-        inventory.save(&durable)?;
+        inventory.save_engine_replacements(&durable)?;
     }
     let mut extra = config.extra.clone();
     extra["offers"] = serde_json::Value::Array(offers);
@@ -2943,7 +4221,14 @@ async fn append_admitted_model_offers_locked(
     Ok(())
 }
 
-fn settle_failure(data_dir: &Path, id: &str, drained: bool) -> anyhow::Result<()> {
+/// `keep_stage`: the failure says nothing against the staged bytes, so they
+/// stay for the next Use unless the preparation was cancelled.
+fn settle_failure(
+    data_dir: &Path,
+    id: &str,
+    drained: bool,
+    keep_stage: bool,
+) -> anyhow::Result<()> {
     let inventory = Inventory::open(data_dir, false)?;
     let mut snapshot = inventory.load()?;
     let record = snapshot
@@ -2963,17 +4248,32 @@ fn settle_failure(data_dir: &Path, id: &str, drained: bool) -> anyhow::Result<()
     if !drained || admission_may_exist {
         record.state = PreparationState::Uncertain;
     } else {
+        let mut kept = None;
         if record.admission_id == id {
-            inventory.remove_stage()?;
+            let bytes = inventory.stage_bytes()?;
+            if keep_stage && !record.cancel_requested && bytes > 0 {
+                kept = Some(KeptStage {
+                    operation_id: id.to_owned(),
+                    bytes,
+                    kept_at: now()?,
+                });
+            } else {
+                inventory.remove_stage()?;
+            }
         }
+        let now = now()?;
         record.state = if record.cancel_requested {
             PreparationState::Cancelled
-        } else if now()? >= record.expires_at {
+        } else if now >= record.expires_at {
             PreparationState::Expired
         } else {
             PreparationState::Failed
         };
         record.reserved_bytes = 0;
+        record.settled_at = Some(now);
+        if record.admission_id == id {
+            snapshot.kept_stage = kept;
+        }
     }
     snapshot.prune_retention();
     inventory.save(&snapshot)
@@ -2982,6 +4282,285 @@ fn settle_failure(data_dir: &Path, id: &str, drained: bool) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_memory() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+        Ok(elastos_common::host_memory::HostMemory {
+            total: 16 * 1024 * 1024 * 1024,
+            available: 16 * 1024 * 1024 * 1024,
+            pressure: elastos_common::host_memory::MemoryPressure::NotReported,
+        })
+    }
+    fn test_owner() -> PreparationOwner {
+        PreparationOwner::with_memory(test_memory)
+    }
+    fn fixture_request_id(data_dir: &Path, label: &str, issued_seconds: u64) -> String {
+        if label.starts_with("model-v1:") || !bounded_id(label, 128) {
+            return label.to_owned();
+        }
+        static IDS: std::sync::OnceLock<
+            Mutex<std::collections::BTreeMap<(std::path::PathBuf, String), String>>,
+        > = std::sync::OnceLock::new();
+        IDS.get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry((data_dir.to_owned(), label.to_owned()))
+            .or_insert_with(|| format!("model-v1:{}:{label}", issued_seconds * 1000))
+            .clone()
+    }
+    impl PreparationOwner {
+        fn invoke_fixture(
+            &self,
+            data_dir: &Path,
+            registry: Option<Arc<elastos_runtime::provider::ProviderRegistry>>,
+            caller: PreparationCaller<'_>,
+            request_id: &str,
+            input: &serde_json::Value,
+            revalidate: Revalidate,
+        ) -> anyhow::Result<serde_json::Value> {
+            let id = if caller.method.operation.as_deref() == Some("use") {
+                fixture_request_id(data_dir, request_id, now()?)
+            } else {
+                request_id.to_owned()
+            };
+            self.invoke(data_dir, registry, caller, &id, input, revalidate)
+        }
+    }
+    fn reserve(
+        data_dir: &Path,
+        caller: &PreparationCaller<'_>,
+        request_id: &str,
+        cid: &str,
+    ) -> anyhow::Result<PreparationRecord> {
+        super::reserve(
+            data_dir,
+            caller,
+            &fixture_request_id(data_dir, request_id, now()?),
+            cid,
+            test_memory,
+        )
+    }
+    fn reserve_at(
+        data_dir: &Path,
+        caller: &PreparationCaller<'_>,
+        request_id: &str,
+        cid: &str,
+        now: u64,
+    ) -> anyhow::Result<PreparationRecord> {
+        super::reserve_at(
+            data_dir,
+            caller,
+            &fixture_request_id(data_dir, request_id, now),
+            cid,
+            now,
+            test_memory,
+        )
+    }
+
+    #[test]
+    fn model_preparation_device_minimum_refuses_before_effects_and_retains_replay() {
+        fn insufficient() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            Ok(elastos_common::host_memory::HostMemory {
+                total: 4 * 1024 * 1024 * 1024,
+                available: 4 * 1024 * 1024 * 1024,
+                pressure: elastos_common::host_memory::MemoryPressure::NotReported,
+            })
+        }
+        fn unavailable() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+        fn unexpected_observation() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            panic!("retained requests are answered before device observation")
+        }
+        let (root, cid) = fixture();
+        let context = context();
+        let method = method("use");
+        let caller = caller(&context, &method);
+        let capacity_id = fixture_request_id(root.path(), "capacity-check", now().unwrap());
+        for (read, expected) in [
+            (
+                insufficient as MemoryReader,
+                PreparationMemoryRefusal::Insufficient,
+            ),
+            (
+                unavailable as MemoryReader,
+                PreparationMemoryRefusal::Unavailable,
+            ),
+        ] {
+            let error = super::reserve(root.path(), &caller, &capacity_id, &cid, read).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<PreparationMemoryRefusal>(),
+                Some(&expected)
+            );
+            assert!(!root.path().join("model-preparation").exists());
+        }
+        let admitted = reserve(root.path(), &caller, "capacity-check", &cid).unwrap();
+        let saved = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+        assert_eq!(
+            super::reserve(
+                root.path(),
+                &caller,
+                &capacity_id,
+                &cid,
+                unexpected_observation
+            )
+            .unwrap(),
+            admitted
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+            saved
+        );
+        assert!(super::reserve(
+            root.path(),
+            &caller,
+            &fixture_request_id(root.path(), "changed-request", now().unwrap()),
+            &cid,
+            unavailable
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+            saved
+        );
+    }
+
+    #[tokio::test]
+    async fn model_get_unseen_legacy_or_expired_id_refuses_before_effects() {
+        fn unexpected_observation() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            panic!("expired new requests stop before host observation")
+        }
+        for id in [
+            "legacy-request".to_owned(),
+            format!("model-v1:{}:expired", now().unwrap() * 1000 - 300_001),
+            format!("model-v1:{}:future", now().unwrap() * 1000 + 600_000),
+        ] {
+            let (root, cid) = fixture();
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            let backend = Arc::new(PreparationBackend::new(Default::default(), cid.clone()));
+            registry
+                .register_sub_provider("ipfs", backend.clone())
+                .await
+                .unwrap();
+            let owner = PreparationOwner::with_memory(unexpected_observation);
+            let error = owner
+                .invoke(
+                    root.path(),
+                    Some(registry),
+                    caller(&context(), &method("use")),
+                    &id,
+                    &serde_json::json!({"cid":cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap_err();
+            assert!(error.is::<PreparationRequestExpired>());
+            assert!(owner.worker.lock().unwrap().is_none());
+            assert!(backend.calls.lock().unwrap().is_empty());
+            assert!(backend.capacity_requests.lock().unwrap().is_empty());
+            assert!(!root.path().join("model-preparation").exists());
+        }
+    }
+
+    #[test]
+    fn model_preparation_retained_legacy_id_precedes_freshness_and_floor() {
+        fn unexpected_observation() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            panic!("retained legacy facts stop before host observation")
+        }
+        let (root, cid) = fixture();
+        let context = context();
+        let use_method = method("use");
+        let cancel_method = method("cancel");
+        let t0 = now().unwrap();
+        let admitted = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "legacy-fixture",
+            &cid,
+            t0,
+        )
+        .unwrap();
+        manage(
+            root.path(),
+            &caller(&context, &cancel_method),
+            &admitted.operation_id,
+            true,
+            t0,
+        )
+        .unwrap();
+        let retained = {
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            let record = &mut state.records[0];
+            record.request_binding.request_id = "retained-legacy".into();
+            record.request_binding = binding(record);
+            record.operation_id = operation_id(record).unwrap();
+            record.admission_id = record.operation_id.clone();
+            let retained = record.clone();
+            state.pruned_issued_floor_ms = (t0 + 3600) * 1000;
+            inventory.save(&state).unwrap();
+            retained
+        };
+        let path = root.path().join("model-preparation/state.json");
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(
+            super::reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                "retained-legacy",
+                &cid,
+                t0 + 7200,
+                unexpected_observation
+            )
+            .unwrap(),
+            retained
+        );
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+        let inventory = Inventory::open(root.path(), false).unwrap();
+        let mut state = inventory.load().unwrap();
+        state.pruned_issued_floor_ms -= 1;
+        assert!(
+            inventory.save(&state).is_err(),
+            "the persisted floor is monotonic"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_get_device_refusal_starts_no_worker_or_storage_calls() {
+        fn insufficient() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            Ok(elastos_common::host_memory::HostMemory {
+                total: 4 * 1024 * 1024 * 1024,
+                available: 4 * 1024 * 1024 * 1024,
+                pressure: elastos_common::host_memory::MemoryPressure::NotReported,
+            })
+        }
+        fn unavailable() -> std::io::Result<elastos_common::host_memory::HostMemory> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+        for read in [insufficient as MemoryReader, unavailable as MemoryReader] {
+            let (root, cid) = fixture();
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            let backend = Arc::new(PreparationBackend::new(Default::default(), cid.clone()));
+            registry
+                .register_sub_provider("ipfs", backend.clone())
+                .await
+                .unwrap();
+            let owner = PreparationOwner::with_memory(read);
+            let error = owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry),
+                    caller(&context(), &method("use")),
+                    "device-refusal",
+                    &serde_json::json!({"cid":cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap_err();
+            assert!(error.is::<PreparationMemoryRefusal>());
+            assert!(owner.worker.lock().unwrap().is_none());
+            assert!(backend.calls.lock().unwrap().is_empty());
+            assert!(backend.capacity_requests.lock().unwrap().is_empty());
+            assert!(!root.path().join("model-preparation").exists());
+        }
+    }
 
     fn method(operation: &str) -> CapsuleAffordanceDescriptor {
         serde_json::from_value(serde_json::json!({
@@ -3021,6 +4600,70 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
 
+    #[test]
+    fn model_preparation_budget_causes_refuse_before_effects_and_recover() {
+        let (root, cid) = fixture();
+        for (field, budget) in [
+            ("max_model_memory_bytes", PreparationBudgetRefusal::Memory),
+            ("max_cache_bytes", PreparationBudgetRefusal::Cache),
+        ] {
+            let path = root.path().join("components.json");
+            let original = std::fs::read(&path).unwrap();
+            change_config(root.path(), |config| {
+                config["model_catalog"]["local_use"][field] = serde_json::json!(1)
+            });
+            let error = reserve(
+                root.path(),
+                &caller(&context(), &method("use")),
+                "known-budget",
+                &cid,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<PreparationBudgetRefusal>(),
+                Some(&budget)
+            );
+            assert!(
+                !root.path().join("model-preparation").exists(),
+                "a refused Get has no reservation or stage"
+            );
+            std::fs::write(&path, original).unwrap();
+        }
+        let record = reserve(
+            root.path(),
+            &caller(&context(), &method("use")),
+            "known-budget",
+            &cid,
+        )
+        .unwrap();
+        let saved = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+        for (field, budget) in [
+            ("max_model_memory_bytes", PreparationBudgetRefusal::Memory),
+            ("max_cache_bytes", PreparationBudgetRefusal::Cache),
+        ] {
+            let path = root.path().join("components.json");
+            let original = std::fs::read(&path).unwrap();
+            change_config(root.path(), |config| {
+                config["model_catalog"]["local_use"][field] = serde_json::json!(1)
+            });
+            let error = current_entry(root.path(), &record).err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<PreparationBudgetRefusal>(),
+                Some(&budget)
+            );
+            assert_eq!(
+                failure_phase(&error.context(PreparationFailurePhase::Policy)).public_class(),
+                budget.public_class()
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+                saved
+            );
+            std::fs::write(&path, original).unwrap();
+            assert!(current_entry(root.path(), &record).is_ok());
+        }
+    }
+
     fn caller<'a>(
         context: &'a HomeLaunchTokenContext,
         method: &'a CapsuleAffordanceDescriptor,
@@ -3044,6 +4687,7 @@ mod tests {
             std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<u8>>>,
         calls: Mutex<Vec<String>>,
         capacity_requests: Mutex<Vec<u64>>,
+        capacity_available: Mutex<Option<u64>>,
         capacity_volume: u64,
         fail_capacity_at: Option<usize>,
         read_sizes: Mutex<Vec<usize>>,
@@ -3187,10 +4831,15 @@ mod tests {
                         ));
                     }
                     Ok(serde_json::json!({"status":"ok","data":{
-                        "volume_id":self.capacity_volume,"capacity_bytes":1_u64 << 40,"available_bytes":1_u64 << 39,"required_bytes":request["required_bytes"]
+                        "volume_id":self.capacity_volume,"capacity_bytes":1_u64 << 40,"available_bytes":self.capacity_available.lock().unwrap().unwrap_or(1_u64 << 39),"required_bytes":request["required_bytes"]
                     }}))
                 }
                 "runtime_prepare_backend" => {
+                    if *self.read_fault.lock().unwrap() == Some("storage_service_unavailable") {
+                        return Err(elastos_runtime::provider::ProviderError::Provider(
+                            "private stopped storage /secret credential".into(),
+                        ));
+                    }
                     if self.hold_drain.swap(false, Ordering::AcqRel) {
                         self.entered.notify_one();
                         self.release.notified().await;
@@ -3339,6 +4988,63 @@ mod tests {
         staged_package_fixture(created_at, renamed, payload, files).await
     }
 
+    #[tokio::test]
+    async fn model_readiness_budget_causes_preserve_admitted_content() {
+        let (root, record, backend, _) = staged_fixture(now().unwrap(), true).await;
+        update_operation(root.path(), &record.operation_id, |record| {
+            record.state = PreparationState::Admitted
+        })
+        .unwrap();
+        let path = root.path().join("components.json");
+        let config = std::fs::read(&path).unwrap();
+        let inventory = root.path().join("model-preparation/state.json");
+        let saved = std::fs::read(&inventory).unwrap();
+        let weights = std::fs::read(root.path().join(format!(
+            "model-preparation/admitted-{}/weights.gguf",
+            record.admission_id
+        )))
+        .unwrap();
+        for (field, budget) in [
+            ("max_model_memory_bytes", PreparationBudgetRefusal::Memory),
+            ("max_cache_bytes", PreparationBudgetRefusal::Cache),
+        ] {
+            change_config(root.path(), |config| {
+                config["model_catalog"]["local_use"][field] = serde_json::json!(1)
+            });
+            let projection =
+                model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                    .await;
+            assert_eq!(projection["admitted"], true);
+            assert_eq!(projection["kept"], true);
+            assert_eq!(projection["dispatch_ready"], false);
+            assert_eq!(
+                projection["dispatch_unavailable_reason"],
+                budget.public_class()
+            );
+            assert_eq!(std::fs::read(&inventory).unwrap(), saved);
+            assert_eq!(
+                std::fs::read(root.path().join(format!(
+                    "model-preparation/admitted-{}/weights.gguf",
+                    record.admission_id
+                )))
+                .unwrap(),
+                weights
+            );
+            assert!(
+                backend.calls.lock().unwrap().is_empty(),
+                "readiness refuses before engine or content effects"
+            );
+            std::fs::write(&path, &config).unwrap();
+            let restored =
+                model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                    .await;
+            assert_ne!(
+                restored["dispatch_unavailable_reason"],
+                budget.public_class()
+            );
+        }
+    }
+
     async fn staged_package_fixture(
         created_at: u64,
         renamed: bool,
@@ -3409,16 +5115,15 @@ mod tests {
                 "shutdown_timeout_ms":5000, "enable_thinking":false
             })
         );
-        for platform in [
-            "linux-arm64",
-            "darwin-amd64",
-            "linux-x86_64",
-            "Linux-amd64",
-            "*",
-            "",
-        ] {
-            assert!(
-                local_model_startup_profile(platform).is_err(),
+        assert_eq!(
+            local_model_startup_profile("linux-arm64").unwrap(),
+            local_model_startup_profile("linux-amd64").unwrap()
+        );
+        for platform in ["darwin-amd64", "linux-x86_64", "Linux-amd64", "*", ""] {
+            let error = local_model_startup_profile(platform).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::setup::LocalModelExecutionUnavailable>(),
+                Some(&crate::setup::LocalModelExecutionUnavailable::UnsupportedHost),
                 "{platform:?} has no proved host profile"
             );
         }
@@ -3427,7 +5132,8 @@ mod tests {
     // Startup binding runs wherever a Runtime-owned host profile exists.
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "linux", target_arch = "x86_64")
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64")
     ))]
     mod startup_binding {
         use super::*;
@@ -3454,7 +5160,7 @@ mod tests {
             let digest = format!("sha256:{:x}", Sha256::digest(bytes));
             let archive = format!("sha256:{}", "a".repeat(64));
             let platform = crate::setup::detect_platform();
-            std::fs::write(bundle.join("llama-server"), bytes).unwrap();
+            crate::test_support::write_from_child(&bundle.join("llama-server"), bytes, 0o500);
             std::fs::write(
                 bundle.join(".elastos-engine.json"),
                 serde_json::to_vec(&serde_json::json!({
@@ -3472,10 +5178,11 @@ mod tests {
                     }}
                 });
             });
-            for (name, mode) in [("llama-server", 0o500), (".elastos-engine.json", 0o400)] {
-                std::fs::set_permissions(bundle.join(name), std::fs::Permissions::from_mode(mode))
-                    .unwrap();
-            }
+            std::fs::set_permissions(
+                bundle.join(".elastos-engine.json"),
+                std::fs::Permissions::from_mode(0o400),
+            )
+            .unwrap();
             let mut parent = bundle.clone();
             for _ in Path::new(relative).components() {
                 let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
@@ -3576,7 +5283,23 @@ mod tests {
                 let mut live = expected.clone();
                 live["input_schemas"] = schemas;
                 assert!(model_offer_matches(&live, &expected));
+                live["context"] = serde_json::json!({
+                    "context_window_tokens":4096,"max_output_tokens":1024
+                });
+                assert!(model_offer_matches(&live, &expected));
                 live["policy"]["input_bytes_limit"] = serde_json::json!(1);
+                assert!(!model_offer_matches(&live, &expected));
+            }
+            for context in [
+                serde_json::json!(null),
+                serde_json::json!({}),
+                serde_json::json!({"context_window_tokens":8192,"max_output_tokens":1024}),
+                serde_json::json!({"context_window_tokens":4096,"max_output_tokens":4096}),
+                serde_json::json!({"context_window_tokens":"4096","max_output_tokens":1024}),
+                serde_json::json!({"context_window_tokens":4096,"max_output_tokens":1024,"adapter":{}}),
+            ] {
+                let mut live = expected.clone();
+                live["context"] = context;
                 assert!(!model_offer_matches(&live, &expected));
             }
             for schemas in [
@@ -3624,6 +5347,9 @@ mod tests {
                 elastos_model_contract::TEXT_INPUT_V2_SCHEMA
             ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            offer["context"] = serde_json::json!({
+                "context_window_tokens":4096,"max_output_tokens":1024
+            });
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
                 "protocol_version":"elastos.model-provider/v1",
@@ -3692,7 +5418,7 @@ mod tests {
             for _ in 0..2 {
                 let request = Request::builder()
                     .uri("/api/capsules/catalog")
-                    .header("host", "localhost:61180")
+                    .header("host", "localhost")
                     .header("origin", "null")
                     .header("x-elastos-home-token", &token)
                     .body(Body::empty())
@@ -3781,6 +5507,9 @@ mod tests {
                 elastos_model_contract::TEXT_INPUT_V2_SCHEMA
             ]);
             offer["policy"]["schema"] = serde_json::json!("elastos.model.policy/v1");
+            offer["context"] = serde_json::json!({
+                "context_window_tokens":4096,"max_output_tokens":1024
+            });
             let mut response = serde_json::json!({"status":"ok", "data":{
                 "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
                 "protocol_version":"elastos.model-provider/v1", "offers":[offer.clone()],
@@ -3883,7 +5612,7 @@ mod tests {
         ) -> (axum::http::StatusCode, serde_json::Value) {
             use tower::ServiceExt as _;
             let request = axum::http::Request::builder()
-                .header("host", "localhost:61180")
+                .header("host", "localhost")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .header("content-type", "application/json");
@@ -3909,6 +5638,33 @@ mod tests {
                 )
                 .unwrap(),
             )
+        }
+
+        async fn drain_readiness_worker(root: &Path) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let result = {
+                        let inventory = Inventory::open(root, false).unwrap();
+                        inventory.worker_lock()
+                    };
+                    match result {
+                        Ok(lock) => {
+                            drop(lock);
+                            return;
+                        }
+                        Err(error)
+                            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::WouldBlock
+                            }) =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("readiness worker drain failed: {error:#}"),
+                    }
+                }
+            })
+            .await
+            .expect("readiness activation worker did not release its lock");
         }
 
         #[tokio::test]
@@ -4040,6 +5796,7 @@ mod tests {
                     response["output"].clone()
                 };
                 assert_eq!(value["dispatch_ready"], true, "{response}");
+                assert!(value["dispatch_unavailable_reason"].is_null());
                 assert_eq!(value["kept"], true);
                 assert!(!value.to_string().contains("inference_ready"));
             }
@@ -4118,6 +5875,180 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn model_catalog_readiness_explains_only_missing_source_engine_and_preserves_content()
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
+            let platform = crate::setup::detect_platform();
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"] = serde_json::json!({
+                    "version":"fixture-v1", "platforms":{platform.clone():{
+                        "install_path":"libexec/fixture-engine", "binary_path":"llama-server",
+                        "checksum":format!("sha256:{}", "a".repeat(64))
+                    }}
+                });
+            });
+            let before = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+            let mut expected: PreparationInventory = serde_json::from_slice(&before).unwrap();
+            expected
+                .records
+                .iter_mut()
+                .find(|saved| saved.operation_id == record.operation_id)
+                .unwrap()
+                .failure_phase = Some(PreparationFailurePhase::Activation);
+            let artifact = Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(&record.admission_id)
+                .unwrap();
+            let artifact_inode = std::fs::metadata(&artifact.path).unwrap().ino();
+            let files: Vec<_> = backend
+                .files
+                .keys()
+                .map(|name| {
+                    let path = artifact.path.join(name);
+                    (
+                        path.clone(),
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(path).unwrap().ino(),
+                    )
+                })
+                .collect();
+            let calls = backend.calls.lock().unwrap().clone();
+            let (app, token) = readiness_catalog_app(root.path(), registry.clone(), &context());
+            for (strategy, expected) in [
+                ("source-build", serde_json::json!("source_engine_required")),
+                ("local-copy", serde_json::json!("source_engine_required")),
+                ("prebuilt", serde_json::Value::Null),
+            ] {
+                change_config(root.path(), |config| {
+                    config["external"]["llama-server"]["platforms"][&platform]["strategy"] =
+                        serde_json::json!(strategy);
+                });
+                for method in ["catalog.list", "content.status"] {
+                    let input = if method == "catalog.list" {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"operation_id":record.operation_id})
+                    };
+                    let read_before =
+                        std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+                    let read_calls = backend.calls.lock().unwrap().clone();
+                    let (status, response) = readiness_catalog_request(&app, &token, Some(serde_json::json!({
+                        "request_id":"engine-unavailable-status", "capsule":"marketplace",
+                        "interface":"elastos.marketplace.catalog", "method":method, "input":input
+                    }))).await;
+                    if method == "catalog.list" {
+                        assert_eq!(
+                            std::fs::read(root.path().join("model-preparation/state.json"))
+                                .unwrap(),
+                            read_before
+                        );
+                        assert_eq!(*backend.calls.lock().unwrap(), read_calls);
+                    } else {
+                        drain_readiness_worker(root.path()).await;
+                    }
+                    assert_eq!(status, axum::http::StatusCode::OK, "{response}");
+                    let value = if method == "catalog.list" {
+                        response["output"]["catalog"]["capsules"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["cid"] == record.package_cid)
+                            .unwrap()["model_runtime"]
+                            .clone()
+                    } else {
+                        response["output"].clone()
+                    };
+                    assert_eq!(value["admitted"], true);
+                    assert_eq!(value["kept"], true);
+                    assert_eq!(value["dispatch_ready"], false);
+                    assert_eq!(value["dispatch_unavailable_reason"], expected);
+                    assert!(!value.to_string().contains(root.path().to_str().unwrap()));
+                    assert!(!value.to_string().contains("No such file"));
+                }
+            }
+            // A present invalid receipt stays a general unavailable result. It
+            // cannot claim the missing-only source prerequisite or fetch a repair.
+            std::fs::create_dir_all(root.path().join("libexec/fixture-engine")).unwrap();
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"]["platforms"][&platform]["strategy"] =
+                    serde_json::json!("source-build");
+            });
+            let invalid = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(invalid["admitted"], true);
+            assert_eq!(invalid["dispatch_ready"], false);
+            assert!(invalid["dispatch_unavailable_reason"].is_null());
+            let mut other = context();
+            other.principal_id = "person:other-reader".into();
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &other,
+                    &record.package_cid,
+                    None
+                )
+                .await,
+                unavailable_model_runtime_projection()
+            );
+            assert!(
+                serde_json::from_slice::<PreparationInventory>(
+                    &std::fs::read(root.path().join("model-preparation/state.json")).unwrap()
+                )
+                .unwrap()
+                    == expected,
+                "Status only records the admitted activation failure"
+            );
+            assert_eq!(
+                std::fs::metadata(&artifact.path).unwrap().ino(),
+                artifact_inode
+            );
+            for (path, bytes, inode) in files {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            }
+            assert_eq!(*backend.calls.lock().unwrap(), calls);
+            let _engine = install_engine(root.path());
+            let (_, provider) = readiness_provider(root.path(), &registry).await;
+            let ready = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(ready["dispatch_ready"], true);
+            assert!(ready["dispatch_unavailable_reason"].is_null());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            change_config(root.path(), |config| {
+                config["external"]["llama-server"]["platforms"][&platform]["checksum"] =
+                    serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+            });
+            let changed_pin = model_runtime_projection(
+                root.path(),
+                Some(&registry),
+                &context(),
+                &record.package_cid,
+                None,
+            )
+            .await;
+            assert_eq!(changed_pin["admitted"], true);
+            assert_eq!(changed_pin["dispatch_ready"], false);
+            assert!(changed_pin["dispatch_unavailable_reason"].is_null());
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
         async fn model_catalog_readiness_revalidates_authority_and_catalog_after_offer_read() {
             let (root, record, _, registry) = staged_fixture(now().unwrap(), true).await;
             admit(root.path(), &record);
@@ -4127,10 +6058,17 @@ mod tests {
             provider.hold.store(true, Ordering::Release);
             let request_app = app.clone();
             let request_token = token.clone();
-            let request = tokio::spawn(async move {
+            // JoinSet aborts held fixture requests if an assertion fails.
+            let mut requests = tokio::task::JoinSet::new();
+            requests.spawn(async move {
                 readiness_catalog_request(&request_app, &request_token, None).await
             });
-            provider.entered.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             // This succeeds while the read is held: no inventory/worker lock spans provider I/O.
             retention_intent(root.path(), &context(), &record.package_cid, true).unwrap();
             let config_path = root.path().join("components.json");
@@ -4139,7 +6077,12 @@ mod tests {
                 config["model_catalog"]["publisher_dids"] = serde_json::json!([])
             });
             provider.release.notify_one();
-            let (status, catalog) = request.await.unwrap();
+            let (status, catalog) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
             assert_eq!(status, axum::http::StatusCode::OK);
             assert_eq!(catalog["model_catalog_state"], "unavailable");
             assert!(catalog["capsules"]
@@ -4153,13 +6096,23 @@ mod tests {
                 .iter()
                 .any(|r| r["cid"] == record.package_cid));
             std::fs::write(config_path, original).unwrap();
-            let request =
-                tokio::spawn(async move { readiness_catalog_request(&app, &token, None).await });
-            provider.entered.notified().await;
+            requests.spawn(async move { readiness_catalog_request(&app, &token, None).await });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.entered.notified(),
+            )
+            .await
+            .expect("catalog request must reach the held offer read");
             crate::auth::revoke_session_grant(root.path(), &context().session_id, now().unwrap())
                 .unwrap();
             provider.release.notify_one();
-            assert_eq!(request.await.unwrap().0, axum::http::StatusCode::FORBIDDEN);
+            let (status, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.join_next())
+                    .await
+                    .expect("released catalog request must complete")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
         }
 
         #[tokio::test]
@@ -4659,8 +6612,8 @@ mod tests {
             f.model.busy.store(true, Ordering::Release);
             let path = admitted_weights(f.root.path(), &f.old.operation_id);
             let original = std::fs::read(&path).unwrap();
-            let err = PreparationOwner::default()
-                .invoke(
+            let err = test_owner()
+                .invoke_fixture(
                     f.root.path(),
                     Some(Arc::clone(&f.registry)),
                     caller(&context(), &method("reclaim")),
@@ -4706,8 +6659,8 @@ mod tests {
             drop(inventory);
             let path = admitted_weights(f.root.path(), &f.old.operation_id);
             let original = std::fs::read(&path).unwrap();
-            let err = PreparationOwner::default()
-                .invoke(
+            let err = test_owner()
+                .invoke_fixture(
                     f.root.path(),
                     Some(Arc::clone(&f.registry)),
                     caller(&context(), &method("reclaim")),
@@ -4777,8 +6730,8 @@ mod tests {
             retention_intent(f.root.path(), &context(), &f.old.package_cid, true).unwrap();
             let path = admitted_weights(f.root.path(), &f.old.operation_id);
             assert!(path.is_file());
-            let result = PreparationOwner::default()
-                .invoke(
+            let result = test_owner()
+                .invoke_fixture(
                     f.root.path(),
                     Some(Arc::clone(&f.registry)),
                     caller(&context(), &method("reclaim")),
@@ -5087,7 +7040,9 @@ mod tests {
                     .iter()
                     .filter(|r| r.admission_id == f.old.operation_id)
                     .all(|r| r.reserved_bytes == 0
-                        && if r.request_binding.request_id == "cancelled-alias" {
+                        && if r.request_binding.request_id
+                            == fixture_request_id(f.root.path(), "cancelled-alias", now().unwrap(),)
+                        {
                             r.state == PreparationState::Cancelled
                         } else {
                             r.state == PreparationState::Reclaimed
@@ -5286,6 +7241,327 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn pending_model_status_retries_activation_without_repreparing_content() {
+            let root = tempfile::tempdir().unwrap();
+            let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+            let backend = Arc::new(PreparationBackend::new(files, cid.clone()));
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", backend.clone())
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            model.busy.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let owner = test_owner();
+            let prepared = owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    "pending-model",
+                    &serde_json::json!({"cid":cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let operation = prepared["operation_id"].as_str().unwrap();
+            let pending = load_operation(root.path(), operation).unwrap();
+            assert_eq!(pending.state, PreparationState::Admitted);
+            assert!(pending.activation_pending);
+            let reads = backend
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| *op == "cat")
+                .count();
+            let hashes = || {
+                backend
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|op| *op == "runtime_hash_staged_directory")
+                    .count()
+            };
+            let verified = hashes();
+            assert_eq!(model.calls.lock().unwrap().len(), 1);
+            tokio::time::pause();
+            for _ in 0..10 {
+                let status = owner
+                    .invoke_fixture(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context(), &method("status")),
+                        "poll-refused-activation",
+                        &serde_json::json!({"operation_id":operation}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap();
+                assert_eq!(status["failure_class"], "activation_unavailable");
+                assert!(owner.worker.lock().unwrap().is_none());
+                tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+            }
+            assert_eq!(model.calls.lock().unwrap().len(), 1);
+            assert_eq!(hashes(), verified);
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+            let pending_status = owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "pending-status",
+                    &serde_json::json!({"operation_id":operation}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(pending_status["failure_class"], "activation_unavailable");
+            join_worker(&owner).await;
+            assert_eq!(model.calls.lock().unwrap().len(), 2);
+            assert_eq!(hashes(), verified, "unchanged verified files are reused");
+            assert!(
+                load_operation(root.path(), operation)
+                    .unwrap()
+                    .activation_pending
+            );
+            model.busy.store(false, Ordering::Release);
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+            owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "idle-status",
+                    &serde_json::json!({"operation_id":operation}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let ready = load_operation(root.path(), operation).unwrap();
+            assert_eq!(ready.state, PreparationState::Admitted);
+            assert!(!ready.activation_pending);
+            assert_eq!(ready.operation_id, pending.operation_id);
+            assert_eq!(ready.admission_id, pending.admission_id);
+            assert_eq!(ready.activation, pending.activation);
+            assert!(ready.failure_phase.is_none());
+            assert_eq!(
+                backend
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|op| *op == "cat")
+                    .count(),
+                reads
+            );
+            assert!(model.configured.lock().unwrap().is_some());
+            assert_eq!(model.calls.lock().unwrap().len(), 3);
+            assert_eq!(hashes(), verified);
+        }
+
+        #[tokio::test]
+        async fn model_activation_cached_verification_rehashes_replaced_or_changed_files() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            model.busy.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let owner = test_owner();
+            owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("status")),
+                    "first-activation",
+                    &serde_json::json!({"operation_id":record.operation_id}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            join_worker(&owner).await;
+            let hashes = || {
+                backend
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|op| *op == "runtime_hash_staged_directory")
+                    .count()
+            };
+            assert_eq!(hashes(), 1);
+            let stage = Inventory::open(root.path(), false)
+                .unwrap()
+                .admitted(&record.admission_id)
+                .unwrap();
+            let weights = stage.path.join("weights.gguf");
+            let original = std::fs::read(&weights).unwrap();
+            let replacement = root.path().join("weights-replacement");
+            std::fs::write(&replacement, &original).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&replacement, &weights).unwrap();
+            let retry = || {
+                owner
+                    .invoke_fixture(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context(), &method("use")),
+                        &record.request_binding.request_id,
+                        &serde_json::json!({"cid":record.package_cid}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap()
+            };
+            retry();
+            join_worker(&owner).await;
+            assert_eq!(hashes(), 2, "a new inode requires full verification");
+            assert_eq!(model.calls.lock().unwrap().len(), 2);
+            let mut corrupt = original.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            std::fs::write(&weights, corrupt).unwrap();
+            retry();
+            join_worker(&owner).await;
+            assert_eq!(hashes(), 2, "invalid bytes refuse before the CID verifier");
+            assert_eq!(
+                model.calls.lock().unwrap().len(),
+                2,
+                "invalid bytes never reach Init"
+            );
+            let refused = load_operation(root.path(), &record.operation_id).unwrap();
+            assert!(refused.activation_pending);
+            assert_eq!(
+                refused.failure_phase,
+                Some(PreparationFailurePhase::Activation)
+            );
+            std::fs::write(&weights, &original).unwrap();
+            model.busy.store(false, Ordering::Release);
+            retry();
+            join_worker(&owner).await;
+            assert_eq!(hashes(), 3, "restored bytes require fresh verification");
+            let ready = load_operation(root.path(), &record.operation_id).unwrap();
+            assert!(!ready.activation_pending);
+            assert_eq!(ready.admission_id, record.admission_id);
+            assert_eq!(std::fs::read(&weights).unwrap(), original);
+        }
+
+        #[tokio::test]
+        async fn model_reserved_status_starts_after_the_activation_worker_drains() {
+            let root = tempfile::tempdir().unwrap();
+            let second_cid = cid::Cid::new_v1(
+                0x70,
+                cid::multihash::Multihash::<64>::wrap(0x12, &Sha256::digest(b"waiting model"))
+                    .unwrap(),
+            )
+            .to_string();
+            let (mut payload, primary) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+            let (second, files) = package_fixture_named(
+                b"GGUF\x03\0\0\0second".to_vec(),
+                b"second provenance",
+                "waiting-model-fixture",
+                &second_cid,
+            );
+            payload["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(second["entries"][0].clone());
+            write_preparation_catalog(root.path(), &payload);
+            let first_cid = payload["entries"][0]["cid"].as_str().unwrap();
+            let mut backend = PreparationBackend::new(primary, first_cid.into());
+            backend.extra_packages.insert(second_cid.clone(), files);
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", Arc::new(backend))
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+            let _engine = install_engine(root.path());
+            let model = Arc::new(ModelActivationFixture::default());
+            model.hold.store(true, Ordering::Release);
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            let owner = test_owner();
+            let first = owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    "first-model",
+                    &serde_json::json!({"cid":first_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), model.entered.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                load_operation(root.path(), first["operation_id"].as_str().unwrap())
+                    .unwrap()
+                    .state,
+                PreparationState::Admitted
+            );
+            let waiting = owner
+                .invoke_fixture(
+                    root.path(),
+                    Some(registry.clone()),
+                    caller(&context(), &method("use")),
+                    "waiting-model",
+                    &serde_json::json!({"cid":second_cid}),
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            assert_eq!(waiting["state"], "reserved");
+            let operation = waiting["operation_id"].as_str().unwrap();
+            let status = || {
+                owner
+                    .invoke_fixture(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context(), &method("status")),
+                        "waiting-status",
+                        &serde_json::json!({"operation_id":operation}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(status()["state"], "reserved");
+            assert_eq!(model.calls.lock().unwrap().len(), 1);
+            model.hold.store(false, Ordering::Release);
+            model.release.notify_one();
+            join_worker(&owner).await;
+            assert_eq!(status()["state"], "preparing");
+            join_worker(&owner).await;
+            let ready = load_operation(root.path(), operation).unwrap();
+            assert_eq!(ready.state, PreparationState::Admitted);
+            assert!(!ready.activation_pending);
+            assert_eq!(ready.operation_id, operation);
+            assert_eq!(ready.package_cid, second_cid);
+            assert_eq!(model.calls.lock().unwrap().len(), 2);
+            assert_eq!(
+                model_runtime_projection(
+                    root.path(),
+                    Some(&registry),
+                    &context(),
+                    &second_cid,
+                    Some(operation)
+                )
+                .await["dispatch_ready"],
+                true
+            );
+        }
+
+        #[tokio::test]
         async fn model_preparation_enabled_activation_hashes_each_verification_phase() {
             let root = tempfile::tempdir().unwrap();
             let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -5299,10 +7575,10 @@ mod tests {
                 .unwrap();
             register_content(&registry, root.path()).await;
             let _engine = install_engine(root.path());
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let input = serde_json::json!({"cid":cid});
             let first = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -5338,9 +7614,9 @@ mod tests {
                 .register_sub_provider("model", model.clone())
                 .await
                 .unwrap();
-            let reopened = PreparationOwner::default();
+            let reopened = test_owner();
             let reused = reopened
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -5384,6 +7660,7 @@ mod tests {
             for entry in &mut snapshot.records {
                 if entry.admission_id == record.admission_id {
                     entry.activation_pending = true;
+                    entry.failure_phase = Some(PreparationFailurePhase::Activation);
                 }
             }
             inventory.save(&snapshot).unwrap();
@@ -5405,6 +7682,12 @@ mod tests {
                     .unwrap()
                     .activation_pending
             );
+            for operation in [&record.operation_id, &alias.operation_id] {
+                assert!(load_operation(root.path(), operation)
+                    .unwrap()
+                    .failure_phase
+                    .is_none());
+            }
         }
 
         #[tokio::test]
@@ -5443,9 +7726,9 @@ mod tests {
                 .registration_for_uri("elastos://model/")
                 .await
                 .unwrap();
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("status")),
@@ -5572,7 +7855,7 @@ mod tests {
                 };
                 let (result, ()) = tokio::join!(init, during_init);
                 assert_eq!(result.is_err(), busy);
-                // Startup's caller owns this File until the Init result is handled.
+                // Startup's caller owns this guard until the Init result is handled.
                 assert!(Inventory::open(root.path(), false)
                     .unwrap()
                     .worker_lock()
@@ -5622,9 +7905,9 @@ mod tests {
                 .registration_for_uri("elastos://model/")
                 .await
                 .unwrap();
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("status")),
@@ -5651,7 +7934,7 @@ mod tests {
             model.busy.store(false, Ordering::Release);
             for _ in 0..2 {
                 owner
-                    .invoke(
+                    .invoke_fixture(
                         root.path(),
                         Some(registry.clone()),
                         caller(&context(), &method("use")),
@@ -5716,9 +7999,9 @@ mod tests {
                 .registration_for_uri("elastos://model/")
                 .await
                 .unwrap();
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("status")),
@@ -5742,7 +8025,7 @@ mod tests {
             )
             .await;
             owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -5763,6 +8046,9 @@ mod tests {
                 Some(&record.operation_id),
             )
             .await;
+            // Explicit Use keeps A. Release that intent before capacity pressure
+            // may select A for retirement after the catalog moves to B.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             // A remains active in this real provider after the one-entry signed
             // catalog moves to B. Its retirement cannot use B's catalog facts.
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -5774,7 +8060,7 @@ mod tests {
                 config["model_catalog"]["local_use"]["max_cache_bytes"] =
                     serde_json::json!(2 * charge - 1);
             });
-            let pressure_use = owner.invoke(
+            let pressure_use = owner.invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -5922,6 +8208,157 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn model_startup_binding_rebuilds_only_verified_engine_successors() {
+            let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
+            admit(root.path(), &record);
+            let first_engine = install_engine(root.path());
+            let mut first = config(root.path());
+            let first_worker =
+                append_admitted_model_startup_offers(root.path(), &registry, &mut first)
+                    .await
+                    .unwrap();
+            let model = Arc::new(ModelActivationFixture::default());
+            *model.configured.lock().unwrap() = Some(serde_json::to_value(&first).unwrap());
+            registry
+                .register_sub_provider("model", model.clone())
+                .await
+                .unwrap();
+            complete_admitted_model_startup(root.path(), &registry, first_worker.as_ref())
+                .await
+                .unwrap();
+            let original = load_operation(root.path(), &record.operation_id).unwrap();
+            assert!(!original.activation_pending);
+            drop(first_worker);
+            let old = original.activation.as_ref().unwrap();
+            let bundle = &first_engine.0;
+            std::fs::set_permissions(bundle, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(
+                bundle.join("llama-server"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                bundle.join(".elastos-engine.json"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let _replacement = install_engine_bytes(root.path(), b"verified successor engine");
+            let mut current = config(root.path());
+            let current_worker =
+                append_admitted_model_startup_offers(root.path(), &registry, &mut current)
+                    .await
+                    .unwrap();
+            let replaced = load_operation(root.path(), &record.operation_id).unwrap();
+            let new = replaced.activation.as_ref().unwrap();
+            assert_ne!(new.offer["id"], old.offer["id"]);
+            assert_ne!(new.engine_receipt_sha256, old.engine_receipt_sha256);
+            assert!(new.engine_successor_of(old));
+            assert_eq!(new.offer["adapter"]["model"], old.offer["adapter"]["model"]);
+            assert_eq!(replaced.package_cid, original.package_cid);
+            assert_eq!(replaced.admission_id, original.admission_id);
+            assert!(replaced.activation_pending);
+            assert_eq!(current.extra["offers"][0], first.extra["offers"][0]);
+            assert!(backend.read_sizes.lock().unwrap().is_empty());
+            complete_admitted_model_startup(root.path(), &registry, current_worker.as_ref())
+                .await
+                .unwrap();
+            assert!(
+                load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending,
+                "the old live offer cannot confirm the successor"
+            );
+            drop(current_worker);
+            let path = root.path().join("model-preparation/state.json");
+            let saved = std::fs::read(&path).unwrap();
+            let mut restarted = config(root.path());
+            let restarted_worker =
+                append_admitted_model_startup_offers(root.path(), &registry, &mut restarted)
+                    .await
+                    .unwrap();
+            assert_eq!(restarted.extra, current.extra);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            {
+                let inventory = Inventory::open(root.path(), false).unwrap();
+                let mut state = inventory.load().unwrap();
+                state.records[0].activation = Some(old.clone());
+                assert!(
+                    inventory.save(&state).is_err(),
+                    "ordinary saves cannot replace an engine binding"
+                );
+                state.records[0].activation = Some(new.clone());
+                state.records[0].activation.as_mut().unwrap().offer["title"] =
+                    serde_json::json!("Another model title");
+                assert!(
+                    inventory.save(&state).is_err(),
+                    "ordinary saves preserve the binding"
+                );
+                assert!(
+                    inventory.save_engine_replacements(&state).is_err(),
+                    "engine replacement preserves model fields"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), saved);
+            }
+            for field in [
+                "title",
+                "operation",
+                "policy",
+                "enabled",
+                "model",
+                "settings",
+                "entrypoint",
+            ] {
+                let mut changed = new.clone();
+                match field {
+                    "title" => changed.offer["title"] = serde_json::json!("changed"),
+                    "operation" => changed.offer["operation"] = serde_json::json!("changed"),
+                    "policy" => changed.offer["policy"]["runtime_ms_limit"] = serde_json::json!(1),
+                    "enabled" => changed.offer["enabled"] = serde_json::json!(false),
+                    "model" => {
+                        changed.offer["adapter"]["model"]["sha256"] =
+                            serde_json::json!(format!("sha256:{}", "b".repeat(64)))
+                    }
+                    "settings" => {
+                        changed.offer["adapter"]["settings"]["threads"] = serde_json::json!(999)
+                    }
+                    "entrypoint" => changed.entrypoint = "other.gguf".into(),
+                    _ => unreachable!(),
+                }
+                assert!(!changed.engine_successor_of(new), "changed {field}");
+            }
+            *model.configured.lock().unwrap() = Some(serde_json::to_value(&current).unwrap());
+            complete_admitted_model_startup(root.path(), &registry, restarted_worker.as_ref())
+                .await
+                .unwrap();
+            assert!(
+                !load_operation(root.path(), &record.operation_id)
+                    .unwrap()
+                    .activation_pending
+            );
+            drop(restarted_worker);
+            let saved = std::fs::read(&path).unwrap();
+            std::fs::set_permissions(
+                bundle.join("llama-server"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            crate::test_support::write_from_child(
+                &bundle.join("llama-server"),
+                b"unverified replacement",
+                0o700,
+            );
+            let mut invalid = config(root.path());
+            let before = invalid.extra.clone();
+            assert!(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut invalid)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(invalid.extra, before);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
         }
 
         #[tokio::test]
@@ -6161,9 +8598,9 @@ mod tests {
                     .count()
             };
 
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let first = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -6241,9 +8678,9 @@ mod tests {
                 record.catalog_head_cid
             );
 
-            let reopened = PreparationOwner::default();
+            let reopened = test_owner();
             let reused = reopened
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -6411,9 +8848,9 @@ mod tests {
 
                 let mut admitted = Vec::new();
                 for index in order {
-                    let owner = PreparationOwner::default();
+                    let owner = test_owner();
                     let response = owner
-                        .invoke(
+                        .invoke_fixture(
                             root.path(),
                             Some(registry.clone()),
                             caller(&context(), &method("use")),
@@ -6686,6 +9123,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode())
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/v1/chat/completions/input_tokens':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({'input_tokens': 1}).encode())
+            return
         assert self.path == '/v1/chat/completions' and body['model'] == alias
         assert body['chat_template_kwargs'] == {'enable_thinking': False}
         prompt = body['messages'][0]['content']
@@ -6734,7 +9176,10 @@ server.serve_forever()
                         session_id: ctx.session_id.clone(),
                         capsule_id: "assistant".into(),
                         grant_id: ctx.grant_id.clone(),
-                        request_id: format!("small-output-{prompt}"),
+                        request_id: format!(
+                            "model-v1:{}:small-output-{prompt}",
+                            now().unwrap() * 1000
+                        ),
                         offer_id: offer.clone(),
                         operation: "text.generate".into(),
                         input_hash: model_input_hash(&input).unwrap(),
@@ -6873,6 +9318,8 @@ server.serve_forever()
                 )
                 .await
                 .unwrap();
+            // Let pressure reach the unknown-run gate rather than the Keep gate.
+            retention_intent(root.path(), &context(), &record.package_cid, false).unwrap();
             let (mut next_catalog, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
             let next_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
             next_catalog["entries"][0]["cid"] = serde_json::json!(next_cid);
@@ -6881,8 +9328,8 @@ server.serve_forever()
                 config["model_catalog"]["local_use"]["max_cache_bytes"] =
                     serde_json::json!(2 * preparation_charge(record.total_bytes).unwrap() - 1);
             });
-            let owner = PreparationOwner::default();
-            let pressure = owner.invoke(
+            let owner = test_owner();
+            let pressure = owner.invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -6960,6 +9407,7 @@ server.serve_forever()
                 extra_packages: std::collections::BTreeMap::new(),
                 calls: Mutex::new(vec![]),
                 capacity_requests: Mutex::new(vec![]),
+                capacity_available: Mutex::new(None),
                 capacity_volume: 7,
                 fail_capacity_at: None,
                 read_sizes: Mutex::new(vec![]),
@@ -7006,9 +9454,9 @@ server.serve_forever()
         }
         let registry = (!missing_registry)
             .then(|| Arc::new(elastos_runtime::provider::ProviderRegistry::new()));
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         assert!(owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 registry,
                 caller(&context(), &method("use")),
@@ -7078,9 +9526,9 @@ server.serve_forever()
                 serde_json::json!(2 * charge - 1)
         });
         let state_path = root.path().join("model-preparation/state.json");
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let pending = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -7090,6 +9538,7 @@ server.serve_forever()
             )
             .unwrap();
         assert_eq!(pending["state"], "capacity_pending");
+        assert_eq!(pending["failure_class"], "cache_budget_unavailable");
         assert!(owner.worker.lock().unwrap().is_none());
         let pending_bytes = std::fs::read(&state_path).unwrap();
 
@@ -7107,7 +9556,7 @@ server.serve_forever()
         assert_eq!(retried.reserved_bytes, 0);
         assert_eq!(std::fs::read(&state_path).unwrap(), pending_bytes);
         let started = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("use")),
@@ -7231,9 +9680,9 @@ server.serve_forever()
             "reservation must not dispatch effects"
         );
         for _ in 0..2 {
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let repeated = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("use")),
@@ -7250,8 +9699,8 @@ server.serve_forever()
         let inventory = Inventory::open(root.path(), false).unwrap();
         let held_worker = inventory.worker_lock().unwrap();
         drop(inventory);
-        assert!(PreparationOwner::default()
-            .invoke(
+        assert!(test_owner()
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -7338,18 +9787,35 @@ server.serve_forever()
         };
         use elastos_runtime::auth::AuthSessionGrantV1;
 
-        for (fault, phase) in [
+        // `staged`: the stage stays after the failure. A read failure keeps the
+        // verified bytes for the next Use; an undrained one keeps everything.
+        for (fault, phase, staged) in [
             (
                 "metadata_tamper",
                 PreparationFailurePhase::MetadataIntegrity,
+                false,
             ),
-            ("file_unavailable", PreparationFailurePhase::WeightsRead),
+            (
+                "file_unavailable",
+                PreparationFailurePhase::WeightsRead,
+                true,
+            ),
             (
                 "file_unavailable_undrained",
                 PreparationFailurePhase::WeightsRead,
+                true,
             ),
-            ("header", PreparationFailurePhase::WeightsHeader),
-            ("authority_revoked", PreparationFailurePhase::Authority),
+            ("header", PreparationFailurePhase::WeightsHeader, false),
+            (
+                "storage_service_unavailable",
+                PreparationFailurePhase::StorageService,
+                false,
+            ),
+            (
+                "authority_revoked",
+                PreparationFailurePhase::Authority,
+                false,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -7418,11 +9884,11 @@ server.serve_forever()
                 ensure!(current == admitted, "preparation authority changed");
                 Ok(())
             });
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let output = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
-                    Some(registry),
+                    Some(registry.clone()),
                     caller(&context, &method("use")),
                     "failure-phase",
                     &serde_json::json!({"cid":cid}),
@@ -7432,7 +9898,10 @@ server.serve_forever()
             join_worker(&owner).await;
             let record =
                 load_operation(root.path(), output["operation_id"].as_str().unwrap()).unwrap();
-            let undrained = fault == "file_unavailable_undrained";
+            let undrained = matches!(
+                fault,
+                "file_unavailable_undrained" | "storage_service_unavailable"
+            );
             assert_eq!(
                 record.state,
                 if undrained {
@@ -7443,7 +9912,15 @@ server.serve_forever()
                 "{fault}"
             );
             assert_eq!(record.failure_phase, Some(phase), "{fault}");
-            assert_eq!(record.completed_bytes, metadata_bytes, "{fault}");
+            assert_eq!(
+                record.completed_bytes,
+                if fault == "storage_service_unavailable" {
+                    0
+                } else {
+                    metadata_bytes
+                },
+                "{fault}"
+            );
             assert_eq!(
                 record.reserved_bytes,
                 if undrained {
@@ -7454,7 +9931,8 @@ server.serve_forever()
             );
             assert_eq!(
                 root.path().join("model-preparation/stage").exists(),
-                undrained
+                staged,
+                "{fault}"
             );
             assert_eq!(record.projection()["failure_class"], phase.public_class());
             assert_eq!(
@@ -7477,16 +9955,59 @@ server.serve_forever()
             old.as_object_mut().unwrap().remove("failure_phase");
             let old: PreparationRecord = serde_json::from_value(old).unwrap();
             assert_eq!(old.projection()["failure_class"], serde_json::Value::Null);
+            if fault == "storage_service_unavailable" {
+                *backend.read_fault.lock().unwrap() = None;
+                owner
+                    .invoke_fixture(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context, &method("status")),
+                        "storage-restored",
+                        &serde_json::json!({"operation_id":record.operation_id}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap();
+                join_worker(&owner).await;
+                let reconciled = load_operation(root.path(), &record.operation_id).unwrap();
+                assert_eq!(reconciled.state, PreparationState::Failed);
+                assert_eq!(reconciled.reserved_bytes, 0);
+                assert_eq!(
+                    reconciled.failure_phase,
+                    Some(PreparationFailurePhase::Interrupted)
+                );
+                let retry = owner
+                    .invoke_fixture(
+                        root.path(),
+                        Some(registry.clone()),
+                        caller(&context, &method("use")),
+                        "retry-storage-restored",
+                        &serde_json::json!({"cid":cid}),
+                        Arc::new(|| Ok(())),
+                    )
+                    .unwrap();
+                join_worker(&owner).await;
+                let recovered =
+                    load_operation(root.path(), retry["operation_id"].as_str().unwrap()).unwrap();
+                assert_eq!(recovered.state, PreparationState::Admitted);
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .kept(&context.principal_id, &cid));
+            }
         }
     }
 
     #[tokio::test]
     async fn model_preparation_actual_fetch_rejects_tampered_and_truncated_bytes() {
-        for fault in [
-            "index_tamper",
-            "index_truncate",
-            "file_tamper",
-            "file_truncate",
+        // A truncated weights answer is refused before it is written, so the
+        // parts already staged stay for the next Use; tampered bytes and a
+        // bad index remove the stage.
+        for (fault, staged) in [
+            ("index_tamper", false),
+            ("index_truncate", false),
+            ("file_tamper", false),
+            ("file_truncate", true),
         ] {
             let root = tempfile::tempdir().unwrap();
             let (payload, files) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
@@ -7500,9 +10021,9 @@ server.serve_forever()
                 .await
                 .unwrap();
             register_content(&registry, root.path()).await;
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let result = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry),
                     caller(&context(), &method("use")),
@@ -7516,7 +10037,11 @@ server.serve_forever()
                 load_operation(root.path(), result["operation_id"].as_str().unwrap()).unwrap();
             assert_eq!(record.state, PreparationState::Failed, "{fault}");
             assert_eq!(record.reserved_bytes, 0);
-            assert!(!root.path().join("model-preparation/stage").exists());
+            assert_eq!(
+                root.path().join("model-preparation/stage").exists(),
+                staged,
+                "{fault}"
+            );
             assert!(storage::missing(
                 &Inventory::open(root.path(), false)
                     .unwrap()
@@ -7545,9 +10070,9 @@ server.serve_forever()
             .await
             .unwrap();
         register_content(&registry, root.path()).await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let result = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -7566,7 +10091,7 @@ server.serve_forever()
         let before = load_operation(root.path(), id).unwrap();
         let started = std::time::Instant::now();
         let cancelled = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("cancel")),
@@ -7589,7 +10114,7 @@ server.serve_forever()
         assert_eq!(record.state, PreparationState::Cancelled);
         assert_eq!(
             record.failure_phase,
-            Some(PreparationFailurePhase::WeightsRead)
+            Some(PreparationFailurePhase::Interrupted)
         );
         assert_eq!(record.completed_bytes, before.completed_bytes);
         assert_eq!(record.reserved_bytes, 0);
@@ -7610,7 +10135,7 @@ server.serve_forever()
         let mut previous_status = None;
         for request_id in ["status-1", "status-2"] {
             let status = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&context(), &method("status")),
@@ -7630,9 +10155,9 @@ server.serve_forever()
             assert_eq!(persisted.state, PreparationState::Cancelled);
             assert_eq!(persisted.reserved_bytes, 0);
         }
-        let restarted = PreparationOwner::default();
+        let restarted = test_owner();
         let status = restarted
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("status")),
@@ -7647,7 +10172,7 @@ server.serve_forever()
         assert_eq!(Some(&status), previous_status.as_ref());
         assert!(restarted.worker.lock().unwrap().is_none());
         let again = restarted
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("status")),
@@ -7797,39 +10322,73 @@ server.serve_forever()
             )
         }
 
-        fn loopback_listener(address: &str) {
-            let port = address
-                .strip_prefix("/ip4/127.0.0.1/tcp/")
-                .and_then(|port| port.parse::<u16>().ok())
-                .unwrap();
-            assert_ne!(port, 0, "fixture listener must have a bound loopback port");
+        /// The publisher's Home as a Carrier holder answers a model read:
+        /// every bounded read comes from its own offline repo. The Carrier hop
+        /// itself is covered by the `SlowHolderPreparation` tests.
+        struct OfflineRepoHolder {
+            api_port: u16,
+            client: reqwest::Client,
+            reads: std::sync::atomic::AtomicUsize,
         }
 
-        async fn require_peer(
-            kubo: &Path,
-            root: &Path,
-            repo: &Path,
-            expected: &str,
-            deadline: Instant,
-        ) {
-            loop {
-                let peers = run(
-                    command(kubo, root, repo, root, &["swarm", "peers"]),
-                    root,
-                    deadline,
-                )
-                .await;
-                let peers: Vec<_> = peers.lines().collect();
-                if peers.is_empty() {
-                    assert!(Instant::now() < deadline, "fixture peer readiness deadline");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for OfflineRepoHolder {
+            fn name(&self) -> &'static str {
+                "offline-repo-holder-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec!["availability"]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("preparation reads availability through send_raw")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                use base64::Engine as _;
+                let failed =
+                    |error: String| elastos_runtime::provider::ProviderError::Provider(error);
+                assert_eq!(request["bounded_read"], true);
+                let arg = format!(
+                    "{}/{}",
+                    request["cid"].as_str().unwrap(),
+                    request["path"].as_str().unwrap()
+                );
+                let range = &request["range"];
+                let (offset, length) = match (range["start"].as_u64(), range["end"].as_u64()) {
+                    (Some(start), Some(end)) => (start, end - start + 1),
+                    _ => (0, request["max_bytes"].as_u64().unwrap()),
+                };
+                let response = self
+                    .client
+                    .post(format!("http://127.0.0.1:{}/api/v0/cat", self.api_port))
+                    .query(&[
+                        ("arg", arg),
+                        ("offline", "true".into()),
+                        ("offset", offset.to_string()),
+                        ("length", length.to_string()),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|error| failed(error.to_string()))?;
+                if !response.status().is_success() {
+                    return Ok(serde_json::json!({"status":"error",
+                        "code":"carrier_fetch_failed", "message":"holder repo miss"}));
                 }
-                assert_eq!(peers.len(), 1, "fixture must have only its exact peer");
-                let (address, peer) = peers[0].rsplit_once("/p2p/").unwrap();
-                loopback_listener(address);
-                assert_eq!(peer, expected);
-                return;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| failed(error.to_string()))?;
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                Ok(serde_json::json!({"status":"ok",
+                    "data":{"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}))
             }
         }
 
@@ -7837,13 +10396,10 @@ server.serve_forever()
             kubo: &Path,
             root: &Path,
             repo: &Path,
-            cold: bool,
             deadline: Instant,
         ) -> (OwnedChild, File, File, u16) {
-            let mut args = vec!["daemon", "--routing=none", "--enable-gc=false"];
-            if !cold {
-                args.push("--offline");
-            }
+            // As ipfs-provider runs Kubo: offline, a local content store only.
+            let args = ["daemon", "--offline", "--routing=none", "--enable-gc=false"];
             let stdout = tempfile::tempfile_in(root).unwrap();
             let stderr = tempfile::tempfile_in(root).unwrap();
             let mut daemon = OwnedChild(
@@ -7907,7 +10463,7 @@ server.serve_forever()
         }
 
         #[tokio::test]
-        #[ignore = "requires explicit pinned binaries and isolated loopback peers; parent runs cold process proof"]
+        #[ignore = "requires explicit pinned binaries and an isolated offline holder repo; parent runs cold process proof"]
         async fn model_preparation_real_content_native_process_cold_64mib() {
             preparation_process(true).await;
         }
@@ -7955,8 +10511,12 @@ server.serve_forever()
                 + 32 * 1024 * 1024;
             let dir = File::open(&root_path).unwrap();
             let (volume_capacity, initial_free) = volume_bytes(&dir);
-            storage::require_space_floor(volume_capacity, initial_free, u128::from(layout_charge))
-                .unwrap();
+            storage::require_reservation_fits(
+                volume_capacity,
+                initial_free,
+                u128::from(layout_charge),
+            )
+            .unwrap();
             let data = root_path.join("data");
             let seed = root_path.join("seed");
             let repo = data.join("ipfs-repo");
@@ -8025,25 +10585,10 @@ server.serve_forever()
                 config["Bootstrap"] = serde_json::json!([]);
                 config["Addresses"]["API"] = serde_json::json!("/ip4/127.0.0.1/tcp/0");
                 config["Addresses"]["Gateway"] = serde_json::json!("");
-                config["Addresses"]["Swarm"] = if cold {
-                    serde_json::json!(["/ip4/127.0.0.1/tcp/0"])
-                } else {
-                    serde_json::json!([])
-                };
+                config["Addresses"]["Swarm"] = serde_json::json!([]);
                 config["Routing"]["Type"] = serde_json::json!("none");
                 config["Discovery"]["MDNS"]["Enabled"] = serde_json::json!(false);
                 config["AutoConf"]["Enabled"] = serde_json::json!(false);
-                if cold {
-                    config["Swarm"]["DisableNatPortMap"] = serde_json::json!(true);
-                    config["Swarm"]["RelayClient"]["Enabled"] = serde_json::json!(false);
-                    config["Swarm"]["RelayService"]["Enabled"] = serde_json::json!(false);
-                    config["Swarm"]["EnableHolePunching"] = serde_json::json!(false);
-                    config["AutoNAT"]["ServiceMode"] = serde_json::json!("disabled");
-                    config["Swarm"]["Transports"]["Network"] = serde_json::json!({
-                        "TCP":true,"Relay":false,"QUIC":false,"Websocket":false,
-                        "WebTransport":false,"WebRTCDirect":false
-                    });
-                }
                 config["Import"] = proof_import_profile();
                 fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
             }
@@ -8146,7 +10691,7 @@ server.serve_forever()
                     )
                     .await,
                     baseline,
-                    "consumer block set changed before peer connection"
+                    "consumer block set changed before Use"
                 );
             }
             assert!(
@@ -8156,64 +10701,26 @@ server.serve_forever()
             let backend_before = disk_bytes(&repo);
             let seed_disk = disk_bytes(&seed);
             let (mut daemon, stdout, stderr, port) =
-                start_daemon(&kubo, &root_path, &repo, cold, deadline).await;
+                start_daemon(&kubo, &root_path, &repo, deadline).await;
             let mut publisher = if cold {
-                Some(start_daemon(&kubo, &root_path, &publisher_repo, true, deadline).await)
+                Some(start_daemon(&kubo, &root_path, &publisher_repo, deadline).await)
             } else {
                 None
             };
-            let mut peer_ids = Vec::new();
-            if cold {
-                let mut listeners = Vec::new();
-                for fixture_repo in [&repo, &publisher_repo] {
-                    let config: serde_json::Value =
-                        serde_json::from_slice(&fs::read(fixture_repo.join("config")).unwrap())
-                            .unwrap();
-                    peer_ids.push(config["Identity"]["PeerID"].as_str().unwrap().to_owned());
-                    let listener = run(
-                        command(
-                            &kubo,
-                            &root_path,
-                            fixture_repo,
-                            &root_path,
-                            &["swarm", "addrs", "listen"],
-                        ),
-                        &root_path,
-                        deadline,
-                    )
-                    .await;
-                    loopback_listener(&listener);
-                    listeners.push(listener);
-                    assert!(run(
-                        command(
-                            &kubo,
-                            &root_path,
-                            fixture_repo,
-                            &root_path,
-                            &["swarm", "peers"]
-                        ),
-                        &root_path,
-                        deadline
-                    )
-                    .await
-                    .is_empty());
-                }
-                let address = format!("{}/p2p/{}", listeners[1], peer_ids[1]);
-                run(
-                    command(
-                        &kubo,
-                        &root_path,
-                        &repo,
-                        &root_path,
-                        &["swarm", "connect", &address],
-                    ),
-                    &root_path,
-                    deadline,
-                )
-                .await;
-                require_peer(&kubo, &root_path, &repo, &peer_ids[1], deadline).await;
-                require_peer(&kubo, &root_path, &publisher_repo, &peer_ids[0], deadline).await;
-            }
+            // Kubo runs offline, so the consumer's repo never reaches the
+            // publisher's; a cold Get reads every part from the holder.
+            let holder = publisher.as_ref().map(|(_, _, _, api_port)| {
+                Arc::new(OfflineRepoHolder {
+                    api_port: *api_port,
+                    client: reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .unwrap(),
+                    reads: Default::default(),
+                })
+            });
             let setup_ms = setup_started.elapsed().as_millis();
             let publisher_before = if cold && pinned.is_none() {
                 disk_bytes(&publisher_repo)
@@ -8221,7 +10728,8 @@ server.serve_forever()
                 (0, 0)
             };
             fs::write(data.join("ipfs-coords.json"), serde_json::to_vec(&serde_json::json!({
-                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),"last_used":now().unwrap()
+                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),
+                "last_used":now().unwrap(),"offline":true
             })).unwrap()).unwrap();
             let bridge = Arc::new(
                 ProviderBridge::spawn(
@@ -8246,8 +10754,15 @@ server.serve_forever()
                 .await
                 .unwrap();
             register_content(&registry, &data).await;
-            let owner = Arc::new(PreparationOwner::default());
-            let test_owner = owner.clone();
+            if let Some(holder) = &holder {
+                registry
+                    .register_sub_provider("availability", holder.clone())
+                    .await
+                    .unwrap();
+            }
+            let test_holder = holder.clone();
+            let owner = Arc::new(test_owner());
+            let running_owner = owner.clone();
             let test_data = data.clone();
             let test_repo = repo.clone();
             let test_registry = registry.clone();
@@ -8265,8 +10780,8 @@ server.serve_forever()
             let mut work = tokio::spawn(async move {
                 let started = Instant::now();
                 let input = serde_json::json!({"cid":cid});
-                let response = test_owner
-                    .invoke(
+                let response = running_owner
+                    .invoke_fixture(
                         &test_data,
                         Some(test_registry.clone()),
                         caller(&context(), &method("use")),
@@ -8285,7 +10800,7 @@ server.serve_forever()
                 let mut last_sample = Instant::now();
                 let mut max_sample_gap_ms = 0;
                 let mut rss_peak_kib = 0;
-                while !test_owner
+                while !running_owner
                     .worker
                     .lock()
                     .unwrap()
@@ -8319,7 +10834,7 @@ server.serve_forever()
                     combined_allocated_peak = combined_allocated_peak
                         .max(stage.1 + backend.1 + publisher.1 + seed_disk.1);
                     minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                    storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                    storage::require_reservation_fits(volume_capacity, minimum_free, 0).unwrap();
                     assert!(
                         logs.iter()
                             .all(|log| log.metadata().unwrap().len() <= 65536),
@@ -8334,7 +10849,7 @@ server.serve_forever()
                     tokio::time::sleep(Duration::from_millis(if real_model { 1000 } else { 10 }))
                         .await;
                 }
-                join_worker(&test_owner).await;
+                join_worker(&running_owner).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let record = load_operation(&test_data, &id).unwrap();
                 assert_eq!(record.state, PreparationState::Admitted);
@@ -8378,20 +10893,12 @@ server.serve_forever()
                     publisher_peak.0.max(publisher_after.0),
                     publisher_peak.1.max(publisher_after.1),
                 );
-                if cold && !real_model {
-                    assert!(
-                        backend_after.0 >= backend_before.0 + weights_size as u64,
-                        "cold transfer must grow consumer backend logical bytes"
-                    );
-                    assert!(
-                        backend_after.1 > backend_before.1,
-                        "cold transfer must allocate consumer backend blocks"
-                    );
-                }
+                // A Get stages the package outside Kubo and only hashes it
+                // there, so the consumer's repo need not grow.
                 combined_allocated_peak = combined_allocated_peak
                     .max(admitted_disk.1 + backend_after.1 + publisher_after.1 + seed_disk.1);
                 minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
-                storage::require_space_floor(volume_capacity, minimum_free, 0).unwrap();
+                storage::require_reservation_fits(volume_capacity, minimum_free, 0).unwrap();
                 let requests = test_backend.calls.lock().unwrap().clone();
                 let reads = requests.iter().filter(|op| *op == "cat").count();
                 let expected_reads = 1
@@ -8404,7 +10911,14 @@ server.serve_forever()
                         .filter(|(path, _)| *path != "_elastos_object.json")
                         .map(|(_, bytes)| bytes.len().div_ceil(65536))
                         .sum::<usize>();
-                assert_eq!(reads, expected_reads);
+                if let Some(holder) = &test_holder {
+                    // One local miss (repeated once after backend preparation),
+                    // then every part comes from the holder's offline repo.
+                    assert!((1..=2).contains(&reads), "local reads: {reads}");
+                    assert_eq!(holder.reads.load(Ordering::Acquire), expected_reads);
+                } else {
+                    assert_eq!(reads, expected_reads);
+                }
                 // The real engine enables activation composition after admission;
                 // both independently verify the exact stored package CID.
                 let admission_and_activation_hashes = if real_model { 2 } else { 1 };
@@ -8415,13 +10929,13 @@ server.serve_forever()
                         .count(),
                     admission_and_activation_hashes
                 );
-                let reopened = PreparationOwner::default();
+                let reopened = test_owner();
                 if real_model {
                     retention_intent(&test_data, &context(), &cid, true).unwrap();
                 }
                 let reuse_started = Instant::now();
                 let alias = reopened
-                    .invoke(
+                    .invoke_fixture(
                         &test_data,
                         Some(test_registry.clone()),
                         caller(&context(), &method("use")),
@@ -8510,6 +11024,7 @@ server.serve_forever()
                 );
                 serde_json::json!({"cold":cold,"setup_ms":setup_ms,"elapsed_preparation_ms":elapsed_ms,
                     "reuse_ms":reuse_ms,"content_reads":reads,
+                    "holder_reads":test_holder.as_ref().map(|holder| holder.reads.load(Ordering::Acquire)),
                     "layout_preflight_bytes":layout_charge,"minimum_sampled_free_bytes":minimum_free,
                     "sample_interval_ms":if real_model {1000} else {10},"samples":samples,"max_sample_gap_ms":max_sample_gap_ms,
                     "test_process_sampled_rss_peak_kib":rss_peak_kib,"inference":inference,
@@ -8553,23 +11068,6 @@ server.serve_forever()
             drop(registry);
             drop(backend);
             drop(bridge);
-            // Perform peer assertions in a task so an assertion still reaches
-            // the exact-child cleanup below.
-            let peer_check = if cold {
-                let kubo = kubo.clone();
-                let root = root_path.clone();
-                let repo = repo.clone();
-                let publisher_repo = publisher_repo.clone();
-                Some(
-                    tokio::spawn(async move {
-                        require_peer(&kubo, &root, &repo, &peer_ids[1], deadline).await;
-                        require_peer(&kubo, &root, &publisher_repo, &peer_ids[0], deadline).await;
-                    })
-                    .await,
-                )
-            } else {
-                None
-            };
             for result in [daemon.0.kill(), daemon.0.wait().map(|_| ())] {
                 if let Err(error) = result {
                     cleanup_errors.push(format!("consumer cleanup: {error}"));
@@ -8597,9 +11095,6 @@ server.serve_forever()
             }
             assert!(cleanup_errors.is_empty(), "{cleanup_errors:?}");
             assert!(!root_path.exists());
-            if let Some(peer_check) = peer_check {
-                peer_check.unwrap();
-            }
             let mut receipt = outcome
                 .expect("production preparation deadline")
                 .expect("production preparation task");
@@ -8607,7 +11102,7 @@ server.serve_forever()
             receipt["native_shutdown_reap"] = serde_json::json!(true);
             receipt["kubo_reaped"] = serde_json::json!(true);
             receipt["kubo_children_reaped"] = serde_json::json!(if cold { 2 } else { 1 });
-            receipt["consumer_package_absent_before_connect"] = serde_json::json!(cold);
+            receipt["consumer_package_absent_before_use"] = serde_json::json!(cold);
             receipt["consumer_init_block"] = serde_json::json!(consumer_baseline);
             if let Some(pinned) = &pinned {
                 // Volume samples replace recursive large-backend scans. Do not
@@ -8635,9 +11130,9 @@ server.serve_forever()
                 );
             }
             receipt["proof_limit"] = serde_json::json!(if pinned.is_some() {
-                "Exact pinned model, isolated publisher-attested catalog, cold loopback Content admission and native model reply/restart. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
+                "Exact pinned model, isolated publisher-attested catalog, cold Get from a holder's offline Kubo through the availability plane, Content admission and native model reply/restart. The Carrier hop is covered by the holder tests. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
             } else if cold {
-                "64 MiB-capped signed synthetic cold loopback delivery through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Public-network, exact pinned models and inference remain open."
+                "64 MiB-capped signed synthetic cold Get: one local miss on the consumer's offline Kubo, then every part from the holder's offline Kubo through the availability plane, Content/native Use/admission/reuse. The Carrier hop is covered by the holder tests. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Exact pinned models and inference remain open."
             } else {
                 "8 MiB signed synthetic seeded offline Kubo proof through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Cold-network, exact pinned models and inference remain open."
             });
@@ -8653,9 +11148,9 @@ server.serve_forever()
         change_config(root.path(), |config| {
             config["model_catalog"]["local_use"] = serde_json::Value::Null
         });
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("cancel")),
@@ -8690,10 +11185,10 @@ server.serve_forever()
     async fn model_preparation_failed_drain_keeps_charge_until_exact_cancel_retry() {
         let (root, record, backend, registry) = staged_fixture(now().unwrap(), false).await;
         backend.fail_drain.store(true, Ordering::Release);
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let input = serde_json::json!({"operation_id":record.operation_id});
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("cancel")),
@@ -8712,7 +11207,7 @@ server.serve_forever()
             .exists());
         backend.fail_drain.store(false, Ordering::Release);
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("cancel")),
@@ -8744,9 +11239,9 @@ server.serve_forever()
             );
             Ok(())
         });
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("status")),
@@ -8777,9 +11272,9 @@ server.serve_forever()
         operation_id: &str,
         revalidate: Revalidate,
     ) {
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root,
                 Some(registry),
                 caller(&context(), &method("status")),
@@ -8793,6 +11288,240 @@ server.serve_forever()
 
     fn stage_weights(root: &Path) -> std::path::PathBuf {
         root.join("model-preparation/stage/weights.gguf")
+    }
+
+    fn kept_stage_owner(root: &Path) -> Option<String> {
+        Inventory::open(root, false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .kept_stage
+            .map(|kept| kept.operation_id)
+    }
+
+    fn set_cache_budget(root: &Path, bytes: u64) {
+        change_config(root, |config| {
+            config["model_catalog"]["local_use"]["max_cache_bytes"] = serde_json::json!(bytes)
+        });
+    }
+
+    /// An attempt whose weights stopped after their header, settled after a
+    /// read that failed in transit: its stage is kept for the next Use.
+    /// Returns the bytes the stage holds.
+    async fn kept_stage_fixture() -> (
+        tempfile::TempDir,
+        PreparationRecord,
+        Arc<elastos_runtime::provider::ProviderRegistry>,
+        u64,
+    ) {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), false).await;
+        let path = stage_weights(root.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(8);
+        std::fs::write(&path, bytes).unwrap();
+        settle_failure(root.path(), &record.operation_id, true, true).unwrap();
+        assert_eq!(
+            kept_stage_owner(root.path()),
+            Some(record.operation_id.clone())
+        );
+        let on_disk = backend
+            .files
+            .iter()
+            .map(|(path, bytes)| {
+                if path == "weights.gguf" {
+                    8
+                } else {
+                    bytes.len() as u64
+                }
+            })
+            .sum();
+        (root, record, registry, on_disk)
+    }
+
+    #[tokio::test]
+    async fn model_preparation_kept_stage_stays_charged_until_a_preparation_takes_it_over() {
+        let (root, record, _registry, on_disk) = kept_stage_fixture().await;
+        let state = Inventory::open(root.path(), false).unwrap().load().unwrap();
+        assert_eq!(state.kept_stage.as_ref().unwrap().bytes, on_disk);
+        assert_eq!(state.records[0].reserved_bytes, 0);
+        set_cache_budget(root.path(), on_disk - 1);
+        assert!(
+            require_cache_budget(root.path(), &state).is_err(),
+            "the kept bytes still count against the cache budget"
+        );
+        set_cache_budget(root.path(), on_disk);
+        require_cache_budget(root.path(), &state).unwrap();
+        // The next Use's own charge covers the stage it takes over.
+        let charge = preparation_charge(record.total_bytes).unwrap();
+        set_cache_budget(root.path(), charge);
+        assert!(cache_budget_fits(root.path(), &state, charge).unwrap());
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_on_a_failed_attempt_discards_its_kept_stage() {
+        let (root, record, registry, on_disk) = kept_stage_fixture().await;
+        let owner = test_owner();
+        let reply = owner
+            .invoke_fixture(
+                root.path(),
+                Some(registry),
+                caller(&context(), &method("cancel")),
+                "discard-kept",
+                &serde_json::json!({"operation_id": record.operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(reply["state"], "failed");
+        assert!(owner.worker.lock().unwrap().is_none());
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert_eq!(kept_stage_owner(root.path()), None);
+        set_cache_budget(root.path(), on_disk - 1);
+        require_cache_budget(
+            root.path(),
+            &Inventory::open(root.path(), false).unwrap().load().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_preparation_capacity_start_takes_the_kept_stage_over() {
+        struct NoOffers;
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for NoOffers {
+            fn name(&self) -> &'static str {
+                "no-offers-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("offers only")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                assert_eq!(request["op"], "offers_list");
+                Ok(serde_json::json!({"status":"ok","data":{
+                    "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+                    "protocol_version":"elastos.model-provider/v1",
+                    "offers":[], "offer_revisions":{}
+                }}))
+            }
+        }
+        let (root, failed, registry, _) = kept_stage_fixture().await;
+        registry
+            .register_sub_provider("model", Arc::new(NoOffers))
+            .await
+            .unwrap();
+        // A later Use of the same model waited for capacity.
+        let pending = reserve(
+            root.path(),
+            &caller(&context(), &method("use")),
+            "after-capacity",
+            &failed.package_cid,
+        )
+        .unwrap();
+        {
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.operation_id == pending.operation_id)
+                .unwrap();
+            record.state = PreparationState::CapacityPending;
+            record.reserved_bytes = 0;
+            inventory.save(&state).unwrap();
+        }
+        let worker = Inventory::open(root.path(), false)
+            .unwrap()
+            .worker_lock()
+            .unwrap();
+        let revalidate: Revalidate = Arc::new(|| Ok(()));
+        assert!(prepare_capacity(
+            root.path(),
+            &registry,
+            &pending.operation_id,
+            &AtomicBool::new(false),
+            &revalidate,
+            &worker,
+        )
+        .await
+        .unwrap());
+        drop(worker);
+        let started = load_operation(root.path(), &pending.operation_id).unwrap();
+        let charge = preparation_charge(started.total_bytes).unwrap();
+        assert_eq!(started.state, PreparationState::Preparing);
+        assert_eq!(started.reserved_bytes, charge);
+        assert_eq!(kept_stage_owner(root.path()), None);
+        // Its reservation alone covers the stage: nothing is counted twice.
+        set_cache_budget(root.path(), charge);
+        require_cache_budget(
+            root.path(),
+            &Inventory::open(root.path(), false).unwrap().load().unwrap(),
+        )
+        .unwrap();
+        // Cancel on the old failed attempt leaves the running preparation's stage.
+        let reply = test_owner()
+            .invoke_fixture(
+                root.path(),
+                Some(registry),
+                caller(&context(), &method("cancel")),
+                "cancel-old-attempt",
+                &serde_json::json!({"operation_id": failed.operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(reply["state"], "failed");
+        assert!(stage_weights(root.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn model_preparation_startup_removes_an_old_or_no_longer_offered_kept_stage() {
+        for case in ["recent", "seven_days_old", "not_offered"] {
+            let (root, record, _registry, _) = kept_stage_fixture().await;
+            match case {
+                "seven_days_old" => {
+                    let inventory = Inventory::open(root.path(), false).unwrap();
+                    let mut state = inventory.load().unwrap();
+                    state.kept_stage.as_mut().unwrap().kept_at -= KEPT_STAGE_SECONDS;
+                    inventory.save(&state).unwrap();
+                }
+                "not_offered" => {
+                    let (mut next, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+                    next["entries"][0]["cid"] = serde_json::json!(
+                        "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"
+                    );
+                    write_preparation_catalog(root.path(), &next);
+                }
+                _ => {}
+            }
+            let registry = elastos_runtime::provider::ProviderRegistry::new();
+            let mut config = crate::api::model_provider_bridge_config(root.path()).unwrap();
+            drop(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut config)
+                    .await
+                    .unwrap(),
+            );
+            let kept = case == "recent";
+            assert_eq!(
+                root.path().join("model-preparation/stage").exists(),
+                kept,
+                "{case}"
+            );
+            assert_eq!(
+                kept_stage_owner(root.path()),
+                kept.then(|| record.operation_id.clone()),
+                "{case}"
+            );
+        }
     }
 
     fn assert_deadline_unchanged(before: &PreparationRecord, after: &PreparationRecord) {
@@ -8855,7 +11584,12 @@ server.serve_forever()
         assert_eq!(terminal.state, PreparationState::Expired);
         assert_eq!(terminal.reserved_bytes, 0);
         assert_deadline_unchanged(&record, &terminal);
-        assert!(!root.path().join("model-preparation/stage").exists());
+        // The interrupted stage stays for the next Use, which re-hashes it.
+        assert!(root.path().join("model-preparation/stage").exists());
+        assert_eq!(
+            kept_stage_owner(root.path()),
+            Some(record.operation_id.clone())
+        );
         assert!(Inventory::open(root.path(), false)
             .unwrap()
             .admitted(&record.operation_id)
@@ -8970,9 +11704,9 @@ server.serve_forever()
     #[tokio::test]
     async fn model_preparation_cancel_expired_complete_stage_does_not_admit() {
         let (root, record, backend, registry) = staged_fixture(1, false).await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("cancel")),
@@ -8999,12 +11733,12 @@ server.serve_forever()
     #[tokio::test]
     async fn model_preparation_restart_reconciles_expired_rename_after_exact_hash() {
         let (root, record, backend, registry) = staged_fixture(1, true).await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let input = serde_json::json!({"operation_id":record.operation_id});
         let wrong_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
         *backend.cid.lock().unwrap() = wrong_cid.into();
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("status")),
@@ -9021,7 +11755,7 @@ server.serve_forever()
         // A later cancel cannot erase the already-renamed artifact; it settles
         // the exact prior effect after current authority and bytes are verified.
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&context(), &method("cancel")),
@@ -9047,7 +11781,7 @@ server.serve_forever()
         cid: &str,
         keep: bool,
     ) -> anyhow::Result<serde_json::Value> {
-        PreparationOwner::default().invoke(
+        test_owner().invoke_fixture(
             root,
             None,
             caller(principal, &method("retention")),
@@ -9062,9 +11796,9 @@ server.serve_forever()
         record: &PreparationRecord,
         registry: Arc<elastos_runtime::provider::ProviderRegistry>,
     ) {
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root,
                 Some(registry),
                 caller(&context(), &method("status")),
@@ -9124,7 +11858,7 @@ server.serve_forever()
         assert_eq!(projection["admitted"], false);
         assert_eq!(projection["dispatch_ready"], false);
         assert!(projection["offer_id"].is_null());
-        settle_failure(root.path(), &record.operation_id, false).unwrap();
+        settle_failure(root.path(), &record.operation_id, false, false).unwrap();
         assert_eq!(
             load_operation(root.path(), &record.operation_id)
                 .unwrap()
@@ -9173,15 +11907,31 @@ server.serve_forever()
             current_entry(root.path(), &admitted).is_err(),
             "the original admission stays bound to the previous head"
         );
+        let stale =
+            model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
+                .await;
+        assert_eq!(
+            (
+                &stale["admitted"],
+                &stale["dispatch_ready"],
+                &stale["dispatch_unavailable_reason"]
+            ),
+            (
+                &serde_json::json!(true),
+                &serde_json::json!(false),
+                &serde_json::json!("catalog_updated")
+            ),
+            "an admission bound to the previous head asks for one Use"
+        );
         assert_eq!(
             load_operation(root.path(), &record.operation_id).unwrap(),
             admitted
         );
         assert_eq!(backend.calls.lock().unwrap().len(), baseline_calls);
 
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let reply = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -9232,6 +11982,62 @@ server.serve_forever()
             model_runtime_projection(root.path(), None, &context(), &record.package_cid, None)
                 .await;
         assert_eq!(projection["admitted"], true);
+        let rebound = model_runtime_projection(
+            root.path(),
+            None,
+            &context(),
+            &record.package_cid,
+            Some(&alias.operation_id),
+        )
+        .await;
+        assert_eq!(rebound["admitted"], true);
+        assert_ne!(rebound["dispatch_unavailable_reason"], "catalog_updated");
+    }
+
+    #[tokio::test]
+    async fn catalog_updated_reason_requires_the_current_trusted_offer_and_grant() {
+        let (root, record, _backend, registry) = staged_fixture(now().unwrap(), true).await;
+        finish_retention_fixture(root.path(), &record, registry).await;
+        let (data_dir, cid) = (root.path(), record.package_cid.as_str());
+        let reason = || async move {
+            let projection = model_runtime_projection(data_dir, None, &context(), cid, None).await;
+            assert_eq!(projection["admitted"], true);
+            assert_eq!(projection["dispatch_ready"], false);
+            projection["dispatch_unavailable_reason"].clone()
+        };
+
+        // A new head that no longer offers this package is not a list update.
+        let (mut removed, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        removed.as_object_mut().unwrap().remove("expires_at");
+        let next_cid = "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm";
+        assert_ne!(next_cid, record.package_cid);
+        removed["entries"][0]["cid"] = serde_json::json!(next_cid);
+        write_preparation_catalog(root.path(), &removed);
+        assert!(reason().await.is_null());
+
+        // Still offered under a new head, but local use is revoked.
+        let (mut offered, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+        offered.as_object_mut().unwrap().remove("expires_at");
+        write_preparation_catalog(root.path(), &offered);
+        change_config(root.path(), |config| {
+            config["model_catalog"]
+                .as_object_mut()
+                .unwrap()
+                .remove("local_use");
+        });
+        assert!(reason().await.is_null());
+
+        // Offered and granted, but the catalogue bytes no longer match the pin.
+        write_preparation_catalog(root.path(), &offered);
+        let catalog = root.path().join(super::super::MODEL_CATALOG_FILE);
+        let mut bytes = std::fs::read(&catalog).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&catalog, bytes).unwrap();
+        assert!(reason().await.is_null());
+
+        // Offered and granted under the new head: one Use rebinds it.
+        write_preparation_catalog(root.path(), &offered);
+        assert_eq!(reason().await, "catalog_updated");
     }
 
     #[tokio::test]
@@ -9284,6 +12090,7 @@ server.serve_forever()
             None,
         )
         .await;
+        silent.publish(&cid);
         let holder_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let holder = carrier_fixture::start_content_holder_runtime(
             92,
@@ -9291,6 +12098,7 @@ server.serve_forever()
             holder_requests.clone(),
         )
         .await;
+        holder.publish(&cid);
         consumer
             .memory_lookup
             .add_endpoint_info(holder.addr.clone());
@@ -9322,10 +12130,10 @@ server.serve_forever()
             &[(silent.ticket.clone(), [91u8; 32], silent.did.clone(), now)],
         )
         .await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let started = std::time::Instant::now();
         let reply = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -9347,7 +12155,7 @@ server.serve_forever()
             "the read is waiting on the connected silent holder"
         );
         let cancelled = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("cancel")),
@@ -9385,10 +12193,10 @@ server.serve_forever()
             ],
         )
         .await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         let started = std::time::Instant::now();
         let reply = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("use")),
@@ -9418,6 +12226,1244 @@ server.serve_forever()
         carrier_fixture::shutdown_test_carrier_node(silent.node).await;
         carrier_fixture::shutdown_test_carrier_node(holder.node).await;
         carrier_fixture::shutdown_test_carrier_node(consumer).await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_reads_remaining_parts_from_holders_after_one_local_miss() {
+        use crate::carrier::tests as carrier_fixture;
+        let root = tempfile::tempdir().unwrap();
+        // Four 64 KiB weight parts plus the index and four small files.
+        let mut weights = b"GGUF\x03\0\0\0".to_vec();
+        weights.resize(3 * 65536 + 5, 7);
+        let (payload, files) = package_fixture(weights);
+        write_preparation_catalog(root.path(), &payload);
+        let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+        let backend = Arc::new(PreparationBackend::new(files.clone(), cid.clone()));
+        backend.missing_cache.store(true, Ordering::Release);
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        registry
+            .register_sub_provider("ipfs", backend.clone())
+            .await
+            .unwrap();
+        register_content(&registry, root.path()).await;
+        let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[93u8; 32]);
+        let consumer = crate::carrier::start_isolated_carrier_node_with_registry(
+            &consumer_sk,
+            &consumer_did,
+            root.path().join("carrier"),
+            Some(Arc::downgrade(&registry)),
+        )
+        .await
+        .unwrap();
+        registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    consumer.endpoint.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        registry
+            .register(Arc::new(
+                crate::carrier::CarrierAvailabilityProvider::with_provider_registry(
+                    consumer.gossip_state.clone(),
+                    Arc::downgrade(&registry),
+                ),
+            ))
+            .await;
+        let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let holder =
+            carrier_fixture::start_content_holder_runtime(94, files.clone(), served.clone()).await;
+        holder.publish(&cid);
+        consumer
+            .memory_lookup
+            .add_endpoint_info(holder.addr.clone());
+        carrier_fixture::seed_content_availability_announcements(
+            &consumer,
+            &cid,
+            &[(
+                holder.ticket.clone(),
+                [94u8; 32],
+                holder.did.clone(),
+                now().unwrap(),
+            )],
+        )
+        .await;
+
+        let owner = test_owner();
+        let reply = owner
+            .invoke_fixture(
+                root.path(),
+                Some(registry.clone()),
+                caller(&context(), &method("use")),
+                "one-local-miss",
+                &serde_json::json!({"cid": cid}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("preparation settles")
+            .unwrap();
+        let record = load_operation(root.path(), reply["operation_id"].as_str().unwrap()).unwrap();
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        let local_reads = backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.as_str() == "cat")
+            .count();
+        assert_eq!(
+            local_reads, 1,
+            "only the first part tries the local backend"
+        );
+        let served = served.lock().unwrap().clone();
+        assert_eq!(
+            served.len(),
+            9,
+            "every part, the index included, came from the holder"
+        );
+        assert!(served.iter().all(|request| request["bounded_read"] == true));
+        carrier_fixture::shutdown_test_carrier_node(holder.node).await;
+        carrier_fixture::shutdown_test_carrier_node(consumer).await;
+    }
+
+    /// A consumer whose own cache is empty and one holder that answers every
+    /// bounded read after `delay`, so each part costs one simulated round trip.
+    struct SlowHolderPreparation {
+        root: tempfile::TempDir,
+        registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+        cid: String,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        served: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        /// The consumer's and the holder's Carrier nodes; none in process.
+        carrier: Option<(
+            crate::carrier::CarrierNode,
+            crate::carrier::tests::HolderRuntime,
+        )>,
+    }
+
+    /// A holder reached through availability in process, so a test can pause
+    /// time: reads of the weights part at `fail_at` fail in transit (the code
+    /// Carrier reports for a late or lost answer) `failures` times, then it
+    /// serves; the first read of the weights part at `refuse_at` is refused.
+    /// Requests are recorded in the shape the Carrier holder sees.
+    struct TransitHolder {
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        served: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        fail_at: u64,
+        failures: std::sync::atomic::AtomicUsize,
+        refuse_at: std::sync::Mutex<Option<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for TransitHolder {
+        fn name(&self) -> &'static str {
+            "transit-holder-fixture"
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["availability"]
+        }
+        async fn handle(
+            &self,
+            _: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            panic!("preparation reads availability through send_raw")
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+            use base64::Engine as _;
+            let mut seen = request.clone();
+            seen["_runtime_invocation"] = serde_json::json!({"range": request["range"]});
+            self.served.lock().unwrap().push(seen);
+            let file = &self.files[request["path"].as_str().unwrap()];
+            let range = &request["range"];
+            if request["path"] == "weights.gguf"
+                && range["start"].as_u64().is_some_and(|start| {
+                    let mut refuse_at = self.refuse_at.lock().unwrap();
+                    refuse_at.take_if(|at| *at == start).is_some()
+                })
+            {
+                return Ok(serde_json::json!({"status":"error",
+                    "code":"carrier_fetch_failed", "message":"fixture holder refused"}));
+            }
+            if request["path"] == "weights.gguf"
+                && range["start"] == self.fail_at
+                && self
+                    .failures
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Ok(serde_json::json!({"status":"error",
+                    "code":crate::carrier::CARRIER_FETCH_IN_TRANSIT_CODE,
+                    "message":"fixture holder answer deadline passed"}));
+            }
+            let bytes = match (range["start"].as_u64(), range["end"].as_u64()) {
+                (Some(start), Some(end)) => &file[start as usize..=end as usize],
+                _ => &file[..],
+            };
+            Ok(serde_json::json!({"status":"ok",
+                "data":{"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}))
+        }
+    }
+
+    impl SlowHolderPreparation {
+        async fn start(
+            seed: u8,
+            behavior: crate::carrier::tests::HolderBehavior,
+            serve: impl FnOnce(&mut std::collections::BTreeMap<String, Vec<u8>>),
+        ) -> Self {
+            Self::start_with_capacity_refusal(seed, behavior, None, serve).await
+        }
+
+        /// As `start`; the consumer's backend refuses its `nth` capacity check.
+        async fn start_with_capacity_refusal(
+            seed: u8,
+            behavior: crate::carrier::tests::HolderBehavior,
+            fail_capacity_at: Option<usize>,
+            serve: impl FnOnce(&mut std::collections::BTreeMap<String, Vec<u8>>),
+        ) -> Self {
+            use crate::carrier::tests as carrier_fixture;
+            let (root, cid, files, registry) = Self::consumer(fail_capacity_at).await;
+            let (consumer_sk, consumer_did) = elastos_identity::derive_did(&[seed; 32]);
+            let consumer = crate::carrier::start_isolated_carrier_node_with_registry(
+                &consumer_sk,
+                &consumer_did,
+                root.path().join("carrier"),
+                Some(Arc::downgrade(&registry)),
+            )
+            .await
+            .unwrap();
+            registry
+                .set_carrier_invoker(Arc::new(
+                    crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                        consumer.endpoint.clone(),
+                        Arc::downgrade(&registry),
+                    ),
+                ))
+                .await;
+            // The only holder is announced up front; after it fails a read, wait
+            // 1 s (not the product's 30 s) for another before reporting failure.
+            registry
+                .register(Arc::new(
+                    crate::carrier::CarrierAvailabilityProvider::with_provider_registry(
+                        consumer.gossip_state.clone(),
+                        Arc::downgrade(&registry),
+                    )
+                    .with_discovery_wait(std::time::Duration::from_secs(1)),
+                ))
+                .await;
+            let mut served_files = files.clone();
+            serve(&mut served_files);
+            let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let holder_seed = seed + 1;
+            let holder = carrier_fixture::start_slow_content_holder_runtime(
+                holder_seed,
+                served_files,
+                served.clone(),
+                behavior,
+            )
+            .await;
+            holder.publish(&cid);
+            consumer
+                .memory_lookup
+                .add_endpoint_info(holder.addr.clone());
+            carrier_fixture::seed_content_availability_announcements(
+                &consumer,
+                &cid,
+                &[(
+                    holder.ticket.clone(),
+                    [holder_seed; 32],
+                    holder.did.clone(),
+                    now().unwrap(),
+                )],
+            )
+            .await;
+            Self {
+                root,
+                registry,
+                cid,
+                files,
+                served,
+                carrier: Some((consumer, holder)),
+            }
+        }
+
+        /// The package and a consumer whose own cache is empty; its backend
+        /// refuses its `nth` capacity check.
+        async fn consumer(
+            fail_capacity_at: Option<usize>,
+        ) -> (
+            tempfile::TempDir,
+            String,
+            std::collections::BTreeMap<String, Vec<u8>>,
+            Arc<elastos_runtime::provider::ProviderRegistry>,
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            // 44 weight parts of 64 KiB (the last one short) and four one-part
+            // files: 48 parts, six full windows.
+            let mut weights = b"GGUF\x03\0\0\0".to_vec();
+            weights.extend(
+                (0..43 * 65536 + 100u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8),
+            );
+            let (payload, files) = package_fixture(weights);
+            write_preparation_catalog(root.path(), &payload);
+            let cid = payload["entries"][0]["cid"].as_str().unwrap().to_owned();
+            let mut backend = PreparationBackend::new(files.clone(), cid.clone());
+            backend.fail_capacity_at = fail_capacity_at;
+            let backend = Arc::new(backend);
+            backend.missing_cache.store(true, Ordering::Release);
+            let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+            registry
+                .register_sub_provider("ipfs", backend)
+                .await
+                .unwrap();
+            register_content(&registry, root.path()).await;
+            (root, cid, files, registry)
+        }
+
+        /// As `start` with a `TransitHolder` failing reads of weight part
+        /// `part` in transit `failures` times.
+        async fn in_process(part: u64, failures: usize) -> Self {
+            Self::in_process_refusing(part, failures, None).await
+        }
+
+        /// As `in_process`; the holder refuses the first read of weight part
+        /// `refused`.
+        async fn in_process_refusing(part: u64, failures: usize, refused: Option<u64>) -> Self {
+            let (root, cid, files, registry) = Self::consumer(None).await;
+            let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+            registry
+                .register(Arc::new(TransitHolder {
+                    files: files.clone(),
+                    served: served.clone(),
+                    fail_at: part * 65536,
+                    failures: failures.into(),
+                    refuse_at: refused.map(|part| part * 65536).into(),
+                }))
+                .await;
+            Self {
+                root,
+                registry,
+                cid,
+                files,
+                served,
+                carrier: None,
+            }
+        }
+
+        fn invoke_fixture(
+            &self,
+            owner: &PreparationOwner,
+            method_name: &str,
+            key: &str,
+            input: serde_json::Value,
+        ) -> serde_json::Value {
+            owner
+                .invoke_fixture(
+                    self.root.path(),
+                    Some(self.registry.clone()),
+                    caller(&context(), &method(method_name)),
+                    key,
+                    &input,
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap()
+        }
+
+        /// Run one preparation to settlement; returns its record and wall time.
+        async fn prepare(&self, key: &str) -> (PreparationRecord, std::time::Duration) {
+            let owner = test_owner();
+            let started = std::time::Instant::now();
+            let reply =
+                self.invoke_fixture(&owner, "use", key, serde_json::json!({"cid": self.cid}));
+            let task = owner.worker.lock().unwrap().take().unwrap();
+            // Six attempts and their automatic resume waits fit in ten minutes.
+            tokio::time::timeout(std::time::Duration::from_secs(600), task)
+                .await
+                .expect("preparation settles")
+                .unwrap();
+            let elapsed = started.elapsed();
+            let id = reply["operation_id"].as_str().unwrap();
+            (load_operation(self.root.path(), id).unwrap(), elapsed)
+        }
+
+        fn part_reads(&self) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.get("max_bytes").is_none())
+                .count()
+        }
+
+        /// Holder reads of the weights part that starts at `offset`.
+        fn reads_at(&self, offset: u64) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request["path"] == "weights.gguf"
+                        && request["_runtime_invocation"]["range"]["start"] == offset
+                })
+                .count()
+        }
+
+        async fn shutdown(self) {
+            use crate::carrier::tests as carrier_fixture;
+            if let Some((consumer, holder)) = self.carrier {
+                carrier_fixture::shutdown_test_carrier_node(holder.node).await;
+                carrier_fixture::shutdown_test_carrier_node(consumer).await;
+            }
+        }
+    }
+
+    /// Admit the package from a holder answering each read after ~one
+    /// public-seed round trip (~0.24 s measured on Linux); returns the
+    /// transfer speedup over reading one part at a time.
+    async fn slow_holder_transfer_speedup(seed: u8, serialized: bool) -> f64 {
+        let delay = std::time::Duration::from_millis(250);
+        let behavior = crate::carrier::tests::HolderBehavior {
+            delay,
+            serialized,
+            ..Default::default()
+        };
+        let fixture = SlowHolderPreparation::start(seed, behavior, |_| {}).await;
+        let (record, elapsed) = fixture.prepare("slow-holder").await;
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        assert_eq!(record.completed_bytes, record.total_bytes);
+        // Admitted bytes are exactly the signed package, every part read once.
+        let expected_parts: usize = fixture
+            .files
+            .iter()
+            .filter(|(path, _)| path.as_str() != crate::content::CONTENT_OBJECT_MANIFEST_PATH)
+            .map(|(_, bytes)| bytes.len().div_ceil(65536))
+            .sum();
+        assert_eq!(fixture.part_reads(), expected_parts);
+        for (path, bytes) in &fixture.files {
+            let admitted = fixture.root.path().join(format!(
+                "model-preparation/admitted-{}/{path}",
+                record.admission_id
+            ));
+            assert_eq!(&std::fs::read(&admitted).unwrap(), bytes, "{path}");
+        }
+        // One part at a time pays the holder delay once per part. The transfer
+        // span runs from the first part served to the last part answered.
+        let served: Vec<u64> = fixture
+            .served
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.get("max_bytes").is_none())
+            .map(|request| request["_fixture_served_at_ms"].as_u64().unwrap())
+            .collect();
+        let span = std::time::Duration::from_millis(
+            served.iter().max().unwrap() - served.iter().min().unwrap(),
+        ) + delay;
+        let serial = delay * expected_parts as u32;
+        let speedup = serial.as_secs_f64() / span.as_secs_f64();
+        eprintln!(
+            "preparation (serialized holder: {serialized}): {expected_parts} parts at {delay:?} each; serial transfer floor {serial:?}, measured transfer {span:?} ({speedup:.1}x), whole preparation {elapsed:?}"
+        );
+        fixture.shutdown().await;
+        speedup
+    }
+
+    #[tokio::test]
+    async fn model_preparation_keeps_parts_in_flight_against_a_slow_holder() {
+        let speedup = slow_holder_transfer_speedup(95, false).await;
+        // ~6.4x alone; the full suite's CPU load slows the per-part checks.
+        assert!(
+            speedup > 3.0,
+            "{MODEL_PARTS_IN_FLIGHT} parts in flight cut transfer time: {speedup:.1}x"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_preparation_parts_in_flight_cost_nothing_against_a_serializing_holder() {
+        let speedup = slow_holder_transfer_speedup(101, true).await;
+        assert!(
+            speedup > 0.8,
+            "a holder that answers one read at a time is not slowed: {speedup:.1}x"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_preparation_rejects_a_corrupted_part_read_in_parallel() {
+        let fixture = SlowHolderPreparation::start(
+            97,
+            crate::carrier::tests::HolderBehavior {
+                delay: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+            |files| files.get_mut("weights.gguf").unwrap()[5 * 65536 + 17] ^= 0xff,
+        )
+        .await;
+        let (record, _) = fixture.prepare("corrupt-part").await;
+        assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+        assert_eq!(
+            record.failure_phase,
+            Some(PreparationFailurePhase::WeightsIntegrity)
+        );
+        assert_eq!(record.reserved_bytes, 0);
+        assert!(!fixture
+            .root
+            .path()
+            .join(format!(
+                "model-preparation/admitted-{}",
+                record.admission_id
+            ))
+            .exists());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_with_parts_in_flight_admits_nothing() {
+        let fixture = SlowHolderPreparation::start(
+            99,
+            crate::carrier::tests::HolderBehavior {
+                delay: std::time::Duration::from_millis(100),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let owner = test_owner();
+        let reply = fixture.invoke_fixture(
+            &owner,
+            "use",
+            "cancel-mid",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        for _ in 0..200 {
+            if fixture.part_reads() >= 12 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(fixture.part_reads() >= 12, "download is under way");
+        let cancelled = fixture.invoke_fixture(
+            &owner,
+            "cancel",
+            "cancel-mid-request",
+            serde_json::json!({"operation_id": id}),
+        );
+        assert_eq!(cancelled["cancel_requested"], true);
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("cancellation settles")
+            .unwrap();
+        let record = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(record.state, PreparationState::Cancelled, "{record:?}");
+        assert!(record.completed_bytes < record.total_bytes);
+        assert_eq!(record.reserved_bytes, 0);
+        let prepared = fixture.root.path().join("model-preparation");
+        assert!(!prepared.join("stage").exists());
+        assert!(!prepared.join(format!("admitted-{id}")).exists());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_repeats_a_part_read_that_stalls_once() {
+        // Two weight parts each stall once past the 5 s holder answer budget.
+        let stalled = [3 * 65536, 20 * 65536];
+        let fixture = SlowHolderPreparation::start(
+            103,
+            crate::carrier::tests::HolderBehavior {
+                stall_once: stalled.into(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let (record, elapsed) = fixture.prepare("stall-once").await;
+        assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+        assert_eq!(record.completed_bytes, record.total_bytes);
+        for offset in stalled {
+            assert_eq!(fixture.reads_at(offset), 2, "part {offset} read twice");
+        }
+        for (path, bytes) in &fixture.files {
+            let admitted = fixture.root.path().join(format!(
+                "model-preparation/admitted-{}/{path}",
+                record.admission_id
+            ));
+            assert_eq!(&std::fs::read(&admitted).unwrap(), bytes, "{path}");
+        }
+        eprintln!("preparation admitted after two stalled part reads in {elapsed:?}");
+        fixture.shutdown().await;
+    }
+
+    /// A part whose reads keep failing in transit stops each attempt after
+    /// four reads; the Get resumes by itself five times, then reports an
+    /// interrupted download that keeps its stage for Retry instead of
+    /// "content could not be read".
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_reports_an_interrupted_download_after_six_failed_attempts() {
+        let failing = 7 * 65536;
+        let fixture = SlowHolderPreparation::in_process(7, usize::MAX).await;
+        let (record, _) = fixture.prepare("lost-in-transit").await;
+        assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+        assert_eq!(record.projection()["failure_class"], "download_interrupted");
+        assert_eq!(
+            fixture.reads_at(failing),
+            (1 + MODEL_GET_RESUME_WAITS.len()) * (1 + MODEL_PART_RETRY_BACKOFF.len())
+        );
+        assert_eq!(
+            fixture.index_reads(),
+            1,
+            "every resume reuses the kept index"
+        );
+        assert_eq!(fixture.kept_stage(), Some(record.operation_id.clone()));
+        assert_eq!(record.reserved_bytes, 0);
+        assert!(!fixture
+            .root
+            .path()
+            .join(format!(
+                "model-preparation/admitted-{}",
+                record.admission_id
+            ))
+            .exists());
+        fixture.shutdown().await;
+    }
+
+    /// A refusal a later part in the window already met is never read again
+    /// by an automatic resume, even when an earlier part failed in transit.
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_does_not_resume_past_a_refusal_already_met() {
+        let attempt = 1 + MODEL_PART_RETRY_BACKOFF.len();
+        let fixture = SlowHolderPreparation::in_process_refusing(20, attempt, Some(21)).await;
+        let (record, _) = fixture.prepare("refused-behind-transit").await;
+        assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+        assert_eq!(
+            record.failure_phase,
+            Some(PreparationFailurePhase::WeightsRead)
+        );
+        assert_eq!(fixture.reads_at(20 * 65536), attempt);
+        assert_eq!(
+            fixture.reads_at(21 * 65536),
+            1,
+            "the refused part is not read again"
+        );
+        assert_eq!(fixture.kept_stage(), Some(record.operation_id.clone()));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_during_read_backoff_ends_cancelled() {
+        let failing = 2 * 65536;
+        let fixture = SlowHolderPreparation::start(
+            107,
+            crate::carrier::tests::HolderBehavior {
+                stall_always: [failing].into(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let owner = test_owner();
+        let reply = fixture.invoke_fixture(
+            &owner,
+            "use",
+            "cancel-backoff",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        for _ in 0..2000 {
+            if fixture.reads_at(failing) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(fixture.reads_at(failing), 2, "second read was sent");
+        // The second read misses its 5 s answer deadline; the part then waits
+        // out its 1 s backoff before a third read. Cancel inside it.
+        tokio::time::sleep(std::time::Duration::from_millis(5400)).await;
+        let cancelled = fixture.invoke_fixture(
+            &owner,
+            "cancel",
+            "cancel-backoff-request",
+            serde_json::json!({"operation_id": id}),
+        );
+        assert_eq!(cancelled["cancel_requested"], true);
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("cancellation settles")
+            .unwrap();
+        let record = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(record.state, PreparationState::Cancelled, "{record:?}");
+        assert_eq!(fixture.reads_at(failing), 2, "no read after cancel");
+        assert_eq!(record.reserved_bytes, 0);
+        let prepared = fixture.root.path().join("model-preparation");
+        assert!(!prepared.join("stage").exists());
+        assert!(!prepared.join(format!("admitted-{id}")).exists());
+        fixture.shutdown().await;
+    }
+
+    /// Alpha.17 on a Mac: a progress save holding the inventory lock past the
+    /// cancel check's 1 s wait stopped the Get as unreadable content. A busy
+    /// lock only moves the check to the next poll; Cancel still ends the read.
+    #[tokio::test]
+    async fn model_preparation_cancel_check_waits_out_a_busy_inventory_lock() {
+        let (root, record, _, _) = staged_fixture(now().unwrap(), false).await;
+        let id = record.operation_id.as_str();
+        let held = Inventory::open(root.path(), false).unwrap();
+        let read = unless_cancelled(root.path(), id, async {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            anyhow::Ok(7)
+        });
+        assert_eq!(read.await.unwrap(), 7, "the read outlives a busy lock");
+        drop(held);
+        update_operation(root.path(), id, |record| record.cancel_requested = true).unwrap();
+        let pending = std::future::pending::<anyhow::Result<()>>();
+        let cancelled = unless_cancelled(root.path(), id, pending).await;
+        assert!(cancelled.unwrap_err().is::<PreparationStopped>());
+    }
+
+    /// A part read the holder refuses or answers badly is read once and stops
+    /// the preparation: only failures in transit are repeated. The answer was
+    /// refused before it was written, so it says nothing against the parts
+    /// already on disk: they stay for the next Use.
+    #[tokio::test]
+    async fn model_preparation_never_repeats_a_refused_or_malformed_part_read() {
+        let failing = 4 * 65536;
+        for (seed, refused) in [(109, true), (111, false)] {
+            let fixture = SlowHolderPreparation::start(
+                seed,
+                crate::carrier::tests::HolderBehavior {
+                    refuse_always: if refused { [failing].into() } else { [].into() },
+                    oversize: if refused { [].into() } else { [failing].into() },
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await;
+            let (record, _) = fixture.prepare("bad-answer").await;
+            assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+            assert_eq!(
+                record.failure_phase,
+                Some(PreparationFailurePhase::WeightsRead)
+            );
+            assert_eq!(fixture.reads_at(failing), 1, "refused={refused}");
+            assert_eq!(
+                std::fs::metadata(fixture.stage().join("weights.gguf"))
+                    .unwrap()
+                    .len(),
+                failing,
+                "refused={refused}"
+            );
+            assert_eq!(fixture.kept_stage(), Some(record.operation_id.clone()));
+            fixture.shutdown().await;
+        }
+    }
+
+    /// Alpha.14 on a Jetson: a holder read that was refused (not lost in
+    /// transit) at 78.7% sent the next Retry back to 0%. The Retry continues
+    /// from the last whole part on disk instead.
+    #[tokio::test]
+    async fn model_preparation_resumes_after_a_refused_part_read() {
+        let failing = 20 * 65536;
+        let fixture = SlowHolderPreparation::start(
+            125,
+            crate::carrier::tests::HolderBehavior {
+                refuse_once: [failing].into(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let (failed, _) = fixture.prepare("refused-use").await;
+        assert_eq!(failed.state, PreparationState::Failed, "{failed:?}");
+        assert_eq!(
+            failed.failure_phase,
+            Some(PreparationFailurePhase::WeightsRead)
+        );
+        assert_eq!(fixture.kept_stage(), Some(failed.operation_id.clone()));
+        let (parts, index) = (fixture.part_reads(), fixture.index_reads());
+        let (record, _) = fixture.prepare("retry").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(
+            fixture.part_reads() - parts,
+            fixture.parts_after(failing),
+            "the Retry reads only the parts not yet on disk"
+        );
+        assert_eq!(fixture.index_reads(), index, "the kept index is reused");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_repeat_is_not_sent_after_another_part_lost_capacity() {
+        // Part 10 stalls once. While it waits, part 15 (the first past 1 MiB)
+        // runs the backend capacity check, which is refused; part 10's repeat
+        // must then stop instead of reading again.
+        let stalled = 10 * 65536;
+        let fixture = SlowHolderPreparation::start_with_capacity_refusal(
+            113,
+            crate::carrier::tests::HolderBehavior {
+                stall_once: [stalled].into(),
+                ..Default::default()
+            },
+            Some(2),
+            |_| {},
+        )
+        .await;
+        let (record, _) = fixture.prepare("capacity-during-backoff").await;
+        assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+        assert_eq!(
+            record.failure_phase,
+            Some(PreparationFailurePhase::StorageService)
+        );
+        assert_eq!(fixture.reads_at(stalled), 1, "no repeat after the refusal");
+        fixture.shutdown().await;
+    }
+
+    impl SlowHolderPreparation {
+        fn stage(&self) -> std::path::PathBuf {
+            self.root.path().join("model-preparation/stage")
+        }
+
+        fn kept_stage(&self) -> Option<String> {
+            kept_stage_owner(self.root.path())
+        }
+
+        fn index_reads(&self) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.get("max_bytes").is_some())
+                .count()
+        }
+
+        /// Part reads still needed when the weights hold `weights_kept`
+        /// bytes and every file before them is complete.
+        fn parts_after(&self, weights_kept: u64) -> usize {
+            let closure = crate::content::parse_content_object_manifest(
+                &self.cid,
+                &self.files["_elastos_object.json"],
+            )
+            .unwrap();
+            let weights = closure
+                .files
+                .iter()
+                .position(|file| file.path == "weights.gguf")
+                .unwrap();
+            closure.files[weights..]
+                .iter()
+                .map(|file| {
+                    let kept = if file.path == "weights.gguf" {
+                        weights_kept
+                    } else {
+                        0
+                    };
+                    (file.size - kept).div_ceil(65536) as usize
+                })
+                .sum()
+        }
+
+        fn all_parts(&self) -> usize {
+            self.files
+                .iter()
+                .filter(|(path, _)| path.as_str() != "_elastos_object.json")
+                .map(|(_, bytes)| bytes.len().div_ceil(65536))
+                .sum()
+        }
+
+        fn assert_admitted(&self, record: &PreparationRecord) {
+            assert_eq!(record.state, PreparationState::Admitted, "{record:?}");
+            assert_eq!(record.completed_bytes, record.total_bytes);
+            for (path, bytes) in &self.files {
+                let admitted = self.root.path().join(format!(
+                    "model-preparation/admitted-{}/{path}",
+                    record.admission_id
+                ));
+                assert_eq!(&std::fs::read(&admitted).unwrap(), bytes, "{path}");
+            }
+            assert!(!self.stage().exists());
+            assert_eq!(self.kept_stage(), None);
+        }
+
+        /// A first Use that stopped at weight part 20 because its reads kept
+        /// failing in transit through every automatic resume, and kept its
+        /// stage; the holder answers every later read.
+        async fn failed_halfway() -> Self {
+            let attempts = 1 + MODEL_GET_RESUME_WAITS.len();
+            let fixture =
+                Self::in_process(20, attempts * (1 + MODEL_PART_RETRY_BACKOFF.len())).await;
+            let (failed, _) = fixture.prepare("first-use").await;
+            assert_eq!(failed.state, PreparationState::Failed, "{failed:?}");
+            assert_eq!(
+                failed.failure_phase,
+                Some(PreparationFailurePhase::Interrupted)
+            );
+            assert_eq!(failed.reserved_bytes, 0);
+            assert_eq!(
+                std::fs::metadata(fixture.stage().join("weights.gguf"))
+                    .unwrap()
+                    .len(),
+                20 * 65536
+            );
+            assert_eq!(fixture.kept_stage(), Some(failed.operation_id.clone()));
+            fixture
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_resumes_after_a_read_failure_with_only_remaining_parts() {
+        let fixture = SlowHolderPreparation::failed_halfway().await;
+        let (parts, index) = (fixture.part_reads(), fixture.index_reads());
+        let (record, _) = fixture.prepare("next-use").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(
+            fixture.part_reads() - parts,
+            fixture.parts_after(20 * 65536),
+            "only the parts not yet on disk are read"
+        );
+        assert_eq!(fixture.index_reads(), index, "the kept index is reused");
+        for part in 0..20 {
+            assert_eq!(fixture.reads_at(part * 65536), 1, "part {part} read once");
+        }
+        fixture.shutdown().await;
+    }
+
+    /// Alpha.17 on a Mac: the Qwen Get stopped twice at 64-67 MB with
+    /// "Model content could not be read" and Retry then finished it. The Get
+    /// now resumes by itself from the saved bytes, with its progress never
+    /// below them and no failure shown, within the same operation.
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_get_resumes_by_itself_after_reads_keep_failing_in_transit() {
+        // Weight part 20 fails in transit nine times: two whole attempts and
+        // the first read of a third, which then completes the Get.
+        let fixture = SlowHolderPreparation::in_process(20, 9).await;
+        let owner = test_owner();
+        let reply = fixture.invoke_fixture(
+            &owner,
+            "use",
+            "auto-resume",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        let saved = std::cell::Cell::new(0);
+        let sample = || {
+            let record = load_operation(fixture.root.path(), &id).unwrap();
+            assert!(
+                record.completed_bytes >= saved.get(),
+                "progress went back: {record:?}"
+            );
+            saved.set(record.completed_bytes);
+            record
+        };
+        while !task.is_finished() {
+            let record = sample();
+            if record.state != PreparationState::Admitted {
+                assert_eq!(record.failure_phase, None, "{record:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.await.unwrap();
+        let record = sample();
+        assert_eq!(fixture.reads_at(20 * 65536), 10);
+        fixture.assert_admitted(&record);
+        // Activation needs an engine this fixture lacks; the Get itself
+        // recorded no failure.
+        assert!(
+            !record
+                .failure_phase
+                .is_some_and(PreparationFailurePhase::keeps_stage),
+            "{record:?}"
+        );
+        assert_eq!(
+            fixture.index_reads(),
+            1,
+            "every resume reuses the kept index"
+        );
+        for part in 0..20 {
+            assert_eq!(fixture.reads_at(part * 65536), 1, "part {part} read once");
+        }
+        fixture.shutdown().await;
+    }
+
+    /// Cancel and a stopping Home end an automatic resume wait at once:
+    /// Cancel discards the stage, a stopping Home keeps it for Retry.
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_cancel_or_home_stop_ends_a_resume_wait_at_once() {
+        for home_stops in [false, true] {
+            let fixture = SlowHolderPreparation::in_process(20, usize::MAX).await;
+            let owner = test_owner();
+            let reply = fixture.invoke_fixture(
+                &owner,
+                "use",
+                "resume-wait",
+                serde_json::json!({"cid": fixture.cid}),
+            );
+            let id = reply["operation_id"].as_str().unwrap().to_owned();
+            let finished = || {
+                owner
+                    .worker
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|task| task.is_finished())
+            };
+            // The second attempt stops after its fourth read; the Get then
+            // waits 15 s. Stop 5 s into that wait.
+            let reads = 2 * (1 + MODEL_PART_RETRY_BACKOFF.len());
+            while fixture.reads_at(20 * 65536) < reads {
+                assert!(!finished());
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            assert!(!finished());
+            let task = if home_stops {
+                let task = owner.worker.lock().unwrap().take().unwrap();
+                drop(owner);
+                task
+            } else {
+                let cancelled = fixture.invoke_fixture(
+                    &owner,
+                    "cancel",
+                    "resume-wait-cancel",
+                    serde_json::json!({"operation_id": id}),
+                );
+                assert_eq!(cancelled["cancel_requested"], true);
+                owner.worker.lock().unwrap().take().unwrap()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("the wait ends at once")
+                .unwrap();
+            let record = load_operation(fixture.root.path(), &id).unwrap();
+            assert_eq!(
+                fixture.reads_at(20 * 65536),
+                reads,
+                "no read after the stop"
+            );
+            assert_eq!(record.reserved_bytes, 0);
+            if home_stops {
+                assert_eq!(record.state, PreparationState::Failed, "{record:?}");
+                assert_eq!(record.projection()["failure_class"], "download_interrupted");
+                assert_eq!(fixture.kept_stage(), Some(id));
+            } else {
+                assert_eq!(record.state, PreparationState::Cancelled, "{record:?}");
+                assert!(!fixture.stage().exists());
+            }
+            fixture.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn model_preparation_resumes_after_a_restart_from_the_bytes_on_disk() {
+        let fixture = SlowHolderPreparation::start(
+            119,
+            crate::carrier::tests::HolderBehavior {
+                delay: std::time::Duration::from_millis(30),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let owner = test_owner();
+        let reply = fixture.invoke_fixture(
+            &owner,
+            "use",
+            "before-restart",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        let weights = fixture.stage().join("weights.gguf");
+        for _ in 0..1000 {
+            if std::fs::metadata(&weights).is_ok_and(|meta| meta.len() >= 8 * 65536) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Home stops abruptly: the worker never settles.
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let interrupted = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(interrupted.state, PreparationState::Preparing);
+        // The last parts the record counted never reached the disk, and a
+        // torn write left part of a part behind.
+        let on_disk = std::fs::metadata(&weights).unwrap().len();
+        assert!(on_disk >= 8 * 65536 && on_disk % 65536 == 0, "{on_disk}");
+        let resumed_at = on_disk - 2 * 65536;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&weights)
+            .unwrap()
+            .set_len(resumed_at + 1000)
+            .unwrap();
+        drop(owner);
+        let mut config = crate::api::model_provider_bridge_config(fixture.root.path()).unwrap();
+        drop(
+            append_admitted_model_startup_offers(
+                fixture.root.path(),
+                &fixture.registry,
+                &mut config,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            std::fs::metadata(&weights).unwrap().len(),
+            resumed_at + 1000
+        );
+        // After the restart, status reconciles: the stage stays for the next Use.
+        let owner = test_owner();
+        fixture.invoke_fixture(
+            &owner,
+            "status",
+            "after-restart",
+            serde_json::json!({"operation_id": id}),
+        );
+        join_worker(&owner).await;
+        let settled = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(settled.state, PreparationState::Failed, "{settled:?}");
+        assert_eq!(
+            settled.projection()["failure_class"],
+            "download_interrupted"
+        );
+        assert_eq!(fixture.kept_stage(), Some(id));
+        let parts = fixture.part_reads();
+        let (record, _) = fixture.prepare("after-restart-use").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(
+            fixture.part_reads() - parts,
+            fixture.parts_after(resumed_at),
+            "reads resume at the last whole part on disk"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn model_preparation_resumes_after_home_owner_stops_and_startup_keeps_stage() {
+        let fixture = SlowHolderPreparation::start(
+            127,
+            crate::carrier::tests::HolderBehavior {
+                delay: std::time::Duration::from_millis(30),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+        let owner = test_owner();
+        let reply = fixture.invoke_fixture(
+            &owner,
+            "use",
+            "before-home-stop",
+            serde_json::json!({"cid": fixture.cid}),
+        );
+        let id = reply["operation_id"].as_str().unwrap().to_owned();
+        let weights = fixture.stage().join("weights.gguf");
+        for _ in 0..1000 {
+            if std::fs::metadata(&weights).is_ok_and(|meta| meta.len() >= 8 * 65536) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Normal Home shutdown lets its worker observe stopping and drain.
+        let task = owner.worker.lock().unwrap().take().unwrap();
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("Home preparation worker drains after its owner stops")
+            .unwrap();
+        let stopped = load_operation(fixture.root.path(), &id).unwrap();
+        assert_eq!(stopped.state, PreparationState::Failed, "{stopped:?}");
+        assert_eq!(
+            stopped.projection()["failure_class"],
+            "download_interrupted"
+        );
+        assert_eq!(fixture.kept_stage(), Some(id));
+        let kept = std::fs::read(&weights).unwrap();
+        assert!(kept.len() >= 8 * 65536 && kept.len() < fixture.files["weights.gguf"].len());
+        let mut config = crate::api::model_provider_bridge_config(fixture.root.path()).unwrap();
+        drop(
+            append_admitted_model_startup_offers(
+                fixture.root.path(),
+                &fixture.registry,
+                &mut config,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(std::fs::read(&weights).unwrap(), kept);
+        let (parts, index) = (fixture.part_reads(), fixture.index_reads());
+        let (record, _) = fixture.prepare("after-home-restart").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(
+            fixture.part_reads() - parts,
+            fixture.parts_after(kept.len() as u64)
+        );
+        assert_eq!(
+            fixture.index_reads(),
+            index,
+            "startup preserves the signed index"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_rejects_a_corrupted_kept_part_and_starts_over() {
+        let fixture = SlowHolderPreparation::failed_halfway().await;
+        {
+            let path = fixture.stage().join("weights.gguf");
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[5 * 65536 + 3] ^= 0xff;
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let parts = fixture.part_reads();
+        let (rejected, _) = fixture.prepare("corrupt-resume").await;
+        assert_eq!(rejected.state, PreparationState::Failed, "{rejected:?}");
+        assert_eq!(
+            rejected.failure_phase,
+            Some(PreparationFailurePhase::WeightsIntegrity)
+        );
+        assert_eq!(
+            fixture.part_reads() - parts,
+            fixture.parts_after(20 * 65536)
+        );
+        assert!(!fixture.stage().exists());
+        assert_eq!(fixture.kept_stage(), None);
+        let (parts, index) = (fixture.part_reads(), fixture.index_reads());
+        let (record, _) = fixture.prepare("fresh-use").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(fixture.part_reads() - parts, fixture.all_parts());
+        assert_eq!(fixture.index_reads(), index + 1);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_preparation_does_not_continue_a_stage_of_another_package() {
+        let fixture = SlowHolderPreparation::failed_halfway().await;
+        {
+            let path = fixture.stage().join("_elastos_object.json");
+            let mut other: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            other["content_digest"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+            std::fs::write(&path, serde_json::to_vec(&other).unwrap()).unwrap();
+        }
+        let (parts, index) = (fixture.part_reads(), fixture.index_reads());
+        let (record, _) = fixture.prepare("other-package").await;
+        fixture.assert_admitted(&record);
+        assert_eq!(fixture.part_reads() - parts, fixture.all_parts());
+        assert_eq!(fixture.index_reads(), index + 1);
+        fixture.shutdown().await;
     }
 
     #[test]
@@ -9534,7 +13580,7 @@ server.serve_forever()
                 .unwrap();
                 assert!(pending.cancel_requested);
             }
-            settle_failure(root.path(), &record.operation_id, false).unwrap();
+            settle_failure(root.path(), &record.operation_id, false, false).unwrap();
             {
                 let inventory = Inventory::open(root.path(), false).unwrap();
                 assert!(inventory
@@ -9542,7 +13588,7 @@ server.serve_forever()
                     .unwrap()
                     .kept(&context().principal_id, &record.package_cid));
             }
-            settle_failure(root.path(), &record.operation_id, true).unwrap();
+            settle_failure(root.path(), &record.operation_id, true, false).unwrap();
             let settled = load_operation(root.path(), &record.operation_id).unwrap();
             assert_eq!(
                 settled.state,
@@ -9637,8 +13683,9 @@ server.serve_forever()
                 std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
                 saved
             );
-            let status = PreparationOwner::default()
-                .invoke(
+            let owner = test_owner();
+            let status = owner
+                .invoke_fixture(
                     root.path(),
                     None,
                     caller(&context(), &method("status")),
@@ -9648,6 +13695,8 @@ server.serve_forever()
                 )
                 .unwrap();
             assert_eq!(status["kept"], keep);
+            assert_eq!(status["admitted"], true);
+            assert!(owner.worker.lock().unwrap().is_none());
             assert!(status.get("inference_ready").is_none());
             assert_eq!(
                 Inventory::open(root.path(), false)
@@ -9688,9 +13737,9 @@ server.serve_forever()
             (&first, "same-principal-alias"),
             (&second, "second-principal-alias"),
         ] {
-            let owner = PreparationOwner::default();
+            let owner = test_owner();
             let reply = owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(principal, &method("use")),
@@ -9726,8 +13775,8 @@ server.serve_forever()
             (&first, &aliases[0]),
             (&second, &aliases[1]),
         ] {
-            let reply = PreparationOwner::default()
-                .invoke(
+            let reply = test_owner()
+                .invoke_fixture(
                     root.path(),
                     None,
                     caller(principal, &method("status")),
@@ -9778,8 +13827,8 @@ server.serve_forever()
             serde_json::json!({"cid":"x".repeat(129),"keep":false}),
             serde_json::json!({"cid":record.package_cid.to_uppercase(),"keep":false}),
         ] {
-            assert!(PreparationOwner::default()
-                .invoke(
+            assert!(test_owner()
+                .invoke_fixture(
                     root.path(),
                     None,
                     caller(&context(), &method("retention")),
@@ -9800,8 +13849,8 @@ server.serve_forever()
                 "id" => denied.id = "content.use".into(),
                 _ => denied.operation = Some("keep".into()),
             }
-            assert!(PreparationOwner::default()
-                .invoke(
+            assert!(test_owner()
+                .invoke_fixture(
                     root.path(),
                     None,
                     caller(&context(), &denied),
@@ -9814,8 +13863,8 @@ server.serve_forever()
         let mut invalid = context();
         invalid.principal_id.clear();
         assert!(retention_intent(root.path(), &invalid, &record.package_cid, false).is_err());
-        assert!(PreparationOwner::default()
-            .invoke(
+        assert!(test_owner()
+            .invoke_fixture(
                 root.path(),
                 None,
                 caller(&context(), &method("retention")),
@@ -9826,8 +13875,8 @@ server.serve_forever()
             .is_err());
         let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = checks.clone();
-        assert!(PreparationOwner::default()
-            .invoke(
+        assert!(test_owner()
+            .invoke_fixture(
                 root.path(),
                 None,
                 caller(&context(), &method("retention")),
@@ -9916,9 +13965,9 @@ server.serve_forever()
     #[tokio::test]
     async fn model_preparation_exact_cid_reuse_preserves_actor_request_isolation() {
         let (root, record, backend, registry) = staged_fixture(now().unwrap(), true).await;
-        let owner = PreparationOwner::default();
+        let owner = test_owner();
         owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&context(), &method("status")),
@@ -9932,7 +13981,7 @@ server.serve_forever()
         other.principal_id = "person:other-fixture".into();
         for op in ["status", "cancel"] {
             assert!(owner
-                .invoke(
+                .invoke_fixture(
                     root.path(),
                     Some(registry.clone()),
                     caller(&other, &method(op)),
@@ -9944,7 +13993,7 @@ server.serve_forever()
         }
         let input = serde_json::json!({"cid":record.package_cid});
         let response = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry.clone()),
                 caller(&other, &method("use")),
@@ -9961,7 +14010,10 @@ server.serve_forever()
         assert_eq!(reused.admission_id, record.operation_id);
         assert_eq!(reused.reserved_bytes, 0);
         assert_eq!(reused.request_binding.principal, other.principal_id);
-        assert_eq!(reused.request_binding.request_id, "fresh");
+        assert_eq!(
+            reused.request_binding.request_id,
+            fixture_request_id(root.path(), "fresh", now().unwrap())
+        );
         assert_eq!(
             load_operation(root.path(), &record.operation_id)
                 .unwrap()
@@ -9971,7 +14023,7 @@ server.serve_forever()
         assert!(!root.path().join("model-preparation/stage").exists());
         let prior = backend.calls.lock().unwrap().len();
         let replay = owner
-            .invoke(
+            .invoke_fixture(
                 root.path(),
                 Some(registry),
                 caller(&other, &method("use")),
@@ -10196,11 +14248,11 @@ server.serve_forever()
             method: &reader_method,
             ..caller
         };
+        // A read answers from state.json and never adopts the uncommitted file.
         assert_eq!(
             manage(root.path(), &reader, &record.operation_id, false, 3).unwrap(),
             record
         );
-        assert!(!root.path().join("model-preparation/state.next").exists());
         let expired = manage(
             root.path(),
             &reader,
@@ -10209,20 +14261,102 @@ server.serve_forever()
             record.expires_at,
         )
         .unwrap();
+        assert!(
+            !root.path().join("model-preparation/state.next").exists(),
+            "the next change discards the uncommitted file"
+        );
         assert_eq!(expired.state, PreparationState::Expired);
         assert_eq!(expired.reserved_bytes, 0);
         assert_eq!(expired.request_binding, record.request_binding);
-        let next = reserve_at(root.path(), &caller, "req-2", &cid, record.expires_at).unwrap();
+        let state_path = root.path().join("model-preparation/state.json");
+        let saved = std::fs::read(&state_path).unwrap();
+        let stale = reserve_at(root.path(), &caller, "req-2", &cid, record.expires_at).unwrap_err();
+        assert!(stale.downcast_ref::<PreparationRequestExpired>().is_some());
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved);
+        let next = reserve_at(root.path(), &caller, "req-3", &cid, record.expires_at).unwrap();
         assert_ne!(next.operation_id, record.operation_id);
     }
 
-    #[test]
-    fn model_preparation_record_bound_and_serialization_corruption_fail_closed() {
+    #[tokio::test]
+    async fn model_preparation_status_reads_progress_while_the_worker_holds_the_lock() {
         let (root, cid) = fixture();
         let context = context();
         let use_method = method("use");
         let caller = caller(&context, &use_method);
-        let record = reserve(root.path(), &caller, "req-1", &cid).unwrap();
+        let record = reserve_at(root.path(), &caller, "req-1", &cid, 2).unwrap();
+        let progress = record.total_bytes / 2;
+        update_operation(root.path(), &record.operation_id, |record| {
+            record.state = PreparationState::Preparing;
+            record.index_bytes = 512;
+            record.completed_bytes = progress;
+        })
+        .unwrap();
+        let status_method = method("status");
+        let reader = PreparationCaller {
+            method: &status_method,
+            ..caller
+        };
+        // The worker's progress save holds the inventory lock.
+        let held = Inventory::open(root.path(), false).unwrap();
+        let started = std::time::Instant::now();
+        let polled = manage(root.path(), &reader, &record.operation_id, false, 3).unwrap();
+        assert_eq!(
+            (polled.state, polled.completed_bytes),
+            (PreparationState::Preparing, progress)
+        );
+        let projection = model_runtime_projection(
+            root.path(),
+            None,
+            &context,
+            &cid,
+            Some(&record.operation_id),
+        )
+        .await;
+        assert_eq!(projection["preparation"]["completed_bytes"], progress);
+        assert_eq!(projection["preparation"]["state"], "preparing");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "status reads do not wait for the lock"
+        );
+        // A change, such as cancel, still takes the lock.
+        let cancel_method = method("cancel");
+        let canceller = PreparationCaller {
+            method: &cancel_method,
+            ..reader
+        };
+        assert!(manage(root.path(), &canceller, &record.operation_id, true, 3).is_err());
+        drop(held);
+        let cancelled = manage(root.path(), &canceller, &record.operation_id, true, 3).unwrap();
+        assert!(cancelled.cancel_requested);
+    }
+
+    #[test]
+    fn model_preparation_progress_saves_at_most_once_per_mib_or_second() {
+        let start = std::time::Instant::now();
+        let mut progress = ProgressSaves::new(0, start);
+        let package = 4 * 1024 * 1024;
+        let saves: Vec<u64> = (0..package / 65536)
+            .filter_map(|_| progress.written(65536, false, start))
+            .collect();
+        assert_eq!(saves, [1, 2, 3, 4].map(|mib| mib * 1024 * 1024));
+        // A slow download still shows progress about once a second.
+        let later = start + std::time::Duration::from_secs(1);
+        assert_eq!(progress.written(65536, false, later), Some(package + 65536));
+        assert_eq!(progress.written(65536, false, later), None);
+        // Each finished file is saved, so a failure shows its complete files.
+        assert_eq!(
+            progress.written(100, true, later),
+            Some(package + 2 * 65536 + 100)
+        );
+    }
+
+    #[test]
+    fn model_preparation_serialization_corruption_fails_closed() {
+        let (root, cid) = fixture();
+        let context = context();
+        let use_method = method("use");
+        let caller = caller(&context, &use_method);
+        reserve(root.path(), &caller, "req-1", &cid).unwrap();
         let state_path = root.path().join("model-preparation/state.json");
         let original = std::fs::read(&state_path).unwrap();
         for corrupt in [b"{".to_vec(), b"null".to_vec(), vec![b' '; 256 * 1024 + 1]] {
@@ -10243,28 +14377,276 @@ server.serve_forever()
             assert!(reserve(root.path(), &caller, "req-2", &cid).is_err());
             assert_eq!(std::fs::read(&state_path).unwrap(), corrupt);
         }
-        std::fs::write(&state_path, original).unwrap();
-        // The bounded history below contains only cancelled records. Release
-        // the live reservation's Keep claim before constructing that history.
-        retention_intent(root.path(), &context, &cid, false).unwrap();
-        let inventory = Inventory::open(root.path(), false).unwrap();
-        let mut state = inventory.load().unwrap();
-        state.records.clear();
-        for number in 0..MAX_RECORDS {
-            let mut terminal = record.clone();
-            terminal.request_binding.request_id = format!("req-{number}");
-            terminal.request_binding = binding(&terminal);
-            terminal.operation_id = operation_id(&terminal).unwrap();
-            terminal.admission_id = terminal.operation_id.clone();
-            terminal.state = PreparationState::Cancelled;
-            terminal.reserved_bytes = 0;
-            state.records.push(terminal);
+    }
+
+    /// A finished attempt keeps answering status and replay for an hour; only
+    /// then may it make room under the record cap.
+    #[test]
+    fn model_preparation_record_cap_keeps_an_hour_of_finished_attempts() {
+        let (root, cid) = fixture();
+        let context = context();
+        let (use_method, cancel_method, status_method) =
+            (method("use"), method("cancel"), method("status"));
+        let t0 = now().unwrap();
+        let mut ids = Vec::new();
+        // 63 cancelled attempts and one that just failed fill the cap.
+        for cycle in 0..MAX_RECORDS {
+            let attempt = reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                &format!("retry-{cycle}"),
+                &cid,
+                t0,
+            )
+            .unwrap();
+            if cycle + 1 < MAX_RECORDS {
+                let caller = caller(&context, &cancel_method);
+                manage(root.path(), &caller, &attempt.operation_id, true, t0).unwrap();
+            } else {
+                settle_failure(root.path(), &attempt.operation_id, true, false).unwrap();
+            }
+            ids.push(attempt.operation_id);
         }
-        inventory.save(&state).unwrap();
-        drop(inventory);
-        let prior = std::fs::read(&state_path).unwrap();
-        assert!(reserve(root.path(), &caller, "req-over-limit", &cid).is_err());
-        assert_eq!(std::fs::read(&state_path).unwrap(), prior);
+        let late = |seconds: u64| t0 + TERMINAL_HISTORY_SECONDS + seconds;
+        assert!(
+            reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                "too-soon",
+                &cid,
+                late(0) - 120,
+            )
+            .is_err(),
+            "nothing settled an hour ago, so the cap refuses as before"
+        );
+        let just_failed = ids.last().unwrap();
+        let polled = status(root.path(), &caller(&context, &status_method), just_failed).unwrap();
+        assert_eq!(polled.state, PreparationState::Failed);
+        let state_path = root.path().join("model-preparation/state.json");
+        let before_prune = std::fs::read(&state_path).unwrap();
+        let transaction = root.path().join("model-preparation/state.next");
+        std::fs::create_dir(&transaction).unwrap();
+        assert!(reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "blocked-floor-publication",
+            &cid,
+            late(60)
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            before_prune,
+            "a failed floor transaction preserves every old binding before deletion"
+        );
+        std::fs::remove_dir(transaction).unwrap();
+        // An hour later the longest-settled attempt makes room.
+        let next = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "after-an-hour",
+            &cid,
+            late(60),
+        )
+        .unwrap();
+        assert_eq!(next.state, PreparationState::Reserved);
+        assert!(load_operation(root.path(), &ids[0]).is_err());
+        assert_eq!(
+            load_operation(root.path(), just_failed).unwrap().state,
+            PreparationState::Failed
+        );
+        // A replay of the pruned request cannot create another reservation.
+        let caller_cancel = caller(&context, &cancel_method);
+        manage(
+            root.path(),
+            &caller_cancel,
+            &next.operation_id,
+            true,
+            late(60),
+        )
+        .unwrap();
+        let saved = std::fs::read(root.path().join("model-preparation/state.json")).unwrap();
+        let replay = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "retry-0",
+            &cid,
+            late(120),
+        )
+        .unwrap_err();
+        assert!(replay.is::<PreparationRequestExpired>());
+        assert_eq!(
+            std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+            saved
+        );
+        // Reopening after a clock rollback preserves the floor. The old ID is
+        // refused even when its timestamp is fresh again.
+        let replay = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "retry-0",
+            &cid,
+            t0,
+        )
+        .unwrap_err();
+        assert!(replay.is::<PreparationRequestExpired>());
+        assert_eq!(
+            std::fs::read(root.path().join("model-preparation/state.json")).unwrap(),
+            saved
+        );
+    }
+
+    /// A replay refused for a changed identity still saves the expiry it found.
+    #[test]
+    fn model_preparation_refused_replay_keeps_an_overdue_reservations_expiry() {
+        let (root, cid) = fixture();
+        let context = context();
+        let use_method = method("use");
+        let t0 = now().unwrap();
+        let reserved = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "replayed",
+            &cid,
+            t0,
+        )
+        .unwrap();
+        let mut changed = caller(&context, &use_method);
+        changed.interface = "elastos.capsule.other";
+        let t1 = t0 + RESERVATION_SECONDS;
+        assert!(reserve_at(root.path(), &changed, "replayed", &cid, t1).is_err());
+        let expired = load_operation(root.path(), &reserved.operation_id).unwrap();
+        assert_eq!(expired.state, PreparationState::Expired);
+        assert_eq!(expired.settled_at, Some(t1));
+    }
+
+    /// A refused Use still saves the expiry of an overdue reservation, so its
+    /// hour of history runs from that expiry and a later Use gets through.
+    #[tokio::test]
+    async fn model_preparation_refused_use_keeps_an_overdue_reservations_expiry() {
+        let (root, mut owner, _backend, _registry) = staged_fixture(now().unwrap(), true).await;
+        let t0 = owner.created_at;
+        owner.state = PreparationState::Admitted;
+        let overdue_id;
+        {
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            state.records = vec![owner.clone()];
+            // 62 admitted copies that own nothing but are never pruned.
+            for number in 0..MAX_RECORDS - 2 {
+                let mut alias = owner.clone();
+                alias.request_binding.request_id = format!("alias-{number}");
+                alias.request_binding = binding(&alias);
+                alias.operation_id = operation_id(&alias).unwrap();
+                alias.admission_id = owner.operation_id.clone();
+                alias.reserved_bytes = 0;
+                state.records.push(alias);
+            }
+            // One reservation that was never started and is now overdue.
+            let mut overdue = owner.clone();
+            overdue.request_binding.request_id = "overdue".into();
+            overdue.request_binding = binding(&overdue);
+            overdue.operation_id = operation_id(&overdue).unwrap();
+            overdue.admission_id = overdue.operation_id.clone();
+            overdue.state = PreparationState::Reserved;
+            overdue.index_bytes = 0;
+            overdue.completed_bytes = 0;
+            overdue_id = overdue.operation_id.clone();
+            state.records.push(overdue);
+            inventory.save(&state).unwrap();
+        }
+        let context = context();
+        let use_method = method("use");
+        let t1 = t0 + RESERVATION_SECONDS;
+        let reserve_then = |request: &str, at: u64| {
+            reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                request,
+                &owner.package_cid,
+                at,
+            )
+        };
+        assert!(reserve_then("blocked", t1).is_err());
+        let expired = load_operation(root.path(), &overdue_id).unwrap();
+        assert_eq!(expired.state, PreparationState::Expired);
+        assert_eq!(expired.settled_at, Some(t1));
+        let next = reserve_then("an-hour-later", t1 + TERMINAL_HISTORY_SECONDS).unwrap();
+        assert_eq!(next.state, PreparationState::Reserved);
+        assert!(load_operation(root.path(), &overdue_id).is_err());
+    }
+
+    /// After 100 retries spread over more than an hour a Use still starts, and
+    /// a record owning admitted bytes or a kept stage is never pruned.
+    #[tokio::test]
+    async fn model_preparation_record_cap_prunes_only_ownerless_finished_attempts() {
+        for owner_kind in ["kept_stage", "admitted"] {
+            let (root, owner) = if owner_kind == "kept_stage" {
+                let (root, record, _registry, _) = kept_stage_fixture().await;
+                (root, record)
+            } else {
+                let (root, mut record, _backend, _registry) =
+                    staged_fixture(now().unwrap(), true).await;
+                record.state = PreparationState::Admitted;
+                let inventory = Inventory::open(root.path(), false).unwrap();
+                let mut state = inventory.load().unwrap();
+                state.records[0] = record.clone();
+                inventory.save(&state).unwrap();
+                (root, record)
+            };
+            let context = context();
+            let (use_method, cancel_method) = (method("use"), method("cancel"));
+            let t0 = now().unwrap();
+            let at = |cycle: u64| t0 + cycle * 90;
+            for cycle in 0..100 {
+                let attempt = reserve_at(
+                    root.path(),
+                    &caller(&context, &use_method),
+                    &format!("retry-{cycle}"),
+                    &owner.package_cid,
+                    at(cycle),
+                )
+                .unwrap();
+                // A failed successor would replace the kept stage, so that
+                // case cycles through Cancel only.
+                if owner_kind == "kept_stage" || cycle % 2 == 0 {
+                    let caller = caller(&context, &cancel_method);
+                    manage(root.path(), &caller, &attempt.operation_id, true, at(cycle)).unwrap();
+                } else {
+                    settle_failure(root.path(), &attempt.operation_id, true, false).unwrap();
+                }
+            }
+            let next = reserve_at(
+                root.path(),
+                &caller(&context, &use_method),
+                "after-100-retries",
+                &owner.package_cid,
+                at(100),
+            )
+            .unwrap();
+            assert_eq!(next.state, PreparationState::Reserved, "{owner_kind}");
+            let state = Inventory::open(root.path(), false).unwrap().load().unwrap();
+            assert!(state.records.len() <= MAX_RECORDS);
+            let kept_owner = state
+                .records
+                .iter()
+                .find(|r| r.operation_id == owner.operation_id)
+                .unwrap_or_else(|| panic!("{owner_kind} owner was pruned"));
+            if owner_kind == "kept_stage" {
+                assert_eq!(kept_owner.state, PreparationState::Failed);
+                assert_eq!(
+                    kept_stage_owner(root.path()),
+                    Some(owner.operation_id.clone())
+                );
+                assert!(stage_weights(root.path()).exists());
+            } else {
+                assert_eq!(kept_owner.state, PreparationState::Admitted);
+                assert!(Inventory::open(root.path(), false)
+                    .unwrap()
+                    .admitted(&owner.operation_id)
+                    .is_ok());
+            }
+        }
     }
 
     #[test]
@@ -10378,24 +14760,29 @@ server.serve_forever()
     }
 
     #[test]
-    fn model_preparation_disk_floor_uses_checked_outstanding_bytes() {
-        assert!(storage::require_space_floor(1000, 200, 100).is_ok());
-        assert!(storage::require_space_floor(1000, 200, 101).is_err());
-        assert!(storage::require_space_floor(1000, 200, 201).is_err());
-        assert!(storage::require_space_floor(0, 0, 0).is_err());
-        assert!(storage::require_space_floor(1000, 1001, 0).is_err());
-        assert!(storage::require_space_floor(u128::MAX, u128::MAX, 0).is_err());
+    fn model_preparation_disk_check_keeps_the_shared_free_space_reserve() {
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        let capacity = 1 << 40;
+        assert!(storage::require_reservation_fits(capacity, reserve + 200, 200).is_ok());
+        let refused = storage::require_reservation_fits(capacity, reserve + 199, 200).unwrap_err();
+        assert!(refused.is::<elastos_common::NotEnoughFreeSpace>());
+        assert!(!storage::reservation_fits(capacity, reserve + 199, 200).unwrap());
+        // Volume size alone never refuses a reservation that fits.
+        assert!(storage::require_reservation_fits(1 << 50, reserve + 10, 10).is_ok());
+        assert!(storage::require_reservation_fits(0, 0, 0).is_err());
+        assert!(storage::reservation_fits(capacity, capacity + 1, 0).is_err());
+        assert!(storage::require_reservation_fits(u128::MAX, u128::MAX, u128::MAX).is_err());
     }
 
     #[test]
     fn model_preparation_capacity_cold_growth_stays_within_initial_charge() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
         let margin = 1024 * 1024;
         let charge = preparation_charge(payload).unwrap();
-        let initial_free = floor + u128::from(charge) + margin;
-        assert!(storage::require_space_floor(capacity, initial_free, charge.into()).is_ok());
+        let initial_free =
+            u128::from(charge) + margin + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+        assert!(storage::require_reservation_fits(capacity, initial_free, charge.into()).is_ok());
         for completed in [0, payload / 4, payload / 2, payload] {
             let index = if completed == 0 { 0 } else { 717 };
             let delivered = u128::from(completed + index);
@@ -10404,7 +14791,7 @@ server.serve_forever()
             // are deterministic logical-growth facts, not Kubo allocation proof.
             let free = initial_free - 2 * delivered;
             assert!(
-                storage::require_space_floor(
+                storage::require_reservation_fits(
                     capacity,
                     free,
                     u128::from(stage) + u128::from(backend)
@@ -10423,23 +14810,21 @@ server.serve_forever()
     #[test]
     fn model_preparation_capacity_separate_cold_volume_and_warm_backend() {
         let payload = 64 * 1024 * 1024;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
-        let margin = 1024 * 1024;
+        let capacity = 1_u128 << 40;
+        let margin = 1024 * 1024 + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         let stage_budget = staging_charge(payload).unwrap();
         let backend_budget = preparation_charge(payload).unwrap() - stage_budget;
         let completed = payload / 4;
         let index = 717;
         let delivered = u128::from(completed + index);
         let (stage, backend) = remaining_capacity_charges(payload, completed, index).unwrap();
-        let stage_free = floor + u128::from(stage_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, stage_free, stage.into()).is_ok());
-        let backend_free = floor + u128::from(backend_budget) + margin - delivered;
-        assert!(storage::require_space_floor(capacity, backend_free, backend.into()).is_ok());
+        let stage_free = u128::from(stage_budget) + margin - delivered;
+        assert!(storage::require_reservation_fits(capacity, stage_free, stage.into()).is_ok());
+        let backend_free = u128::from(backend_budget) + margin - delivered;
+        assert!(storage::require_reservation_fits(capacity, backend_free, backend.into()).is_ok());
         // A warm backend stores nothing new. Logical credit stays conservative.
-        let warm_free =
-            floor + u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
-        assert!(storage::require_space_floor(
+        let warm_free = u128::from(preparation_charge(payload).unwrap()) + margin - delivered;
+        assert!(storage::require_reservation_fits(
             capacity,
             warm_free,
             u128::from(stage) + u128::from(backend)
@@ -10450,10 +14835,9 @@ server.serve_forever()
             u128::from(backend),
             u128::from(stage) + u128::from(backend),
         ] {
-            assert!(storage::require_space_floor(capacity, floor + required, required).is_ok());
-            assert!(
-                storage::require_space_floor(capacity, floor + required - 1, required).is_err()
-            );
+            let available = required + u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
+            assert!(storage::require_reservation_fits(capacity, available, required).is_ok());
+            assert!(storage::require_reservation_fits(capacity, available - 1, required).is_err());
         }
     }
 
@@ -10486,6 +14870,40 @@ server.serve_forever()
             *backend.capacity_requests.lock().unwrap(),
             vec![full_backend - delivered]
         );
+        assert_eq!(
+            load_operation(root.path(), &record.operation_id)
+                .unwrap()
+                .reserved_bytes,
+            record.reserved_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn model_preparation_capacity_owner_distinguishes_space_and_service() {
+        let (root, record, backend, registry) = capacity_window_fixture(false, None).await;
+        *backend.capacity_available.lock().unwrap() = Some(5);
+        let error = require_capacity(root.path(), &registry, &record)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_phase(&error), PreparationFailurePhase::Capacity);
+        assert!(error.is::<elastos_common::NotEnoughFreeSpace>());
+        assert!(backend.read_sizes.lock().unwrap().is_empty());
+        assert!(!backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|op| op == "runtime_hash_staged_directory"));
+        let (root, record, backend, registry) = capacity_window_fixture(false, Some(1)).await;
+        let error = require_capacity(root.path(), &registry, &record)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_phase(&error),
+            PreparationFailurePhase::StorageService
+        );
+        assert!(!error.is::<elastos_common::NotEnoughFreeSpace>());
+        assert!(backend.read_sizes.lock().unwrap().is_empty());
         assert_eq!(
             load_operation(root.path(), &record.operation_id)
                 .unwrap()
@@ -10553,6 +14971,7 @@ server.serve_forever()
                 &record.operation_id,
                 &AtomicBool::new(false),
                 &revalidate,
+                None,
             )
             .await
             .unwrap();
@@ -10603,6 +15022,7 @@ server.serve_forever()
                 &record.operation_id,
                 &AtomicBool::new(false),
                 &revalidate,
+                None,
             )
             .await
             .unwrap_err();
@@ -10646,10 +15066,10 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn model_preparation_capacity_windows_runtime_floor_counts_shared_backend_growth() {
+    async fn model_preparation_capacity_windows_runtime_check_counts_shared_backend_growth() {
         let (_root, mut record, _, _) = capacity_window_fixture(true, None).await;
-        let capacity = 1_u128 << 30;
-        let floor = capacity.div_ceil(10);
+        let capacity = 1_u128 << 40;
+        let reserve = u128::from(elastos_common::FREE_SPACE_RESERVE_BYTES);
         for completed in [0, 65536, 1024 * 1024, record.total_bytes] {
             record.completed_bytes = completed;
             record.index_bytes = 717;
@@ -10659,23 +15079,23 @@ server.serve_forever()
             for shared in [false, true] {
                 let required = runtime_capacity_charge(&record, shared).unwrap();
                 assert_eq!(required, if shared { stage + backend } else { stage });
-                assert!(storage::require_space_floor(
+                assert!(storage::require_reservation_fits(
                     capacity,
-                    floor + u128::from(required),
+                    u128::from(required) + reserve,
                     required.into()
                 )
                 .is_ok());
-                assert!(storage::require_space_floor(
+                assert!(storage::require_reservation_fits(
                     capacity,
-                    floor + u128::from(required) - 1,
+                    u128::from(required) + reserve - 1,
                     required.into()
                 )
                 .is_err());
             }
             // A Runtime volume with only the stage allowance cannot pass as shared.
-            assert!(storage::require_space_floor(
+            assert!(storage::require_reservation_fits(
                 capacity,
-                floor + u128::from(stage),
+                u128::from(stage) + reserve,
                 runtime_capacity_charge(&record, true).unwrap().into()
             )
             .is_err());
@@ -10715,17 +15135,20 @@ server.serve_forever()
                     &registry,
                     &record.operation_id,
                     &stopped,
-                    &revalidate
+                    &revalidate,
+                    None,
                 )
                 .await
                 .is_err(),
                 "{fault}"
             );
+            // Parts already sent when the fault lands may finish; every later
+            // part fails its check before it is sent, so at most one window is read.
             let reads = backend.read_sizes.lock().unwrap();
-            assert_eq!(
-                reads.iter().filter(|&&length| length == 65536).count(),
-                1,
-                "{fault}"
+            let parts = reads.iter().filter(|&&length| length == 65536).count();
+            assert!(
+                (1..=MODEL_PARTS_IN_FLIGHT).contains(&parts),
+                "{fault}: {parts}"
             );
             assert_eq!(
                 backend.capacity_requests.lock().unwrap().len(),
@@ -10779,7 +15202,9 @@ server.serve_forever()
             schema: SCHEMA.into(),
             records: vec![rewritten],
             retention_claims: Vec::new(),
+            pruned_issued_floor_ms: 0,
             retirement: None,
+            kept_stage: None,
         };
         rewritten.validate().unwrap();
         std::fs::write(&path, serde_json::to_vec(&rewritten).unwrap()).unwrap();
@@ -10970,7 +15395,8 @@ server.serve_forever()
             grant_id: "preparation-grant".into(),
         };
         let capsule = "marketplace";
-        let request_id = "prepare-fixture-1";
+        let request_id = fixture_request_id(root.path(), "prepare-fixture-1", now().unwrap());
+        let request_id = request_id.as_str();
         let use_method = method("use");
         let status_method = method("status");
         let cancel_method = method("cancel");

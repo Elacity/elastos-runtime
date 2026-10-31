@@ -38,11 +38,11 @@ const HOME_BROWSER_EXIT_LOCAL_OFFER_ID: &str = "local:provider:browser-exit";
 const HOME_BROWSER_EXIT_PEER_SERVICE_URI: &str = "elastos://peer/browser-exit";
 const HOME_REMOTE_EXIT_SERVICE_KIND: &str = "remote_exit";
 pub(super) const PROFILE_REQUIRED_DISCOVERY_MESSAGE: &str =
-    "Save your Profile before turning on Discovery";
+    "Save your Profile before turning on Public";
 const PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE: &str =
     "Save your Profile before using People contacts";
 const PROFILE_REQUIRED_SERVICES_MESSAGE: &str =
-    "Save your Profile before using Services with other people";
+    "Save your Profile before sharing with other people";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProfileRequiredError(&'static str);
@@ -123,14 +123,14 @@ struct HomeRealtimeEvent {
     at: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HomeRealtimeSnapshot {
     principal_id: String,
+    runtime_signature: String,
     recovery_readiness: RecoveryReadinessSummary,
     profile_readiness: ProfileReadinessSummary,
     notification_signature: Vec<String>,
     wallet_request_signature: Vec<String>,
-    capability_request_count: usize,
     desktop_signature: Vec<String>,
     room_signature: String,
     people_signature: Vec<String>,
@@ -174,6 +174,14 @@ pub(super) struct PeopleDiscoveryRequestCreate {
     advertisement_id: String,
 }
 
+/// `POST /api/apps/people/contacts/request`: add someone by the DID they
+/// shared. Response `{status, display_name}`; see `contact_request_response`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PeopleContactRequestCreate {
+    profile_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HomePeopleDiscoverySummary {
     schema: &'static str,
@@ -202,7 +210,8 @@ struct HomePeopleDiscoveryPeerSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
     last_seen_at: u64,
-    status: String,
+    /// `visible` (no relationship yet), `contact`, `requested` or `pending`.
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -403,23 +412,33 @@ pub(super) async fn home_summary(
                 Ok(authority) => authority,
                 Err(err) => return home_error_response(err),
             };
-            if let Err(err) = apply_profile_people_authority(
+            let contact_read = match contact_authority
+                .as_ref()
+                .map(|authority| authority.store.read_only_snapshot())
+                .transpose()
+            {
+                Ok(read) => read,
+                Err(err) => return home_error_response(err),
+            };
+            if let Err(err) = apply_profile_people_authority_from_snapshot(
                 &mut home_state.people,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_read.as_ref(),
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_contact_request_notification_projection(
+            if let Err(err) = apply_contact_request_notification_projection_from_snapshot(
                 &state.data_dir,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_authority.as_ref(),
+                contact_read.as_ref(),
+                state.collaboration_chat_product_port.as_ref(),
                 &mut home_state.notifications,
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_services_peer_authority(
+            if let Err(err) = apply_services_peer_authority_from_snapshot(
                 &state.data_dir,
                 context,
-                state.collaboration_discovery_service.as_ref(),
+                contact_read.as_ref(),
                 &mut home_state.services,
             ) {
                 return home_error_response(err);
@@ -456,7 +475,12 @@ pub(super) async fn home_summary(
         };
 
     let mut notifications = home_state.notifications;
-    let active_shell = match home_active_shell_summary(&state.data_dir, context.as_ref()) {
+    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
+    let active_shell = match home_active_shell_summary_from_catalog(
+        &state.data_dir,
+        context.as_ref(),
+        &capsule_catalog,
+    ) {
         Ok(shell) => shell,
         Err(err) => return home_error_response(err),
     };
@@ -467,20 +491,21 @@ pub(super) async fn home_summary(
     };
     if let (Some(context), Some(authority)) = (context.as_ref(), wallet_authority.as_ref()) {
         let wallet_approvals = system_wallet_approvals_summary(&state, authority, false).await;
-        append_wallet_approval_notifications(
-            &mut notifications,
+        append_inbox_requests(
+            &state,
+            context,
             wallet_approvals.approval_requests,
-        );
-        if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await
-        {
-            append_runtime_capability_notifications(&mut notifications, capability_requests);
+            &mut notifications,
+        )
+        .await;
+        #[cfg(unix)]
+        if let Ok(routes) = owner_hosted_routes(&state.data_dir, context) {
+            append_hosted_route_notifications(&mut notifications, &routes);
         }
-        append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
     }
-    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
     let targets = home_targets_from_catalog(&capsule_catalog);
-    let capsule_interfaces = capsule_interface_registry_summary_with_bindings(
-        &state.data_dir,
+    let capsule_interfaces = capsule_interface_registry_summary_with_bindings_from_catalog(
+        &capsule_catalog,
         state.provider_registry.as_deref(),
     )
     .await;
@@ -528,7 +553,11 @@ pub(super) async fn people_summary(
     };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
-    let presence_port = state.collaboration_presence_product_port.clone();
+    let presence_snapshot = match state.collaboration_presence_product_port.as_ref() {
+        Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
+        None => None,
+    };
+    let community_names = community_member_names_or_none(&state).await;
     match tokio::task::spawn_blocking(move || {
         let mut state = home_state(&data_dir);
         let contact_authority = load_configured_contact_authority_for_context(
@@ -542,20 +571,32 @@ pub(super) async fn people_summary(
         )?;
         let mut people = state.people;
         let now = now_ts();
-        apply_contact_reachability(&mut people, presence_port.as_ref(), now);
+        if let Some(snapshot) = presence_snapshot.as_ref() {
+            stamp_contact_reachability(&mut people, snapshot, now);
+        }
         let discovery = if let (Some(service), Some(authority)) =
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
+            let snapshot = authority.store.read_only_snapshot()?;
+            stamp_undeliverable_requests(&mut people, &snapshot, service, now)?;
+            stamp_community_names(&mut people, &snapshot, &community_names, now)?;
             configured_people_discovery_summary(
-                &service.read_only_status(authority.store.as_ref(), &authority.profile, now)?,
+                &service.read_only_status_from_snapshot(&snapshot, &authority.profile, now)?,
+                &contact_relationships(&snapshot, now),
                 now,
             )
         } else {
             unconfigured_people_discovery_summary()
         };
+        // The local Profile DID, so People can show "Your DID" and copy it.
+        // It is deliberately not part of `identity`, which never carries DIDs.
+        let profile_id = contact_authority
+            .as_ref()
+            .map(|authority| authority.profile.document().profile_did.clone());
         Ok::<_, anyhow::Error>(serde_json::json!({
             "schema": "elastos.people.summary/v1",
             "identity": identity.without_device_identity(),
+            "profile_id": profile_id,
             "people": people,
             "discovery": discovery,
         }))
@@ -586,7 +627,11 @@ pub(super) async fn people_discovery_update(
                     now,
                 )
                 .await?;
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -607,7 +652,11 @@ pub(super) async fn people_discovery_refresh(
         &headers,
         false,
         |service, authority, now| async move {
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -626,11 +675,7 @@ pub(super) async fn people_discovery_request_create(
 ) -> Response {
     let advertisement_id = body.advertisement_id.trim().to_string();
     if advertisement_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "discovery advertisement id is required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "Choose someone on Public to add.").into_response();
     }
     let summary = match configured_people_discovery_action(
         &state,
@@ -741,10 +786,186 @@ pub(super) async fn people_contact_remove(
     .into_response()
 }
 
+pub(super) async fn people_contact_request_create(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleContactRequestCreate>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
+    let Some(service) = state.collaboration_discovery_service.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            "Contacts are unavailable on this Home.",
+        )
+            .into_response();
+    };
+    let data_dir = state.data_dir.clone();
+    let authority = match tokio::task::spawn_blocking({
+        let context = context.clone();
+        let service = service.clone();
+        move || load_configured_contact_authority_for_context(&data_dir, &context, Some(&service))
+    })
+    .await
+    {
+        Ok(Ok(Some(authority))) => authority,
+        Ok(Ok(None)) => {
+            return room_service_error_response(profile_required_error(
+                PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE,
+            ))
+        }
+        Ok(Err(err)) => return room_service_error_response(err),
+        Err(err) => return room_service_join_error_response(err),
+    };
+    let recipient = body.profile_id.trim().to_string();
+    let community_names = community_member_names_or_none(&state).await;
+    send_profile_contact_request_response(
+        &service,
+        &state,
+        &community_names,
+        &context,
+        &authority,
+        &recipient,
+    )
+    .await
+}
+
+/// Community names for presentation only: an unreadable source leaves the
+/// name unknown and never blocks the action.
+pub(super) async fn community_member_names_or_none(
+    state: &GatewayState,
+) -> std::collections::HashMap<String, String> {
+    match super::gateway_room::community_member_names(state, now_ts()).await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "Community names are unavailable");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Queues a request by Profile DID and answers with `contact_request_answer`.
+/// A refusal is a 400 or 409 whose body is the refusal's text, and never
+/// echoes the DID. The device DIDs this Home knows from Community, presence
+/// and signed posts, are refused like a contact's device DID.
+pub(super) async fn send_profile_contact_request_response(
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    state: &GatewayState,
+    community_names: &std::collections::HashMap<String, String>,
+    context: &HomeLaunchTokenContext,
+    authority: &ConfiguredContactAuthority,
+    recipient_profile_did: &str,
+) -> Response {
+    let now = now_ts();
+    // The device check only adds a refusal; an unreadable Community store
+    // must not block a request by DID.
+    let mut seen_device_dids = Vec::new();
+    if let Some(port) = state.collaboration_presence_product_port.as_ref() {
+        match port.seen_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community presence")
+            }
+        }
+    }
+    if let Some(port) = state.collaboration_chat_product_port.as_ref() {
+        match port.community_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community posts")
+            }
+        }
+    }
+    // A Community node that refuses requests by DID is known before anything
+    // is queued, so the first request is refused like the later ones.
+    service
+        .check_profile_relay_support(authority.store.as_ref(), &authority.profile, now)
+        .await;
+    let outcome = match service
+        .send_profile_contact_request(
+            authority.store.as_ref(),
+            recipient_profile_did,
+            &seen_device_dids,
+            &authority.profile,
+            now,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => return room_service_error_response(err),
+    };
+    if let Err(err) = register_configured_contact_sync_for_context(service, context, authority, now)
+        .and_then(|()| {
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)
+        })
+    {
+        return room_service_error_response(err);
+    }
+    // The signed name this Home holds: its contact store first, then the
+    // Community names Chat shows.
+    let display_name = if outcome
+        == crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::OwnProfile
+    {
+        Ok(None)
+    } else {
+        authority
+            .store
+            .read_only_snapshot()
+            .and_then(|read| read.display_name_for(recipient_profile_did, now))
+    };
+    match display_name {
+        Ok(name) => contact_request_answer(
+            &outcome,
+            name.or_else(|| community_names.get(recipient_profile_did).cloned())
+                .as_deref(),
+        ),
+        Err(err) => room_service_error_response(err),
+    }
+}
+
+/// The answer to a contact request from People or a Chat card:
+/// `{status, message}`. `status` is `requested`, `already_requested`,
+/// `already_contact`, `pending_from_them` or `own_profile`; `message` is the
+/// text a person sees, naming them by the signed name this Home holds, if any.
+pub(super) fn contact_request_answer(
+    outcome: &crate::collaboration_discovery_runtime::ProfileContactRequestOutcome,
+    display_name: Option<&str>,
+) -> Response {
+    use crate::collaboration_discovery_runtime::ProfileContactRequestOutcome as Outcome;
+    let message = match (outcome, display_name) {
+        // A pending request is one fact; who sees it when is not something
+        // to act on.
+        (Outcome::Requested | Outcome::AlreadyRequested, _) => "Request sent.".to_string(),
+        (Outcome::AlreadyContact { .. }, Some(name)) => format!("{name} is already a contact."),
+        (Outcome::AlreadyContact { .. }, None) => "They're already a contact.".to_string(),
+        (Outcome::PendingFromThem { .. }, Some(name)) => {
+            format!("{name} already asked to connect. Open Inbox to answer.")
+        }
+        (Outcome::PendingFromThem { .. }, None) => {
+            "They already asked to connect. Open Inbox to answer.".to_string()
+        }
+        (Outcome::OwnProfile, _) => "That's your own DID.".to_string(),
+    };
+    Json(serde_json::json!({
+        "status": outcome.status(),
+        "message": message,
+    }))
+    .into_response()
+}
+
 fn configured_people_summary_from_contact_store(
     store: &crate::collaboration_contact_store::CollaborationContactStore,
 ) -> anyhow::Result<HomePeopleSummary> {
-    let snapshot = store.snapshot()?;
+    configured_people_summary_from_snapshot(&store.read_only_snapshot()?)
+}
+
+fn configured_people_summary_from_snapshot(
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+) -> anyhow::Result<HomePeopleSummary> {
+    let snapshot = read.snapshot()?;
     let now = now_ts();
     let mut contacts = snapshot
         .contacts()
@@ -762,6 +983,7 @@ fn configured_people_summary_from_contact_store(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         })
         .collect::<Vec<_>>();
     // The complete People states, each projected from signed truth. Precedence
@@ -773,23 +995,26 @@ fn configured_people_summary_from_contact_store(
         .iter()
         .map(|contact| contact.remote_profile_did().to_string())
         .collect();
-    for requested in store.outgoing_pending_requests(now)? {
-        if !seen.insert(requested.remote_profile_did.clone()) {
+    for requested in read.outgoing_pending_requests(now)? {
+        if !seen.insert(requested.recipient_profile_did.clone()) {
             continue;
         }
         contacts.push(HomePeopleContactSummary {
-            contact_id: home_people_contact_id(&requested.remote_profile_did),
-            remote_profile_did: Some(requested.remote_profile_did.clone()),
-            added_at: requested.occurred_at,
+            contact_id: home_people_contact_id(&requested.recipient_profile_did),
+            remote_profile_did: Some(requested.recipient_profile_did),
+            added_at: requested.created_at,
             conversation_id: None,
-            display_name: requested.display_name.clone(),
-            handle: requested.handle.clone(),
+            // Empty while this Home holds no signed Profile for them; People
+            // then shows the row as Request sent.
+            display_name: requested.display_name.unwrap_or_default(),
+            handle: requested.handle,
             relationship: "requested".to_string(),
             can_message: false,
             device_label: None,
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     for removed in snapshot.removed() {
@@ -813,9 +1038,10 @@ fn configured_people_summary_from_contact_store(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
-    for declined in store.declined_relationships()? {
+    for declined in read.declined_relationships()? {
         if !seen.insert(declined.remote_profile_did.clone()) {
             continue;
         }
@@ -832,6 +1058,7 @@ fn configured_people_summary_from_contact_store(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     Ok(HomePeopleSummary {
@@ -849,17 +1076,73 @@ pub(super) struct ConfiguredContactAuthority {
     pub(super) store: std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
 }
 
+/// Profile DID to (`contact` | `requested` | `pending`, direct conversation)
+/// from this principal's signed contact store, over both request kinds. A
+/// removed or declined pair is absent like a stranger, because a new request
+/// may be sent to it; a store that cannot be read yields none.
+pub(super) type ContactRelationships =
+    std::collections::HashMap<String, (&'static str, Option<String>)>;
+
+pub(super) fn contact_relationships(
+    store: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    now: u64,
+) -> ContactRelationships {
+    use crate::collaboration_contact_store::CollaborationContactRelationship as Relationship;
+    let Ok(relationships) = store.relationships(now) else {
+        return ContactRelationships::new();
+    };
+    relationships
+        .into_iter()
+        .filter_map(|(profile_did, relationship)| {
+            let conversation_id = match &relationship {
+                Relationship::Contact { conversation_id } => Some(conversation_id.clone()),
+                Relationship::PendingFromThem { .. } | Relationship::Requested => None,
+                Relationship::None
+                | Relationship::OwnProfile
+                | Relationship::Removed { .. }
+                | Relationship::Declined => return None,
+            };
+            Some((profile_did, (relationship.as_str(), conversation_id)))
+        })
+        .collect()
+}
+
 /// Adds this principal's durable pending contact requests to one Home/Inbox
 /// read response. The contact store remains the only persistent truth.
 pub(super) fn apply_contact_request_notification_projection(
     data_dir: &std::path::Path,
-    contact_store: Option<
-        &std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
-    >,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
     notifications: &mut HomeNotificationsSummary,
 ) -> anyhow::Result<()> {
-    let pending = match contact_store {
-        Some(store) => store
+    let read = contact_authority
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_contact_request_notification_projection_from_snapshot(
+        data_dir,
+        contact_authority,
+        read.as_ref(),
+        community,
+        notifications,
+    )
+}
+
+fn apply_contact_request_notification_projection_from_snapshot(
+    data_dir: &std::path::Path,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
+    notifications: &mut HomeNotificationsSummary,
+) -> anyhow::Result<()> {
+    let contact_store = match (contact_authority, read) {
+        (Some(authority), Some(read)) if std::ptr::eq(authority.store.as_ref(), read.store()) => {
+            Some(read.store())
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("Home notification snapshot does not match its contact authority"),
+    };
+    let pending = match read {
+        Some(read) => read
             .pending_incoming_requests()?
             .iter()
             .map(
@@ -875,6 +1158,23 @@ pub(super) fn apply_contact_request_notification_projection(
         None => Vec::new(),
     };
     let mut summary = crate::notifications::load_summary(data_dir)?;
+    if let Some(store) = contact_store {
+        crate::notifications::project_direct_message_notifications(
+            &mut summary,
+            data_dir,
+            store.local_profile_did(),
+        )?;
+    }
+    if let Some(authority) = contact_authority {
+        if let Some(port) = community {
+            port.community_unread(data_dir, &authority.profile, now_ts())?;
+        }
+        crate::notifications::project_community_message_notifications(
+            &mut summary,
+            data_dir,
+            authority.profile.document().profile_did.as_str(),
+        )?;
+    }
     crate::notifications::project_contact_request_notifications(&mut summary, &pending);
     *notifications = home_notifications_summary(summary);
     Ok(())
@@ -893,6 +1193,15 @@ pub(super) fn load_configured_contact_authority_for_context(
     let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
         return Ok(None);
     };
+    configured_contact_authority_from_profile(data_dir, context, discovery_service, profile)
+        .map(Some)
+}
+pub(super) fn configured_contact_authority_from_profile(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+) -> anyhow::Result<ConfiguredContactAuthority> {
     let local_device_did = crate::collaboration_profile_authority::load_existing_device_did(
         data_dir,
     )?
@@ -907,7 +1216,7 @@ pub(super) fn load_configured_contact_authority_for_context(
             &local_device_did,
         )?,
     );
-    Ok(Some(ConfiguredContactAuthority { profile, store }))
+    Ok(ConfiguredContactAuthority { profile, store })
 }
 
 pub(super) fn load_profile_authority_for_context(
@@ -965,11 +1274,7 @@ where
     let presentation = match authenticated_presence_presentation_for_context(state, &context) {
         Ok(presentation) => presentation,
         Err(HomePresenceAuthenticationError::Denied) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "People discovery authorization denied",
-            )
-                .into_response());
+            return Err((StatusCode::FORBIDDEN, "Public isn’t allowed here.").into_response());
         }
         Err(HomePresenceAuthenticationError::ProfileRequired) => {
             return Err((StatusCode::CONFLICT, PROFILE_REQUIRED_DISCOVERY_MESSAGE).into_response());
@@ -977,7 +1282,7 @@ where
         Err(HomePresenceAuthenticationError::Internal) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "People discovery presentation is unavailable",
+                "Public isn’t available right now.",
             )
                 .into_response());
         }
@@ -987,7 +1292,7 @@ where
         if require_configured {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "collaboration discovery is not configured",
+                "Public isn’t available on this Home.",
             )
                 .into_response());
         }
@@ -1014,14 +1319,23 @@ where
     {
         return Err(home_error_response(err));
     }
+    let store = Arc::clone(&authority.store);
     let status = action(service, authority, now)
         .await
         .map_err(home_error_response)?;
-    Ok(configured_people_discovery_summary(&status, now))
+    let snapshot = store.read_only_snapshot().map_err(home_error_response)?;
+    Ok(configured_people_discovery_summary(
+        &status,
+        &contact_relationships(&snapshot, now),
+        now,
+    ))
 }
 
+/// Each visible person carries their relationship (`visible` when there is
+/// none yet), so People offers Add contact only to people it can add.
 fn configured_people_discovery_summary(
     status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+    relationships: &ContactRelationships,
     now: u64,
 ) -> HomePeopleDiscoverySummary {
     let discovered_peers = status
@@ -1032,7 +1346,9 @@ fn configured_people_discovery_summary(
             display_name: person.display_name().to_string(),
             handle: person.handle().map(str::to_string),
             last_seen_at: person.last_seen_at(),
-            status: "visible".to_string(),
+            status: relationships
+                .get(person.profile_did())
+                .map_or("visible", |(relationship, _)| *relationship),
         })
         .collect::<Vec<_>>();
     let request_count = status.incoming_requests().len();
@@ -1043,28 +1359,30 @@ fn configured_people_discovery_summary(
         .filter(|deadline| *deadline > now);
     let remote_visibility_remaining_seconds =
         remote_visibility_may_remain_until.map(|deadline| deadline.saturating_sub(now));
-    let (status_code, status_message) = if !status.enabled()
-        && remote_visibility_may_remain_until.is_some()
-    {
-        let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
+    let (status_code, status_message) = if status.community_paused() {
+        (
+            "community_left",
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string(),
+        )
+    } else if !status.enabled() && remote_visibility_may_remain_until.is_some() {
+        // The last listing outlives the switch until it expires; no countdown,
+        // since the person cannot act on the seconds.
         (
             "off_pending_expiry",
-            format!(
-                "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another {remaining} seconds while withdrawal is unavailable.",
-            ),
+            "Public is off. You may stay listed for a few minutes.".to_string(),
         )
     } else if !status.enabled() {
-        ("off", "Discovery is off.".to_string())
+        ("off", "Public is off.".to_string())
+    } else if status.connecting() {
+        ("connecting", "Public is on.".to_string())
     } else if status.available() {
-        (
-            "visible",
-            "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
-                .to_string(),
-        )
+        // The listing lasts ten minutes and renews while a signed-in session
+        // keeps this Profile's sync registered, so it reads as plain on.
+        ("visible", "Public is on.".to_string())
     } else {
         (
             "relay_unavailable",
-            "Discovery is temporarily unavailable. Runtime will retry.".to_string(),
+            "Public isn’t working right now. Your Home will try again.".to_string(),
         )
     };
     HomePeopleDiscoverySummary {
@@ -1093,7 +1411,7 @@ fn unconfigured_people_discovery_summary() -> HomePeopleDiscoverySummary {
         remote_visibility_may_remain_until: None,
         remote_visibility_remaining_seconds: None,
         status: "unconfigured".to_string(),
-        status_message: "Discovery isn’t available on this Home.".to_string(),
+        status_message: "Public isn’t available on this Home.".to_string(),
         discovered_count: 0,
         discovered_peers: Vec::new(),
         request_count: 0,
@@ -1177,18 +1495,71 @@ mod discovery_summary_tests {
                     ),
                 ],
             ),
+            &ContactRelationships::new(),
             100,
         );
 
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["request_count"], 1);
         assert!(json.get("requests").is_none());
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("ten minutes"));
+        assert_eq!(json["status_message"], "Public is on.");
         assert_eq!(json["discovered_peers"][0]["advertisement_id"], "ad-123");
         assert!(json["discovered_peers"][0].get("peer_id").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_marks_people_who_already_have_a_relationship() {
+        let visible = ["ad-new", "ad-contact", "ad-requested", "ad-pending"]
+            .into_iter()
+            .map(|id| {
+                crate::collaboration_discovery_runtime::DiscoveryVisiblePerson::test_new(
+                    id, id, None, 100, 700,
+                )
+            })
+            .collect();
+        let relationships = ContactRelationships::from([
+            (
+                "did:key:test-ad-contact".to_string(),
+                ("contact", Some("direct:abc".to_string())),
+            ),
+            ("did:key:test-ad-requested".to_string(), ("requested", None)),
+            ("did:key:test-ad-pending".to_string(), ("pending", None)),
+        ]);
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                true,
+                true,
+                Some(700),
+                None,
+                visible,
+                Vec::new(),
+            ),
+            &relationships,
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        let statuses = json["discovered_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| {
+                (
+                    peer["advertisement_id"].as_str().unwrap(),
+                    peer["status"].as_str().unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            statuses,
+            std::collections::BTreeMap::from([
+                ("ad-contact", "contact"),
+                ("ad-new", "visible"),
+                ("ad-pending", "pending"),
+                ("ad-requested", "requested"),
+            ])
+        );
+        assert!(!json.to_string().contains("did:key:"));
     }
 
     #[test]
@@ -1202,6 +1573,7 @@ mod discovery_summary_tests {
                 Vec::new(),
                 Vec::new(),
             ),
+            &ContactRelationships::new(),
             100,
         );
 
@@ -1211,10 +1583,10 @@ mod discovery_summary_tests {
         assert!(json["expires_at"].is_null());
         assert_eq!(json["remote_visibility_may_remain_until"], 700);
         assert_eq!(json["remote_visibility_remaining_seconds"], 600);
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("another 600 seconds"));
+        assert_eq!(
+            json["status_message"],
+            "Public is off. You may stay listed for a few minutes."
+        );
     }
 
     #[test]
@@ -1228,6 +1600,7 @@ mod discovery_summary_tests {
                 Vec::new(),
                 Vec::new(),
             ),
+            &ContactRelationships::new(),
             100,
         );
 
@@ -1235,6 +1608,27 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "off");
         assert!(json.get("remote_visibility_may_remain_until").is_none());
         assert!(json.get("remote_visibility_remaining_seconds").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_reports_connecting_before_first_relay_pass() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                true,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_connecting_for_test(),
+            &ContactRelationships::new(),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "connecting");
+        assert_eq!(json["status_message"], "Public is on.");
     }
 
     #[test]
@@ -1257,6 +1651,7 @@ mod discovery_summary_tests {
                     ),
                 ],
             ),
+            &ContactRelationships::new(),
             100,
         );
 
@@ -1264,7 +1659,7 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "relay_unavailable");
         assert_eq!(
             json["status_message"],
-            "Discovery is temporarily unavailable. Runtime will retry."
+            "Public isn’t working right now. Your Home will try again."
         );
         assert_eq!(json["request_count"], 1);
         assert!(json.get("pending_request_count").is_none());
@@ -1721,6 +2116,27 @@ mod discovery_summary_tests {
             .unwrap();
 
         assert_eq!(fixture.store.snapshot().unwrap().contacts().len(), 1);
+        let response_read = fixture.store.read_only_snapshot().unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: fixture.store.principal_id().to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        let authority = ConfiguredContactAuthority {
+            profile: fixture.local_profile.clone(),
+            store: fixture.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        let original_notifications = serde_json::to_value(&notifications).unwrap();
         let revocation = signed_discovery_message(
             &fixture.local_key,
             &fixture.local_profile.document().profile_did,
@@ -1755,6 +2171,35 @@ mod discovery_summary_tests {
             .record_local_contact_revocation(&revocation, &fixture.local_profile, now + 3)
             .unwrap();
 
+        // The already started response retains one view across the real revocation.
+        let response_people = configured_people_summary_from_snapshot(&response_read).unwrap();
+        assert_eq!(response_people.contacts[0].relationship, "connected");
+        assert_eq!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&response_read))
+                .unwrap()
+                .contacts
+                .len(),
+            1
+        );
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&notifications).unwrap(),
+            original_notifications
+        );
+        let next_read = fixture.store.read_only_snapshot().unwrap();
+        assert!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&next_read))
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
         let snapshot = fixture.store.snapshot().unwrap();
         assert!(snapshot.contacts().is_empty());
         assert_eq!(snapshot.removed().len(), 1);
@@ -1776,6 +2221,56 @@ mod discovery_summary_tests {
             resendable[0].remote_profile_did,
             remote_profile.document().profile_did
         );
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            fixture.store.localhost_root()
+        );
+        let path = rooted_localhost_fs_path(fixture.store.data_root(), &object_uri).unwrap();
+        crate::auth::write_protected_principal_root_object(
+            fixture.store.data_root(),
+            fixture.store.principal_id(),
+            fixture.store.localhost_root(),
+            &object_uri,
+            &path,
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_people_summary_from_snapshot(&next_read)
+                .unwrap()
+                .contacts[0]
+                .relationship,
+            "removed"
+        );
+        assert!(fixture.store.read_only_snapshot().is_err());
+        assert!(configured_people_summary_from_contact_store(&fixture.store).is_err());
+    }
+
+    #[test]
+    fn home_contact_read_refuses_foreign_authority_and_principal_root() {
+        let fixture = configured_people_fixture();
+        let foreign = configured_people_fixture();
+        let read = fixture.store.read_only_snapshot().unwrap();
+        let authority = ConfiguredContactAuthority {
+            profile: foreign.local_profile.clone(),
+            store: foreign.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        assert!(apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&read),
+            None,
+            &mut notifications,
+        )
+        .is_err());
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:foreign-home-reader".to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        assert!(home_services_peer_contacts_state_from_snapshot(&context, Some(&read)).is_err());
     }
 
     #[test]
@@ -1841,6 +2336,7 @@ mod discovery_summary_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             service_offer_count: 0,
             service_offers: Vec::new(),
@@ -1859,20 +2355,6 @@ mod discovery_summary_tests {
 /// presence projection People's snapshot reads; this mints no new signal and
 /// touches no store. Heartbeat-derived, so it stays out of the People
 /// realtime signature the way `last_seen_at` does.
-fn apply_contact_reachability(
-    people: &mut HomePeopleSummary,
-    presence_port: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
-    now: u64,
-) {
-    let Some(port) = presence_port else {
-        return;
-    };
-    let Ok(snapshot) = port.snapshot(now) else {
-        return;
-    };
-    stamp_contact_reachability(people, &snapshot, now);
-}
-
 fn stamp_contact_reachability(
     people: &mut HomePeopleSummary,
     snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,
@@ -1882,11 +2364,79 @@ fn stamp_contact_reachability(
         let Some(profile_did) = contact.remote_profile_did.as_deref() else {
             continue;
         };
-        contact.reachable =
-            Some(snapshot.records().iter().any(|record| {
-                record.sender_profile_did() == profile_did && record.expires_at() > now
-            }));
+        contact.reachable = Some(profile_reachable(snapshot, profile_did, now));
     }
+}
+
+/// A waiting request to someone whose signed Profile this Home's contact
+/// store does not hold is named from Community, as Chat's card names them.
+fn stamp_community_names(
+    people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    community_names: &std::collections::HashMap<String, String>,
+    now: u64,
+) -> anyhow::Result<()> {
+    for contact in &mut people.contacts {
+        if contact.relationship != "requested" {
+            continue;
+        }
+        let Some(did) = contact.remote_profile_did.as_deref() else {
+            continue;
+        };
+        let Some(name) = community_names.get(did) else {
+            continue;
+        };
+        if read.display_name_for(did, now)?.is_none() {
+            contact.display_name = name.clone();
+        }
+    }
+    Ok(())
+}
+
+/// While the Community node refuses the Profile-contact operations (it runs
+/// a release older than 0.8.0), each waiting request by DID says it can't
+/// be delivered. Requests bound to a Discovery listing use the v1 operations
+/// and keep their plain row. The outbox keeps retrying either way.
+fn stamp_undeliverable_requests(
+    people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    now: u64,
+) -> anyhow::Result<()> {
+    if !service.profile_contact_delivery_unavailable() {
+        return Ok(());
+    }
+    let waiting = read
+        .outgoing_pending_requests(now)?
+        .into_iter()
+        .filter(|request| request.addressed_by_did)
+        .map(|request| request.recipient_profile_did)
+        .collect::<std::collections::HashSet<_>>();
+    for contact in &mut people.contacts {
+        if contact.relationship == "requested"
+            && contact
+                .remote_profile_did
+                .as_deref()
+                .is_some_and(|did| waiting.contains(did))
+        {
+            contact.delivery_detail =
+                Some(crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `profile_did` has an unexpired presence heartbeat right now: the
+/// one meaning of "reachable" for a contact.
+pub(super) fn profile_reachable(
+    snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,
+    profile_did: &str,
+    now: u64,
+) -> bool {
+    snapshot
+        .records()
+        .iter()
+        .any(|record| record.sender_profile_did() == profile_did && record.expires_at() > now)
 }
 
 fn apply_profile_people_authority(
@@ -1903,6 +2453,18 @@ fn apply_profile_people_authority(
     Ok(())
 }
 
+fn apply_profile_people_authority_from_snapshot(
+    people: &mut HomePeopleSummary,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<()> {
+    if let Some(read) = read {
+        *people = configured_people_summary_from_snapshot(read)?;
+        return Ok(());
+    }
+    *people = HomePeopleSummary::default();
+    Ok(())
+}
+
 fn apply_services_peer_authority(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -1911,7 +2473,22 @@ fn apply_services_peer_authority(
     >,
     services: &mut HomeServicesSummary,
 ) -> anyhow::Result<()> {
-    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_services_peer_authority_from_snapshot(data_dir, context, read.as_ref(), services)
+}
+
+fn apply_services_peer_authority_from_snapshot(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    services: &mut HomeServicesSummary,
+) -> anyhow::Result<()> {
+    let contacts = home_services_peer_contacts_state_from_snapshot(context, read)?;
     let mut remote_offers = contacts
         .contacts
         .values()
@@ -1929,6 +2506,7 @@ fn apply_services_peer_authority(
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             })
         })
         .collect::<Vec<_>>();
@@ -2050,14 +2628,11 @@ pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_launch_token_binding(
-        &state.data_dir,
-        &headers,
-        &[SERVICES_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
-    ) {
-        Ok(binding) => binding.context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SERVICES_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     let provider_registry = state.provider_registry.clone();
@@ -2389,6 +2964,10 @@ fn home_services_selection_state(
         Ok(raw) => raw,
         Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(default_state),
         Err(err) if is_missing_principal_root_state_file(&err) => return Ok(default_state),
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_state);
+        }
         Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
     };
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
@@ -2442,7 +3021,7 @@ fn home_save_services_selection_state(
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
         anyhow::bail!("Services state is too large");
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &state.principal_id,
         &state.localhost_root,
@@ -2450,7 +3029,16 @@ fn home_save_services_selection_state(
         &path,
         &raw,
     )
-    .with_context(|| format!("could not write {}", path.display()))
+    .map_err(|err| home_state_write_error(err, &path))
+}
+
+/// Keeps a damaged-file refusal on top, where responses show it.
+fn home_state_write_error(err: anyhow::Error, path: &std::path::Path) -> anyhow::Error {
+    if is_damaged_home_state(&err) {
+        err
+    } else {
+        err.context(format!("could not write {}", path.display()))
+    }
 }
 
 fn home_services_requests_state_uri(context: &HomeLaunchTokenContext) -> String {
@@ -2491,14 +3079,20 @@ fn home_services_requests_state(
     if !path.is_file() {
         return Ok(default_state);
     }
-    let raw = crate::auth::read_principal_root_object(
+    let raw = match crate::auth::read_principal_root_object(
         data_dir,
         &default_state.principal_id,
         &default_state.localhost_root,
         &home_services_requests_state_uri(context),
         &path,
-    )
-    .with_context(|| format!("could not read {}", path.display()))?;
+    ) {
+        Ok(raw) => raw,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_state);
+        }
+        Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
+    };
     if raw.len() > HOME_SERVICES_REQUESTS_MAX_BYTES {
         anyhow::bail!("Services requests state is too large");
     }
@@ -2529,7 +3123,7 @@ fn home_save_services_requests_state(
     if raw.len() > HOME_SERVICES_REQUESTS_MAX_BYTES {
         anyhow::bail!("Services requests state is too large");
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &state.principal_id,
         &state.localhost_root,
@@ -2537,7 +3131,7 @@ fn home_save_services_requests_state(
         &path,
         &raw,
     )
-    .with_context(|| format!("could not write {}", path.display()))
+    .map_err(|err| home_state_write_error(err, &path))
 }
 
 fn home_services_peer_contact_record_for_offer(
@@ -3574,6 +4168,91 @@ fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String 
     }
 }
 
+/// The presence device DID of `context`'s accepted contact that speaks as the
+/// Carrier peer `source`, if any. Every Carrier service that serves only
+/// contacts asks this one question. A principal without a Profile has no
+/// contacts.
+fn accepted_contact_for_carrier_source(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    context: &HomeLaunchTokenContext,
+    local_did: &str,
+    source: &iroh::PublicKey,
+) -> anyhow::Result<Option<String>> {
+    let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
+        return Ok(None);
+    };
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        data_dir,
+        &context.principal_id,
+        &home_browser_localhost_root(context),
+        network.clone(),
+        &profile,
+        local_did,
+    )?;
+    Ok(store
+        .snapshot()?
+        .contacts()
+        .iter()
+        .find(|contact| {
+            crate::carrier::did_to_public_key(contact.remote_presence_device_did()) == Some(*source)
+        })
+        .map(|contact| contact.remote_presence_device_did().to_string()))
+}
+
+/// Whether the Carrier peer `source` is an accepted contact of any of
+/// `principals` on this Home: the people a published file is for. A store
+/// that cannot be read counts as no contact.
+pub(crate) fn carrier_source_is_contact_of(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    principals: &std::collections::BTreeSet<String>,
+    source: &iroh::PublicKey,
+) -> bool {
+    let Ok(Some(local_did)) =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)
+    else {
+        return false;
+    };
+    let Ok(records) = crate::auth::active_passkey_principals(data_dir) else {
+        return false;
+    };
+    passkey_principals_once(records)
+        .into_iter()
+        .filter(|(principal, _)| principals.contains(&principal.principal_id))
+        .any(|(principal, _)| {
+            let context = HomeLaunchTokenContext {
+                principal_id: principal.principal_id,
+                proof_binding_id: Some(principal.proof_binding_id),
+                session_id: String::new(),
+                grant_id: String::new(),
+            };
+            accepted_contact_for_carrier_source(data_dir, network, &context, &local_did, source)
+                .is_ok_and(|contact| contact.is_some())
+        })
+}
+
+/// One entry per principal from the active passkey records. A principal with
+/// several passkeys has one record per passkey but owns one set of service
+/// requests, so the grant loops must read it once. The flag is true only when
+/// every active record for that principal is an admin (fail closed).
+fn passkey_principals_once(
+    records: Vec<crate::auth::PrincipalRecord>,
+) -> Vec<(crate::auth::PrincipalRecord, bool)> {
+    let mut once: Vec<(crate::auth::PrincipalRecord, bool)> = Vec::new();
+    for record in records {
+        let admin = crate::auth::is_admin(&record);
+        match once
+            .iter_mut()
+            .find(|(seen, _)| seen.principal_id == record.principal_id)
+        {
+            Some((_, all_admin)) => *all_admin &= admin,
+            None => once.push((record, admin)),
+        }
+    }
+    once
+}
+
 pub(crate) fn authorize_home_service_exit(
     data_dir: &std::path::Path,
     network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
@@ -3589,7 +4268,7 @@ pub(crate) fn authorize_home_service_exit(
     let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
         .ok_or_else(|| anyhow::anyhow!("Exit signing identity unavailable"))?;
     let mut authorized = None;
-    for principal in principals {
+    for (principal, _) in passkey_principals_once(principals) {
         let context = HomeLaunchTokenContext {
             principal_id: principal.principal_id,
             proof_binding_id: Some(principal.proof_binding_id),
@@ -3609,24 +4288,11 @@ pub(crate) fn authorize_home_service_exit(
                     && home_services_local_exit_shared(data_dir, &context)?,
                 "Exit grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Exit profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Exit requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserExitGrant {
@@ -3672,7 +4338,7 @@ pub(crate) fn authorize_home_engine_preparation_cancellation(
         "Engine cancellation authority scope unavailable"
     );
     let mut matched = false;
-    for principal in principals {
+    for (principal, _) in passkey_principals_once(principals) {
         let context = HomeLaunchTokenContext {
             principal_id: principal.principal_id,
             proof_binding_id: Some(principal.proof_binding_id),
@@ -3722,7 +4388,7 @@ pub(crate) fn authorize_home_service_engine(
     let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
         .ok_or_else(|| anyhow::anyhow!("Engine signing identity unavailable"))?;
     let mut authorized = None;
-    for principal in principals {
+    for (principal, _) in passkey_principals_once(principals) {
         let context = HomeLaunchTokenContext {
             principal_id: principal.principal_id,
             proof_binding_id: Some(principal.proof_binding_id),
@@ -3742,24 +4408,11 @@ pub(crate) fn authorize_home_service_engine(
                     && home_services_local_engine_shared(data_dir, &context)?,
                 "Engine grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Engine profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Engine requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserEngineGrant {
@@ -4033,7 +4686,7 @@ pub(crate) fn authorize_home_service_model(
     let local_did = crate::collaboration_profile_authority::load_existing_device_did(data_dir)?
         .ok_or_else(|| anyhow::anyhow!("model signing identity unavailable"))?;
     let mut authorized = None;
-    for principal in principals {
+    for (principal, provider_is_admin) in passkey_principals_once(principals) {
         let context = HomeLaunchTokenContext {
             principal_id: principal.principal_id,
             proof_binding_id: Some(principal.proof_binding_id),
@@ -4046,33 +4699,26 @@ pub(crate) fn authorize_home_service_model(
             .values()
             .filter(|record| super::model_grant_id(&record.request_id) == grant_id)
         {
+            // Only a current admin hands out the Home's hosted AI connection.
             anyhow::ensure!(
                 record.authenticated_request
                     && record.status == "approved"
                     && record.service_uri == super::MODEL_SERVICE_URI
                     && record.service_kind == super::MODEL_SERVICE_KIND
+                    && (provider_is_admin
+                        || !record
+                            .approved_offer_ids
+                            .iter()
+                            .any(|id| crate::api::model_provider_config::is_hosted_offer_id(id)))
                     && (home_services_local_model_shared(data_dir, &context)?
                         || crate::api::any_hosted_model_shared(data_dir)),
                 "model grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("model profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "model requester is no longer an accepted contact"
             );
             let grant = super::ModelServiceGrant {
@@ -4093,6 +4739,7 @@ pub(crate) fn authorize_home_service_model(
                     .ok_or_else(|| anyhow::anyhow!("model grant expiry required"))?,
                 approved_offer_ids: record.approved_offer_ids.clone(),
                 approved_offer_revision: record.approved_offer_revision.clone(),
+                provider_may_share_hosted: provider_is_admin,
             };
             grant.validate(source, requester_principal_id, now)?;
             anyhow::ensure!(authorized.is_none(), "model grant ownership is ambiguous");
@@ -4199,13 +4846,8 @@ pub(super) fn home_services_sync_access_requests(
     let _guard = mutation_lock
         .lock()
         .map_err(|_| anyhow::anyhow!("Services state is unavailable"))?;
-    if !home_services_local_exit_shared(data_dir, context)?
-        && !home_services_local_engine_shared(data_dir, context)?
-        && !home_services_local_model_shared(data_dir, context)?
-        && !crate::api::any_hosted_model_shared(data_dir)
-    {
-        return Ok(());
-    }
+    let model_shared = home_services_local_model_shared(data_dir, context)?
+        || crate::api::any_hosted_model_shared(data_dir);
     let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
     let known_peers = contacts
         .contacts
@@ -4331,13 +4973,14 @@ pub(super) fn home_services_sync_access_requests(
         .pending_model_catalogs
         .iter()
         .filter(|(peer_id, _)| {
-            now.saturating_sub(
-                state
-                    .catalog_last_response_at
-                    .get(*peer_id)
-                    .copied()
-                    .unwrap_or_default(),
-            ) >= HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS
+            model_shared
+                && now.saturating_sub(
+                    state
+                        .catalog_last_response_at
+                        .get(*peer_id)
+                        .copied()
+                        .unwrap_or_default(),
+                ) >= HOME_MODEL_CATALOG_RESPONSE_COOLDOWN_SECS
         })
         .map(|(peer_id, request)| {
             (
@@ -4534,6 +5177,11 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
     }
 }
 
+const PRIVATE_ENGINE_APPROVAL_COPY: &str =
+    "Your Browser Engine is not shared, so this request cannot be approved.";
+const HOSTED_MODEL_APPROVAL_COPY: &str =
+    "Only an admin can approve use of this Home's hosted AI connection.";
+
 pub(super) fn append_home_service_access_notifications(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -4599,12 +5247,22 @@ pub(super) fn append_home_service_access_notifications(
                 }
                 None => approval_effect.to_string(),
             }
+        } else if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+            && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+        {
+            match home_services_local_engine_shared(data_dir, context) {
+                Ok(false) => PRIVATE_ENGINE_APPROVAL_COPY.to_string(),
+                Ok(true) => approval_effect.to_string(),
+                Err(_) => {
+                    "This Home could not check whether your Browser Engine is shared.".to_string()
+                }
+            }
         } else {
             approval_effect.to_string()
         };
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
                 "{} requests your {service_noun}",
@@ -4615,7 +5273,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),
             }),
             severity: "attention".to_string(),
@@ -4632,7 +5290,7 @@ pub(super) fn append_home_service_access_notifications(
             home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_grant".to_string(),
             title: format!(
                 "{} may use your {service_noun}",
@@ -4643,7 +5301,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-deny-request:{}", request.request_id),
             }),
             severity: "info".to_string(),
@@ -4767,11 +5425,28 @@ fn home_services_record_access_decision(
         anyhow::bail!("service request requires an authenticated requester");
     }
     if status == "approved" {
+        if request.service_kind == super::MODEL_SERVICE_KIND
+            && request.service_uri == super::MODEL_SERVICE_URI
+            && request
+                .requested_model_offer_id
+                .as_deref()
+                .is_some_and(crate::api::model_provider_config::is_hosted_offer_id)
+            && require_admin_principal(data_dir, context).is_err()
+        {
+            anyhow::bail!(HOSTED_MODEL_APPROVAL_COPY);
+        }
         let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
         if !contacts.contacts.values().any(|contact| {
             contact.peer_id == request.requester_peer_id && contact.did == request.requester_did
-        }) || !home_services_request_shared(data_dir, context, &request)?
-        {
+        }) {
+            anyhow::bail!("service request person or shared offer is no longer available");
+        }
+        if !home_services_request_shared(data_dir, context, &request)? {
+            if request.service_kind == crate::carrier::ENGINE_SERVICE_KIND
+                && request.service_uri == crate::carrier::ENGINE_SERVICE_URI
+            {
+                anyhow::bail!(PRIVATE_ENGINE_APPROVAL_COPY);
+            }
             anyhow::bail!("service request person or shared offer is no longer available");
         }
     }
@@ -4793,13 +5468,19 @@ fn home_services_record_access_decision(
             .as_deref()
             .filter(|id| super::gateway_model_service::safe_id(id, 256))
             .ok_or_else(|| anyhow::anyhow!("exact model offer request required"))?;
-        super::gateway_model_service::shareable_offer_for_home(
+        let offer = super::gateway_model_service::shareable_offer_for_home(
             &result,
             data_dir,
             home_services_local_model_shared(data_dir, context)?,
             requested_id,
         )
         .ok_or_else(|| anyhow::anyhow!("requested model offer is unavailable"))?;
+        // Sharing decides "hosted" from the listing, whatever the offer id.
+        if super::gateway_model_service::listed_offer_is_hosted(&offer)
+            && require_admin_principal(data_dir, context).is_err()
+        {
+            anyhow::bail!(HOSTED_MODEL_APPROVAL_COPY);
+        }
         let offer_revision =
             super::gateway_model_service::offer_execution_revision(&result, requested_id)
                 .ok_or_else(|| anyhow::anyhow!("requested model offer revision unavailable"))?;
@@ -4857,11 +5538,18 @@ fn home_services_record_access_decision(
     })
 }
 
-fn require_admin_principal(
+pub(super) fn require_admin_principal(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<()> {
-    let Some(proof_binding_id) = context.proof_binding_id.as_deref() else {
+    require_admin_proof_binding(data_dir, context.proof_binding_id.as_deref())
+}
+
+fn require_admin_proof_binding(
+    data_dir: &std::path::Path,
+    proof_binding_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(proof_binding_id) = proof_binding_id else {
         anyhow::bail!("admin passkey required");
     };
     let principal = crate::auth::load_principal_for_proof_binding(data_dir, proof_binding_id)?;
@@ -4870,6 +5558,12 @@ fn require_admin_principal(
         anyhow::bail!("admin passkey required");
     }
     Ok(())
+}
+
+/// The host itself (its proofless local token) or an admin passkey. Guests
+/// never reach host-wide surfaces such as the Runtime audit log or terminal.
+pub(super) fn acts_for_host(data_dir: &std::path::Path, proof_binding_id: Option<&str>) -> bool {
+    proof_binding_id.is_none() || require_admin_proof_binding(data_dir, proof_binding_id).is_ok()
 }
 
 fn apply_hosted_share_selection(data_dir: &std::path::Path, selected: &mut BTreeSet<String>) {
@@ -5044,33 +5738,20 @@ pub(super) async fn home_events_stream(
         cursor: String::new(),
     };
     let stream = futures_lite::stream::unfold(stream_state, |mut stream_state| async move {
-        loop {
-            let snapshot = home_realtime_snapshot(
-                &stream_state.state,
-                &stream_state.context,
-                &stream_state.authority,
-            )
-            .await;
-            let cursor = home_realtime_cursor(&snapshot);
-            if stream_state.cursor.is_empty() {
-                stream_state.cursor = cursor;
-            } else if cursor != stream_state.cursor {
-                let events = home_realtime_events(&stream_state.cursor, &snapshot);
-                stream_state.cursor = cursor.clone();
-                let response = HomeEventsResponse {
-                    schema: HOME_EVENTS_SCHEMA.to_string(),
-                    cursor,
-                    keepalive: false,
-                    retry_after_ms: HOME_EVENTS_RETRY_MS,
-                    events,
-                };
-                return Some((
-                    Ok::<SseEvent, Infallible>(home_events_sse_event(response)),
-                    stream_state,
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(HOME_EVENTS_POLL_MS)).await;
-        }
+        let HomeEventsStreamState {
+            state,
+            context,
+            authority,
+            cursor,
+        } = &mut stream_state;
+        let response = next_home_events_stream_response(cursor, || {
+            home_realtime_snapshot(state, context, authority)
+        })
+        .await;
+        Some((
+            Ok::<SseEvent, Infallible>(home_events_sse_event(response)),
+            stream_state,
+        ))
     });
 
     let mut response = Sse::new(stream)
@@ -5090,6 +5771,38 @@ pub(super) async fn home_events_stream(
         axum::http::HeaderValue::from_static("no"),
     );
     response
+}
+
+/// Waits one poll interval before every snapshot after the first, so a
+/// snapshot that changes on every call cannot turn the stream into a busy loop.
+async fn next_home_events_stream_response<F, Fut>(
+    cursor: &mut String,
+    mut take_snapshot: F,
+) -> HomeEventsResponse
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = HomeRealtimeSnapshot>,
+{
+    loop {
+        if !cursor.is_empty() {
+            tokio::time::sleep(Duration::from_millis(HOME_EVENTS_POLL_MS)).await;
+        }
+        let snapshot = take_snapshot().await;
+        let next = home_realtime_cursor(&snapshot);
+        if cursor.is_empty() {
+            *cursor = next;
+        } else if next != *cursor {
+            let events = home_realtime_events(cursor, &snapshot);
+            *cursor = next.clone();
+            return HomeEventsResponse {
+                schema: HOME_EVENTS_SCHEMA.to_string(),
+                cursor: next,
+                keepalive: false,
+                retry_after_ms: HOME_EVENTS_RETRY_MS,
+                events,
+            };
+        }
+    }
 }
 
 struct HomeEventsStreamState {
@@ -5123,46 +5836,64 @@ async fn home_realtime_snapshot(
         context,
         state.collaboration_discovery_service.as_ref(),
     );
-    let mut contact_authority_unavailable = contact_authority.is_err();
-    if apply_contact_request_notification_projection(
+    let contact_read = contact_authority
+        .as_ref()
+        .ok()
+        .and_then(|authority| authority.as_ref())
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose();
+    let mut contact_authority_unavailable = contact_authority.is_err() || contact_read.is_err();
+    if apply_contact_request_notification_projection_from_snapshot(
         &state.data_dir,
         contact_authority
             .as_ref()
             .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+            .and_then(|authority| authority.as_ref()),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
+        state.collaboration_chat_product_port.as_ref(),
         &mut home_state.notifications,
     )
     .is_err()
     {
         contact_authority_unavailable = true;
     }
-    if apply_profile_people_authority(
+    if apply_profile_people_authority_from_snapshot(
         &mut home_state.people,
-        contact_authority
-            .as_ref()
-            .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
     )
     .is_err()
     {
         home_state.people = HomePeopleSummary::default();
     }
-    if apply_services_peer_authority(
-        &state.data_dir,
-        context,
-        state.collaboration_discovery_service.as_ref(),
-        &mut home_state.services,
-    )
-    .is_err()
+    if contact_authority.is_err()
+        || contact_read.is_err()
+        || apply_services_peer_authority_from_snapshot(
+            &state.data_dir,
+            context,
+            contact_read.as_ref().ok().and_then(|read| read.as_ref()),
+            &mut home_state.services,
+        )
+        .is_err()
     {
         home_state.services = HomeServicesSummary::default();
     }
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
         home_state.services = HomeServicesSummary::default();
     }
-    let room_signature = home_room_realtime_signature(&home_state.room);
+    // A new direct message refreshes its conversation's notification time,
+    // so the newest such time signals direct messages alongside the room.
+    let direct_message_marker = home_state
+        .notifications
+        .entries
+        .iter()
+        .filter(|entry| crate::notifications::is_direct_message_notification_id(&entry.id))
+        .map(|entry| entry.created_at)
+        .max()
+        .unwrap_or_default();
+    let room_signature = format!(
+        "{}:dm{direct_message_marker}",
+        home_room_realtime_signature(&home_state.room)
+    );
     let mut notifications = home_state.notifications;
     let wallet_approvals = system_wallet_approvals_summary(state, authority, false).await;
     let mut wallet_request_signature = wallet_approvals
@@ -5176,13 +5907,13 @@ async fn home_realtime_snapshot(
         })
         .collect::<Vec<_>>();
     wallet_request_signature.sort();
-    append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
-    let capability_requests = runtime_capability_pending_requests(&state.data_dir)
-        .await
-        .unwrap_or_default();
-    let capability_request_count = capability_requests.len();
-    append_runtime_capability_notifications(&mut notifications, capability_requests);
-    append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
+    append_inbox_requests(
+        state,
+        context,
+        wallet_approvals.approval_requests,
+        &mut notifications,
+    )
+    .await;
     let mut notification_signature = notifications
         .entries
         .iter()
@@ -5197,6 +5928,15 @@ async fn home_realtime_snapshot(
     if contact_authority_unavailable {
         notification_signature.push("contact-authority-unavailable".to_string());
     }
+    // Hosted access decisions are owner Inbox items (gateway_inbox::owner_hosted_routes);
+    // a request, decision, End or expiry reaches Inbox and System as `inbox.changed`.
+    #[cfg(unix)]
+    if ensure_admin_context(&state.data_dir, context).is_ok() {
+        match crate::api::model_provider_egress_decision::realtime_signature(&state.data_dir) {
+            Ok(hosted) => notification_signature.extend(hosted),
+            Err(_) => notification_signature.push("hosted-routes-unavailable".to_string()),
+        }
+    }
     let browser_sessions = super::gateway_browser::browser_gateway_session_status(
         &state.data_dir,
         &context.principal_id,
@@ -5206,10 +5946,25 @@ async fn home_realtime_snapshot(
     .await;
     let recovery_readiness = recovery_readiness_for_context(&state.data_dir, context);
     let desktop_signature = home_desktop_events_signature(state, context).await;
-    let people_signature = home_people_realtime_signature(&home_state.people);
+    let mut people_signature = home_people_realtime_signature(&home_state.people);
+    if let (Some(service), Ok(Some(authority))) = (
+        state.collaboration_discovery_service.as_ref(),
+        contact_authority.as_ref(),
+    ) {
+        if let Ok(status) =
+            service.read_only_status(authority.store.as_ref(), &authority.profile, now_ts())
+        {
+            people_signature.push(home_discovery_realtime_signature(&status));
+        }
+        // Waiting requests by DID change their row text when this flips.
+        if service.profile_contact_delivery_unavailable() {
+            people_signature.push("profile-contact-undeliverable".to_string());
+        }
+    }
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
+        runtime_signature: home_runtime_realtime_signature(&state.data_dir),
         recovery_readiness,
         profile_readiness: profile_readiness_for_principal(
             &state.data_dir,
@@ -5219,13 +5974,28 @@ async fn home_realtime_snapshot(
         .readiness,
         notification_signature,
         wallet_request_signature,
-        capability_request_count,
         desktop_signature,
         room_signature,
         people_signature,
         services_signature,
         browser_sessions,
     }
+}
+
+fn home_runtime_realtime_signature(data_dir: &std::path::Path) -> String {
+    let controller = crate::update_controller::status(data_dir).ok().flatten();
+    stable_cursor_hash(&(
+        GATEWAY_VERSION,
+        std::env::var("ELASTOS_UPDATE_GENERATION").ok(),
+        controller.as_ref().map(|status| {
+            (
+                &status.id,
+                &status.phase,
+                &status.current_version,
+                &status.new_version,
+            )
+        }),
+    ))
 }
 
 fn home_realtime_cursor(snapshot: &HomeRealtimeSnapshot) -> String {
@@ -5258,21 +6028,44 @@ fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCu
     HomeRealtimeCursorParts {
         home: stable_cursor_hash(&(
             &snapshot.principal_id,
+            &snapshot.runtime_signature,
             &snapshot.recovery_readiness,
             &snapshot.profile_readiness,
         )),
         inbox: stable_cursor_hash(&(
             &snapshot.notification_signature,
             &snapshot.wallet_request_signature,
-            snapshot.capability_request_count,
         )),
         wallet: stable_cursor_hash(&snapshot.wallet_request_signature),
-        browser: stable_cursor_hash(&snapshot.browser_sessions),
+        browser: stable_cursor_hash(&browser_sessions_cursor_value(&snapshot.browser_sessions)),
         desktop: stable_cursor_hash(&snapshot.desktop_signature),
         chat_room: stable_cursor_hash(&snapshot.room_signature),
         people: stable_cursor_hash(&snapshot.people_signature),
         services: stable_cursor_hash(&snapshot.services_signature),
     }
+}
+
+/// Session fields that change with the clock, not with the session. Hashing
+/// them made `browser.sessions.changed` fire on every poll.
+const BROWSER_SESSION_CLOCK_FIELDS: [&str; 3] =
+    ["age_ms", "pending_launch_age_ms", "last_frame_at"];
+
+fn browser_sessions_cursor_value(status: &serde_json::Value) -> serde_json::Value {
+    let mut status = status.clone();
+    if let Some(sessions) = status
+        .pointer_mut("/lifecycle/sessions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for session in sessions
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            for field in BROWSER_SESSION_CLOCK_FIELDS {
+                session.remove(field);
+            }
+        }
+    }
+    status
 }
 
 fn stable_cursor_hash<T: Serialize>(value: &T) -> String {
@@ -5302,8 +6095,9 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         .collect::<Vec<_>>();
     sessions.sort();
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         room.room_slug,
+        room.latest_seq,
         room.pending_count,
         room.active_session_count,
         room.member_count,
@@ -5311,6 +6105,27 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         room.local_runtime_role.as_deref().unwrap_or_default(),
         pending.join(","),
         sessions.join(",")
+    )
+}
+
+/// Discovery state that People shows. Countdown seconds stay out so the
+/// signature changes only when what a person can act on changes.
+fn home_discovery_realtime_signature(
+    status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+) -> String {
+    let mut visible = status
+        .visible_people()
+        .iter()
+        .map(|person| person.advertisement_id())
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    format!(
+        "discovery:{}:{}:{}:{}:{}",
+        status.enabled(),
+        status.connecting(),
+        status.available(),
+        status.incoming_requests().len(),
+        visible.join(",")
     )
 }
 
@@ -5555,7 +6370,7 @@ fn require_home_active_shell_token_context(
     require_home_active_shell_update_token_context(data_dir, headers)
 }
 
-fn require_home_active_shell_wallet_authority(
+pub(super) fn require_home_active_shell_wallet_authority(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<RuntimeWalletAuthority> {
@@ -5632,22 +6447,18 @@ pub(super) fn recovery_readiness_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> RecoveryReadinessSummary {
-    match crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+    use crate::api::auth_gateway::PrincipalRootRecoveryReadiness;
+    match crate::api::auth_gateway::principal_root_recovery_readiness_for_verified_principal(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
     ) {
-        Ok(recovery) => {
-            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
-                && !recovery
-                    .required_actions
-                    .iter()
-                    .any(|action| action == "download_recovery_kit_with_profile")
-            {
-                RecoveryReadinessSummary::ready()
-            } else {
-                RecoveryReadinessSummary::setup_required()
-            }
+        Ok(PrincipalRootRecoveryReadiness::Ready) => RecoveryReadinessSummary::ready(),
+        Ok(PrincipalRootRecoveryReadiness::KitOutdated) => {
+            RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
+        }
+        Ok(PrincipalRootRecoveryReadiness::KitMissing) => {
+            RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
         }
         Err(_) => RecoveryReadinessSummary::unavailable(),
     }
@@ -5760,7 +6571,15 @@ fn home_active_shell_summary(
     data_dir: &std::path::Path,
     context: Option<&HomeLaunchTokenContext>,
 ) -> anyhow::Result<HomeActiveShellSummary> {
-    let candidates = home_active_shell_candidates(data_dir);
+    home_active_shell_summary_from_catalog(data_dir, context, &capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_summary_from_catalog(
+    data_dir: &std::path::Path,
+    context: Option<&HomeLaunchTokenContext>,
+    catalog: &CapsuleCatalogResponse,
+) -> anyhow::Result<HomeActiveShellSummary> {
+    let candidates = home_active_shell_candidates_from_catalog(catalog);
     let saved = match context {
         Some(context) => home_active_shell_state(data_dir, context)?.map(|state| state.active),
         None => None,
@@ -5813,18 +6632,24 @@ pub(super) fn home_active_shell_snapshot_value(
 }
 
 fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShellCandidate> {
+    home_active_shell_candidates_from_catalog(&capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_candidates_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> Vec<HomeActiveShellCandidate> {
     let mut candidates = BTreeMap::<String, HomeActiveShellCandidate>::new();
-    for capsule in capsule_catalog_summary(data_dir)
+    for capsule in catalog
         .capsules
-        .into_iter()
+        .iter()
         .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
         .filter(|capsule| capsule.name != HOME_CAPSULE_ID)
         .filter(|capsule| is_trusted_home_shell_id(&capsule.name))
     {
-        let Some(catalog_route) = capsule.route else {
+        let Some(catalog_route) = capsule.route.clone() else {
             continue;
         };
-        let capsule_name = capsule.name;
+        let capsule_name = capsule.name.clone();
         let is_home_gui = capsule_name == HOME_GUI_SHELL_ID;
         let name = capsule_name.clone();
         let candidate = HomeActiveShellCandidate {
@@ -5832,17 +6657,17 @@ fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShe
             title: if is_home_gui {
                 "Home GUI".to_string()
             } else {
-                capsule.title
+                capsule.title.clone()
             },
-            description: capsule.description,
+            description: capsule.description.clone(),
             route: if is_home_gui {
                 HOME_ROUTE.to_string()
             } else {
                 catalog_route
             },
-            role: capsule.role,
+            role: capsule.role.clone(),
             launchable: capsule.launchable,
-            trust_state: capsule.trust_state,
+            trust_state: capsule.trust_state.clone(),
         };
         candidates.insert(name, candidate);
     }
@@ -5893,6 +6718,10 @@ fn home_active_shell_state(
         Ok(bytes) => bytes,
         Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(None),
         Err(err) if is_missing_principal_root_state_file(&err) => return Ok(None),
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(None);
+        }
         Err(err) => return Err(err),
     };
     if bytes.len() > HOME_ACTIVE_SHELL_MAX_BYTES {
@@ -5946,7 +6775,7 @@ fn home_save_active_shell(
     if let Some(parent) = path.parent() {
         crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
@@ -6211,6 +7040,10 @@ fn home_browser_state(
         Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_browser_state(context));
         }
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_home_browser_state(context));
+        }
         Err(err) => return Err(err),
     };
     let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
@@ -6269,6 +7102,59 @@ fn is_missing_principal_root_state_file(err: &anyhow::Error) -> bool {
     })
 }
 
+/// #444 FU2 interim. A Home state file whose label or contents are damaged
+/// reads as its default, so the shell and the Home and System summaries
+/// keep answering; the start log and System → Recovery name the file.
+fn is_damaged_home_state(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED)
+    })
+}
+
+fn warn_damaged_home_state(path: &std::path::Path, err: &anyhow::Error) {
+    tracing::warn!(
+        path = %path.display(),
+        error = %err,
+        "Home state file is damaged; using its default"
+    );
+}
+
+/// Saves a Home state file, refusing to replace one that is damaged: the
+/// refusal is the damage notice, which names the file and the action, and
+/// the file stays as it is until the person moves it out.
+fn write_home_state_object(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if path.is_file() {
+        if let Err(err) = crate::auth::read_principal_root_object(
+            data_dir,
+            principal_id,
+            localhost_root,
+            object_uri,
+            path,
+        ) {
+            if is_damaged_home_state(&err) {
+                return Err(err);
+            }
+        }
+    }
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        bytes,
+    )
+}
+
 fn home_save_browser_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -6295,7 +7181,7 @@ fn home_save_browser_state(
     if let Some(parent) = path.parent() {
         crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
@@ -6412,16 +7298,32 @@ fn home_services_peer_contacts_state(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
 ) -> anyhow::Result<HomeServicesPeerContactsState> {
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    home_services_peer_contacts_state_from_snapshot(context, read.as_ref())
+}
+
+fn home_services_peer_contacts_state_from_snapshot(
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<HomeServicesPeerContactsState> {
     let mut state = default_home_services_peer_contacts_state(context);
-    let Some(authority) =
-        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?
-    else {
+    let Some(read) = read else {
         return Ok(state);
     };
+    if read.store().principal_id() != state.principal_id
+        || read.store().localhost_root() != state.localhost_root
+    {
+        anyhow::bail!("Home Services snapshot does not match its principal root");
+    }
     // A contact permits a request. The provider's separate approval grants use.
     // Delivery follows the endpoint in the current verified Profile chain;
     // legacy peer files remain migration evidence, never contact authority.
-    for contact in authority.store.snapshot()?.contacts() {
+    for contact in read.snapshot()?.contacts() {
         let endpoint_did = contact.remote_presence_device_did();
         let peer_id = crate::carrier::did_to_public_key(endpoint_did)
             .ok_or_else(|| {
@@ -6749,7 +7651,40 @@ fn sanitize_home_layout_targets(
     if let Some(taskbar) = layout_object.get_mut("taskbar") {
         *taskbar = sanitize_home_target_array(taskbar.take(), known_targets);
     }
+    // The phone Home's own arrangement: its Dock row and its pages of apps.
+    if let Some(dock) = layout_object.get_mut("homeDock") {
+        *dock = sanitize_home_target_array(dock.take(), known_targets);
+    }
+    if let Some(pages) = layout_object.get_mut("homePages") {
+        *pages = sanitize_home_target_pages(pages.take(), known_targets);
+    }
     Some(layout)
+}
+
+/// Pages of targets: each id once across all pages, empty pages dropped.
+fn sanitize_home_target_pages(
+    value: serde_json::Value,
+    known_targets: &BTreeSet<String>,
+) -> serde_json::Value {
+    let mut seen = BTreeSet::new();
+    let pages = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|page| page.as_array())
+        .map(|page| {
+            page.iter()
+                .filter_map(|target| target.as_str())
+                .filter(|target| {
+                    known_targets.contains(*target) && seen.insert((*target).to_string())
+                })
+                .map(|target| serde_json::Value::String(target.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|page| !page.is_empty())
+        .map(serde_json::Value::Array)
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(pages)
 }
 
 fn is_home_desktop_object_layout_entry(localhost_root: &str, entry: &str) -> bool {
@@ -6828,11 +7763,23 @@ pub(super) async fn system_summary(
         };
     let context = authority.home_launch_context();
 
-    let (runtime, wallet_accounts, wallet_approvals, runtime_log) = tokio::join!(
+    let host_log_allowed = acts_for_host(&state.data_dir, context.proof_binding_id.as_deref());
+    let (runtime, wallet_accounts, wallet_approvals, runtime_log, runtime_update) = tokio::join!(
         home_runtime_summary(&state.data_dir),
         system_wallet_accounts_summary(&state, &authority),
         system_wallet_approvals_summary(&state, &authority, false),
-        system_runtime_log(&state.data_dir)
+        async {
+            // The Runtime audit log covers the whole host (#404).
+            if host_log_allowed {
+                system_runtime_log(&state.data_dir).await
+            } else {
+                SystemRuntimeLogSummary {
+                    note: Some("Only the Home owner can see Runtime activity.".to_string()),
+                    ..SystemRuntimeLogSummary::default()
+                }
+            }
+        },
+        system_runtime_update_summary(&state.data_dir, &context)
     );
     Json(SystemSummaryResponse {
         identity: match load_gateway_identity_summary_for_context(&state.data_dir, &context) {
@@ -6854,6 +7801,7 @@ pub(super) async fn system_summary(
             Err(err) => return system_error_response(err),
         },
         source: system_source_summary(&state.data_dir, &runtime),
+        runtime_update,
         runtime,
         wallet_accounts,
         wallet_approvals,
@@ -7075,6 +8023,68 @@ pub(super) async fn system_guest_registration_update(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemCommunityMembershipRequest {
+    joined: bool,
+}
+
+fn system_community_membership_summary(state: &GatewayState) -> serde_json::Value {
+    let membership = state
+        .collaboration_chat_product_port
+        .as_ref()
+        .map(|port| port.community_membership());
+    let joined = membership.is_some_and(|membership| membership.joined());
+    serde_json::json!({
+        "schema": "elastos.community-membership/v1",
+        "configured": membership.is_some(),
+        "joined": joined,
+        "detail": if membership.is_none() {
+            "Community is not configured on this Home."
+        } else if joined {
+            "This Home joins Community. Its owner can leave while keeping contacts, Direct messages and history."
+        } else {
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+        },
+    })
+}
+
+pub(super) async fn system_community_membership_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        Ok(_) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
+    }
+}
+
+pub(super) async fn system_community_membership_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<SystemCommunityMembershipRequest>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return system_error_response(error),
+        };
+    if let Err(error) = require_admin_principal(&state.data_dir, &context) {
+        return system_error_response(error);
+    }
+    let Some(port) = state.collaboration_chat_product_port.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            "Community is not configured on this Home.",
+        )
+            .into_response();
+    };
+    match port.set_community_joined(body.joined) {
+        Ok(()) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
+    }
+}
+
 struct HomeBackgroundImageEntry {
     path: PathBuf,
     object_uri: String,
@@ -7226,13 +8236,20 @@ fn home_appearance_preferences(
         }
         Err(err) => return Err(err.into()),
     }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = match crate::auth::read_principal_root_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
         &home_appearance_object_uri(context, HOME_APPEARANCE_PREFERENCES_FILE),
         &path,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(HomeAppearancePreferences::default());
+        }
+        Err(err) => return Err(err),
+    };
     if bytes.len() > HOME_APPEARANCE_PREFERENCES_MAX_BYTES {
         anyhow::bail!("appearance preferences are too large");
     }
@@ -7342,7 +8359,7 @@ fn home_save_appearance_preferences(
         if let Some(parent) = path.parent() {
             crate::auth::create_owner_only_dir_all(data_dir, parent)?;
         }
-        crate::auth::write_principal_root_object(
+        write_home_state_object(
             data_dir,
             &home_browser_principal_id(context),
             &home_browser_localhost_root(context),
@@ -7430,19 +8447,27 @@ fn home_background_overlay_settings(
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<(bool, f64)> {
     let path = home_appearance_path(data_dir, context, HOME_BACKGROUND_OVERLAY_FILE)?;
+    let defaults = (
+        HOME_BACKGROUND_OVERLAY_DEFAULT,
+        HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+    );
     if !path.is_file() {
-        return Ok((
-            HOME_BACKGROUND_OVERLAY_DEFAULT,
-            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
-        ));
+        return Ok(defaults);
     }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = match crate::auth::read_principal_root_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
         &home_appearance_object_uri(context, HOME_BACKGROUND_OVERLAY_FILE),
         &path,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(defaults);
+        }
+        Err(err) => return Err(err),
+    };
     let payload = serde_json::from_slice::<serde_json::Value>(&bytes)?;
     let enabled = payload
         .get("enabled")
@@ -7470,7 +8495,7 @@ fn home_save_background_overlay(
         "enabled": enabled,
         "opacity": home_clamp_background_overlay_opacity(opacity),
     });
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
@@ -7511,12 +8536,32 @@ fn home_reset_background_image(
     home_appearance_summary(data_dir, context)
 }
 
+/// Upload and reset replace the background, but never delete a damaged
+/// image: the refusal is the damage notice that names the file, as for every
+/// other Home state save (#447). Every image is checked before any is removed.
 fn remove_home_background_images(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<()> {
+    let mut paths = Vec::with_capacity(HOME_BACKGROUND_IMAGE_FILES.len());
     for &(file_name, _content_type) in HOME_BACKGROUND_IMAGE_FILES {
         let path = home_appearance_path(data_dir, context, file_name)?;
+        if path.is_file() {
+            if let Err(err) = crate::auth::read_principal_root_object(
+                data_dir,
+                &home_browser_principal_id(context),
+                &home_browser_localhost_root(context),
+                &home_appearance_object_uri(context, file_name),
+                &path,
+            ) {
+                if is_damaged_home_state(&err) {
+                    return Err(err);
+                }
+            }
+        }
+        paths.push(path);
+    }
+    for path in paths {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -7697,9 +8742,21 @@ pub(super) async fn home_background_image(
     ) {
         Ok(bytes) => {
             let mut response = bytes.into_response();
-            response.headers_mut().insert(
+            let headers = response.headers_mut();
+            headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
+            );
+            // Home owns this authenticated same-origin read and hands image
+            // bytes to the opaque GUI/System frames. CORP governs embedding;
+            // the Home token and browser provenance gates above own access.
+            headers.insert(
+                axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+                HeaderValue::from_static("cross-origin"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
             );
             response
         }
@@ -7710,6 +8767,14 @@ pub(super) async fn home_background_image(
 #[cfg(test)]
 mod home_realtime_tests {
     use super::*;
+
+    #[test]
+    fn room_realtime_signature_changes_when_a_message_arrives() {
+        let mut room = HomeRoomSummary::default();
+        let before = home_room_realtime_signature(&room);
+        room.latest_seq = 7;
+        assert_ne!(home_room_realtime_signature(&room), before);
+    }
 
     #[test]
     fn room_realtime_signature_ignores_session_last_seen_heartbeat() {
@@ -7752,6 +8817,7 @@ mod home_realtime_tests {
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         };
         let mut people = HomePeopleSummary {
             contact_count: 3,
@@ -7795,6 +8861,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: Some(20),
                 reachable: Some(true),
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };
@@ -7827,6 +8894,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };
@@ -7842,11 +8910,11 @@ mod home_realtime_tests {
     fn scoped_realtime_change_does_not_emit_home_summary_event() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
-            capability_request_count: 0,
             desktop_signature: Vec::new(),
             room_signature: String::new(),
             people_signature: Vec::new(),
@@ -7882,11 +8950,11 @@ mod home_realtime_tests {
     fn people_realtime_change_emits_people_scoped_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
             recovery_readiness: RecoveryReadinessSummary::unavailable(),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
-            capability_request_count: 0,
             desktop_signature: Vec::new(),
             room_signature: String::new(),
             people_signature: vec!["contact:alice:Alice".to_string()],
@@ -7922,14 +8990,44 @@ mod home_realtime_tests {
     }
 
     #[test]
+    fn runtime_generation_and_update_phase_emit_home_summary_event_only() {
+        let snapshot = HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            runtime_signature: "version-previous:ready".to_string(),
+            recovery_readiness: RecoveryReadinessSummary::ready(),
+            profile_readiness: ProfileReadinessSummary::ready(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            desktop_signature: Vec::new(),
+            room_signature: String::new(),
+            people_signature: Vec::new(),
+            services_signature: Vec::new(),
+            browser_sessions: serde_json::json!({}),
+        };
+        let cursor = home_realtime_cursor(&snapshot);
+        for runtime_signature in ["version-new:ready", "version-previous:restored"] {
+            let changed = HomeRealtimeSnapshot {
+                runtime_signature: runtime_signature.to_string(),
+                ..snapshot.clone()
+            };
+            let events = home_realtime_events(&cursor, &changed);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "home.summary.changed");
+            assert_eq!(events[0].scope, "home");
+        }
+    }
+
+    #[test]
     fn recovery_readiness_change_emits_home_summary_event_only() {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
-            recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            runtime_signature: String::new(),
+            recovery_readiness: RecoveryReadinessSummary::setup_required(
+                RECOVERY_READINESS_REASON_KIT_MISSING,
+            ),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
-            capability_request_count: 0,
             desktop_signature: Vec::new(),
             room_signature: String::new(),
             people_signature: Vec::new(),
@@ -8041,5 +9139,194 @@ mod services_kind_tests {
             ..Default::default()
         };
         assert!(!remote_offer_request_expired(&denied, 100));
+    }
+}
+
+#[cfg(test)]
+mod home_catalogue_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn home_catalogue_projections_share_one_snapshot_and_next_read_sees_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../capsules/home-gui/capsule.json"
+        ))
+        .unwrap();
+        for name in ["home-gui", "fixture-app"] {
+            let dir = root.path().join("capsules").join(name);
+            std::fs::create_dir_all(dir.join("browser")).unwrap();
+            let mut manifest = original.clone();
+            manifest["name"] = name.into();
+            if name == "fixture-app" {
+                manifest["role"] = "app".into();
+                manifest["description"] = "Before".into();
+            }
+            std::fs::write(
+                dir.join("capsule.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("browser/index.html"), "Home fixture").unwrap();
+        }
+        let registry = root.path().join("components.json");
+        let mut components = serde_json::json!({"external": {
+            "home-gui": {"install_path": "capsules/home-gui", "platforms": {}},
+            "fixture-app": {"install_path": "capsules/fixture-app", "platforms": {}}
+        }, "capsules": {}, "profiles": {}});
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let catalog = capsule_catalog_summary(root.path());
+        let shells = home_active_shell_summary_from_catalog(root.path(), None, &catalog).unwrap();
+        assert_eq!(shells.active, HOME_GUI_SHELL_ID);
+        assert_eq!(shells.candidates.len(), 1);
+        let targets = serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap();
+        let interfaces = serde_json::to_value(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await,
+        )
+        .unwrap();
+        assert!(interfaces["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["capsule"] == "fixture-app"));
+
+        components["external"]
+            .as_object_mut()
+            .unwrap()
+            .remove("home-gui");
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let path = root.path().join("capsules/fixture-app/capsule.json");
+        let mut updated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        updated["description"] = "After".into();
+        updated["interfaces"] = serde_json::json!([]);
+        std::fs::write(path, serde_json::to_vec(&updated).unwrap()).unwrap();
+        assert_eq!(
+            home_active_shell_summary_from_catalog(root.path(), None, &catalog)
+                .unwrap()
+                .active,
+            HOME_GUI_SHELL_ID
+        );
+        assert_eq!(
+            serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap(),
+            targets
+        );
+        assert_eq!(
+            serde_json::to_value(
+                capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await
+            )
+            .unwrap(),
+            interfaces
+        );
+
+        let next = capsule_catalog_summary(root.path());
+        assert!(
+            home_active_shell_summary_from_catalog(root.path(), None, &next)
+                .unwrap()
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            next.capsules
+                .iter()
+                .find(|row| row.name == "fixture-app")
+                .unwrap()
+                .description,
+            "After"
+        );
+        assert!(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&next, None)
+                .await
+                .interfaces
+                .is_empty()
+        );
+        assert!(home_active_shell_summary(root.path(), None)
+            .unwrap()
+            .active
+            .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod home_events_pacing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn snapshot_with_browser_session(session: serde_json::Value) -> HomeRealtimeSnapshot {
+        HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
+            recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            desktop_signature: Vec::new(),
+            room_signature: String::new(),
+            people_signature: Vec::new(),
+            services_signature: Vec::new(),
+            browser_sessions: serde_json::json!({
+                "schema": "elastos.browser.session-capacity/v1",
+                "total_sessions": 1,
+                // Shape of browser_gateway_session_status.
+                "lifecycle": {
+                    "schema": "elastos.browser.lifecycle-status/v1",
+                    "sessions": [session],
+                },
+            }),
+        }
+    }
+
+    fn browser_session(phase: &str, age_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "session-hash",
+            "phase": phase,
+            "started_at": 1_000,
+            "age_ms": age_ms,
+            "last_frame_at": 1_000 + age_ms,
+            "pending_launch_age_ms": age_ms,
+        })
+    }
+
+    #[test]
+    fn browser_session_clock_fields_do_not_change_the_cursor() {
+        let earlier = snapshot_with_browser_session(browser_session("active", 10));
+        let later = snapshot_with_browser_session(browser_session("active", 9_000));
+        assert_eq!(home_realtime_cursor(&earlier), home_realtime_cursor(&later));
+
+        let closing = snapshot_with_browser_session(browser_session("closing", 9_000));
+        let events = home_realtime_events(&home_realtime_cursor(&earlier), &closing);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "browser.sessions.changed"),
+            "a real session change must still emit a browser event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_takes_at_most_one_snapshot_per_second_while_sessions_change() {
+        let snapshots = AtomicU32::new(0);
+        let take_snapshot = || {
+            // Every snapshot differs, as a live Browser session's did before.
+            let n = snapshots.fetch_add(1, Ordering::SeqCst);
+            let phase = if n.is_multiple_of(2) {
+                "active"
+            } else {
+                "launching"
+            };
+            std::future::ready(snapshot_with_browser_session(browser_session(phase, 0)))
+        };
+        let start = tokio::time::Instant::now();
+        let mut cursor = String::new();
+        for _ in 0..5 {
+            let response = next_home_events_stream_response(&mut cursor, take_snapshot).await;
+            assert!(!response.events.is_empty());
+            let elapsed_secs = u32::try_from(start.elapsed().as_secs()).unwrap();
+            assert!(
+                snapshots.load(Ordering::SeqCst) <= elapsed_secs + 1,
+                "{} snapshots in {elapsed_secs} s",
+                snapshots.load(Ordering::SeqCst)
+            );
+        }
     }
 }

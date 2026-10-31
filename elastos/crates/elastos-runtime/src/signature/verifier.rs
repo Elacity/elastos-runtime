@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use elastos_common::{CapsuleManifest, ElastosError, Result};
@@ -24,11 +24,17 @@ impl SignatureVerifier {
         }
     }
 
-    /// Add a trusted public key
-    pub fn add_trusted_key(&mut self, key: VerifyingKey) {
+    /// Add a trusted public key. Weak (small-order) keys are refused.
+    pub fn add_trusted_key(&mut self, key: VerifyingKey) -> Result<()> {
+        if key.is_weak() {
+            return Err(ElastosError::InvalidManifest(
+                "Invalid public key: weak key".into(),
+            ));
+        }
         if !self.trusted_keys.iter().any(|k| k == &key) {
             self.trusted_keys.push(key);
         }
+        Ok(())
     }
 
     /// Add a trusted key from hex-encoded bytes
@@ -43,8 +49,7 @@ impl SignatureVerifier {
         let key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|e| ElastosError::InvalidManifest(format!("Invalid public key: {}", e)))?;
 
-        self.add_trusted_key(key);
-        Ok(())
+        self.add_trusted_key(key)
     }
 
     /// Load trusted keys from a file (one hex-encoded key per line)
@@ -94,7 +99,7 @@ impl SignatureVerifier {
 
         // Try each trusted key
         for key in &self.trusted_keys {
-            if key.verify(&message, &signature).is_ok() {
+            if key.verify_strict(&message, &signature).is_ok() {
                 return Ok(true);
             }
         }
@@ -221,7 +226,7 @@ mod tests {
 
         // Verify
         let mut verifier = SignatureVerifier::new();
-        verifier.add_trusted_key(verifying_key);
+        verifier.add_trusted_key(verifying_key).unwrap();
 
         let result = verifier.verify_capsule(&manifest, &content_hash).unwrap();
         assert!(result);
@@ -239,7 +244,7 @@ mod tests {
         sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
 
         let mut verifier = SignatureVerifier::new();
-        verifier.add_trusted_key(wrong_verifying_key);
+        verifier.add_trusted_key(wrong_verifying_key).unwrap();
 
         let result = verifier.verify_capsule(&manifest, &content_hash).unwrap();
         assert!(!result);
@@ -259,7 +264,7 @@ mod tests {
         let tampered_hash = hash_content(b"tampered content");
 
         let mut verifier = SignatureVerifier::new();
-        verifier.add_trusted_key(verifying_key);
+        verifier.add_trusted_key(verifying_key).unwrap();
 
         let result = verifier.verify_capsule(&manifest, &tampered_hash).unwrap();
         assert!(!result);
@@ -279,7 +284,7 @@ mod tests {
         manifest.name = "tampered-name".into();
 
         let mut verifier = SignatureVerifier::new();
-        verifier.add_trusted_key(verifying_key);
+        verifier.add_trusted_key(verifying_key).unwrap();
 
         let result = verifier.verify_capsule(&manifest, &content_hash).unwrap();
         assert!(!result);
@@ -318,5 +323,52 @@ mod tests {
         let result = verifier.verify_capsule(&manifest, &[]);
 
         assert!(result.is_err());
+    }
+
+    fn identity_point_key() -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes
+    }
+
+    #[test]
+    fn weak_trusted_key_does_not_verify_arbitrary_capsule() {
+        let key = VerifyingKey::from_bytes(&identity_point_key()).unwrap();
+        let mut manifest = create_test_manifest();
+        manifest.name = "arbitrary".into();
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        manifest.signature = Some(BASE64.encode(sig));
+        let verifier = SignatureVerifier {
+            trusted_keys: vec![key],
+        };
+        let result = verifier
+            .verify_capsule(&manifest, &hash_content(b"any entrypoint"))
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn weak_trusted_key_is_refused_when_added() {
+        let mut verifier = SignatureVerifier::new();
+        assert!(verifier
+            .add_trusted_key_hex(&hex::encode(identity_point_key()))
+            .is_err());
+        let key = VerifyingKey::from_bytes(&identity_point_key()).unwrap();
+        assert!(verifier.add_trusted_key(key).is_err());
+        assert_eq!(verifier.trusted_key_count(), 0);
+    }
+
+    #[test]
+    fn real_key_signature_still_verifies_strictly() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut manifest = create_test_manifest();
+        let content_hash = hash_content(b"entrypoint");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+        let mut verifier = SignatureVerifier::new();
+        verifier
+            .add_trusted_key_hex(&hex::encode(signing_key.verifying_key().as_bytes()))
+            .unwrap();
+        assert!(verifier.verify_capsule(&manifest, &content_hash).unwrap());
     }
 }

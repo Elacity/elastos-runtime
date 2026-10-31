@@ -28,8 +28,6 @@ export const shellState = {
   homeEventsSource: null,
   homeEventsStreamFailed: false,
   sessionRefreshTimer: null,
-  presenceHeartbeatTimer: null,
-  presenceHeartbeatInFlight: null,
   currentSummary: null,
   requestSummaryRefresh: null,
   activeShellRootTarget: "",
@@ -41,23 +39,53 @@ export const shellState = {
 };
 
 let homeAuthorityToken = "";
+let homeAuthorityContext = null;
 
-export function setHomeAuthorityToken(value) {
+export function setHomeAuthorityToken(value, session = {}) {
   homeAuthorityToken = typeof value === "string" ? value.trim() : "";
+  const fields = [session?.principal_id, session?.session_id, session?.proof_binding_id];
+  const identity = fields.every((field) => typeof field === "string" && field.trim())
+    ? JSON.stringify(fields) : null;
+  if (!homeAuthorityToken) {
+    homeAuthorityContext = null;
+  } else if (!identity || homeAuthorityContext?.identity !== identity) {
+    homeAuthorityContext = { identity };
+  }
 }
 
 export function clearHomeAuthorityToken() {
   homeAuthorityToken = "";
+  homeAuthorityContext = null;
 }
 
 export function hasHomeAuthorityToken() {
   return Boolean(homeAuthorityToken);
 }
 
+export function createHomeBackgroundImageReader() {
+  // The authenticated session response identifies the launch's authority.
+  // Token renewal keeps it; sign-out or another session retires the reader.
+  const authority = homeAuthorityContext;
+  return async () => {
+    if (!homeAuthorityToken) throw new Error("Home sign-in is required");
+    if (!authority || authority !== homeAuthorityContext) throw new Error("Home session changed");
+    const response = await fetch("/api/apps/home/appearance/background-image", {
+      headers: { "x-elastos-home-token": homeAuthorityToken },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error("Home could not read the background image");
+    const blob = await response.blob();
+    if (authority !== homeAuthorityContext) throw new Error("Home session changed");
+    return blob;
+  };
+}
+
 export async function fetchJson(url, init) {
   const requiresHomeAuthority = url === "/api/apps/home/launch"
     || url === "/api/apps/home/active-shell"
-    || url === "/api/apps/home/collaboration/presence";
+    || url === "/api/apps/home/shared-content/get"
+    || url === "/api/apps/home/shared-content/check";
   const authorityHeaders = requiresHomeAuthority && homeAuthorityToken
     ? { "x-elastos-home-token": homeAuthorityToken }
     : {};

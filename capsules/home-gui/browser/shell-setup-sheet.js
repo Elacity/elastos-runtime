@@ -1,10 +1,11 @@
-import { shellState, targetById, saveShellLayoutState } from "./shell-core.js?v=home-20260813a";
+import { shellState, targetById, saveShellLayoutState } from "./shell-core.js?v=home-20261030a";
 import {
   forgetChromeNotification,
   rememberChromeNotification,
   setHomeSetupNotificationHandler,
-} from "./shell-notifications.js?v=home-20260813a";
-import { openTarget, openSystemRecoverySave } from "./shell-windows.js?v=home-20260813a";
+} from "./shell-notifications.js?v=home-20261030a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20261030a";
+import { openTarget, openSystemRecoverySave } from "./shell-windows.js?v=home-20261030a";
 
 const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";
 const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";
@@ -19,11 +20,11 @@ let recoveryButton = null;
 let recoveryBody = null;
 let recoveryStep = null;
 let closeButton = null;
+let goalSteps = [];
 let bound = false;
 let dismissedThisSession = false;
 let recoveryActBusy = false;
 let drag = null;
-let finishedHideTimer = null;
 
 export function bindSetupSheet() {
   if (bound) {
@@ -37,13 +38,19 @@ export function bindSetupSheet() {
   recoveryBody = document.querySelector("#setup-sheet-recovery-body");
   recoveryStep = document.querySelector("#setup-sheet-step-recovery");
   closeButton = document.querySelector("#setup-sheet-close");
+  goalSteps = [...document.querySelectorAll("#setup-sheet [data-setup-goal]")];
   if (!sheet) {
     return;
   }
   bound = true;
+  registerStageLayer("setup-sheet", { selector: "#setup-sheet", close: () => hideSetupSheet() });
   closeButton?.addEventListener("click", () => hideSetupSheet());
   document.querySelector("#setup-sheet-later")?.addEventListener("click", () => hideSetupSheet());
   recoveryButton?.addEventListener("click", () => openRecoveryAct());
+  for (const step of goalSteps) {
+    step.querySelector("button")?.addEventListener("click",
+      () => openGoal(step.dataset.setupGoal, step.dataset.setupSettings));
+  }
   setHomeSetupNotificationHandler(() => {
     dismissedThisSession = false;
     showSetupSheet();
@@ -57,6 +64,12 @@ export function bindSetupSheet() {
       event.preventDefault();
       event.stopPropagation();
       hideSetupSheet();
+    } else if ((event.key === "Enter" || event.key === " ") && event.target === card
+      && sheet.classList.contains("is-yielded")) {
+      // Enter here opens the sheet only, not the selected desktop item.
+      event.preventDefault();
+      event.stopPropagation();
+      returnSetupSheet();
     }
   });
 }
@@ -99,15 +112,10 @@ export function setupSheetOpen() {
   return Boolean(sheet) && !sheet.hidden;
 }
 
-function scheduleFinishedSetupSheetHide() {
-  if (finishedHideTimer !== null) {
-    return;
-  }
-  const holdMs = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 1400;
-  finishedHideTimer = window.setTimeout(() => {
-    finishedHideTimer = null;
-    hideSetupSheet({ restoreFocus: true, rememberDismiss: false });
-  }, holdMs);
+// The sheet is modal again: keyboard focus moves into it from System.
+function returnSetupSheet() {
+  restoreSetupSheetOverlay();
+  (recoveryButton && !recoveryButton.disabled ? recoveryButton : closeButton)?.focus();
 }
 
 export function holdHomeSetupAct(targetId) {
@@ -129,8 +137,10 @@ export function syncSetupSheet(previous, summary) {
   if (!homeSetupNeedsAct(summary)) {
     forgetChromeNotification(SETUP_REMINDER_ID);
     if (setupFinished(summary) && setupSheetOpen()) {
+      // Step 1 done: keep the sheet as the guide to the next steps. It comes back once when
+      // setup finishes; afterwards an app opened from it keeps the front until the card is clicked.
       renderSetupSheet(summary);
-      scheduleFinishedSetupSheetHide();
+      if (!setupFinished(previous) && sheet.classList.contains("is-yielded")) returnSetupSheet();
       return;
     }
     hideSetupSheet({ restoreFocus: false, rememberDismiss: false });
@@ -161,10 +171,6 @@ function rememberSetupReminder() {
 }
 
 export function hideSetupSheet({ restoreFocus = true, rememberDismiss = true } = {}) {
-  if (finishedHideTimer !== null) {
-    window.clearTimeout(finishedHideTimer);
-    finishedHideTimer = null;
-  }
   if (!sheet || sheet.hidden) {
     return;
   }
@@ -207,14 +213,14 @@ function renderSetupSheet(summary) {
   if (titleNode) titleNode.textContent = "Welcome to Home";
   if (leadNode) leadNode.textContent = complete ? "Home is set up."
     : unavailable ? "Open System to check setup."
-    : profileReady ? "Save an updated Recovery Kit that includes your Profile."
+    : profileReady ? "Save your Recovery Kit to finish setting up Home."
     : "Create your Profile and save a complete Recovery Kit in System.";
   recoveryStep?.classList.toggle("is-complete", complete);
   recoveryStep?.classList.toggle("is-current", !complete && !unavailable);
   if (recoveryBody) recoveryBody.textContent = unavailable
     ? "Open System to check setup."
     : complete ? "Profile and Recovery Kit are ready."
-    : profileReady ? "Your Profile stays unchanged. Save the updated kit offline."
+    : profileReady ? "Your Profile is ready. Save the kit somewhere safe and offline."
     : "Confirm your name and save the kit offline.";
   if (recoveryButton) {
     recoveryButton.textContent = complete ? "Ready" : unavailable ? "Open System"
@@ -223,6 +229,24 @@ function renderSetupSheet(summary) {
     recoveryButton.setAttribute("aria-busy", String(recoveryActBusy));
     recoveryButton.classList.toggle("el-button-primary", !complete);
   }
+  let index = 1;
+  for (const step of goalSteps) {
+    const targetId = step.dataset.setupGoal;
+    step.hidden = !targetById(summary, targetId);
+    if (step.hidden) continue;
+    index += 1;
+    step.querySelector(".setup-sheet-step-index").textContent = String(index);
+    // Chat waits for the Profile (SETUP_HOLD_TARGETS).
+    step.querySelector("button").disabled = SETUP_HOLD_TARGETS.has(targetId) && !profileReady;
+  }
+}
+
+function openGoal(targetId, settings) {
+  if (!targetById(shellState.currentSummary, targetId)) return;
+  // The sheet collapses to its card; clicking the card brings it back. Only Close or Later dismiss it.
+  yieldSetupSheet();
+  if (settings) openTarget(targetId, { query: { settings } });
+  else openTarget(targetId);
 }
 
 async function openRecoveryAct() {
@@ -246,10 +270,9 @@ async function openRecoveryAct() {
   } finally {
     recoveryActBusy = false;
     renderSetupSheet(shellState.currentSummary);
-    if (!saved && sheet && !sheet.hidden) {
-      restoreSetupSheetOverlay();
-      if (recoveryBody) recoveryBody.textContent = "Recovery Kit was not saved. Try again, or choose Later.";
-      recoveryButton?.focus();
+    if (sheet && !sheet.hidden) {
+      if (!saved && recoveryBody) recoveryBody.textContent = "Recovery Kit was not saved. Try again, or choose Later.";
+      returnSetupSheet();
     }
   }
 }
@@ -260,6 +283,8 @@ function yieldSetupSheet() {
   }
   sheet.classList.add("is-yielded");
   sheet.setAttribute("aria-modal", "false");
+  // The card is the way back: click it, or focus it and press Enter.
+  card?.setAttribute("tabindex", "0");
 }
 
 function restoreSetupSheetOverlay() {
@@ -269,6 +294,7 @@ function restoreSetupSheetOverlay() {
   sheet.classList.remove("is-yielded");
   sheet.setAttribute("aria-modal", "true");
   if (card) {
+    card.removeAttribute("tabindex");
     card.classList.remove("is-dragging");
     card.style.left = "";
     card.style.top = "";
@@ -289,6 +315,9 @@ function onSetupCardPointerDown(event) {
   }
   const rect = card.getBoundingClientRect();
   drag = {
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
     offsetX: event.clientX - rect.left,
     offsetY: event.clientY - rect.top,
     width: rect.width,
@@ -302,6 +331,10 @@ function onSetupCardPointerMove(event) {
   if (!drag || !card) {
     return;
   }
+  if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 4) {
+    return;
+  }
+  drag.moved = true;
   const maxX = Math.max(8, window.innerWidth - drag.width - 8);
   const maxY = Math.max(8, window.innerHeight - drag.height - 8);
   const x = Math.min(Math.max(8, event.clientX - drag.offsetX), maxX);
@@ -312,10 +345,13 @@ function onSetupCardPointerMove(event) {
   card.style.right = "auto";
 }
 
-function onSetupCardPointerUp() {
+function onSetupCardPointerUp(event) {
   if (!drag || !card) {
     return;
   }
+  const clicked = !drag.moved && event?.type === "pointerup";
   drag = null;
   card.classList.remove("is-dragging");
+  // A click without a drag brings the full sheet back.
+  if (clicked) returnSetupSheet();
 }

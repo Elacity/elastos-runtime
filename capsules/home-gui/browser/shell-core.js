@@ -1,3 +1,6 @@
+import { isPhone } from "./shell-form-factor.js?v=home-20261030a";
+import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261030a";
+
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
 export let desktopWorkspace = document.querySelector(".desktop-workspace");
@@ -17,7 +20,7 @@ export let toolbarIdentityAvatarImage = document.querySelector("#toolbar-identit
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
 export let toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
-export let toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+export let toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
 export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
 export let toolbarSystem = document.querySelector("#toolbar-system");
 export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
@@ -60,9 +63,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20261030a", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20261030a", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -160,7 +163,7 @@ function bindHomeGuiDomRefs() {
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
   toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
-  toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+  toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
   toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
   toolbarSystem = document.querySelector("#toolbar-system");
   toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
@@ -284,13 +287,6 @@ export async function fetchJson(url, init) {
   return response.json();
 }
 
-export async function mutateDesktopObject(op, payload = {}) {
-  return fetchJson("/api/apps/home/desktop/objects", {
-    method: "POST",
-    body: JSON.stringify({ op, ...payload }),
-  });
-}
-
 export function allVisibleTargets(summary) {
   if (!summary || !Array.isArray(summary.targets)) {
     return [];
@@ -398,25 +394,43 @@ export function canonicalTargetTitle(targetId, title) {
   return normalizedTitle || targetId;
 }
 
+/* Every top-level surface the Home GUI owns in the host document: the host
+   mounts and unmounts them together, and the phone stage counts the visible
+   ones (other than the always-present chrome) as Back layers. */
+export const HOME_GUI_HOST_SELECTORS = Object.freeze([
+  ".desktop-backdrop",
+  ".toolbar",
+  ".desktop-workspace",
+  ".taskbar",
+  ".launcher",
+  "#desktop-context-menu",
+  "#home-notification-toast",
+  "#notification-center",
+  "#control-centre",
+  "#wallet-rail",
+  "#inbox-rail",
+  "#setup-sheet",
+  "#spotlight",
+  "#window-switcher",
+  "#quick-look",
+  "#shortcuts-overlay",
+  "#about-overlay",
+]);
+
 /* Window chrome modes are presentation-only. Fail closed to standard.
-   unified-sidebar: split-view apps — lights over the leading column.
-   unified-toolbar: Browser-style — lights over the tool row; menubar owns the
-   focused app name. */
+   unified-sidebar: split-view apps — lights over the leading column. */
 export const WINDOW_CHROME_STANDARD = "standard";
 export const WINDOW_CHROME_UNIFIED_SIDEBAR = "unified-sidebar";
-export const WINDOW_CHROME_UNIFIED_TOOLBAR = "unified-toolbar";
 
 const WINDOW_CHROME_BY_TARGET = {
   marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,
   system: WINDOW_CHROME_UNIFIED_SIDEBAR,
   library: WINDOW_CHROME_UNIFIED_SIDEBAR,
-  services: WINDOW_CHROME_UNIFIED_SIDEBAR,
   people: WINDOW_CHROME_UNIFIED_SIDEBAR,
   documents: WINDOW_CHROME_UNIFIED_SIDEBAR,
   inbox: WINDOW_CHROME_UNIFIED_SIDEBAR,
   chat: WINDOW_CHROME_UNIFIED_SIDEBAR,
   "chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR,
-  browser: WINDOW_CHROME_UNIFIED_TOOLBAR,
 };
 
 const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
@@ -431,9 +445,6 @@ const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
 export function parseWindowChromeMode(value) {
   if (value === WINDOW_CHROME_UNIFIED_SIDEBAR) {
     return WINDOW_CHROME_UNIFIED_SIDEBAR;
-  }
-  if (value === WINDOW_CHROME_UNIFIED_TOOLBAR) {
-    return WINDOW_CHROME_UNIFIED_TOOLBAR;
   }
   return WINDOW_CHROME_STANDARD;
 }
@@ -450,14 +461,11 @@ export function applyWindowChrome(windowNode, targetId) {
   }
   windowNode.classList.remove(
     "window-chrome-unified-sidebar",
-    "window-chrome-unified-toolbar",
     "window-chrome-continuous",
   );
   const mode = windowChromeModeForTarget(targetId);
   if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
     windowNode.classList.add("window-chrome-unified-sidebar");
-  } else if (mode === WINDOW_CHROME_UNIFIED_TOOLBAR) {
-    windowNode.classList.add("window-chrome-unified-toolbar");
   } else if (WINDOW_CHROME_CONTINUOUS_TARGETS.has(normalizeText(targetId).toLowerCase())) {
     windowNode.classList.add("window-chrome-continuous");
   }
@@ -518,7 +526,18 @@ export function initializeShellLayout(summary) {
     desktopHidden: normalizedDesktopHidden,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
     setupReminderDismissed: stored?.setupReminderDismissed === true,
+    // Documents "Save automatically"; off unless the person turned it on.
+    documentsAutosave: stored?.documentsAutosave === true,
   };
+  // The phone arrangement, once the person has made one (shell-phone-home.js).
+  const homeDock = normalizePhoneHomeIds(stored?.homeDock);
+  if (homeDock) {
+    shellState.shellLayoutState.homeDock = homeDock;
+  }
+  const homePages = normalizePhoneHomePages(stored?.homePages);
+  if (homePages) {
+    shellState.shellLayoutState.homePages = homePages;
+  }
 
   let changed =
     !stored ||
@@ -692,14 +711,16 @@ function normalizeTaskbarLayout(taskbar, summary) {
   return normalized;
 }
 
+/* New Homes pin the 0.8.0 goals first (Community, Browser where the platform
+   has it, System for updates); the Assistant pill and Apps lead the Dock. */
 const DEFAULT_TASKBAR_PINS = [
+  "chat-room",
   "browser",
+  "system",
   "library",
   "marketplace",
   "wallet",
   "documents",
-  "chat-room",
-  "system",
 ];
 
 function defaultTaskbarPins(summary) {
@@ -1292,7 +1313,7 @@ function arrayEquals(left, right) {
 }
 
 export function shouldOpenMaximizedByDefault() {
-  return window.innerWidth <= 640;
+  return isPhone();
 }
 
 export function shouldIgnoreDesktopKeydown(event) {

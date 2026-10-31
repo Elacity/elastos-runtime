@@ -9,7 +9,7 @@ import {
 } from "./browser-runtime-api.js?v=browser-20260907c";
 import {
   createBrowserClipboardBridge,
-} from "./browser-clipboard.js?v=browser-20260725b";
+} from "./browser-clipboard.js?v=browser-20261022d";
 import {
   createHomeClipboardClient,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
@@ -18,8 +18,8 @@ import {
   runtimePageOwner,
   sameRuntimePageOwner,
 } from "./browser-page-cleanup.js?v=browser-20260727a";
-import { selkiesMessagesForInput } from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260725b";
+import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261022b";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261022e";
 import {
   browserMetricsText,
   friendlyOpenError,
@@ -27,9 +27,8 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260907c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260915d";
-import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
-import { createOperatorApprovalController, mountOperatorApproval } from "./browser-operator-approval.js";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261022e";
+import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261015a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -40,6 +39,7 @@ const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
 const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
+const BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS = 5;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
 const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
 const GUARANTEE_MECHANISM_MICROVM = "mechanism_microvm";
@@ -85,11 +85,15 @@ const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
 const profileResetButton = document.querySelector("#browser-profile-reset");
+const profileResetConfirmation = document.querySelector("#browser-profile-reset-confirmation");
+const profileResetCancel = document.querySelector("#browser-profile-reset-cancel");
+const profileResetCommit = document.querySelector("#browser-profile-reset-commit");
 const settingsButton = document.querySelector("#browser-settings");
 const settingsPanel = document.querySelector("#browser-settings-panel");
 const settingsCloseButton = document.querySelector("#browser-settings-close");
 const engineSelect = document.querySelector("#browser-engine");
 const engineSummaryNode = document.querySelector("#browser-engine-summary");
+const engineLabelNode = document.querySelector('label[for="browser-engine"]');
 const exitSelect = document.querySelector("#browser-exit");
 const exitSummaryNode = document.querySelector("#browser-exit-summary");
 const statusNode = document.querySelector("#browser-status");
@@ -103,7 +107,12 @@ let currentPage = null;
 let currentPageGeneration = 0;
 let nextPageGeneration = 1;
 const MAX_PENDING_BROWSER_INPUTS = 128;
+const DATACHANNEL_INPUT_BARRIER_TIMEOUT_MS = 3_000;
 let browserInputQueue = null;
+let lastDatachannelInputAt = 0;
+let datachannelDrainedAt = 0;
+let datachannelSendGeneration = 0;
+let datachannelSendDisplay = null;
 let restoredViewerOwner = null;
 let currentView = null;
 let currentDisplayMode = "";
@@ -113,8 +122,11 @@ let statusTimer = 0;
 let canGoBack = false;
 let canGoForward = false;
 let pageStatusTimer = 0;
+let pageStatusPollingRun = null;
 let pageStatusRefreshTimers = [];
+let pageStatusRefreshRun = null;
 let pageHeartbeatTimer = 0;
+let pageHeartbeatRun = null;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
 let recoverableDisplayAttachStarted = false;
@@ -146,6 +158,7 @@ function setSettingsOpen(open) {
     return;
   }
   settingsPanel.hidden = !open;
+  if (!open) profileResetConfirmation.hidden = true;
   settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
@@ -386,18 +399,21 @@ function setLoading(loading) {
   if (profileResetButton) {
     profileResetButton.disabled = loading;
   }
+  if (profileResetCommit) profileResetCommit.disabled = loading;
   renderEmpty.hidden = true;
   refreshButton.disabled = loading || !currentPage;
   updateNavState();
 }
 
 function stopPageStatusPolling() {
+  pageStatusPollingRun = null;
   window.clearTimeout(pageStatusTimer);
   pageStatusTimer = 0;
   stopPageStatusRefresh();
 }
 
 function stopPageStatusRefresh() {
+  pageStatusRefreshRun = null;
   for (const timer of pageStatusRefreshTimers) {
     window.clearTimeout(timer);
   }
@@ -405,6 +421,7 @@ function stopPageStatusRefresh() {
 }
 
 function stopPageHeartbeat() {
+  pageHeartbeatRun = null;
   window.clearTimeout(pageHeartbeatTimer);
   pageHeartbeatTimer = 0;
 }
@@ -1243,8 +1260,9 @@ async function fetchPageStatus({
   history = "replace",
   forceAddress = false,
   fast = false,
+  isCurrent = () => true,
 } = {}) {
-  if (!currentPage?.page_id) {
+  if (!isCurrent() || !currentPage?.page_id) {
     return null;
   }
   const owner = currentRuntimePageOwner();
@@ -1253,7 +1271,7 @@ async function fetchPageStatus({
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
-  if (!runtimeViewerOwnerActive(owner)) return null;
+  if (!isCurrent() || !runtimeViewerOwnerActive(owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1408,12 +1426,16 @@ function schedulePageStatusRefresh({
     ),
   ];
   stopPageStatusRefresh();
+  const run = {};
+  pageStatusRefreshRun = run;
+  const isCurrent = () => pageStatusRefreshRun === run;
   pageStatusRefreshTimers = delays.map((nextDelay) => {
     const timer = window.setTimeout(async () => {
       pageStatusRefreshTimers = pageStatusRefreshTimers.filter(
         (candidate) => candidate !== timer,
       );
       if (
+        !isCurrent() ||
         unloadCleanupStarted ||
         !currentPage ||
         document.hidden ||
@@ -1423,9 +1445,9 @@ function schedulePageStatusRefresh({
       }
       const owner = currentRuntimePageOwner();
       try {
-        await fetchPageStatus({ history, forceAddress });
+        await fetchPageStatus({ history, forceAddress, isCurrent });
       } catch (error) {
-        await handlePageObservationFailure(error, owner);
+        if (isCurrent()) await handlePageObservationFailure(error, owner);
       }
     }, nextDelay);
     return timer;
@@ -1434,8 +1456,11 @@ function schedulePageStatusRefresh({
 
 function startPageStatusPolling() {
   stopPageStatusPolling();
+  const run = {};
+  pageStatusPollingRun = run;
+  const isCurrent = () => pageStatusPollingRun === run;
   const poll = async () => {
-    if (unloadCleanupStarted || !currentPage) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage) {
       return;
     }
     if (document.hidden) {
@@ -1448,11 +1473,12 @@ function startPageStatusPolling() {
     }
     const owner = currentRuntimePageOwner();
     try {
-      await fetchPageStatus({ fast: true });
+      await fetchPageStatus({ fast: true, isCurrent });
     } catch (error) {
-      await handlePageObservationFailure(error, owner);
+      if (isCurrent()) await handlePageObservationFailure(error, owner);
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
@@ -1467,8 +1493,11 @@ function startPageStatusPolling() {
 
 function startPageHeartbeat() {
   stopPageHeartbeat();
+  const run = {};
+  pageHeartbeatRun = run;
+  const isCurrent = () => pageHeartbeatRun === run;
   const beat = async () => {
-    if (unloadCleanupStarted || !currentPage?.page_id) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage?.page_id) {
       return;
     }
     const owner = currentRuntimePageOwner();
@@ -1479,9 +1508,10 @@ function startPageHeartbeat() {
         { method: "POST" },
       );
     } catch (error) {
-      if (await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
+      if (isCurrent() && await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
@@ -1576,7 +1606,7 @@ function encodeDatachannelInput(event) {
 
 async function sendBrowserInput(
   event,
-  { focus = true, history = "push" } = {},
+  { focus = true, history = "push", isStale = null } = {},
 ) {
   const owner = currentRuntimePageOwner();
   if (!owner) {
@@ -1598,6 +1628,10 @@ async function sendBrowserInput(
     if (queue.failed) {
       throw new Error("Browser input was canceled after a failed operation.");
     }
+    // Moves of a drag that already ended must not re-press the guest button.
+    if (isStale?.()) {
+      return;
+    }
     return dispatchBrowserInput(event, { focus, history }, owner);
   });
   queue.tail = pending.catch(() => {
@@ -1611,6 +1645,70 @@ async function sendBrowserInput(
     return await pending;
   } finally {
     queue.pending -= 1;
+  }
+}
+
+function noteDatachannelSend() {
+  const now = Date.now();
+  lastDatachannelInputAt = now;
+  datachannelSendDisplay = remoteDisplay;
+  datachannelSendGeneration = remoteDisplay?.currentInputChannelGeneration?.() ?? 0;
+  datachannelDrainedAt = Number(remoteDisplay?.inputBufferedAmount?.() || 0) === 0 ? now : 0;
+}
+
+// The guest must always get the button release that ends a drag, even while
+// a Runtime request is pending: it goes straight to the datachannel, after
+// the drag's own moves on that channel. The caller marks the drag ended so
+// its still-queued moves send nothing. A drag belongs to the page it started
+// on: once that page is replaced, the release is dropped rather than pressed
+// into the replacement's guest.
+function releaseDragButton(event, dragOwner) {
+  if (
+    !sameRuntimePageOwner(currentRuntimePageOwner(), dragOwner) ||
+    !remoteDisplay?.inputChannelOpen()
+  ) {
+    return;
+  }
+  remoteDisplay.sendInputMessages(encodeDatachannelInput(event));
+  noteDatachannelSend();
+}
+
+// The datachannel has no guest ack, so Runtime-route input that follows a
+// datachannel send waits until the drain is observed and the guest has had
+// the settle delay after it. It fails rather than reorder.
+async function awaitDatachannelInputSettled() {
+  if (!lastDatachannelInputAt) {
+    return;
+  }
+  const deadline = Date.now() + DATACHANNEL_INPUT_BARRIER_TIMEOUT_MS;
+  for (;;) {
+    const now = Date.now();
+    // A closed or rebound channel says nothing about the earlier bytes: refuse
+    // rather than treat its empty buffer as delivery.
+    if (
+      remoteDisplay !== datachannelSendDisplay ||
+      !remoteDisplay?.inputChannelOpen() ||
+      (remoteDisplay?.currentInputChannelGeneration?.() ?? 0) !== datachannelSendGeneration
+    ) {
+      lastDatachannelInputAt = 0;
+      throw new Error("Browser input is still being delivered. Check the page before typing again.");
+    }
+    if (Number(remoteDisplay?.inputBufferedAmount?.() || 0) > 0) {
+      datachannelDrainedAt = 0;
+    } else if (!datachannelDrainedAt) {
+      // Prefer the bufferedamountlow time; without it, the first poll that
+      // sees an empty buffer is the conservative drain time.
+      const eventAt = Number(remoteDisplay?.lastInputDrainAt?.() || 0);
+      datachannelDrainedAt = eventAt >= lastDatachannelInputAt ? eventAt : now;
+    }
+    if (datachannelDrainedAt && now >= datachannelDrainedAt + DATACHANNEL_INPUT_SETTLE_MS) {
+      lastDatachannelInputAt = 0;
+      return;
+    }
+    if (now >= deadline) {
+      throw new Error("Browser input is still being delivered. Check the page before typing again.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -1639,6 +1737,7 @@ async function dispatchBrowserInput(
       throw new Error("Browser remote-display input channel is not open.");
     }
     remoteDisplay.sendInputMessages(encodeDatachannelInput(event));
+    noteDatachannelSend();
     schedulePageStatusRefresh({
       history,
       forceAddress: true,
@@ -1652,6 +1751,10 @@ async function dispatchBrowserInput(
     }
   } else {
     const inputPageId = inputOwner.page_id;
+    await awaitDatachannelInputSettled();
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
+      return;
+    }
     let response;
     try {
       response = await fetchJson(
@@ -1947,6 +2050,12 @@ function syncEngineSelect(summary) {
       ? "Your selected Browser Engine is unavailable. Choose another Engine to change where the page runs."
       : browserEngineSummary(selectedEngine);
   }
+  const hidden = engineChoiceHidden(engines, selectedBrowserEngineId);
+  for (const node of [engineLabelNode, engineSelect, engineSummaryNode]) {
+    if (node) {
+      node.hidden = hidden;
+    }
+  }
   updateSettingsTitle();
 }
 
@@ -2072,7 +2181,7 @@ function browserOpenJobError(status) {
   return next;
 }
 
-async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
+async function waitForRuntimeOpen(response) {
   if (response?.schema === "elastos.browser.open-result/v1") {
     return response;
   }
@@ -2084,9 +2193,11 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   }
   const startedAt = Date.now();
   while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
-    const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
     showStatus(
-      `Opening ${engineLabel} with ${exitLabel}... ${elapsedSeconds}s`,
+      elapsedSeconds >= BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS
+        ? `Starting Browser… ${elapsedSeconds}s`
+        : "Starting Browser…",
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
@@ -2232,7 +2343,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     ) {
       openSettlement.statusUrl = accepted.status_url;
     }
-    const response = await waitForRuntimeOpen(accepted, { engineLabel, exitLabel });
+    const response = await waitForRuntimeOpen(accepted);
     const openedPage = runtimeOpenResultPage(response);
     if (!openedPage) {
       throw new Error("Browser did not open the page.");
@@ -2481,9 +2592,6 @@ async function resetBrowserProfile() {
     showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
     return;
   }
-  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
-    return;
-  }
   const activePage = currentPage;
   const activeGeneration = currentPageGeneration;
   const activeOwner = runtimePageOwner(activePage, activeGeneration);
@@ -2534,6 +2642,18 @@ async function resetBrowserProfile() {
 }
 
 profileResetButton?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = false;
+  profileResetCancel.focus({ preventScroll: true });
+});
+
+profileResetCancel?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = true;
+  profileResetButton.focus({ preventScroll: true });
+});
+
+profileResetCommit?.addEventListener("click", () => {
+  if (profileResetConfirmation.hidden || profileResetCommit.disabled) return;
+  profileResetConfirmation.hidden = true;
   resetBrowserProfile().catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
   });
@@ -2543,14 +2663,22 @@ bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage: () => currentPage,
+  getInputOwner: currentRuntimePageOwner,
+  sameInputOwner: sameRuntimePageOwner,
   getCurrentView: () => currentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText: homeClipboard.readText,
   remoteVideo,
   renderPanel,
+  releaseDragButton,
   sendBrowserInput,
   showStatus,
+  // Held-button drags exist only as Selkies datachannel mouse messages.
+  streamsPointerDrag: () =>
+    currentDisplayMode === "webrtc_remote_display" &&
+    currentInputTransport() === "datachannel" &&
+    currentInputProtocol() === "selkies_v1",
   unlockRemoteAudioFromGesture,
 });
 
@@ -2718,29 +2846,15 @@ window.addEventListener("pagehide", (event) => {
   releaseRuntimePageForUnload();
 });
 
-mountOperatorApproval({
-  container: settingsPanel,
-  controller: createOperatorApprovalController({
-    fetchJson,
-    runtimeOrigin: new URL(window.location.href).origin,
-    getOwner: () => unloadCleanupStarted || homeWindowCloseInFlight
-      ? null : runtimePageOwner(currentPage, currentPageGeneration),
-    sameOwner: sameRuntimePageOwner,
-  }),
-});
-
 const requestedStartupUrl = params.get("url");
 const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
 setLoading(true);
+showStatus("Browser is checking its Engine. Wait, or reopen Browser from Home to retry.", { sticky: true });
 fetchBrowserSummary({ remoteServices: false })
   .then(async (summary) => {
     if (await restoreRuntimePageViewer(summary)) return;
-    if (!requestedStartupUrl) {
-      setLoading(false);
-      return;
-    }
-    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
+    return requestRuntimeOpen(initialUrl, { history: "replace" });
   })
   .catch((error) => {
     if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;

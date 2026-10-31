@@ -9,17 +9,19 @@
  * (wallet → Wallet rail; setup → setup sheet; everything else → Inbox rail).
  */
 
-import { clockNode } from "./shell-core.js?v=home-20260813a";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
+import { clockNode } from "./shell-core.js?v=home-20261030a";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20261030a";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260813a";
+  registerStageLayer,
+} from "./shell-popovers.js?v=home-20261030a";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260813a";
-import { showWalletRail } from "./shell-wallet-rail.js?v=home-20260813a";
+} from "./shell-motion.js?v=home-20261030a";
+import { showWalletRail } from "./shell-wallet-rail.js?v=home-20261030a";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261030a";
 
 const MAX_ENTRIES = 50;
 const WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
@@ -364,6 +366,10 @@ export function bindNotificationCenter() {
   }
   if (!registered) {
     registerShellPopover("notification-center", () => hideNotificationCenter({ restoreFocus: false }));
+    registerStageLayer("notification-center", {
+      selector: "#notification-center",
+      close: () => hideNotificationCenter({ restoreFocus: false }),
+    });
     registered = true;
   }
   clockNode.addEventListener("click", () => {
@@ -372,6 +378,12 @@ export function bindNotificationCenter() {
   clearButton?.addEventListener("click", () => {
     saveHistory([]);
     renderNotificationCenter();
+  });
+  bindSheetHandle(document.querySelector("#notification-center-handle"), {
+    sheet: panel,
+    direction: SHEET_DRAG_UP,
+    close: () => hideNotificationCenter(),
+    tapCloses: true,
   });
   renderNcTimeChrome();
 }

@@ -19,7 +19,10 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
+  WINDOW_TOP_INSET,
+  WINDOW_BOTTOM_INSET,
+  pushUiPreferencesToFrameWindow,
+} from "./shell-core.js?v=home-20261030a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,8 +33,9 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20261030a";
 import {
+  agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
   desktopStageId,
@@ -46,10 +50,11 @@ import {
   restoreExtraDesktops,
   restoreSpaceOrder,
   setActiveStage,
+  syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260813a";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261030a";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261030a";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -123,8 +128,13 @@ export function acceptHomeNavigation(entry, data) {
   record.sequence = data.sequence;
   // Null means this document is still loading, not a request to clear selection.
   if (data.query !== null) {
-    entry.launchQuery = { ...data.query };
-    persistBrowserSession();
+    const currentQuery = normalizedLaunchQuery(entry.launchQuery);
+    const keys = Object.keys(data.query);
+    if (keys.length !== Object.keys(currentQuery).length ||
+        keys.some((key) => currentQuery[key] !== data.query[key])) {
+      entry.launchQuery = { ...data.query };
+      persistBrowserSession();
+    }
   }
   return true;
 }
@@ -348,6 +358,12 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
+const DOCUMENTS_PREFERENCES_REQUEST_TYPE =
+  "elastos.documents.preferences.request/v1";
+const DOCUMENTS_PREFERENCES_SET_TYPE =
+  "elastos.documents.preferences.set/v1";
+const DOCUMENTS_PREFERENCES_TYPE =
+  "elastos.documents.preferences/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const HOME_AGENT_TARGET_ID = "assistant";
 const MAX_SESSION_WINDOWS = 24;
@@ -376,14 +392,6 @@ const COMMON_IFRAME_SANDBOX = [
   "allow-pointer-lock",
   "allow-scripts",
 ];
-const BROWSER_IFRAME_SANDBOX_EXTRAS = [
-  "allow-popups",
-  "allow-popups-to-escape-sandbox",
-];
-const WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS = [
-  "allow-popups",
-  "allow-popups-to-escape-sandbox",
-];
 const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
   "allow-top-navigation-by-user-activation",
   "allow-top-navigation-to-custom-protocols",
@@ -395,15 +403,10 @@ const pendingDocumentsWindowCloses = new Map();
 
 window.addEventListener("message", handleBrowserWindowCloseResult);
 window.addEventListener("message", handleDocumentsWindowCloseResult);
+window.addEventListener("message", handleDocumentsPreferenceMessage);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
-  if (launched?.target === "browser") {
-    tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
-  }
-  if (launched?.target === "wallet-unisat") {
-    tokens.push(...WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS);
-  }
   if (launched?.target === SYSTEM_APP_ID) {
     tokens.push(...SYSTEM_IFRAME_SANDBOX_EXTRAS);
   }
@@ -718,6 +721,10 @@ function clearWindowCloseGuard(node) {
   delete node.dataset.closeGuardIssuedAt;
 }
 
+// A ghost click replays the opening press: no new press, same spot. A later
+// move far enough from that spot (a mouse moving to Close; on the phone also
+// a tap on Close, which has no pointermove, see trackPointerDown) is a fresh
+// gesture.
 function clearWindowCloseGuardIfPointerMoved(node) {
   const originX = Number.parseFloat(node.dataset.closeGuardPointerX || "NaN");
   const originY = Number.parseFloat(node.dataset.closeGuardPointerY || "NaN");
@@ -1051,6 +1058,19 @@ function markBrowserWindowCloseState(entry, state) {
   const closeButton = entry.node.querySelector("[data-action='close']");
   entry.node.dataset.browserCloseState = state;
   closeButton.disabled = state === "pending";
+  if (state === "pending") {
+    if (!entry.browserClosingStatus) {
+      const status = document.createElement("div");
+      status.className = "window-closing-status";
+      status.setAttribute("role", "status");
+      status.textContent = "Closing…";
+      entry.browserClosingStatus = status;
+    }
+    entry.node.querySelector(".window-body").append(entry.browserClosingStatus);
+  } else if (entry.browserClosingStatus) {
+    entry.browserClosingStatus.remove();
+    delete entry.browserClosingStatus;
+  }
   if (state === "retry") {
     closeButton.setAttribute("aria-label", "Retry Browser close");
     closeButton.title = "Runtime cleanup is pending. Activate to retry close.";
@@ -1229,6 +1249,53 @@ function handleDocumentsWindowCloseResult(event) {
   settleDocumentsWindowClose(record, message.ok === true);
 }
 
+// Documents keeps its "Save automatically" choice in this person's Home
+// layout; its opaque frame owns no storage. A Documents window asks for the
+// choice or changes it; every open Documents window hears the result.
+function documentsPreferenceMessage(homeToken) {
+  return {
+    type: DOCUMENTS_PREFERENCES_TYPE,
+    homeToken,
+    autosave: shellState.shellLayoutState?.documentsAutosave === true,
+  };
+}
+
+function handleDocumentsPreferenceMessage(event) {
+  const message = event.data;
+  if (event.origin !== OPAQUE_CAPSULE_ORIGIN || !message || typeof message !== "object") {
+    return;
+  }
+  const isRequest = message.type === DOCUMENTS_PREFERENCES_REQUEST_TYPE &&
+    hasExactKeys(message, ["type", "homeToken"]);
+  const isUpdate = message.type === DOCUMENTS_PREFERENCES_SET_TYPE &&
+    hasExactKeys(message, ["type", "homeToken", "autosave"]) &&
+    typeof message.autosave === "boolean";
+  if (!isRequest && !isUpdate) {
+    return;
+  }
+  const contexts = [...shellState.windows.values()]
+    .map((entry) => documentsWindowCloseContext(entry))
+    .filter(Boolean);
+  const sender = contexts.find((context) => context.frameWindow === event.source);
+  if (!sender || sender.homeToken !== message.homeToken) {
+    return;
+  }
+  if (isRequest) {
+    sender.frameWindow.postMessage(documentsPreferenceMessage(sender.homeToken), "*");
+    return;
+  }
+  if (!shellState.shellLayoutState) {
+    return;
+  }
+  if (shellState.shellLayoutState.documentsAutosave !== message.autosave) {
+    shellState.shellLayoutState.documentsAutosave = message.autosave;
+    saveShellLayoutState();
+  }
+  for (const context of contexts) {
+    context.frameWindow.postMessage(documentsPreferenceMessage(context.homeToken), "*");
+  }
+}
+
 function requestBrowserWindowClose(entry) {
   if (entry.browserCloseRequest) {
     return entry.browserCloseRequest.promise;
@@ -1319,11 +1386,29 @@ function postMarketplaceNavigate(entry, query) {
   }, "*");
 }
 
-function postServicesNavigate(entry, query) {
+function isChatConversationQuery(query) {
+  return !!query && typeof query === "object" && !Array.isArray(query)
+    && Object.keys(query).join(",") === "conversation_id"
+    && typeof query.conversation_id === "string" && query.conversation_id.length > 0;
+}
+
+function postChatNavigate(entry, query) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) return false;
+  frame.contentWindow.postMessage({
+    type: "elastos.chat.navigate/v1",
+    homeToken,
+    query: { conversation_id: query.conversation_id },
+  }, "*");
+  return true;
+}
+
+function postPeopleNavigate(entry, query) {
   const frame = entry.node.querySelector(".window-frame");
   const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
   if (!homeToken || !frame?.contentWindow) return;
-  frame.contentWindow.postMessage({ type: "elastos.services.navigate/v1", homeToken, query }, "*");
+  frame.contentWindow.postMessage({ type: "elastos.people.navigate/v1", homeToken, query }, "*");
 }
 
 function browserLaunchAuthority(route) {
@@ -1725,6 +1810,15 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const defaultHybrid = !single && targetById(shellState.currentSummary, targetId)?.window_policy === "hybrid"
     && options.newWindow !== true && !options.authorizedLaunch && !options.restoredPlacement
     && Object.keys(options.query || {}).length === 0;
+  // A conversation request (People's Message) goes to the open Chat window.
+  if (targetId === "chat-room" && options.newWindow !== true && !options.authorizedLaunch
+    && !options.restoredPlacement && isChatConversationQuery(options.query)) {
+    const open = topDefaultHybridWindow(targetId);
+    if (open && postChatNavigate(open, options.query)) {
+      focusWindow(open.id);
+      return open;
+    }
+  }
   if (!single && !defaultHybrid) return createBrowserTargetWindow(targetId, options);
   let entry = single ? topBrowserWindowEntryForTarget(targetId) : topDefaultHybridWindow(targetId);
   const key = `${single ? "single" : "default"}:${targetId}`;
@@ -1749,8 +1843,8 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   if (targetId === "marketplace" && Object.keys(options.query || {}).length > 0) {
     postMarketplaceNavigate(entry, options.query);
   }
-  if (targetId === "services" && Object.keys(options.query || {}).length > 0) {
-    postServicesNavigate(entry, options.query);
+  if (targetId === "people" && Object.keys(options.query || {}).length > 0) {
+    postPeopleNavigate(entry, options.query);
   }
   if ((targetId === "inbox" || targetId === "wallet") && Object.keys(options.query || {}).length > 0) {
     const ok = await requestSelectionWindow(entry, options.query);
@@ -1931,6 +2025,8 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    // Each load (first mount and reload) starts from the theme default, so hand it the current preference.
+    pushUiPreferencesToFrameWindow(frame.contentWindow);
     probeHomeNavigation(entry, true);
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
@@ -2061,6 +2157,29 @@ function hideWindow(id) {
   hideWindowEntries([entry]);
 }
 
+// Lock and sign-out unload the desktop, so every open Documents window settles
+// its unsaved changes first, one at a time and in view, through the same close
+// handshake: Save, Don't save or Cancel. Cancel or a failed save keeps that
+// window open and stops the lock or sign-out. A window opened while another is
+// asking is asked too, before the session ends. A window whose frame never
+// loaded holds no edits.
+export async function closeDocumentsWindowsBeforeSessionEnd() {
+  const asked = new Set();
+  for (;;) {
+    const entry = [...shellState.windows.values()].find((candidate) =>
+      candidate.targetId === "documents" && !asked.has(candidate) &&
+      documentsWindowCloseContext(candidate));
+    if (!entry) {
+      return true;
+    }
+    asked.add(entry);
+    focusWindow(entry.id);
+    if (!(await requestDocumentsWindowClose(entry))) {
+      return false;
+    }
+  }
+}
+
 export function closeWindow(id) {
   const entry = shellState.windows.get(id);
   if (!entry) {
@@ -2101,34 +2220,27 @@ function browserWindowSpec(launched, offset) {
     return walletConnectorWindowSpec();
   }
   if (launched.target === SYSTEM_APP_ID) {
-    return {
-      x: 36,
-      y: 44,
-      width: 980,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 980, height: 620 }, 0, 0);
   }
   if (launched.target === "gba-emulator") {
-    return {
-      x: 88 + offset * 24,
-      y: 62 + offset * 20,
-      width: 900,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 900, height: 620 }, offset * 24, offset * 20);
   }
   if (launched.target === "browser") {
-    return {
-      x: 48 + offset * 18,
-      y: 54 + offset * 18,
-      width: 1280,
-      height: 804,
-    };
+    return centredWindowSpec({ width: 1280, height: 804 }, offset * 18, offset * 18);
   }
+  return centredWindowSpec({ width: 1040, height: 720 }, offset * 26, offset * 22);
+}
+
+function centredWindowSpec({ width, height }, cascadeX, cascadeY) {
+  const fitted = fitWindowBounds({ x: 0, y: 0, width, height });
+  const workspaceRect = desktop.getBoundingClientRect();
+  const roomWidth = window.innerWidth - workspaceRect.left;
+  const roomHeight = window.innerHeight - workspaceRect.top - WINDOW_TOP_INSET - WINDOW_BOTTOM_INSET;
   return {
-    x: 104 + offset * 26,
-    y: 78 + offset * 22,
-    width: 1040,
-    height: 720,
+    x: Math.round((roomWidth - fitted.width) / 2) + cascadeX,
+    y: WINDOW_TOP_INSET + Math.round((roomHeight - fitted.height) / 2) + cascadeY,
+    width,
+    height,
   };
 }
 
@@ -2424,6 +2536,13 @@ function restoreSessionSpaces(storedSession, restoredEntries) {
     Array.isArray(storedSession?.space_order) ? storedSession.space_order : []
   ).map((key) => resolveStableSpaceKey(key, restoredEntries));
   restoreSpaceOrder(remappedOrder);
+  /* Restoration awaits each window's launch, so the person may have opened
+     the Assistant meanwhile; switching Space now would close that room. Keep
+     the current Space but place the restored windows on it. */
+  if (agentSpaceEngaged()) {
+    syncStagePresentation();
+    return;
+  }
   const savedStageKey =
     typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
       ? storedSession.active_stage.trim()

@@ -167,6 +167,9 @@ export function createHomeClipboardPrompt({
   copy,
   allowButton,
   cancelButton,
+  // True while another Home sheet (the web-link sheet) is on screen; the two
+  // never stack.
+  otherSheetShown = () => false,
 } = {}) {
   if (!root || !title || !copy || !allowButton || !cancelButton) {
     throw new TypeError("Home Clipboard prompt nodes are required");
@@ -240,20 +243,30 @@ export function createHomeClipboardPrompt({
       "Continue to copy this bounded technical identifier to this device clipboard.",
       "Copy identifier",
     ],
-    "documents:resource.uri:write": [
-      "Copy Documents resource link?",
-      "Continue to copy this resource URI to this device clipboard.",
-      "Copy",
-    ],
     "assistant:transcript.markdown:write": [
       "Copy Assistant transcript?",
       "Continue to copy this Assistant conversation as Markdown to this device clipboard.",
+      "Copy",
+    ],
+    "assistant:message.text:write": [
+      "Copy from Assistant?",
+      "Continue to copy this text from an Assistant conversation to this device clipboard.",
       "Copy",
     ],
     "system:identity.did:write": [
       "Copy device DID?",
       "Continue to copy this bounded technical device identifier to this device clipboard.",
       "Copy identifier",
+    ],
+    "people:profile.id:write": [
+      "Copy your DID?",
+      "Continue to copy your DID to this device clipboard so people can add you.",
+      "Copy",
+    ],
+    "chat-room:profile.id:write": [
+      "Copy DID?",
+      "Continue to copy this person's DID to this device clipboard.",
+      "Copy",
     ],
     "chat-room:conversation.invite:write": [
       "Copy conversation invite?",
@@ -264,8 +277,8 @@ export function createHomeClipboardPrompt({
 
   return {
     request({ requestId, targetId, operation, purpose }) {
-      if (active) {
-        const error = new Error("Home already has an active Clipboard prompt");
+      if (active || otherSheetShown()) {
+        const error = new Error("Home already has an active prompt");
         error.code = "busy";
         return Promise.reject(error);
       }

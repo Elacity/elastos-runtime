@@ -303,7 +303,7 @@ pub(crate) struct ProviderHost {
     _registry: Arc<ProviderRegistry>,
     carrier: elastos_server::carrier::CarrierRuntimeService,
     receipt_path: PathBuf,
-    _host_lock: elastos_server::host_lock::HostProcessGuard,
+    _host_lock: elastos_server::host_lock::FileLock,
 }
 
 impl ProviderHost {
@@ -378,6 +378,7 @@ pub(crate) async fn compose(plan: &ProviderHostPlan) -> anyhow::Result<ProviderH
         &did,
         &plan.data_dir,
         plan.carrier_addr,
+        &[],
     )
     .await
     .context("provider host Carrier plane failed to start")?;

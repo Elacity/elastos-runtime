@@ -27,6 +27,36 @@ export function childUri(parent, name) {
   return String(parent || "").replace(/\/+$/, "") + "/" + encodeURIComponent(name).replace(/%20/g, " ");
 }
 
+// The longest place root that holds the URI, or null.
+export function matchRoot(roots, uri) {
+  const value = String(uri || "");
+  return (Array.isArray(roots) ? roots : [])
+    .filter((root) => value === root.uri || value.startsWith(root.uri + "/"))
+    .sort((left, right) => right.uri.length - left.uri.length)[0] || null;
+}
+
+// The place path to a URI as the breadcrumbs show it: the root's label, then
+// each decoded segment. Empty when no root holds the URI.
+export function pathCrumbs(roots, uri) {
+  const root = matchRoot(roots, uri);
+  if (!root) return [];
+  const crumbs = [{ label: root.label, uri: root.uri }];
+  let cursor = root.uri;
+  for (const segment of String(uri).slice(root.uri.length + 1).split("/").filter(Boolean)) {
+    cursor += "/" + segment;
+    crumbs.push({ label: decodeSegment(segment), uri: cursor });
+  }
+  return crumbs;
+}
+
+function decodeSegment(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 export function nextObjectName(objects, base, extension = "") {
   const existing = new Set(objects.map((object) => String(object.name || "").toLowerCase()));
   const initial = `${base}${extension}`;
@@ -57,6 +87,17 @@ export function isTrashRootUri(uri) {
 
 export function isBlockedObject(object) {
   return !!object?.blocked_reason;
+}
+
+const PROTECTION_LABELS = {
+  protected_principal_root_object_damaged: "Damaged or not readable here",
+  protected_principal_root_object_not_encrypted: "Not encrypted",
+};
+
+export function protectionLabel(object) {
+  const reason = object?.blocked_reason;
+  if (!reason) return "ok";
+  return PROTECTION_LABELS[reason] || reason;
 }
 
 export function hasCapability(object, capability) {
@@ -106,22 +147,69 @@ export function publishedCid(object) {
   return String(object?.published_cid || "").trim();
 }
 
+// The recorded publication's link. It names the published version, never the
+// file's current bytes, so a later save does not change what was shared.
+export function publishedLink(object) {
+  const cid = publishedCid(object);
+  return cid ? `elastos://${cid}` : "";
+}
+
+export const PUBLISH_CONFIRM_BODY = "Your contacts can get it while your Home is open.";
+
+// A shared file whose last repair could not pin it again. Library's record
+// is the last known state; it does not check the pin itself.
+export function isSharingBroken(object) {
+  const availability = object?.availability;
+  const status = typeof availability === "string" ? availability : availability?.status;
+  return !!object?.published && status === "repair_needed";
+}
+
+export function isProtectedContent(object) {
+  return !!(object?.metadata?.protected_content || object?.protected_content);
+}
+
+export function canPublishObject(object) {
+  return !!object &&
+    !isDirectory(object) &&
+    !inTrash(object) &&
+    !isBlockedObject(object) &&
+    !object.published &&
+    hasCapability(object, "publish");
+}
+
+const LIBRARY_ERROR_TEXT = {
+  empty_file: "Empty files can't be shared.",
+  too_large: "This file is too large to share. Files up to 8 MiB can be shared.",
+  stale_revision: "This file changed. Refresh Library and try again.",
+  unsupported: "This file can't be shared from here.",
+  unavailable: "Sharing isn't available right now. Try again.",
+  changed_since_publish: "This file changed after you shared it. Stop sharing it first, then share it again.",
+  published_withdraw_first: "Stop sharing this file before deleting it.",
+};
+
+// Why the provider refused with `unsupported`, in plain words.
+const UNSUPPORTED_REASON_TEXT = {
+  folder: "Folders can't be shared.",
+  protected: "Protected files can't be shared.",
+};
+
+// Plain words for a Library error code; empty for an unknown code.
+export function libraryErrorText(error) {
+  const code = String(error?.code || "");
+  if (code === "unsupported") {
+    return UNSUPPORTED_REASON_TEXT[String(error?.reason || "")] || LIBRARY_ERROR_TEXT.unsupported;
+  }
+  return LIBRARY_ERROR_TEXT[code] || "";
+}
+
+export function publishFailureText(error, name) {
+  return libraryErrorText(error) || `${name || "This file"} could not be shared. Try again.`;
+}
+
 export function visibilityContract(object) {
   const visibility = object?.metadata?.visibility;
   if (visibility && typeof visibility === "object") return visibility;
-  return {
-    schema: "elastos.library.visibility/v1",
-    placement: inTrash(object) ? "trash" : "private_folder",
-    placement_label: inTrash(object) ? "Trash" : "Private folder",
-    effective_access: object?.published ? "public_content_link" : "principal_private",
-    published: !!object?.published,
-    published_cid: publishedCid(object) || null,
-    published_link: publishedCid(object) ? `elastos://${publishedCid(object)}` : null,
-    shared: !!object?.shared,
-    share_policy: object?.shared ? "shared" : "not_shared",
-    public_folder_policy: "placement_only",
-    publish_required_for_public_link: !isDirectory(object) && !object?.published,
-  };
+  return { placement: inTrash(object) ? "trash" : "private_folder" };
 }
 
 export function previewKind(object) {
@@ -131,7 +219,6 @@ export function previewKind(object) {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
   if (mime.startsWith("audio/")) return "audio";
-  if (mime === "application/pdf" || name.endsWith(".pdf")) return "pdf";
   if (
     mime.startsWith("text/") ||
     [
@@ -170,7 +257,8 @@ export function isRuntimeCustodyProtectableVideo(object) {
     !object?.metadata?.readonly &&
     !object?.metadata?.protected_content &&
     String(object.mime || "").startsWith("video/") &&
-    capabilities?.includes("publish")
+    capabilities?.includes("publish") &&
+    capabilities.includes("protect")
   );
 }
 

@@ -115,6 +115,18 @@ impl TuiState {
         }
     }
 
+    /// The one-line hand-off shown when Enter has nothing to run in the
+    /// terminal because the selected app only opens on the Desktop.
+    fn desktop_only_notice(&self, snapshot: &HomeSnapshot) -> Option<String> {
+        if self.tab != Tab::Apps {
+            return None;
+        }
+        let entries = app_entries(snapshot);
+        let entry = entries.get(self.app_index.min(entries.len().saturating_sub(1)))?;
+        (entry.action_id.is_none() && entry.category == "Apps")
+            .then(|| format!("Open {} on the Desktop", entry.label))
+    }
+
     fn handle_mouse(&mut self, event: MouseEvent, cols: usize, snapshot: &HomeSnapshot) -> bool {
         if event.released {
             return false;

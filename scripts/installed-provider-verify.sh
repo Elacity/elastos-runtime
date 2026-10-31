@@ -11,7 +11,7 @@ Usage: $(basename "$0") [--require-verified] [component ...]
 
 Verifies installed external component binaries against the installed
 components.json manifest. With no component arguments, verifies every installed
-external component that has an install_path and binary present.
+external component for the selected platform that has an install_path and binary present.
 
   --require-verified  Reject an explicitly named component that verification skips.
 
@@ -84,8 +84,9 @@ verify_component() {
             '
               .external[$name] as $component
               | if $component == null then empty else
-                  ($component.platforms[$platform] // $component.platforms[$alias] // $component.platforms["*"] // {}) as $platform_info
+                  ($component.platforms[$platform] // $component.platforms[$alias] // $component.platforms["*"]) as $platform_info
                   | {
+                      supported: ($platform_info != null),
                       install_path: ($platform_info.install_path // $component.install_path // ""),
                       checksum: ($platform_info.checksum // ""),
                       extract_path: ($platform_info.extract_path // ""),
@@ -99,6 +100,14 @@ verify_component() {
     if [[ -z "$info" ]]; then
         echo "[installed-provider-verify] missing external component: $name" >&2
         return 1
+    fi
+
+    if [[ "$(jq -r '.supported' <<<"$info")" != "true" ]]; then
+        if [[ "$explicit" == "1" ]]; then
+            echo "[installed-provider-verify] $name has no $PLATFORM platform entry" >&2
+            return 1
+        fi
+        return 0
     fi
 
     install_path="$(jq -r '.install_path' <<<"$info")"

@@ -19,10 +19,7 @@ const GRAPH_ENCODING: &str = "base64-car";
 const DEFAULT_MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct CoordFile {
@@ -458,19 +455,19 @@ fn read_coord_file(data_dir: &Path) -> Option<CoordFile> {
     serde_json::from_str(&content).ok()
 }
 
+/// Refreshes `last_used` and keeps every other field ipfs-provider wrote,
+/// such as `offline`, which marks a daemon it may keep borrowing.
 fn update_coord_last_used(data_dir: &Path) {
-    let Some(mut coord) = read_coord_file(data_dir) else {
+    let path = coord_file_path(data_dir);
+    let Some(mut coord) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+    else {
         return;
     };
-    coord.last_used = now_unix_secs();
-    let path = coord_file_path(data_dir);
-    let Ok(json) = serde_json::to_string_pretty(&json!({
-        "kubo_pid": coord.kubo_pid,
-        "api_port": coord.api_port,
-        "gateway_port": coord.gateway_port,
-        "started_at": coord.started_at,
-        "last_used": coord.last_used,
-    })) else {
+    coord["last_used"] = json!(now_unix_secs());
+    let Ok(json) = serde_json::to_string_pretty(&coord) else {
         return;
     };
     let tmp = path.with_extension("tmp");
@@ -486,6 +483,44 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn main() {
+    eprintln!("{PROVIDER_ID}: starting v{PROVIDER_VERSION}");
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut provider = ContentBlockGraphProvider::default();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("{PROVIDER_ID} read error: {err}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = error("invalid_request", &err.to_string());
+                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+        };
+        let is_shutdown = matches!(request, Request::Shutdown);
+        let response = provider.handle(request);
+        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        stdout.flush().unwrap();
+        if is_shutdown {
+            break;
+        }
+    }
+
+    eprintln!("{PROVIDER_ID}: exiting");
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,43 +631,20 @@ mod tests {
         });
         assert_eq!(response["code"], "cid_mismatch");
     }
-}
 
-fn main() {
-    eprintln!("{PROVIDER_ID}: starting v{PROVIDER_VERSION}");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut provider = ContentBlockGraphProvider::default();
-
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => {
-                eprintln!("{PROVIDER_ID} read error: {err}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
-            Err(err) => {
-                let response = error("invalid_request", &err.to_string());
-                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-                stdout.flush().unwrap();
-                continue;
-            }
-        };
-        let is_shutdown = matches!(request, Request::Shutdown);
-        let response = provider.handle(request);
-        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-        stdout.flush().unwrap();
-        if is_shutdown {
-            break;
-        }
+    #[test]
+    fn last_used_refresh_keeps_the_offline_mark() {
+        let data_dir = temp_dir("coord-offline");
+        fs::write(
+            coord_file_path(&data_dir),
+            r#"{"kubo_pid":1,"api_port":2,"gateway_port":3,"started_at":4,"last_used":5,"offline":true}"#,
+        )
+        .unwrap();
+        update_coord_last_used(&data_dir);
+        let coord: Value =
+            serde_json::from_slice(&fs::read(coord_file_path(&data_dir)).unwrap()).unwrap();
+        assert_eq!(coord["offline"], true);
+        assert_eq!(coord["api_port"], 2);
+        assert!(coord["last_used"].as_u64().unwrap() > 5);
     }
-
-    eprintln!("{PROVIDER_ID}: exiting");
 }

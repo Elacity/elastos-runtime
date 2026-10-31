@@ -19,25 +19,31 @@
    Contract with the frame (event.source pins the sender; the frame is
    opaque-sandboxed so target origin is "*"):
      Home → capsule   home-agent:open | home-agent:shelf-handover {on} | home-agent:close
-     capsule → Home   home-agent:ready | home-agent:shelf-metrics {width,height,radius}
+     capsule → Home   home-agent:hello {docId} (document started) |
+                      home-agent:ready {docId} (workspace loaded) | home-agent:shelf-metrics {width,height,radius}
                       home-agent:close | home-agent:open-viewer {request}
                       home-agent:open-browser {url} */
 
 import {
   closeOtherShellPopovers,
+  LAYER_STATE,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260813a";
+  registerStageLayer,
+} from "./shell-popovers.js?v=home-20261030a";
 import {
   agentStageId,
   bindAgentSpace,
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261030a";
+import { isPhone } from "./shell-form-factor.js?v=home-20261030a";
 import {
+  createAssistantFrameReadiness,
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
-} from "./home-agent-message-contract.js?v=home-20260813a";
+} from "./home-agent-message-contract.js?v=home-20261030a";
+import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261030a";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "assistant";
@@ -55,6 +61,10 @@ const RETURN_MS = 160;
 const ROOM_MS = 720;
 const FACE_MIN_W = 320;
 const FACE_MAX_W = 720;
+/* Side gutters of .taskbar.is-assistant-face's max-width. The phone gutter is
+   the Dock's and the Apps face's, so the stretch never narrows the pill. */
+const FACE_GUTTER = 48;
+const FACE_GUTTER_PHONE = 20;
 
 let deps = null;
 let generation = 0;
@@ -64,6 +74,7 @@ let idleDockWidth = 0;
 let spaceEl = null;
 let frame = null;
 let frameReady = false;
+const frameReadiness = createAssistantFrameReadiness();
 let launching = false;
 let launchQuery = {};
 let authorizedLaunch = null;
@@ -72,6 +83,7 @@ let spaceHideTimer = 0;
 let closing = false;
 /* The Space the user came from; the ring returns there when the room closes. */
 let returnStageId = "";
+let browserAvailable = false;
 
 function taskbarEl() {
   return document.querySelector(".taskbar");
@@ -133,13 +145,17 @@ function setFaceOpen(open) {
   toggle?.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
+function faceViewportWidth() {
+  return window.innerWidth - (isPhone() ? FACE_GUTTER_PHONE : FACE_GUTTER);
+}
+
 /* Default geometry is the composer's idle pill; the capsule reports the live
    one as soon as its pill lays out, and again whenever it grows. */
 function lockFaceGeometry(taskbar) {
   if (taskbar.style.getPropertyValue("--assistant-face-w")) {
     return;
   }
-  const maxW = Math.max(FACE_MIN_W, window.innerWidth - 48);
+  const maxW = Math.max(FACE_MIN_W, faceViewportWidth());
   taskbar.style.setProperty("--assistant-face-w", `${Math.round(Math.min(maxW, FACE_MAX_W))}px`);
 }
 
@@ -148,7 +164,7 @@ function lockFaceGeometry(taskbar) {
 function faceTargetWidth(taskbar) {
   const locked = parseFloat(taskbar.style.getPropertyValue("--assistant-face-w"));
   const width = Number.isFinite(locked) && locked >= FACE_MIN_W ? locked : FACE_MAX_W;
-  return Math.round(Math.min(width, window.innerWidth - 48));
+  return Math.round(Math.min(width, faceViewportWidth()));
 }
 
 function applyFaceMetrics(metrics) {
@@ -218,14 +234,9 @@ function postToFrame(message) {
   target.postMessage(message, "*");
 }
 
-function onAssistantFrameDocumentLoad() {
-  if (!frame?.dataset.route) {
-    return;
-  }
-  /* Home keeps dataset.route across a capsule document reload. The new
-     document must handshake ready again, or the room stays empty. */
+function hideFrameUntilReady() {
   frameReady = false;
-  frame.classList.remove("is-ready");
+  frame?.classList.remove("is-ready");
 }
 
 function markFrameReady() {
@@ -289,6 +300,7 @@ async function mountAssistantFrame() {
     frame.setAttribute("allow", deps.iframeAllowForLaunch(launched));
     frame.title = deps.escapeHtml(launched.title || "Assistant");
     const route = new URL(String(launched.route || ""), window.location.origin);
+    frameReadiness.reset();
     frame.src = route.href;
     frame.dataset.route = route.href;
   } catch (error) {
@@ -342,6 +354,18 @@ function closeAssistantSpace({ instant = false } = {}) {
   spaceHideTimer = window.setTimeout(park, ROOM_MS + 40);
 }
 
+/* Back on the phone closes the room immediately. The dock morph can already
+   be leaving, or the room can be up without that morph; either way the
+   space has to go. */
+export function dismissAssistantForBack() {
+  const taskbar = taskbarEl();
+  const wasOpen = assistantFaceActive() || Boolean(taskbar?.dataset.assistantMorph);
+  if (wasOpen) {
+    hideAssistantFace({ instant: true });
+  }
+  closeAssistantSpace({ instant: true });
+}
+
 /* Host retires the GUI surface (sign-out, lock): drop the session with it. */
 export function retireAssistantSpace() {
   retirementGeneration += 1;
@@ -354,6 +378,7 @@ export function retireAssistantSpace() {
     clearFaceGeometry(taskbar);
   }
   frameReady = false;
+  frameReadiness.reset();
   if (frame) {
     frame.removeAttribute("src");
     delete frame.dataset.route;
@@ -371,9 +396,13 @@ function onFrameMessage(event) {
     return;
   }
   switch (message.type) {
-    case "home-agent:ready":
-      markFrameReady();
+    case "home-agent:hello":
+    case "home-agent:ready": {
+      const change = frameReadiness.receive(message);
+      if (change === "hide") hideFrameUntilReady();
+      if (change === "show") markFrameReady();
       break;
+    }
     case "home-agent:shelf-metrics":
       applyFaceMetrics(message);
       break;
@@ -391,7 +420,7 @@ function onFrameMessage(event) {
     }
     case "home-agent:open-browser": {
       const url = normalizeHomeAgentBrowserUrl(message);
-      if (url && typeof deps?.openTarget === "function") {
+      if (url && browserAvailable && typeof deps?.openTarget === "function") {
         deps.openTarget("browser", { query: { url } });
       }
       break;
@@ -403,18 +432,18 @@ function onFrameMessage(event) {
 
 /* ---- Face ------------------------------------------------------------------ */
 
-/* The toggle exists only when the capsule is installed; it wears the capsule's
-   own declared icon like every other dock item. */
+/* The toggle exists only when the capsule is installed. Unlike other dock
+   items it wears Home's own Assistant mark (shell-assistant-mark.js), not the
+   capsule's icon: the mark is part of the face cadence Home owns. */
 export function syncAssistantFaceAvailability(summary) {
   const toggle = toggleEl();
   if (!toggle || !deps) {
     return;
   }
+  browserAvailable = Boolean(deps.targetById(summary, "browser"));
   const target = deps.targetById(summary, TARGET_ID);
   toggle.hidden = !target;
-  if (target) {
-    deps.mountGlyph(toggle.querySelector(".taskbar-item-icon"), TARGET_ID);
-  } else if (assistantFaceActive()) {
+  if (!target && assistantFaceActive()) {
     retireAssistantSpace();
   }
 }
@@ -502,12 +531,18 @@ export function hideAssistantFace({ instant = false } = {}) {
     setFaceOpen(false);
     setPhase(taskbar, "");
     closing = false;
-    toggleEl()?.focus({ preventScroll: true });
+    deps.restoreDockFocus(toggleEl());
   };
 
   if (instant || reducedMotion()) {
     setHandover(false);
     closeAssistantSpace({ instant: true });
+    if (isPhone()) {
+      // clearTimers() cancelled the steps that drop the transient pill width.
+      taskbar.classList.remove("is-dock-width-easing");
+      taskbar.style.removeProperty("width");
+      taskbar.style.removeProperty("--dock-width-ms");
+    }
     finish();
     return;
   }
@@ -549,7 +584,7 @@ export function hideAssistantFace({ instant = false } = {}) {
       after(RETURN_MS + 16, () => {
         setPhase(taskbar, "");
         closing = false;
-        toggleEl()?.focus({ preventScroll: true });
+        deps.restoreDockFocus(toggleEl());
       });
     });
   });
@@ -567,8 +602,8 @@ export function toggleAssistantFace() {
  * Wire the face once the GUI template is in the DOM.
  * @param {{
  *   easeDockPillWidth: (fromW: number, durationName?: string) => void,
+ *   restoreDockFocus: (item: HTMLElement | null) => void,
  *   targetById: (summary: unknown, targetId: string) => unknown,
- *   mountGlyph: (container: Element | null, targetId: string) => void,
  *   launchHomeTarget: (targetId: string, query: object) => Promise<object>,
  *   iframeSandboxForLaunch: (launched: object) => string,
  *   iframeAllowForLaunch: (launched: object) => string,
@@ -580,15 +615,26 @@ export function bindAssistantFace(dependencies) {
   deps = dependencies;
   spaceEl = document.querySelector("#assistant-space");
   frame = document.querySelector("#assistant-space-frame");
-  frame?.addEventListener("load", onAssistantFrameDocumentLoad);
   registerShellPopover(FACE_ID, () => hideAssistantFace({ instant: true }));
+  registerStageLayer("assistant", {
+    selector: "#assistant-space",
+    state: () => (Boolean(spaceEl && !spaceEl.hidden) || assistantFaceActive() || Boolean(taskbarEl()?.dataset.assistantMorph)
+      ? LAYER_STATE.open
+      : LAYER_STATE.closed),
+    close: () => dismissAssistantForBack(),
+  });
   bindAgentSpace({
     available: () => Boolean(toggleEl()) && !toggleEl().hidden,
     busy: () => Boolean(taskbarEl()?.dataset.assistantMorph),
+    engaged: () => !closing && (assistantFaceActive() || Boolean(taskbarEl()?.dataset.assistantMorph)),
     open: () => showAssistantFace(),
     close: () => hideAssistantFace(),
   });
-  toggleEl()?.addEventListener("click", () => toggleAssistantFace());
+  bindAssistantMark(toggleEl(), {
+    onActivate: () => toggleAssistantFace(),
+    /* Only an opening earns the chevron contact; closing is immediate. */
+    animate: () => !assistantFaceActive() && !taskbarEl()?.dataset.assistantMorph,
+  });
   document.querySelector("#assistant-space-retry")?.addEventListener("click", () => {
     void mountAssistantFrame();
   });

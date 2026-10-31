@@ -2,16 +2,20 @@
 
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { discoverySummary } from "./lib/people-discovery-fixture.mjs";
+import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/people/browser");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
+const PHONE_SCREENSHOT = "/tmp/people-phone-390x844.png";
+const SHOTS_DIR = process.env.PEOPLE_SHOTS_DIR || "/tmp/people-pages-shots";
 
 function assert(condition, message, details = undefined) {
   if (!condition) {
@@ -40,37 +44,6 @@ async function readJson(request) {
   return text ? JSON.parse(text) : {};
 }
 
-function discoverySummary({
-  configured = false,
-  enabled = false,
-  status = configured ? (enabled ? "visible" : "off") : "unconfigured",
-  statusMessage = configured
-    ? (enabled
-      ? "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
-      : "Discovery is off.")
-    : "Discovery is unavailable.",
-  discoveredPeers = [],
-  pendingRequestCount = 0,
-  remainingSeconds = null,
-  remoteVisibilityMayRemainUntil = null,
-  remoteVisibilityRemainingSeconds = null,
-} = {}) {
-  return {
-    schema: "elastos.people.discovery/v1",
-    configured,
-    enabled,
-    status,
-    status_message: statusMessage,
-    expires_at: remainingSeconds === null ? null : 1_000 + remainingSeconds,
-    remaining_seconds: remainingSeconds,
-    remote_visibility_may_remain_until: remoteVisibilityMayRemainUntil,
-    remote_visibility_remaining_seconds: remoteVisibilityRemainingSeconds,
-    discovered_count: discoveredPeers.length,
-    discovered_peers: discoveredPeers,
-    request_count: pendingRequestCount,
-  };
-}
-
 function summary({
   readinessStatus,
   profileName = "",
@@ -79,6 +52,7 @@ function summary({
   discovery,
 }) {
   return {
+    profile_id: readinessStatus === "ready" ? "did:key:z6MkLocalProfileFixture111111111111111111111111111" : null,
     identity: {
       ...(profileName ? { profile: { display_name: profileName } } : {}),
       ...(setupSuggestion ? { profile_setup_display_name: setupSuggestion } : {}),
@@ -115,6 +89,7 @@ function visibleDiscoveryPeer() {
     advertisement_id: "ad-visible-1",
     display_name: "Jordan Visible",
     handle: "jordan",
+    status: "visible",
     peer_id: "must-not-render-peer-id",
     connect_ticket: "must-not-render-ticket",
     route: "must-not-render-route",
@@ -133,6 +108,8 @@ function freshScenarioState(scenario) {
     discoveryTogglePosts: 0,
     profileAttemptCount: 0,
     createdProfileName: "",
+    removalAttempts: 0,
+    contactRemoved: false,
   };
 }
 
@@ -167,21 +144,36 @@ function scenarioSummary(state) {
           configured: true,
           enabled: false,
           status: "off",
-          statusMessage: "Discovery is off.",
+          statusMessage: "Public is off.",
         }),
+    });
+  }
+  if (state.scenario === "remove-confirmation") {
+    return summary({
+      readinessStatus: "ready",
+      profileName: "Ready Profile",
+      contacts: [
+        { ...acceptedContact(), relationship: state.contactRemoved ? "removed" : "connected", can_message: !state.contactRemoved },
+        { ...acceptedContact(), contact_id: "contact:other", display_name: "Other Contact", conversation_id: "direct:opaque:other" },
+      ],
+      discovery: discoverySummary({ configured: true }),
     });
   }
   if (state.scenario === "visible") {
     return summary({
       readinessStatus: "ready",
       profileName: "Visible Profile",
-      contacts: [acceptedContact()],
+      contacts: [
+        { ...acceptedContact(), reachable: true },
+        { contact_id: "contact:waiting", display_name: "", relationship: "requested", can_message: false },
+        { contact_id: "contact:stuck", display_name: "Sam Waiting", relationship: "requested", can_message: false,
+          reachable: true, delivery_detail: "They may be on an older version. Ask them to update, or turn on Public in People on both Homes." },
+      ],
       discovery: discoverySummary({
         configured: true,
         enabled: true,
         status: "visible",
-        statusMessage:
-          "Discovery is on. Visibility lasts up to ten minutes. This window has 540 seconds left, and both people must be visible at the same time.",
+        statusMessage: "Public is on.",
         discoveredPeers: [visibleDiscoveryPeer()],
         pendingRequestCount: 1,
         remainingSeconds: 540,
@@ -197,7 +189,7 @@ function scenarioSummary(state) {
           configured: true,
           enabled: false,
           status: "off",
-          statusMessage: "Discovery is off.",
+          statusMessage: "Public is off.",
         }),
       })
       : summary({
@@ -237,6 +229,7 @@ function startServer() {
     discoveryRequests: 0,
     discoveryToggles: 0,
     profileAttempts: 0,
+    removalTargets: [],
   };
   const server = createServer(async (request, response) => {
     try {
@@ -261,7 +254,7 @@ function startServer() {
         const body = Buffer.from(
           "<!doctype html><html><body style=\"margin:0\">"
           + "<script>window.peopleSmokeMessages=[];window.addEventListener('message',(event)=>window.peopleSmokeMessages.push(event.data));</script>"
-          + `<iframe title="People" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" style="border:0;height:100vh;width:100vw" src="${iframeSrc}"></iframe>`
+          + `<iframe title="People" sandbox="allow-forms allow-pointer-lock allow-scripts" style="border:0;height:100vh;width:100vw" src="${iframeSrc}"></iframe>`
           + "</body></html>",
         );
         response.writeHead(200, {
@@ -272,6 +265,12 @@ function startServer() {
         return;
       }
 
+      if (["/apps/home/home-clipboard-client.js", "/apps/home/home-clipboard-protocol.js"].includes(url.pathname)) {
+        const body = await readFile(join(repoRoot, "capsules/home/browser", url.pathname.split("/").at(-1)));
+        response.writeHead(200, { "access-control-allow-origin": "null", "content-type": "text/javascript" });
+        response.end(body);
+        return;
+      }
       if (url.pathname.startsWith("/apps/people/")) {
         await serveFile(response, url.pathname);
         return;
@@ -308,6 +307,31 @@ function startServer() {
         const body = await readJson(request);
         assert(body.advertisement_id === "ad-visible-1", "People request used the wrong advertisement selector", body);
         return json(response, scenarioSummary(state).discovery);
+      }
+      if (url.pathname === "/api/apps/people/contacts/request" && request.method === "POST") {
+        const { profile_id } = await readJson(request);
+        if (profile_id === "invalid") {
+          response.writeHead(400, { "access-control-allow-origin": "null", "content-type": "text/plain" });
+          response.end("That isn't a DID. A DID starts with did:key:z.");
+          return;
+        }
+        assert(profile_id === "did:key:zRemote", "DID request body differs");
+        return json(response, {
+          status: "requested",
+          message: "Request sent.",
+        });
+      }
+      if (url.pathname === "/api/apps/people/contacts/remove" && request.method === "POST") {
+        const body = await readJson(request);
+        assert(scenario === "remove-confirmation" && body.contact_id === "contact:accepted",
+          "People removal changed its confirmed target", body);
+        trace.removalTargets.push(body.contact_id);
+        state.removalAttempts += 1;
+        if (state.removalAttempts === 1) {
+          return json(response, { error: "unauthorized" }, 401);
+        }
+        state.contactRemoved = true;
+        return json(response, { status: "ok" });
       }
       if (url.pathname === "/api/apps/people/profile" && request.method === "POST") {
         trace.profileAttempts += 1;
@@ -362,16 +386,36 @@ async function peopleFrame(page) {
 }
 
 async function openPeople(page, port, scenario, width) {
-  await page.setViewportSize({ width, height: 900 });
+  await page.setViewportSize({ width, height: width === 375 ? 1400 : 900 });
   await page.goto(`http://127.0.0.1:${port}/fixture?scenario=${encodeURIComponent(scenario)}`, {
     waitUntil: "domcontentloaded",
   });
   return peopleFrame(page);
 }
 
-async function openDiscovery(frame) {
-  await frame.locator('[data-section-target="discovery"]').click();
-  await frame.waitForFunction(() => document.querySelector("#discovery")?.hidden === false);
+// People, Profile and Public are three pages; `discovery` is Public's id.
+async function openSection(frame, id) {
+  await frame.locator(`[data-section-target="${id}"]`).click();
+  await frame.waitForFunction((section) => document.getElementById(section)?.hidden === false, id);
+}
+
+function shownSection(frame) {
+  return frame.evaluate(() => [...document.querySelectorAll(".people-section")]
+    .filter((section) => !section.hidden).map((section) => section.id).join(","));
+}
+
+// Evidence for a person: each page at this width, in the dark and the light theme.
+async function screenshotPages(page, frame, width) {
+  await mkdir(SHOTS_DIR, { recursive: true });
+  for (const theme of ["dark", "light"]) {
+    await frame.evaluate((next) => document.documentElement.setAttribute("data-el-theme", next), theme);
+    for (const [id, name] of [["people", "people"], ["profile", "profile"], ["discovery", "public"]]) {
+      await openSection(frame, id);
+      await assertNoOverflow(frame, `${name} page (${theme}) at ${width}px`);
+      await page.screenshot({ path: join(SHOTS_DIR, `${name}-${width}-${theme}.png`), fullPage: false });
+    }
+  }
+  await frame.evaluate(() => document.documentElement.setAttribute("data-el-theme", "dark"));
 }
 
 async function assertNoOverflow(frame, label) {
@@ -390,11 +434,12 @@ async function assertNoOverflow(frame, label) {
       ".people-content",
       ".people-content-inner",
       ".people-section:not([hidden])",
-      ".profile-card",
-      ".profile-form",
+      ".people-form",
+      ".people-field-row",
+      ".people-requests",
       ".people-list",
-      ".discovery-header",
-      ".discovery-grid",
+      ".person-card",
+      ".public-head",
     ];
     const panels = [];
     for (const selector of selectors) {
@@ -478,10 +523,12 @@ async function assertVisible(frame, selectors, label) {
 }
 
 async function assertNoIdentityLeak(frame, label) {
-  const pageState = await frame.evaluate(() => ({
-    text: document.body.innerText,
-    html: document.documentElement.outerHTML,
-  }));
+  const pageState = await frame.evaluate(() => {
+    const body = document.body.cloneNode(true);
+    body.querySelector("#profile-id-value")?.remove();
+    body.querySelector("#add-contact-id")?.remove();
+    return { text: body.textContent, html: body.innerHTML };
+  });
   const textChecks = [
     /did:key:/i,
     /\bendpoint\b/i,
@@ -523,80 +570,120 @@ async function waitForStatus(frame, expectedText) {
   );
 }
 
+const FIRST_RUN_COPY = "Choose the name people see. Public stays off until you turn it on.";
+
 async function assertFirstRunScenario(frame, width) {
-  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "Create your Profile"));
+  // The static page has no description. Wait for the text only people.js writes,
+  // so the checks below read the rendered first-run state, not the HTML before the script runs.
+  await waitFor(() => frame.evaluate((copy) => document.querySelector("#profile-description")?.textContent?.trim()
+    === copy, FIRST_RUN_COPY));
+  assert(await shownSection(frame) === "profile", "first run must open on Profile", { shown: await shownSection(frame) });
   await assertNoOverflow(frame, `first run at ${width}px`);
   await assertVisible(frame, [
-    "#people-count",
     "#profile-title",
     "#profile-description",
     "#profile-name",
     "#profile-submit",
   ], `first run at ${width}px`);
   const state = await frame.evaluate(() => ({
-    count: document.querySelector("#people-count")?.textContent?.trim() || "",
     title: document.querySelector("#profile-title")?.textContent?.trim() || "",
-    description: document.querySelector("#profile-description")?.textContent?.trim() || "",
     value: document.querySelector("#profile-name")?.value || "",
     placeholder: document.querySelector("#profile-name")?.getAttribute("placeholder") || "",
     submit: document.querySelector("#profile-submit")?.textContent?.trim() || "",
   }));
-  assert(state.count === "0 contacts", "first run contact count is wrong", state);
   assert(state.title === "Create your Profile", "first run title is wrong", state);
-  assert(
-    state.description === "Your Profile is your signed identity for People and Chat.",
-    "first run explanation is wrong",
-    state,
-  );
   assert(state.value === "Suggested Profile Name", "first run should prefill the suggested profile name", state);
   assert(state.placeholder === "Your name", "first run should keep a stable editable placeholder", state);
   assert(state.submit === "Create Profile", "first run should offer explicit Profile creation", state);
+  assert(await frame.locator("#profile-id").isHidden(), "Your DID appeared before Profile creation");
+  await openSection(frame, "people");
+  assert(await frame.locator("#add-contact-form").isHidden(), "Add appeared before Profile creation");
+  assert(await frame.locator("#people-count").innerText() === "0", "first run contact count is wrong");
+  assert(await frame.locator("#people-list").innerText() === "No contacts yet.", "first run empty list is wrong");
   await assertNoIdentityLeak(frame, `first run at ${width}px`);
 }
 
 async function assertReadyOffScenario(frame, page, width) {
-  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "My Profile"));
-  await assertNoOverflow(frame, `ready/off at ${width}px`);
-  await assertVisible(frame, [
-    "#profile-title",
-    "#profile-description",
-    "#profile-name",
-    "#profile-submit",
-  ], `ready/off profile at ${width}px`);
-  await openDiscovery(frame);
-  await assertNoOverflow(frame, `ready/off discovery at ${width}px`);
-  await assertVisible(frame, [
-    "#discovery-status",
-    "#discovery-toggle",
-    "#discovery-refresh",
-    "#discovery-visible-count",
-    "#discovery-requests-count",
-  ], `ready/off discovery controls at ${width}px`);
+  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-form")?.dataset.profileState === "saved"));
+  assert(await shownSection(frame) === "people", "a saved Profile must open on People");
+  await openSection(frame, "profile");
+  await assertNoOverflow(frame, `ready/off profile at ${width}px`);
+  await assertVisible(frame, ["#profile-name", "#profile-submit", "#profile-id-value", "#profile-id-copy"],
+    `ready/off profile at ${width}px`);
+  const profile = await frame.evaluate(() => ({
+    text: document.querySelector("#profile").innerText.replace(/\s+/g, " ").trim(),
+    titleHidden: document.querySelector("#profile-title").hidden,
+    descriptionHidden: document.querySelector("#profile-description").hidden,
+    submit: document.querySelector("#profile-submit")?.textContent?.trim() || "",
+  }));
+  assert(profile.titleHidden && profile.descriptionHidden && profile.submit === "Save"
+    && profile.text === "Display name Save Your DID did:key:z6MkLocalProfileFixture111111111111111111111111111 Copy",
+  "a saved Profile shows only the name, Save, the DID and Copy", profile);
+  await page.evaluate(() => {
+    const child = document.querySelector("iframe").contentWindow;
+    const homeToken = new URLSearchParams(new URL(document.querySelector("iframe").src).hash.slice(1)).get("home_token");
+    child.postMessage({ type: "home:clipboard-ready", schema: "elastos.home.clipboard.ready/v1",
+      targetId: "people", homeToken, parentOrigin: location.origin, generation: "fixture:1" }, "*");
+    window.peopleCopies = [];
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (event.source !== child || data?.type !== "home:clipboard-request") return;
+      window.peopleCopies.push(data);
+      child.postMessage({ type: "home:clipboard-result", schema: "elastos.home.clipboard.result/v1",
+        requestId: data.requestId, targetId: "people", homeToken, parentOrigin: location.origin,
+        generation: "fixture:1", operation: "write", purpose: "profile.id", ok: true }, "*");
+    });
+  });
+  await frame.locator("#profile-id-copy").click();
+  await waitForStatus(frame, "DID copied.");
+  const copies = await page.evaluate(() => window.peopleCopies);
+  assert(copies.length === 1 && copies[0].purpose === "profile.id"
+    && copies[0].text === await frame.locator("#profile-id-value").innerText(), "Copy lost the Profile DID", copies);
+
+  await openSection(frame, "people");
+  assert(await frame.locator("#people-status").isHidden(), "a status line followed its page to another page");
+  await assertVisible(frame, ["#add-contact-id", "#add-contact-submit"], `Add by DID at ${width}px`);
+  await frame.locator("#add-contact-id").fill("invalid");
+  await frame.locator("#add-contact-submit").click();
+  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent === "That isn't a DID. A DID starts with did:key:z.");
+  assert(await frame.locator("#add-contact-id").inputValue() === "invalid", "Refusal cleared the input");
+  await frame.locator("#add-contact-id").fill("did:key:zRemote");
+  await frame.locator("#add-contact-id").press("Enter");
+  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent === "Request sent.");
+  assert(await frame.locator("#add-contact-id").inputValue() === "", "Sent request kept the input");
+  await assertNoOverflow(frame, `DID request at ${width}px`);
+
+  await openSection(frame, "discovery");
+  await assertNoOverflow(frame, `ready/off Public at ${width}px`);
+  await assertVisible(frame, ["#discovery-status", "#discovery-toggle", "#discovery-refresh"],
+    `ready/off Public controls at ${width}px`);
   const offState = await frame.evaluate(() => ({
-    profileName: document.querySelector("#profile-name")?.value || "",
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     toggle: document.querySelector("#discovery-toggle")?.textContent?.trim() || "",
     refreshDisabled: document.querySelector("#discovery-refresh")?.disabled === true,
-    visibleCount: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
-    requestCount: document.querySelector("#discovery-requests-count")?.textContent?.trim() || "",
+    listHidden: document.querySelector("#discovery-people")?.hidden === true,
   }));
-  assert(offState.profileName === "Ready Profile", "ready/off should show the saved profile name", offState);
-  assert(offState.status === "Discovery is off.", "ready/off should show the off discovery state", offState);
-  assert(offState.toggle === "Turn On", "ready/off should offer discovery opt-in", offState);
+  assert(offState.status === "Public is off." && await frame.locator("#discovery-note").isHidden(),
+    "ready/off should show the off Public state", offState);
+  assert(offState.toggle === "Turn On", "ready/off should offer Public opt-in", offState);
   assert(offState.refreshDisabled === false, "ready/off should keep Refresh usable", offState);
-  assert(offState.visibleCount === "0 visible", "ready/off visible count is wrong", offState);
-  assert(offState.requestCount === "0 requests", "ready/off request count is wrong", offState);
+  assert(offState.listHidden, "an empty list must not show while Public is off", offState);
 
   await frame.locator("#discovery-refresh").click();
-  await waitForStatus(frame, "Refresh requested.");
   await frame.locator("#discovery-toggle").click();
   await waitFor(() => frame.evaluate(() => document.querySelector("#discovery-toggle")?.textContent?.trim() === "Turn Off"));
   const toggled = await frame.evaluate(() => ({
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     toggle: document.querySelector("#discovery-toggle")?.textContent?.trim() || "",
+    note: document.querySelector("#discovery-note")?.hidden ? "" : document.querySelector("#discovery-note")?.textContent?.trim(),
+    list: document.querySelector("#discovery-list")?.textContent?.trim() || "",
+    count: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
+    flashed: document.querySelector("#people-status")?.hidden === false,
   }));
   assert(
-    /Visibility lasts up to ten minutes/i.test(toggled.status) && toggled.toggle === "Turn Off",
+    toggled.status === "Public is on." && toggled.note === "People can find you while you are signed in to Home."
+      && toggled.toggle === "Turn Off"
+      && toggled.list === "No one else is public right now." && toggled.count === "0" && !toggled.flashed,
     "ready/off controls did not stay usable after opt-in",
     toggled,
   );
@@ -606,49 +693,59 @@ async function assertReadyOffScenario(frame, page, width) {
   await assertNoIdentityLeak(frame, `ready/off at ${width}px`);
 }
 
-async function assertVisibleDiscoveryScenario(frame, page, width) {
-  await openDiscovery(frame);
+async function assertVisibleDiscoveryScenario(frame, page, width, trace) {
+  await waitFor(() => frame.evaluate(() => document.querySelector("#people-requests")?.hidden === false));
+  await assertNoOverflow(frame, `People with a request at ${width}px`);
+  const peopleState = await frame.evaluate(() => ({
+    requests: document.querySelector("#people-requests-count")?.textContent?.trim() || "",
+    rows: [...document.querySelectorAll("#people-list .person-card")].map((card) => [
+      card.querySelector("h4")?.textContent || "",
+      ...[...card.querySelectorAll(".person-details span, .person-actions button")].map((node) => node.textContent),
+    ].join("|")),
+  }));
+  assert(peopleState.requests === "1 contact request waiting.", "People must point to the waiting request", peopleState);
+  assert(peopleState.rows.length === 3 && peopleState.rows[0] === "Ari Contact|Online now|Message|Remove"
+    && peopleState.rows[1] === "Request sent" && peopleState.rows[2] === "Sam Waiting|Not delivered",
+  "each row is a name and one short status", peopleState);
+  await assertVisible(frame, ['#people-requests [data-action="open-inbox"]'], `People requests at ${width}px`);
+  // Undelivered rows say only Not delivered; one note above the list says what to do.
+  await assertVisible(frame, ["#people-undelivered"], `undelivered note at ${width}px`);
+  const note = await frame.evaluate(() => ({
+    text: document.querySelector("#people-undelivered").textContent,
+    rows: document.querySelector("#people-list").textContent,
+  }));
+  assert(note.text === "Some requests can't be delivered yet. Ask them to update, or turn on Public on both Homes."
+    && !/older version|Why\?/.test(note.rows), "one note, not a reason on each row", note);
+  await screenshotPages(page, frame, width);
+
+  await openSection(frame, "discovery");
   await waitFor(() => frame.evaluate(() => document.querySelectorAll('#discovery-list [data-action="discovery-request"]').length === 1));
-  await assertNoOverflow(frame, `visible discovery at ${width}px`);
+  await assertNoOverflow(frame, `visible Public at ${width}px`);
   await assertVisible(frame, [
     "#discovery-status",
     "#discovery-toggle",
     "#discovery-refresh",
     "#discovery-visible-count",
-    "#discovery-requests-count",
     '#discovery-list [data-action="discovery-request"]',
-    '#discovery-requests-list [data-action="open-inbox"]',
-  ], `visible discovery controls at ${width}px`);
+  ], `visible Public controls at ${width}px`);
 
   const discoveryState = await frame.evaluate(() => ({
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     addContact: document.querySelector('#discovery-list [data-action="discovery-request"]')?.textContent?.trim() || "",
-    inbox: document.querySelector('#discovery-requests-list [data-action="open-inbox"]')?.textContent?.trim() || "",
     visibleCount: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
-    requestCount: document.querySelector("#discovery-requests-count")?.textContent?.trim() || "",
   }));
-  assert(
-    /540 seconds/.test(discoveryState.status),
-    "visible discovery should show the bounded window",
-    discoveryState,
-  );
-  assert(discoveryState.addContact === "Add contact", "visible discovery action is wrong", discoveryState);
-  assert(discoveryState.inbox === "Open Inbox", "visible inbox action is wrong", discoveryState);
-  assert(discoveryState.visibleCount === "1 visible", "visible discovery count is wrong", discoveryState);
-  assert(discoveryState.requestCount === "1 request", "visible request count is wrong", discoveryState);
+  assert(discoveryState.status === "Public is on.", "visible Public shows no countdown", discoveryState);
+  assert(discoveryState.addContact === "Add contact", "visible Public action is wrong", discoveryState);
+  assert(discoveryState.visibleCount === "1", "visible Public count is wrong", discoveryState);
 
+  const requestsBefore = trace.discoveryRequests;
   await frame.locator('#discovery-list [data-action="discovery-request"]').click();
-  await waitForStatus(frame, "Contact request queued.");
-  await frame.locator('#discovery-requests-list [data-action="open-inbox"]').click();
-  const messages = await page.evaluate(() => window.peopleSmokeMessages || []);
-  const inboxMessage = messages.findLast?.((message) => message?.type === "home:open-target")
-    || [...messages].reverse().find((message) => message?.type === "home:open-target");
-  assert(
-    inboxMessage?.target === "inbox",
-    "visible discovery did not open Inbox through the Home target bridge",
-    { messages },
-  );
-  await assertNoIdentityLeak(frame, `visible discovery at ${width}px`);
+  await waitFor(() => trace.discoveryRequests === requestsBefore + 1);
+  await openSection(frame, "people");
+  await frame.locator('#people-requests [data-action="open-inbox"]').click();
+  await waitFor(async () => (await page.evaluate(() => window.peopleSmokeMessages || []))
+    .some((message) => message?.type === "home:open-target" && message.target === "inbox"));
+  await assertNoIdentityLeak(frame, `visible Public at ${width}px`);
 }
 
 async function assertProfileFailureScenario(frame, width) {
@@ -676,15 +773,15 @@ async function assertProfileFailureScenario(frame, width) {
   await assertNoIdentityLeak(frame, `profile failure after error at ${width}px`);
 
   await frame.locator("#profile-submit").click();
-  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "My Profile"));
+  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-form")?.dataset.profileState === "saved"));
   await waitForStatus(frame, "Profile created.");
   const recovered = await frame.evaluate(() => ({
-    title: document.querySelector("#profile-title")?.textContent?.trim() || "",
+    titleHidden: document.querySelector("#profile-title")?.hidden === true,
     inputValue: document.querySelector("#profile-name")?.value || "",
     submitText: document.querySelector("#profile-submit")?.textContent?.trim() || "",
   }));
   assert(
-    recovered.title === "My Profile"
+    recovered.titleHidden
       && recovered.inputValue === "Retry Name"
       && recovered.submitText === "Save",
     "profile retry did not recover to the ready state",
@@ -693,7 +790,83 @@ async function assertProfileFailureScenario(frame, width) {
   await assertNoOverflow(frame, `profile failure recovered at ${width}px`);
 }
 
-async function runScenario(page, port, scenario, width) {
+// Phone: the three pages are one segmented row at the top, every segment a
+// 44 px target, and the content follows with no page title above it.
+async function assertPhoneScenario(page, port) {
+  const frame = await openPeople(page, port, "ready-off", PHONE_VIEWPORT.width);
+  await page.setViewportSize(PHONE_VIEWPORT);
+  await setPhoneFormFactor(frame);
+  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-form")?.dataset.profileState === "saved"));
+  const readRow = () => frame.evaluate(() => {
+    const items = [...document.querySelectorAll("[data-section-target]")].map((item) => {
+      const rect = item.getBoundingClientRect();
+      return { label: item.innerText.trim(), top: Math.round(rect.top), left: Math.round(rect.left),
+        right: Math.round(rect.right), height: Math.round(rect.height), active: item.classList.contains("active") };
+    });
+    const content = document.querySelector(".people-content").getBoundingClientRect();
+    const title = getComputedStyle(document.querySelector(".people-page-title")).display;
+    return { items, contentTop: Math.round(content.top), title, width: innerWidth };
+  });
+  const row = await readRow();
+  assert(
+    row.items.map((item) => item.label).join(",") === "People,Profile,Public"
+      && row.items.every((item) => item.top === row.items[0].top && item.height >= 44 && item.left >= 0 && item.right <= row.width)
+      && row.items[0].top <= 16 && row.contentTop >= row.items[0].top + 44 && row.title === "none"
+      && row.items[0].active,
+    "People phone: the pages must be one row of 44 px segments above the content",
+    row,
+  );
+  await assertNoOverflow(frame, "People phone");
+  await page.screenshot({ path: PHONE_SCREENSHOT });
+  await openSection(frame, "discovery");
+  assert((await readRow()).items[2].active, "People phone: Public did not become the active segment");
+  await assertNoOverflow(frame, "People phone Public");
+}
+
+async function assertRemoveConfirmationScenario(frame, page, width, trace) {
+  const beforePosts = trace.removalTargets.length;
+  const remove = frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]');
+  await remove.waitFor({ state: "visible" });
+  await remove.evaluate(node => node.scrollIntoView({ block: "center" }));
+  await remove.click();
+  const confirm = frame.locator('[data-action="confirm-remove"][data-contact-id="contact:accepted"]');
+  const cancel = frame.locator('[data-action="cancel-remove"][data-contact-id="contact:accepted"]');
+  await confirm.waitFor({ state: "visible" });
+  assert(await cancel.evaluate(node => node === document.activeElement), "Remove must focus the safe Cancel action");
+  assert((await frame.locator('.person-confirm').innerText()).includes("Remove Ari Contact from People?"),
+    "Remove confirmation named the wrong contact");
+  await assertVisible(frame, ['.person-confirm', '[data-action="cancel-remove"]', '[data-action="confirm-remove"]'],
+    `Remove confirmation at ${width}px`);
+  await assertNoOverflow(frame, `Remove confirmation at ${width}px`);
+  assert(trace.removalTargets.length === beforePosts, "Opening confirmation sent a removal POST");
+  await cancel.click();
+  await confirm.waitFor({ state: "hidden" });
+  assert(trace.removalTargets.length === beforePosts, "Cancel sent a removal POST");
+  await remove.evaluate(node => node.scrollIntoView({ block: "center" }));
+  await remove.click();
+  const failed = page.waitForResponse(response => response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/api/apps/people/contacts/remove", { timeout: 10000 });
+  await confirm.click();
+  assert((await failed).status() === 401, "Removal refusal was not exercised");
+  await waitForStatus(frame, "Could not complete that action.");
+  await waitFor(() => confirm.isEnabled());
+  assert(trace.removalTargets.length === beforePosts + 1, "Refused removal dispatched more than once");
+  assert((await frame.locator('.person-confirm').innerText()).includes("Remove Ari Contact from People?"),
+    "Removal retry changed its contact");
+  await confirm.click();
+  await waitForStatus(frame, "Removed from People.");
+  await confirm.waitFor({ state: "hidden" });
+  assert(trace.removalTargets.length === beforePosts + 2
+    && trace.removalTargets.slice(beforePosts).every(id => id === "contact:accepted"),
+    "Removal retry changed its exact target", trace);
+  assert(await frame.locator('[data-action="remove"][data-contact-id="contact:other"]').isVisible(),
+    "Removing one contact changed the other contact");
+  assert(await frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]').count() === 0,
+    "Removed contact still has Remove");
+  await assertNoOverflow(frame, `Removed contacts at ${width}px`);
+}
+
+async function runScenario(page, port, scenario, width, trace) {
   const frame = await openPeople(page, port, scenario, width);
   if (scenario === "first-run") {
     await assertFirstRunScenario(frame, width);
@@ -704,11 +877,15 @@ async function runScenario(page, port, scenario, width) {
     return;
   }
   if (scenario === "visible") {
-    await assertVisibleDiscoveryScenario(frame, page, width);
+    await assertVisibleDiscoveryScenario(frame, page, width, trace);
     return;
   }
   if (scenario === "profile-failure") {
     await assertProfileFailureScenario(frame, width);
+    return;
+  }
+  if (scenario === "remove-confirmation") {
+    await assertRemoveConfirmationScenario(frame, page, width, trace);
     return;
   }
   throw new Error(`unknown People smoke scenario: ${scenario}`);
@@ -725,17 +902,20 @@ async function main() {
   });
   const page = context.pages()[0] || await context.newPage();
   try {
+    await assertPhoneScenario(page, port);
     for (const width of [375, 1280]) {
       await runScenario(page, port, "first-run", width);
       await runScenario(page, port, "ready-off", width);
-      await runScenario(page, port, "visible", width);
+      await runScenario(page, port, "visible", width, trace);
       await runScenario(page, port, "profile-failure", width);
+      await runScenario(page, port, "remove-confirmation", width, trace);
     }
-    assert(trace.discoveryRefreshes === 2, "People smoke changed Discovery refresh count", trace);
-    assert(trace.discoveryToggles === 2, "People smoke changed Discovery toggle count", trace);
-    assert(trace.discoveryRequests === 2, "People smoke changed discovery request count", trace);
+    assert(trace.discoveryRefreshes === 2, "People smoke changed Public refresh count", trace);
+    assert(trace.discoveryToggles === 2, "People smoke changed Public toggle count", trace);
+    assert(trace.discoveryRequests === 2, "People smoke changed Public request count", trace);
     assert(trace.profileAttempts === 4, "People smoke changed Profile attempt count", trace);
-    console.log("PASS People first-run, discovery, retry, and layout");
+    assert(trace.removalTargets.length === 4, "People smoke changed removal attempt count", trace);
+    console.log(`PASS People, Profile and Public pages: first run, Public, retry, exact contact confirmation, layout; screenshots in ${SHOTS_DIR}`);
   } finally {
     await context.close();
     server.close();

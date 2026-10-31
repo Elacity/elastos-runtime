@@ -35,6 +35,12 @@ assert(
   "Wallet must load the canonical shared theme assets and the reviewed hero surface.",
 );
 assert(
+  walletJs.includes('balanceStateNode.textContent = "This account has no wallet yet.";')
+    && readFileSync(resolve(walletRoot, "wallet-render.js"), "utf8").includes("This account has no wallet yet.")
+    && indexHtml.includes('<button id="wallet-create-cta" class="wallet-button" type="button">Create account</button>'),
+  "Wallet with no account must say the account has no wallet yet and offer Create account (#393).",
+);
+assert(
   vendorScript.includes("wallet/browser")
     && vendorScript.includes("wallet-metamask/browser")
     && vendorScript.includes("wallet-unisat/browser")

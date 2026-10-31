@@ -106,7 +106,10 @@ fn proxy_connection(tcp_stream: TcpStream, vsock_cid: u32, vsock_port: u32) {
     let vsock_stream = match create_vsock_connection(vsock_cid, vsock_port) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to connect to vsock {}:{}: {}", vsock_cid, vsock_port, e);
+            eprintln!(
+                "Failed to connect to vsock {}:{}: {}",
+                vsock_cid, vsock_port, e
+            );
             return;
         }
     };
@@ -223,7 +226,11 @@ fn handle_provider_stream(
 
 /// Provider mode: spawn ONE persistent provider process, forward all vsock
 /// connections through it using line-delimited JSON (one request → one response).
-fn run_provider_mode(listen_port: u32, provider_cmd: &str, provider_args: &[String]) -> std::io::Result<()> {
+fn run_provider_mode(
+    listen_port: u32,
+    provider_cmd: &str,
+    provider_args: &[String],
+) -> std::io::Result<()> {
     let listener_fd = create_vsock_listener(listen_port)?;
 
     let mut child = Command::new(provider_cmd)
@@ -253,7 +260,8 @@ fn run_provider_mode(listen_port: u32, provider_cmd: &str, provider_args: &[Stri
 
     loop {
         // SAFETY: accept on valid listener fd.
-        let client_fd = unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let client_fd =
+            unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if client_fd < 0 {
             eprintln!(
                 "provider accept error on port {}: {}",
@@ -306,12 +314,9 @@ fn run_provider_tcp_mode(
         match stream {
             Ok(stream) => {
                 let reader = BufReader::new(stream.try_clone()?);
-                if let Err(e) = handle_provider_stream(
-                    reader,
-                    stream,
-                    &mut child_stdin,
-                    &mut child_stdout,
-                ) {
+                if let Err(e) =
+                    handle_provider_stream(reader, stream, &mut child_stdin, &mut child_stdout)
+                {
                     eprintln!("provider tcp session error: {}", e);
                 }
             }
@@ -394,7 +399,10 @@ fn main() {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", tcp_port))
             .expect("Failed to bind TCP listener");
 
-        println!("carrier-bridge(serial): 127.0.0.1:{} -> {}", tcp_port, serial_path);
+        println!(
+            "carrier-bridge(serial): 127.0.0.1:{} -> {}",
+            tcp_port, serial_path
+        );
 
         for stream in listener.incoming() {
             match stream {
@@ -461,7 +469,10 @@ fn main() {
     if args.len() != 4 {
         eprintln!("Usage: {} <tcp-port> <vsock-cid> <vsock-port>", args[0]);
         eprintln!("Example: {} 3000 2 3000", args[0]);
-        eprintln!("Or:      {} provider <port> <provider-cmd> [args...]", args[0]);
+        eprintln!(
+            "Or:      {} provider <port> <provider-cmd> [args...]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -469,10 +480,13 @@ fn main() {
     let vsock_cid: u32 = args[2].parse().expect("Invalid vsock CID");
     let vsock_port: u32 = args[3].parse().expect("Invalid vsock port");
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", tcp_port))
-        .expect("Failed to bind TCP listener");
+    let listener =
+        TcpListener::bind(format!("127.0.0.1:{}", tcp_port)).expect("Failed to bind TCP listener");
 
-    println!("vsock-proxy: 127.0.0.1:{} -> vsock {}:{}", tcp_port, vsock_cid, vsock_port);
+    println!(
+        "vsock-proxy: 127.0.0.1:{} -> vsock {}:{}",
+        tcp_port, vsock_cid, vsock_port
+    );
 
     for stream in listener.incoming() {
         match stream {
@@ -487,5 +501,51 @@ fn main() {
                 eprintln!("Accept error: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_provider_stream;
+    use std::io::{self, Cursor, Write};
+
+    #[test]
+    fn provider_stream_forwards_each_request_and_its_reply_in_order() {
+        let requests = b"{\"op\":\"status\"}\n{\"op\":\"read\"}\n";
+        let replies = b"{\"status\":\"ready\"}\n{\"value\":42}\n";
+        let mut provider_input = Vec::new();
+        let mut client_output = Vec::new();
+        handle_provider_stream(
+            Cursor::new(requests),
+            &mut client_output,
+            &mut provider_input,
+            &mut Cursor::new(replies),
+        )
+        .unwrap();
+        assert_eq!(provider_input, requests);
+        assert_eq!(client_output, replies);
+    }
+
+    #[test]
+    fn provider_write_failure_stops_the_stream() {
+        struct ClosedProvider;
+        impl Write for ClosedProvider {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut client_output = Vec::new();
+        let error = handle_provider_stream(
+            Cursor::new(b"request\nnext\n"),
+            &mut client_output,
+            &mut ClosedProvider,
+            &mut Cursor::new(b"reply\n"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(client_output.is_empty());
     }
 }

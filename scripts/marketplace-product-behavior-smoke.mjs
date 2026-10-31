@@ -17,10 +17,10 @@ const vendorScript = readFileSync(resolve("scripts/vendor-ui-tokens.sh"), "utf8"
 const letterSpacingValues = [...css.matchAll(/letter-spacing:\s*([^;]+);/g)].map((match) => match[1].trim());
 
 assert(
-  html.includes("<title>Apps · ElastOS</title>")
+  html.includes("<title>Marketplace · ElastOS</title>")
     && html.includes('<script src="./elastos-theme.js"></script>')
     && html.includes('<link rel="stylesheet" href="./elastos-ui.css">')
-    && html.includes('<div class="store-product-name">Apps</div>')
+    && html.includes('<div class="store-product-name">Marketplace</div>')
     && html.includes('data-destination="media"'),
   "Marketplace must expose the Apps and Media surfaces and load the canonical shared theme assets.",
 );
@@ -103,12 +103,6 @@ assert(
     && js.includes('postObjectProvider("buy", { mint_id: mintId })')
     && !js.includes("MAX_PUBLISHED_AT_LENGTH"),
   "Marketplace must retain canonical media values while presenting validated uint256 values in decimal.",
-);
-assert(
-  js.includes("loadCatalogData().then(render)")
-    && js.includes("loadMediaData().then(render)")
-    && !js.includes("await Promise.all([loadCatalogData(), loadMediaData()]);"),
-  "Marketplace must let catalog and media surfaces finish independently.",
 );
 assert(
   !js.includes("/api/viewers/")

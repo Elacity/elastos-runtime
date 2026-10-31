@@ -22,7 +22,7 @@ HELP = "delete: use alias 'all'; list"
 class CapacityTests(unittest.TestCase):
     def setUp(self):
         self.record, self.growth, self.clock, self.commands = {}, 100, 0, []
-        self.disk = SimpleNamespace(total=1000, free=100)
+        self.disk = SimpleNamespace(total=1000, free=50)
         self.bindings = Mock(return_value={'sdk': 'native', 'clang_sha256': 'a'})
         self.images = [{'image': {'state': 'Ready'}}, {'image': {'state': 'Deleting'}}, {}]
 
@@ -38,8 +38,8 @@ class CapacityTests(unittest.TestCase):
         return ''
 
     def refusal(self, *, status='unavailable', growth=100, kind=ValueError):
-        error = kind(f'hosted Mac capacity unavailable: free=100 total=1000 planned_growth={growth}')
-        error.capacity = {'status': status, 'planned_growth_bytes': growth, 'free_bytes_after': 100, 'total_bytes': 1000}
+        error = kind(f'hosted Mac capacity unavailable: free=50 total=1000 planned_growth={growth}')
+        error.capacity = {'status': status, 'planned_growth_bytes': growth, 'free_bytes_after': 50, 'total_bytes': 1000}
         return error
 
     def run_capacity(self, prepare, **overrides):
@@ -87,7 +87,7 @@ class CapacityTests(unittest.TestCase):
         self.disk.free = 250
         with self.assertRaises(ValueError):
             self.run_capacity(Mock(side_effect=self.refusal()))
-        self.disk.free = 100
+        self.disk.free = 50
         self.bindings.side_effect = [{'sdk': 'native'}, {'sdk': 'changed'}]
         with self.assertRaisesRegex(ValueError, 'Native build inputs changed'):
             self.run_capacity(Mock(side_effect=self.refusal()))
@@ -133,9 +133,11 @@ class CapacityTests(unittest.TestCase):
         self.assertIs(caught.exception, second)
         self.assertNotEqual(self.record.get('status'), 'ready')
 
-    def test_reserve_boundary_is_exact(self):
-        self.assertTrue(controller.enough(SimpleNamespace(total=1000, free=250), 100))
-        self.assertFalse(controller.enough(SimpleNamespace(total=1000, free=249), 100))
+    def test_growth_boundary_is_exact(self):
+        self.assertTrue(controller.enough(SimpleNamespace(total=1000, free=100), 100))
+        self.assertFalse(controller.enough(SimpleNamespace(total=1000, free=99), 100))
+        # Volume size alone never refuses growth that fits.
+        self.assertTrue(controller.enough(SimpleNamespace(total=10**15, free=100), 100))
 
     def test_entrypoint_refuses_local_and_self_hosted_runs(self):
         with patch.object(sys, 'argv', ['capacity']), patch.object(controller, 'query') as query:

@@ -48,10 +48,7 @@ use protocol::*;
 use storage::*;
 use validation::*;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTH_CHALLENGE_TTL_SECS: u64 = 5 * 60;
 #[cfg(test)]
 const APPROVAL_REQUEST_TTL_SECS: u64 = 10 * 60;

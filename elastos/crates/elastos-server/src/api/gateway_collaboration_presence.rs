@@ -46,7 +46,10 @@ pub(super) enum HomePresenceAuthenticationError {
     Internal,
 }
 
-pub(super) async fn home_collaboration_presence(
+/// Chat's heartbeat while its Community view is visible: the only publisher
+/// for "Only while Community is open", and a refresh for "Always". The
+/// launch token proves Chat asked; that the view is visible is Chat's word.
+pub(super) async fn chat_room_presence_heartbeat(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     body: Bytes,
@@ -58,26 +61,31 @@ pub(super) async fn home_collaboration_presence(
         )
             .into_response();
     }
-    let presentation = match authenticated_home_presence_presentation(&state, &headers) {
-        Ok(presentation) => presentation,
-        Err(HomePresenceAuthenticationError::Denied) => {
-            return (StatusCode::FORBIDDEN, "Home presence authorization denied").into_response();
-        }
-        Err(HomePresenceAuthenticationError::ProfileRequired) => {
-            return (
-                StatusCode::CONFLICT,
-                crate::api::gateway::gateway_home_system::PROFILE_REQUIRED_DISCOVERY_MESSAGE,
-            )
-                .into_response();
-        }
-        Err(HomePresenceAuthenticationError::Internal) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Home presence presentation is unavailable",
-            )
-                .into_response();
-        }
-    };
+    let presentation =
+        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
+            .map_err(|_| HomePresenceAuthenticationError::Denied)
+            .and_then(|context| authenticated_presence_presentation_for_context(&state, &context))
+        {
+            Ok(presentation) => presentation,
+            Err(HomePresenceAuthenticationError::Denied) => {
+                return (StatusCode::FORBIDDEN, "Home presence authorization denied")
+                    .into_response();
+            }
+            Err(HomePresenceAuthenticationError::ProfileRequired) => {
+                return (
+                    StatusCode::CONFLICT,
+                    crate::api::gateway::gateway_home_system::PROFILE_REQUIRED_DISCOVERY_MESSAGE,
+                )
+                    .into_response();
+            }
+            Err(HomePresenceAuthenticationError::Internal) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Home presence presentation is unavailable",
+                )
+                    .into_response();
+            }
+        };
     let Some(port) = state.collaboration_presence_product_port.as_ref() else {
         return Json(HomeCollaborationPresenceResult {
             configured: false,
@@ -86,42 +94,27 @@ pub(super) async fn home_collaboration_presence(
         })
         .into_response();
     };
-    // A tab publishes on behalf of the same person the Runtime does, to the
-    // same open topic, so it obeys the same switch. Discovery off is a
-    // successful heartbeat that announces nothing, not an error: the person
-    // asked for this, and the tab has no failure to report.
-    let local_device_did =
-        crate::collaboration_profile_authority::load_existing_device_did(&state.data_dir)
-            .ok()
-            .flatten();
-    if !presence_opted_in(
+    // Not shown is a successful heartbeat that announces nothing, not an
+    // error: the person asked for this, and Chat has no failure to report.
+    // Chat presents only a `/while-open` grant; "Always" is the timer's.
+    let granted = community_presence_mode(
         &state.data_dir,
-        state.collaboration_discovery_service.as_ref(),
+        port,
         &presentation.principal_id,
         &presentation.profile,
-        local_device_did.as_deref(),
-    ) {
+        crate::collaboration_presence_grant::PresencePublisher::CommunityOpen,
+        now_ts(),
+    )
+    .await;
+    let Some(granted) = granted else {
         return Json(HomeCollaborationPresenceResult {
             configured: true,
             queued: false,
             next_heartbeat_after_ms: HOME_PRESENCE_HEARTBEAT_MS,
         })
         .into_response();
-    }
-    let now = now_ts();
-    let request_id = match presence_heartbeat_request_id(&presentation, now) {
-        Ok(request_id) => request_id,
-        Err(error) => return home_error_response(error),
     };
-    let operation = match crate::collaboration_presence::presence_request_binding(
-        &request_id,
-        &presentation.principal_id,
-        &presentation.profile,
-    ) {
-        Ok(operation) => operation,
-        Err(error) => return home_error_response(error),
-    };
-    if let Err(error) = port.prepare_presence(operation, &presentation.profile, now) {
+    if let Err(error) = prepare_person_presence(port, &presentation, &granted, now_ts()) {
         return home_error_response(error);
     }
     Json(HomeCollaborationPresenceResult {
@@ -177,7 +170,7 @@ pub(super) async fn people_collaboration_presence(
         .into_response();
     };
     let local_profile_did = &presentation.profile.document().profile_did;
-    let snapshot = match port.snapshot(now) {
+    let snapshot = match port.authorized_snapshot(now).await {
         Ok(snapshot) => snapshot,
         Err(error) => return home_error_response(error),
     };
@@ -201,15 +194,6 @@ pub(super) async fn people_collaboration_presence(
         online,
     })
     .into_response()
-}
-
-pub(super) fn authenticated_home_presence_presentation(
-    state: &GatewayState,
-    headers: &HeaderMap,
-) -> Result<AuthenticatedPresencePresentation, HomePresenceAuthenticationError> {
-    let context = require_home_token_context(&state.data_dir, headers)
-        .map_err(|_| HomePresenceAuthenticationError::Denied)?;
-    authenticated_presence_presentation_for_context(state, &context)
 }
 
 pub(super) fn authenticated_presence_presentation_for_context(
@@ -254,26 +238,317 @@ pub(super) fn authenticated_presence_presentation_for_context(
     })
 }
 
+const COMMUNITY_PRESENCE_SCHEMA: &str = "elastos.community-presence/v1";
+/// Inbox card actions: `community-presence-<always|open|later|never>:<request>`.
+pub(super) const COMMUNITY_PRESENCE_ACTIONS: [(
+    &str,
+    crate::collaboration_presence_grant::PresenceDecision,
+); 4] = [
+    (
+        "community-presence-always:",
+        crate::collaboration_presence_grant::PresenceDecision::Always,
+    ),
+    (
+        "community-presence-open:",
+        crate::collaboration_presence_grant::PresenceDecision::WhileOpen,
+    ),
+    (
+        "community-presence-later:",
+        crate::collaboration_presence_grant::PresenceDecision::Later,
+    ),
+    (
+        "community-presence-never:",
+        crate::collaboration_presence_grant::PresenceDecision::Never,
+    ),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CommunityPresenceModeRequest {
+    mode: String,
+}
+
+type PresenceSubject<'a> = (
+    &'a crate::collaboration_presence::CollaborationPresenceProductPort,
+    String,
+    crate::collaboration_presence_grant::PresenceScope,
+);
+
+/// The caller's own Profile DID and Community scope, when Community exists.
+fn presence_subject<'a>(
+    state: &'a GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<Option<PresenceSubject<'a>>> {
+    let Some(port) = state.collaboration_presence_product_port.as_ref() else {
+        return Ok(None);
+    };
+    let Some(profile) =
+        gateway_home_system::load_profile_authority_for_context(&state.data_dir, context)?
+    else {
+        anyhow::bail!("Create your Profile before choosing how Community shows you.");
+    };
+    Ok(Some((
+        port,
+        profile.document().profile_did.clone(),
+        port.presence_scope(),
+    )))
+}
+
+/// The caller's presence state for Chat and System: `requested`,
+/// `deferred`, `refused`, `hidden`, `always`, `while_open`, or none. The
+/// mode only; the token never leaves the Runtime.
+pub(super) fn community_presence_state(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> Option<&'static str> {
+    let (_, _, scope) = presence_subject(state, context).ok()??;
+    crate::collaboration_presence_grant::state(&state.data_dir, &context.principal_id, &scope)
+        .ok()?
+}
+
+/// Chat asks on Community open (`asked_by_person` false), or when the person
+/// taps "Show me in Community" after Later. It never grants anything.
+pub(super) fn request_community_presence(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    asked_by_person: bool,
+) -> anyhow::Result<()> {
+    let Some((port, _, scope)) = presence_subject(state, context)? else {
+        return Ok(());
+    };
+    if !port.community_joined() || port.presence_authority().is_none() {
+        return Ok(());
+    }
+    crate::collaboration_presence_grant::request(
+        &state.data_dir,
+        &context.principal_id,
+        &scope,
+        asked_by_person,
+        now_ts(),
+    )
+}
+
+/// Chat's "Show me in Community" line: opens the Inbox card again.
+pub(super) async fn chat_room_community_presence_request(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return home_error_response(error),
+        };
+    if let Err(error) = request_community_presence(&state, &context, true) {
+        return home_error_response(error);
+    }
+    community_presence_response(&state, &context)
+}
+
+pub(super) async fn system_community_presence_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        Ok(context) => community_presence_response(&state, &context),
+        Err(error) => home_error_response(error),
+    }
+}
+
+/// System → Security (Community section), any role, own grant only: `always`, `while_open` or
+/// `hidden`.
+pub(super) async fn system_community_presence_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<CommunityPresenceModeRequest>,
+) -> Response {
+    use crate::collaboration_presence_grant::PresenceDecision;
+    let decision = match body.mode.as_str() {
+        "always" => PresenceDecision::Always,
+        "while_open" => PresenceDecision::WhileOpen,
+        "hidden" => PresenceDecision::Hidden,
+        _ => return (StatusCode::BAD_REQUEST, "unknown Community presence mode").into_response(),
+    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return home_error_response(error),
+        };
+    if let Err(error) = set_community_presence(&state, &context, decision).await {
+        return home_error_response(error);
+    }
+    community_presence_response(&state, &context)
+}
+
+/// The only place a presence token is minted or revoked: the person's own
+/// answer in Inbox or System, for the principal of that launch token.
+async fn set_community_presence(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    decision: crate::collaboration_presence_grant::PresenceDecision,
+) -> anyhow::Result<()> {
+    let (port, profile_did, scope) = presence_subject(state, context)?
+        .ok_or_else(|| anyhow::anyhow!("Community is not configured on this Home."))?;
+    let authority = port
+        .presence_authority()
+        .ok_or_else(|| anyhow::anyhow!("Community presence is not available on this Home."))?;
+    crate::collaboration_presence_grant::set_presence_grant(
+        authority,
+        &state.data_dir,
+        &context.principal_id,
+        &profile_did,
+        &scope,
+        decision,
+        now_ts(),
+    )
+    .await?;
+    // Each answer retires the previous projection and queued announcements.
+    // The selected publisher prepares fresh presence under the current grant.
+    port.retire_own_presence(&context.principal_id, &profile_did)?;
+    Ok(())
+}
+
+fn community_presence_response(state: &GatewayState, context: &HomeLaunchTokenContext) -> Response {
+    let joined = state
+        .collaboration_presence_product_port
+        .as_ref()
+        .map(|port| port.community_joined());
+    Json(serde_json::json!({
+        "schema": COMMUNITY_PRESENCE_SCHEMA,
+        "configured": joined.is_some(),
+        "joined": joined.unwrap_or(false),
+        "community_presence": community_presence_state(state, context),
+    }))
+    .into_response()
+}
+
+/// The Inbox card's answer, for the person signed in to Inbox only: the
+/// record is that person's by construction.
+pub(super) async fn answer_community_presence_request(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    action_id: &str,
+) -> Option<anyhow::Result<String>> {
+    let (decision, request) = COMMUNITY_PRESENCE_ACTIONS
+        .iter()
+        .find_map(|(prefix, decision)| Some((*decision, action_id.strip_prefix(prefix)?)))?;
+    let answer = async {
+        let (_, _, scope) = presence_subject(state, context)?
+            .ok_or_else(|| anyhow::anyhow!("Community is not configured on this Home."))?;
+        let open = crate::collaboration_presence_grant::open_request_at(
+            &state.data_dir,
+            &context.principal_id,
+            &scope,
+        )?;
+        if open.map(|at| at.to_string()).as_deref() != Some(request) {
+            anyhow::bail!("That Community request is no longer open.");
+        }
+        set_community_presence(state, context, decision).await?;
+        Ok(presence_answer_text(decision).to_string())
+    };
+    Some(answer.await)
+}
+
+/// What Inbox shows after the person answers the presence request.
+fn presence_answer_text(
+    decision: crate::collaboration_presence_grant::PresenceDecision,
+) -> &'static str {
+    use crate::collaboration_presence_grant::PresenceDecision;
+    match decision {
+        PresenceDecision::Always => "Community shows you while your Home is online.",
+        PresenceDecision::WhileOpen => "Community shows you while Community is open.",
+        PresenceDecision::Later => {
+            "Not now. Choose Show me in Community in Chat when you want to decide."
+        }
+        _ => "Hidden. Change it in System → Security, under Community.",
+    }
+}
+
+const COMMUNITY_PRESENCE_REQUEST_BODY: &str = "Community members would see your name, your \
+    Profile ID, this Home's device address, and that your Home is online, announced every 15 \
+    seconds while you are shown. Every Home in Community sees it, including the seed's Community \
+    node. It lets members see who is online and lets you load earlier posts. Change it any time \
+    in System → Security, under Community.";
+
+/// The one Inbox card a person with an open request sees.
+pub(super) fn community_presence_request_notification(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> Option<HomeNotificationEntrySummary> {
+    let (_, _, scope) = presence_subject(state, context).ok()??;
+    let issued_at = crate::collaboration_presence_grant::open_request_at(
+        &state.data_dir,
+        &context.principal_id,
+        &scope,
+    )
+    .ok()??;
+    Some(HomeNotificationEntrySummary {
+        id: format!("community-presence-request:{issued_at}"),
+        source_app: CHAT_ROOM_CAPSULE_ID.to_string(),
+        kind: "community_presence_request".to_string(),
+        title: "Show yourself in Community?".to_string(),
+        body: COMMUNITY_PRESENCE_REQUEST_BODY.to_string(),
+        action_ref: Some(HomeNotificationActionSummary {
+            app: INBOX_CAPSULE_ID.to_string(),
+            action_id: format!("{}{issued_at}", COMMUNITY_PRESENCE_ACTIONS[0].0),
+        }),
+        severity: "attention".to_string(),
+        read: false,
+        created_at: issued_at,
+    })
+}
+
+fn prepare_person_presence(
+    port: &crate::collaboration_presence::CollaborationPresenceProductPort,
+    presentation: &AuthenticatedPresencePresentation,
+    grant: &crate::collaboration_presence_grant::GrantedPresence,
+    now: u64,
+) -> anyhow::Result<()> {
+    let request_id = grant.bind_request_id(&presence_heartbeat_request_id(presentation, now)?);
+    let operation = crate::collaboration_presence::presence_request_binding(
+        &request_id,
+        &presentation.principal_id,
+        &presentation.profile,
+    )?;
+    port.prepare_presence(operation, &presentation.profile, now)?;
+    Ok(())
+}
+
 /// Announce the people who live on this Home, from the Runtime.
 ///
 /// Presence is a gossip announcement with a lifetime, so it has to be
-/// refreshed — but it was refreshed by a browser tab, once per tab, and it
-/// vanished when the tab closed, so two running Homes showed each other
-/// Offline. Everything the announcement carries is durable: the principal
-/// record and its signed Profile. The session only ever said which person
-/// was asking. This publishes for every Profile on the Home, once, no
-/// matter how many tabs are open or whether any are.
-pub fn publish_runtime_owned_presence(
+/// refreshed. Everything the announcement carries is durable: the principal
+/// record and its signed Profile. This publishes, once per pass, for every
+/// person on the Home whose grant says "Always while Home is online", after
+/// validating that person's token against the live capability store.
+pub async fn publish_runtime_owned_presence(
     data_dir: &std::path::Path,
     port: &crate::collaboration_presence::CollaborationPresenceProductPort,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    >,
     now: u64,
 ) -> anyhow::Result<usize> {
-    let local_device_did =
-        crate::collaboration_profile_authority::load_existing_device_did(data_dir)?;
+    let pass = publish_runtime_owned_presence_pass(data_dir, port, now).await;
+    // History asks the person to show themselves only after a pass that
+    // read every person and found no grant; any error leaves it unknown.
+    port.record_local_publication(match &pass {
+        Ok((published, _)) if *published > 0 => Some(true),
+        Ok((_, true)) => Some(false),
+        _ => None,
+    });
+    pass.map(|(published, _)| published)
+}
+
+/// Returns how many people were announced and whether nobody here has any
+/// presence grant.
+async fn publish_runtime_owned_presence_pass(
+    data_dir: &std::path::Path,
+    port: &crate::collaboration_presence::CollaborationPresenceProductPort,
+    now: u64,
+) -> anyhow::Result<(usize, bool)> {
+    if !port.community_joined() {
+        return Ok((0, false));
+    }
     let mut published = 0usize;
+    let mut nobody_granted = true;
+    let scope = port.presence_scope();
     for principal in crate::auth::active_passkey_principals(data_dir)? {
         let localhost_root = crate::auth::principal_localhost_root(&principal.principal_id);
         let Some(profile) = crate::collaboration_profile_authority::load_profile_authority(
@@ -288,19 +563,28 @@ pub fn publish_runtime_owned_presence(
         if display_name.is_empty() {
             continue;
         }
-        // Announcing from the Runtime means announcing whenever this Home is
-        // up, not only while someone is looking at it — so it must obey the
-        // switch the person actually set. A Home whose owner has Discovery
-        // off says nothing, exactly as they asked.
-        if !presence_opted_in(
+        let granted = community_presence_mode(
             data_dir,
-            discovery_service,
+            port,
             &principal.principal_id,
             &profile,
-            local_device_did.as_deref(),
-        ) {
+            crate::collaboration_presence_grant::PresencePublisher::Runtime,
+            now,
+        )
+        .await;
+        let Some(granted) = granted else {
+            // Someone shown only while Community is open still counts as a
+            // grant on this Home for the History hint.
+            if crate::collaboration_presence_grant::state(data_dir, &principal.principal_id, &scope)
+                .ok()
+                .flatten()
+                == Some("while_open")
+            {
+                nobody_granted = false;
+            }
             continue;
-        }
+        };
+        nobody_granted = false;
         let presentation = AuthenticatedPresencePresentation {
             principal_id: principal.principal_id.clone(),
             profile: profile.clone(),
@@ -309,50 +593,48 @@ pub fn publish_runtime_owned_presence(
             principal_updated_at: principal.updated_at,
             profile_updated_at: Some(profile.document().updated_at),
         };
-        let request_id = presence_heartbeat_request_id(&presentation, now)?;
-        let operation = crate::collaboration_presence::presence_request_binding(
-            &request_id,
-            &presentation.principal_id,
-            &presentation.profile,
-        )?;
-        port.prepare_presence(operation, &presentation.profile, now)?;
+        prepare_person_presence(port, &presentation, &granted, now)?;
         published = published.saturating_add(1);
     }
-    Ok(published)
+    Ok((published, nobody_granted))
 }
 
-/// Has this person opted in to being announced? Presence rides the same
-/// bounded Discovery choice the product already offers; absent a contact
-/// store to ask, the Home says nothing rather than assuming consent.
-///
-/// Both publishers ask this. The browser's heartbeat and the Runtime's
-/// timer announce the same person to the same open topic, so gating one
-/// and not the other would leave the person announced whenever they had
-/// their Home open — which is exactly the leak, only quieter.
-fn presence_opted_in(
+/// The one question every publisher asks: may this publisher announce this
+/// person in this Community now? `None`: not joined, no grant for this
+/// publisher, not decided, unreadable, or the token no longer validates, so
+/// the Home says nothing. Leaving Community stops it for everyone; Discovery
+/// is a different choice and is not consulted.
+pub(super) async fn community_presence_mode(
     data_dir: &std::path::Path,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    >,
+    port: &crate::collaboration_presence::CollaborationPresenceProductPort,
     principal_id: &str,
     profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
-    local_device_did: Option<&str>,
-) -> bool {
-    let (Some(service), Some(device_did)) = (discovery_service, local_device_did) else {
-        return false;
+    publisher: crate::collaboration_presence_grant::PresencePublisher,
+    now: u64,
+) -> Option<crate::collaboration_presence_grant::GrantedPresence> {
+    let granted = match port.presence_authority() {
+        Some(authority) if port.community_joined() => {
+            crate::collaboration_presence_grant::presence_grant(
+                authority,
+                data_dir,
+                principal_id,
+                &profile.document().profile_did,
+                &port.presence_scope(),
+                publisher,
+                now,
+            )
+            .await
+        }
+        _ => None,
     };
-    let localhost_root = crate::auth::principal_localhost_root(principal_id);
-    let Ok(store) = crate::collaboration_contact_store::CollaborationContactStore::new(
-        data_dir,
-        principal_id,
-        &localhost_root,
-        service.network_profile(),
-        profile,
-        device_did,
-    ) else {
-        return false;
-    };
-    store.discovery_enabled().unwrap_or(false)
+    if granted.is_none() {
+        // A publisher-mode mismatch can leave the other publisher's grant
+        // valid. The common use gate retires state only when that grant also
+        // fails, including Hidden, revocation and an epoch change.
+        port.retire_denied_current_presence(principal_id, &profile.document().profile_did, now)
+            .await;
+    }
+    granted
 }
 
 fn presence_heartbeat_request_id(
@@ -542,12 +824,12 @@ mod tests {
     }
 
     /// Announcing from the Runtime means announcing whenever this Home is up,
-    /// so the Discovery switch is the only thing standing between a person
-    /// and being broadcast around the clock. A Home that publishes for
-    /// someone who never turned Discovery on is a privacy defect, not a
-    /// missing feature, so this asserts the silence directly.
+    /// so the person's own Community choice is what stands between them and
+    /// being announced around the clock. Joining Community is automatic, so
+    /// it is not that choice; Discovery is a different one. Leaving Community
+    /// stops it for everyone on the Home.
     #[tokio::test]
-    async fn runtime_presence_says_nothing_until_discovery_is_switched_on() {
+    async fn runtime_presence_follows_the_persons_community_choice_not_discovery() {
         const NETWORK: &str = "presence-runtime-opt-in";
         let temp = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -555,7 +837,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let (runtime_device_key, _) = elastos_identity::load_or_create_did(temp.path()).unwrap();
+        elastos_identity::load_or_create_did(temp.path()).unwrap();
 
         let now_created = crate::auth::now_ts();
         let rp_id = "elastos.elacitylabs.com";
@@ -610,53 +892,41 @@ mod tests {
 
         let (trusted_key, _) = generate_keypair();
         let network_profile = presence_test_network_profile(&trusted_key, NETWORK);
-        let discovery_service =
-            crate::collaboration_discovery_runtime::CollaborationDiscoveryService::new(
-                SigningKey::from_bytes(&runtime_device_key.to_bytes()),
-                network_profile.clone(),
-                std::sync::Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
+        let chat =
+            crate::collaboration_product::test_chat_product_port(temp.path(), NETWORK, "community");
+        let authority = crate::collaboration_presence_grant::test_authority();
+        let port = crate::collaboration_presence::CollaborationPresenceProductPort::new(
+            chat.test_core().clone(),
+        )
+        .unwrap()
+        .with_presence_authority(authority.clone());
+        let scope = port.presence_scope();
+        let decide = |decision| {
+            crate::collaboration_presence_grant::set_presence_grant(
+                &authority,
+                temp.path(),
+                &principal.principal_id,
+                &profile.document().profile_did,
+                &scope,
+                decision,
+                crate::auth::now_ts(),
             )
-            .await
-            .unwrap();
+        };
+        use crate::collaboration_presence_grant::PresenceDecision;
+        let now = crate::auth::now_ts();
 
-        // A Home with a Profile and a running Runtime, whose owner has not
-        // asked to be found: it stays quiet.
-        assert!(
-            !presence_opted_in(
-                temp.path(),
-                Some(&discovery_service),
-                &principal.principal_id,
-                &profile,
-                Some(local_device_did.as_str()),
-            ),
-            "a Home announces nobody who has not switched Discovery on"
+        // A joined Home whose person has not chosen yet stays quiet, and
+        // History learns that nobody here chose to be shown.
+        assert_eq!(port.local_publication(), None);
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now)
+                .await
+                .unwrap(),
+            0
         );
+        assert_eq!(port.local_publication(), Some(false));
 
-        // Without a discovery service, or without a device identity, consent
-        // cannot be established at all — so it is not assumed.
-        assert!(
-            !presence_opted_in(
-                temp.path(),
-                None,
-                &principal.principal_id,
-                &profile,
-                Some(local_device_did.as_str()),
-            ),
-            "no discovery service means no announcement, not an assumed yes"
-        );
-        assert!(
-            !presence_opted_in(
-                temp.path(),
-                Some(&discovery_service),
-                &principal.principal_id,
-                &profile,
-                None,
-            ),
-            "no device identity means no announcement, not an assumed yes"
-        );
-
-        // The person opens People and switches Discovery on. Only now does
-        // the Runtime speak for them.
+        // Discovery is a different choice: switching it on announces nobody.
         let store = crate::collaboration_contact_store::CollaborationContactStore::new(
             temp.path(),
             &principal.principal_id,
@@ -666,19 +936,107 @@ mod tests {
             &local_device_did,
         )
         .unwrap();
-        store
-            .set_discovery_enabled(true, crate::auth::now_ts())
-            .unwrap();
-        assert!(
-            presence_opted_in(
-                temp.path(),
-                Some(&discovery_service),
-                &principal.principal_id,
-                &profile,
-                Some(local_device_did.as_str()),
-            ),
-            "a person who switched Discovery on is announced without a browser open"
+        store.set_discovery_enabled(true, now).unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now)
+                .await
+                .unwrap(),
+            0
         );
+
+        // Only while Community is open: the timer still says nothing, but a
+        // grant exists on this Home.
+        store.set_discovery_enabled(false, now).unwrap();
+        decide(PresenceDecision::WhileOpen).await.unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(port.local_publication(), None);
+
+        // Always, with Discovery off: the Runtime now announces them
+        // without a browser open.
+        decide(PresenceDecision::Always).await.unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(port.local_publication(), Some(true));
+        let prepared = port.pending_outgoing_presences(now).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            prepared[0].sender_profile_did(),
+            profile.document().profile_did
+        );
+        assert!(prepared[0].expires_at() <= now + crate::collaboration_presence::PRESENCE_TTL_SECS);
+        port.project_prepared_presence(&prepared[0], now).unwrap();
+        assert_eq!(port.snapshot(now).unwrap().records().len(), 1);
+        // Presence is not a post: it leaves no replay tombstone behind.
+        assert_eq!(chat.test_core().summary().unwrap().replay_tombstones, 0);
+
+        // The next publisher pass retires both local and queued presence.
+        decide(PresenceDecision::Hidden).await.unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now + 15)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(port.snapshot(now + 15).unwrap().records().is_empty());
+        assert!(chat
+            .test_core()
+            .pending_outgoing(now + 15)
+            .unwrap()
+            .is_empty());
+        decide(PresenceDecision::Always).await.unwrap();
+
+        // Without the Runtime's capability manager no grant is honoured.
+        let unmanaged = crate::collaboration_presence::CollaborationPresenceProductPort::new(
+            chat.test_core().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &unmanaged, now + 15)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Leaving Community stops it for everyone, whatever they chose.
+        chat.test_core().set_community_joined(false).unwrap();
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, now + 30)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn presence_texts_name_where_the_setting_is() {
+        // The setting is the Community section of System → Security; there
+        // is no System → Community page.
+        use crate::collaboration_presence_grant::PresenceDecision;
+        let texts = [
+            presence_answer_text(PresenceDecision::Later),
+            presence_answer_text(PresenceDecision::Never),
+            COMMUNITY_PRESENCE_REQUEST_BODY,
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL,
+        ];
+        for text in texts {
+            assert!(!text.contains("System → Community"), "{text}");
+            assert!(!text.contains("Tap "), "device-neutral: {text}");
+        }
+        for text in &texts[1..] {
+            assert!(
+                text.contains("System → Security, under Community"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

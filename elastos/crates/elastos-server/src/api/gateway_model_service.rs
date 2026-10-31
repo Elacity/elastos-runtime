@@ -78,6 +78,8 @@ pub(crate) struct ModelServiceGrant {
     /// An older grant has no snapshot and cannot authorize a new run.
     pub approved_offer_ids: BTreeSet<String>,
     pub approved_offer_revision: String,
+    /// Only a grant owned by a current admin may reach a hosted offer.
+    pub provider_may_share_hosted: bool,
 }
 
 impl ModelServiceGrant {
@@ -454,6 +456,17 @@ fn denied(code: &str, message: &str) -> Value {
 
 pub(crate) const INVOCATION_REFUSAL_SCHEMA: &str = "elastos.model.invocation-refusal/v1";
 
+/// This closed provider fault means request validation declined new inference.
+/// It is distinct from Runtime's refusal before calling the provider.
+pub(crate) fn provider_refused_expired_request(result: &Value) -> bool {
+    result.as_object().is_some_and(|object| {
+        object.len() == 3
+            && result["status"] == "error"
+            && result["code"] == elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE
+            && result["message"] == elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+    })
+}
+
 /// Binds a refusal to this invocation, without settling any previous attempt.
 pub(crate) fn invocation_refusal_binding(request: &Value) -> Option<Value> {
     if request["op"] != "runs_create" || request["remote_model"]["refusal_scope"] != "invocation" {
@@ -478,9 +491,30 @@ fn refused_before_dispatch(
     message: &str,
     owns_reservation: bool,
 ) -> Value {
-    let Some(binding) = invocation_refusal_binding(request) else {
+    refused_invocation(
+        data_dir,
+        source_did,
+        request,
+        code,
+        message,
+        owns_reservation,
+        "not_started",
+    )
+}
+
+fn refused_invocation(
+    data_dir: &Path,
+    source_did: &str,
+    request: &Value,
+    code: &str,
+    message: &str,
+    owns_reservation: bool,
+    dispatch: &str,
+) -> Value {
+    let Some(mut binding) = invocation_refusal_binding(request) else {
         return denied(code, message);
     };
+    binding["dispatch"] = json!(dispatch);
     let grant_id = request["remote_model"]["grant_id"]
         .as_str()
         .unwrap_or_default();
@@ -511,7 +545,9 @@ fn refused_before_dispatch(
     }
     json!({ "ok": true, "result": {
         "status": "error", "code": "remote_model_invocation_refused",
-        "reason": code, "message": "This invocation was refused before provider dispatch.",
+        "reason": code, "message": if dispatch == "provider_refused" {
+            elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+        } else { "This invocation was refused before provider dispatch." },
         "refusal": binding,
     } })
 }
@@ -795,7 +831,7 @@ fn annotate_listed_offers_with_hosted_share(result: &mut Value, data_dir: &Path)
     }
 }
 
-fn listed_offer_is_hosted(offer: &Value) -> bool {
+pub(in crate::api::gateway) fn listed_offer_is_hosted(offer: &Value) -> bool {
     offer.get("hosted").is_some_and(|value| !value.is_null())
         || offer
             .pointer("/adapter/hosted")
@@ -879,14 +915,16 @@ fn shareable_offers_for_grant(
     include_local: bool,
     approved_offer_ids: &BTreeSet<String>,
     approved_offer_revision: &str,
+    may_share_hosted: bool,
 ) -> Vec<Value> {
     shareable_offers_for_home(result, data_dir, include_local)
         .into_iter()
         .filter(|offer| {
-            offer["id"].as_str().is_some_and(|id| {
-                approved_offer_ids.contains(id)
-                    && offer_execution_revision(result, id) == Some(approved_offer_revision)
-            })
+            (may_share_hosted || !listed_offer_is_hosted(offer))
+                && offer["id"].as_str().is_some_and(|id| {
+                    approved_offer_ids.contains(id)
+                        && offer_execution_revision(result, id) == Some(approved_offer_revision)
+                })
         })
         .collect()
 }
@@ -1244,17 +1282,18 @@ pub(crate) async fn invoke(
     local_object.remove("_runtime_invocation");
     local_object.remove("op");
 
-    let (context, indexed_run, include_local, approved_offer_ids, approved_offer_revision) =
-        match operation {
-            "offers_list" | "runs_create" => {
-                let grant = match read_authority(
-                    data_dir,
-                    &network,
-                    source,
-                    grant_id,
-                    requester_principal_id,
-                )
-                .await
+    let (
+        context,
+        indexed_run,
+        include_local,
+        approved_offer_ids,
+        approved_offer_revision,
+        may_share_hosted,
+    ) = match operation {
+        "offers_list" | "runs_create" => {
+            let grant =
+                match read_authority(data_dir, &network, source, grant_id, requester_principal_id)
+                    .await
                 {
                     Ok(grant) => grant,
                     Err(err) => {
@@ -1269,67 +1308,69 @@ pub(crate) async fn invoke(
                         );
                     }
                 };
-                if let Err(err) = grant.validate(&source, requester_principal_id, now) {
-                    tracing::info!("remote model grant rejected: {err}");
-                    return refused_before_dispatch(
-                        data_dir,
-                        &source_did,
-                        request,
-                        "denied",
-                        "model grant is not active for this requester",
-                        false,
-                    );
-                }
-                let include_local = super::gateway_home_system::local_model_offer_is_shared(
+            if let Err(err) = grant.validate(&source, requester_principal_id, now) {
+                tracing::info!("remote model grant rejected: {err}");
+                return refused_before_dispatch(
                     data_dir,
-                    &grant.provider_principal_id,
+                    &source_did,
+                    request,
+                    "denied",
+                    "model grant is not active for this requester",
+                    false,
                 );
-                (
-                    remote_context(
-                        &remote_principal_id(&source_did, requester_principal_id),
-                        &grant.grant_id,
-                    ),
-                    None,
-                    include_local,
-                    grant.approved_offer_ids,
-                    grant.approved_offer_revision,
-                )
             }
-            _ => {
-                let Some(run_id) = local_object
-                    .get("run_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                else {
-                    return denied(
-                        "invalid_provider_invocation",
-                        "model run operation requires run_id",
-                    );
-                };
-                let record = match remote_model_run(data_dir, &run_id) {
-                    Ok(Some(record)) => record,
-                    Ok(None) => return denied("denied", "model run is not owned by this grant"),
-                    Err(err) => {
-                        tracing::warn!("remote model run index unavailable: {err}");
-                        return denied("provider_failure", "model run index is unavailable");
-                    }
-                };
-                if record.grant_id != grant_id
-                    || record.source_endpoint_did != source_did
-                    || record.requester_principal_id != requester_principal_id
-                    || record.capsule_id != capsule_id
-                {
-                    return denied("denied", "model run is not owned by this grant");
+            let include_local = super::gateway_home_system::local_model_offer_is_shared(
+                data_dir,
+                &grant.provider_principal_id,
+            );
+            (
+                remote_context(
+                    &remote_principal_id(&source_did, requester_principal_id),
+                    &grant.grant_id,
+                ),
+                None,
+                include_local,
+                grant.approved_offer_ids,
+                grant.approved_offer_revision,
+                grant.provider_may_share_hosted,
+            )
+        }
+        _ => {
+            let Some(run_id) = local_object
+                .get("run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return denied(
+                    "invalid_provider_invocation",
+                    "model run operation requires run_id",
+                );
+            };
+            let record = match remote_model_run(data_dir, &run_id) {
+                Ok(Some(record)) => record,
+                Ok(None) => return denied("denied", "model run is not owned by this grant"),
+                Err(err) => {
+                    tracing::warn!("remote model run index unavailable: {err}");
+                    return denied("provider_failure", "model run index is unavailable");
                 }
-                (
-                    remote_context(&record.remote_principal_id, grant_id),
-                    Some((run_id, record)),
-                    true,
-                    BTreeSet::new(),
-                    String::new(),
-                )
+            };
+            if record.grant_id != grant_id
+                || record.source_endpoint_did != source_did
+                || record.requester_principal_id != requester_principal_id
+                || record.capsule_id != capsule_id
+            {
+                return denied("denied", "model run is not owned by this grant");
             }
-        };
+            (
+                remote_context(&record.remote_principal_id, grant_id),
+                Some((run_id, record)),
+                true,
+                BTreeSet::new(),
+                String::new(),
+                false,
+            )
+        }
+    };
 
     let mut normalized =
         match normalize_model_provider_request(operation, &local, &context, capsule_id) {
@@ -1362,6 +1403,7 @@ pub(crate) async fn invoke(
                     include_local,
                     &approved_offer_ids,
                     &approved_offer_revision,
+                    may_share_hosted,
                 ),
                 result["data"]["offer_revisions"].clone(),
             ),
@@ -1485,6 +1527,19 @@ pub(crate) async fn invoke(
         }
     };
     if let Some(message) = provider_status_error(&result) {
+        if held_slot && provider_refused_expired_request(&result) {
+            let refusal = refused_invocation(
+                data_dir,
+                &source_did,
+                request,
+                elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+                elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+                true,
+                "provider_refused",
+            );
+            release_run_slot(data_dir, now, &reservation_key);
+            return refusal;
+        }
         if held_slot {
             release_run_slot(data_dir, now, &reservation_key);
         }
@@ -1580,6 +1635,7 @@ pub(crate) async fn invoke(
                 include_local,
                 &approved_offer_ids,
                 &approved_offer_revision,
+                may_share_hosted,
             ),
         ),
         "runs_create" => {
@@ -1766,6 +1822,7 @@ mod tests {
             expires_at: 1_000 + MODEL_GRANT_TTL_SECS,
             approved_offer_ids: BTreeSet::from(["qwen".into()]),
             approved_offer_revision: format!("sha256:{}", "a".repeat(64)),
+            provider_may_share_hosted: false,
         };
         assert!(grant.validate(&key, "seed-principal", 1_500).is_ok());
         assert!(grant.validate(&other, "seed-principal", 1_500).is_err());

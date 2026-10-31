@@ -129,7 +129,7 @@ export function emptyHero() {
   const empty = document.createElement("div");
   empty.className = "wallet-empty";
   empty.innerHTML = `
-    <p class="wallet-state">No accounts yet. Create a built-in account, or connect MetaMask / UniSat below.</p>
+    <p class="wallet-state">This account has no wallet yet. Select Create account, or connect MetaMask / UniSat below.</p>
   `;
   return empty;
 }

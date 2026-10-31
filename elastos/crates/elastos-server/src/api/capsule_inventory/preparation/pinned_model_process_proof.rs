@@ -20,7 +20,7 @@ struct PinnedModel {
     quantized_repository: &'static str,
     quantized_revision: &'static str,
     provenance: &'static str,
-    /// Whole-proof budget: import, loopback transfer, admission, reply/restart.
+    /// Whole-proof budget: import, holder transfer, admission, reply/restart.
     deadline_secs: u64,
     /// Accepts the completed text of the first reply.
     reply_accepts: fn(&str) -> bool,
@@ -83,6 +83,7 @@ fn pinned_engine_sha(platform: &str) -> &'static str {
     match platform {
         "darwin-arm64" => "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
         "linux-amd64" => "fa24fc90877d1edc68990af5f4f8e476256959357d7f58cf59910e5657f7403f",
+        "linux-arm64" => "da88cc0a679c80cdf699fe368c4d2f772e5bce4280ad9316c30ed4c09e9d2cde",
         other => panic!("no pinned b10516 engine identity for {other}"),
     }
 }
@@ -227,7 +228,7 @@ async fn model_preparation_streamed_bootstrap_matches_directory_cid() {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().canonicalize().unwrap();
     let (capacity, free) = volume_bytes(&File::open(&root_path).unwrap());
-    storage::require_space_floor(capacity, free, 64 * 1024 * 1024).unwrap();
+    storage::require_reservation_fits(capacity, free, 64 * 1024 * 1024).unwrap();
     let repo = root_path.join("repo");
     let seed = root_path.join("seed");
     fs::create_dir(&seed).unwrap();
@@ -414,8 +415,7 @@ impl PinnedModel {
     fn env_path(&self, suffix: &str) -> PathBuf {
         let name = format!("ELASTOS_TEST_{}_{suffix}", self.env_prefix);
         PathBuf::from(
-            std::env::var_os(&name)
-                .unwrap_or_else(|| panic!("explicit {name} proof prerequisite")),
+            std::env::var_os(&name).unwrap_or_else(|| panic!("explicit {name} proof prerequisite")),
         )
     }
 }
@@ -461,7 +461,8 @@ impl PinnedModelProof {
         provenance["quantized_repository"] = serde_json::json!(model.quantized_repository);
         provenance["quantized_revision"] = serde_json::json!(model.quantized_revision);
         let mut files = std::collections::BTreeMap::from([
-            ("LICENSE".into(), self.license.clone()), ("LICENSE.base".into(), self.license.clone()),
+            ("LICENSE".into(), self.license.clone()),
+            ("LICENSE.base".into(), self.license.clone()),
             ("PROVENANCE.md".into(), model.provenance.as_bytes().to_vec()),
             ("capsule.json".into(), serde_json::to_vec(capsule).unwrap()),
         ]);
@@ -748,7 +749,7 @@ async fn pinned_first_reply(
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "pinned-proof-reply".into(),
+        request_id: format!("model-v1:{}:pinned-proof-reply", now().unwrap() * 1000),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),
@@ -818,7 +819,10 @@ fn assert_pinned_reply(model: &PinnedModel, terminal: &serde_json::Value) {
         text.chars().count(),
         text.chars().take(64).collect::<String>()
     );
-    assert!((model.reply_accepts)(text), "reply rejected by pinned model check");
+    assert!(
+        (model.reply_accepts)(text),
+        "reply rejected by pinned model check"
+    );
 }
 
 struct PinnedRunProof {
@@ -847,7 +851,10 @@ async fn pinned_runs_and_active_cancel(
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "pinned-proof-active-cancel".into(),
+        request_id: format!(
+            "model-v1:{}:pinned-proof-active-cancel",
+            now().unwrap() * 1000
+        ),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),

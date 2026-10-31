@@ -1,3 +1,5 @@
+import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const lockedShell = document.getElementById("locked-shell");
 const peopleShell = document.getElementById("people-shell");
 const statusNode = document.getElementById("people-status");
@@ -6,15 +8,26 @@ const profileInput = document.getElementById("profile-name");
 const profileTitle = document.getElementById("profile-title");
 const profileDescription = document.getElementById("profile-description");
 const profileSubmit = document.getElementById("profile-submit");
+const profileIdSection = document.getElementById("profile-id");
+const profileIdValue = document.getElementById("profile-id-value");
+const profileIdCopy = document.getElementById("profile-id-copy");
+const addContactForm = document.getElementById("add-contact-form");
+const addContactInput = document.getElementById("add-contact-id");
+const addContactSubmit = document.getElementById("add-contact-submit");
+const addContactResult = document.getElementById("add-contact-result");
+const addContactInbox = document.getElementById("add-contact-inbox");
 const peopleList = document.getElementById("people-list");
+const peopleRequests = document.getElementById("people-requests");
+const peopleRequestsCount = document.getElementById("people-requests-count");
+const peopleUndelivered = document.getElementById("people-undelivered");
+const discoveryPeople = document.getElementById("discovery-people");
 const discoveryList = document.getElementById("discovery-list");
-const discoveryRequestsList = document.getElementById("discovery-requests-list");
 const discoveryStatusNode = document.getElementById("discovery-status");
+const discoveryNoteNode = document.getElementById("discovery-note");
 const discoveryToggleButton = document.getElementById("discovery-toggle");
 const discoveryRefreshButton = document.getElementById("discovery-refresh");
 const peopleCountNode = document.getElementById("people-count");
 const discoveryVisibleCountNode = document.getElementById("discovery-visible-count");
-const discoveryRequestsCountNode = document.getElementById("discovery-requests-count");
 const pageTitle = document.querySelector(".people-page-title");
 const launchParams = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -22,12 +35,25 @@ const homeParentOrigin = launchParams.get("home_origin") || "";
 const DISCOVERY_SCHEMA = "elastos.people.discovery/v1";
 const SECTION_TITLES = {
   people: "People",
-  discovery: "Discovery",
+  profile: "Profile",
+  discovery: "Public",
 };
 
+const homeClipboard = createHomeClipboardClient({
+  targetId: "people",
+  homeOrigin: homeParentOrigin,
+  homeToken,
+});
+let localProfileId = "";
+let sendingContact = false;
 let refreshGeneration = 0;
 let profileDraftDirty = false;
 let profileDraftValue = "";
+let currentContacts = [];
+let pendingRemoveId = "";
+let removingContactId = "";
+let currentSection = "";
+let sectionChosen = false;
 
 announceReady();
 
@@ -45,7 +71,30 @@ async function boot() {
   }
   lockedShell?.classList.add("hidden");
   peopleShell?.classList.remove("hidden");
+  homeClipboard.start();
   await refreshPeople();
+}
+
+function prefillContactFromLaunch() {
+  const did = launchParams.get("did");
+  if (!localProfileId || sendingContact || !addContactInput || !did || did !== did.trim()
+      || !/^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(did)) return;
+  sectionChosen = true;
+  activateSection("people");
+  addContactInput.value = did;
+  addContactInput.scrollIntoView({ block: "center" });
+  addContactInput.focus();
+  launchParams.delete("did");
+}
+
+function receivePeopleNavigation(event) {
+  const data = event.data;
+  if (event.source !== window.parent || event.origin !== "null"
+      || data?.type !== "elastos.people.navigate/v1" || data.homeToken !== homeToken
+      || !data.query || Object.keys(data.query).join(",") !== "did"
+      || typeof data.query.did !== "string") return;
+  launchParams.set("did", data.query.did);
+  prefillContactFromLaunch();
 }
 
 function announceReady() {
@@ -71,6 +120,7 @@ function announceReady() {
 function bindNavigation() {
   for (const button of document.querySelectorAll("[data-section-target]")) {
     button.addEventListener("click", () => {
+      sectionChosen = true;
       activateSection(readText(button.dataset.sectionTarget));
     });
   }
@@ -78,7 +128,8 @@ function bindNavigation() {
 }
 
 // The sidebar reads as tabs, so it behaves as tabs: one section at a time,
-// with the page title naming the one you are looking at.
+// with the page title naming the one you are looking at. A status line
+// belongs to the page it came from.
 function activateSection(targetId) {
   if (!SECTION_TITLES[targetId]) {
     return;
@@ -98,9 +149,30 @@ function activateSection(targetId) {
   if (pageTitle) {
     pageTitle.textContent = SECTION_TITLES[targetId];
   }
+  if (currentSection && currentSection !== targetId) {
+    showStatus("");
+  }
+  currentSection = targetId;
 }
 
 function bindActions() {
+  window.addEventListener("message", receivePeopleNavigation);
+  profileIdCopy?.addEventListener("click", async () => {
+    if (!localProfileId || profileIdCopy.disabled) return;
+    profileIdCopy.disabled = true;
+    try {
+      await homeClipboard.writeText(localProfileId, { purpose: "profile.id" });
+      showStatus("DID copied.", "ok");
+    } catch (_error) {
+      showStatus("DID could not be copied. Try again.", "error");
+    } finally {
+      profileIdCopy.disabled = false;
+    }
+  });
+  addContactForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendContactRequest();
+  });
   profileForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     saveProfile().catch((error) => showStatus(profileSaveFailureMessage(error), "error"));
@@ -108,6 +180,20 @@ function bindActions() {
   profileInput?.addEventListener("input", () => {
     profileDraftDirty = true;
     profileDraftValue = profileInput.value;
+  });
+  // Home pushes people.changed when contacts or Discovery state change, so
+  // "Connecting…" and newly visible people update without a manual Refresh.
+  window.addEventListener("message", (event) => {
+    if (event.origin !== homeParentOrigin || event.source !== window.top) {
+      return;
+    }
+    const message = event.data || {};
+    if (message.type !== "elastos:runtime-events" || !Array.isArray(message.events)) {
+      return;
+    }
+    if (message.events.some((item) => item?.scope === "people" || item?.kind === "people.changed")) {
+      refreshPeople({ quiet: true }).catch(() => {});
+    }
   });
   window.addEventListener("message", (event) => {
     if (event.origin !== "null" || event.source !== window.parent) {
@@ -134,18 +220,42 @@ function bindActions() {
 
 async function handleAction(button) {
   const action = readText(button.dataset.action);
-  if (action === "remove") {
+  if (action === "remove" || action === "cancel-remove" || action === "confirm-remove") {
     const contactId = readText(button.dataset.contactId);
-    const label = readText(button.dataset.contactName) || "this person";
-    if (!contactId || !window.confirm(`Remove ${label} from People?`)) {
+    if (removingContactId || !contactId) {
       return;
     }
-    await mutatePeople(
-      "/api/apps/people/contacts/remove",
-      { contact_id: contactId },
-      "Removed from People.",
-      button,
-    );
+    if (action === "cancel-remove") {
+      if (contactId !== pendingRemoveId) return;
+      pendingRemoveId = "";
+      renderPeople({ contacts: currentContacts });
+      focusContactAction("remove", contactId);
+      return;
+    }
+    const contact = currentContacts.find((item) => readText(item.contact_id) === contactId
+      && readText(item.relationship) === "connected");
+    if (!contact || (action === "confirm-remove" && contactId !== pendingRemoveId)) {
+      return;
+    }
+    if (action === "remove") {
+      pendingRemoveId = contactId;
+      renderPeople({ contacts: currentContacts });
+      focusContactAction("cancel-remove", contactId);
+      return;
+    }
+    removingContactId = contactId;
+    renderPeople({ contacts: currentContacts });
+    try {
+      await mutatePeople(
+        "/api/apps/people/contacts/remove",
+        { contact_id: contactId },
+        "Removed from People.",
+        button,
+      );
+    } finally {
+      removingContactId = "";
+      renderPeople({ contacts: currentContacts });
+    }
     return;
   }
   if (action === "chat") {
@@ -154,32 +264,21 @@ async function handleAction(button) {
   }
   if (action === "discovery-toggle") {
     const enabled = button.dataset.enabled === "true";
-    await mutateDiscovery(
-      "/api/apps/people/discovery",
-      { enabled: !enabled },
-      !enabled ? "Discovery is on." : "Discovery is off.",
-      button,
-    );
+    await mutateDiscovery("/api/apps/people/discovery", { enabled: !enabled }, button);
     return;
   }
   if (action === "discovery-refresh") {
-    await mutateDiscovery(
-      "/api/apps/people/discovery/refresh",
-      {},
-      "Refresh requested.",
-      button,
-    );
+    await mutateDiscovery("/api/apps/people/discovery/refresh", {}, button);
     return;
   }
   if (action === "discovery-request") {
     const advertisementId = readText(button.dataset.advertisementId);
     if (!advertisementId) {
-      throw new Error("Discovery person is unavailable.");
+      throw new Error("This person is no longer public.");
     }
     await mutateDiscovery(
       "/api/apps/people/discovery/requests",
       { advertisement_id: advertisementId },
-      "Contact request queued.",
       button,
     );
     return;
@@ -216,8 +315,54 @@ function renderSummary(summary) {
   const identity = objectValue(summary?.identity);
   const people = objectValue(summary?.people);
   renderProfile(identity);
+  renderProfileId(summary?.profile_id);
   renderPeople(people);
   renderDiscovery(summary?.discovery);
+  // Without a Profile there is nothing to do on People yet, so the first
+  // load opens Profile; after that the person picks the page.
+  if (!sectionChosen) {
+    sectionChosen = true;
+    activateSection(profileForm?.dataset.profileState === "saved" ? "people" : "profile");
+  }
+}
+
+function renderProfileId(profileId) {
+  localProfileId = readText(profileId);
+  if (profileIdValue) profileIdValue.textContent = localProfileId;
+  if (profileIdSection) profileIdSection.hidden = !localProfileId;
+  if (addContactForm) addContactForm.hidden = !localProfileId;
+  prefillContactFromLaunch();
+}
+
+async function sendContactRequest() {
+  const profileId = readText(addContactInput?.value);
+  if (!localProfileId || sendingContact || !profileId) return;
+  sendingContact = true;
+  addContactSubmit.disabled = true;
+  addContactInput.disabled = true;
+  addContactInbox.hidden = true;
+  addContactResult.textContent = "";
+  try {
+    const result = await fetchJson("/api/apps/people/contacts/request", {
+      method: "POST", body: JSON.stringify({ profile_id: profileId }),
+    });
+    const message = readText(result?.message);
+    if (!message) throw new Error("Could not confirm the request. Try again.");
+    addContactResult.textContent = message;
+    addContactInbox.hidden = result.status !== "pending_from_them";
+    addContactInput.value = "";
+    // A refresh failure does not change the confirmed request outcome.
+    await refreshPeople({ quiet: true }).catch(() => {});
+  } catch (error) {
+    addContactResult.textContent = [400, 409].includes(error?.status)
+      ? readText(error.message) || "Could not send the request. Try again."
+      : publicError(error, "Could not send the request. Try again.");
+  } finally {
+    sendingContact = false;
+    addContactSubmit.disabled = false;
+    addContactInput.disabled = false;
+    prefillContactFromLaunch();
+  }
 }
 
 function renderProfile(identity) {
@@ -242,17 +387,21 @@ function renderProfile(identity) {
     profileInput.value = hasProfile ? displayName : profileDraftValue;
     profileInput.placeholder = "Your name";
   }
+  // A saved Profile needs no heading or explanation: the page title says
+  // Profile and the field holds the name.
   if (profileTitle) {
     profileTitle.textContent = hasProfile
-      ? "My Profile"
+      ? ""
       : (unavailable ? "Profile unavailable" : "Create your Profile");
+    profileTitle.hidden = hasProfile;
   }
   if (profileDescription) {
     profileDescription.textContent = hasProfile
-      ? "Shown to people you connect with."
+      ? ""
       : (unavailable
         ? "Profile could not be verified. Use System Recovery before continuing."
-        : "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.");
+        : "Choose the name people see. Public stays off until you turn it on.");
+    profileDescription.hidden = hasProfile;
   }
   if (profileSubmit) {
     profileSubmit.textContent = hasProfile
@@ -266,57 +415,69 @@ function renderProfile(identity) {
 
 function renderPeople(people) {
   const contacts = arrayValue(people?.contacts).filter(isValidContact);
+  currentContacts = contacts;
+  if (!contacts.some((contact) => readText(contact.contact_id) === pendingRemoveId
+    && readText(contact.relationship) === "connected")) {
+    pendingRemoveId = "";
+  }
   if (peopleCountNode) {
-    peopleCountNode.textContent = `${contacts.length} contact${contacts.length === 1 ? "" : "s"}`;
+    peopleCountNode.textContent = String(contacts.length);
+  }
+  // One note covers every request that cannot be delivered; the rows only
+  // say Not delivered.
+  if (peopleUndelivered) {
+    peopleUndelivered.hidden = !contacts.some((contact) => readText(contact.relationship) === "requested"
+      && readText(contact.delivery_detail));
   }
   peopleList.innerHTML = contacts.length
     ? contacts.map(contactMarkup).join("")
-    : emptyMarkup("No contacts yet", "Accepted contacts appear here.");
+    : emptyMarkup("No contacts yet.");
 }
 
 function renderDiscovery(discovery) {
   const safeDiscovery = normalizeDiscoverySummary(discovery);
   const configured = safeDiscovery.configured;
   const enabled = safeDiscovery.enabled;
+  const peers = safeDiscovery.discoveredPeers;
   if (discoveryVisibleCountNode) {
-    discoveryVisibleCountNode.textContent =
-      `${safeDiscovery.discoveredPeers.length} visible`;
-  }
-  if (discoveryRequestsCountNode) {
-    discoveryRequestsCountNode.textContent =
-      `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"}`;
+    discoveryVisibleCountNode.textContent = String(peers.length);
   }
   if (discoveryStatusNode) {
     discoveryStatusNode.textContent = safeDiscovery.statusMessage;
+  }
+  // The listing renews itself while you are signed in, so on is plain on.
+  if (discoveryNoteNode) {
+    discoveryNoteNode.hidden = !(enabled && ["visible", "connecting"].includes(safeDiscovery.status));
   }
   if (discoveryToggleButton) {
     discoveryToggleButton.hidden = !configured;
     discoveryToggleButton.dataset.enabled = enabled ? "true" : "false";
     discoveryToggleButton.textContent = enabled ? "Turn Off" : "Turn On";
+    discoveryToggleButton.disabled = !configured || safeDiscovery.status === "community_left";
   }
   if (discoveryRefreshButton) {
     discoveryRefreshButton.hidden = !configured;
-    discoveryRefreshButton.disabled = !configured;
+    discoveryRefreshButton.disabled = !configured || safeDiscovery.status === "community_left";
   }
-
-  discoveryList.innerHTML = safeDiscovery.discoveredPeers.length
-    ? safeDiscovery.discoveredPeers.map(discoveryPeerMarkup).join("")
-    : emptyMarkup(
-        safeDiscovery.emptyTitle,
-        safeDiscovery.emptyCopy,
-      );
-  discoveryRequestsList.innerHTML = safeDiscovery.pendingRequestCount > 0
-    ? personCard({
-      name: `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"} waiting`,
-      details: "<span>Contact requests for your Profile are decided in Inbox.</span>",
-      actions: '<button type="button" data-action="open-inbox">Open Inbox</button>',
-    })
-    : emptyMarkup(
-        "No requests",
-        configured
-          ? "Contact requests for your Profile are decided in Inbox."
-          : "Discovery requests are unavailable until collaboration is configured.",
-      );
+  // The list shows while you are public; otherwise the status line says why
+  // there is no one to show.
+  const showList = peers.length > 0 || safeDiscovery.status === "visible";
+  if (discoveryPeople) {
+    discoveryPeople.hidden = !showList;
+  }
+  discoveryList.innerHTML = peers.length
+    ? peers.map(discoveryPeerMarkup).join("")
+    : (showList ? emptyMarkup("No one else is public right now.") : "");
+  // Requests to you are answered in Inbox; People only points there.
+  const requests = safeDiscovery.pendingRequestCount;
+  if (peopleRequests) {
+    peopleRequests.hidden = requests === 0;
+  }
+  if (peopleRequestsCount) {
+    peopleRequestsCount.textContent = requests
+      ? `${requests} contact request${requests === 1 ? "" : "s"} waiting.`
+      : "";
+  }
 }
 
 function normalizeDiscoverySummary(discovery) {
@@ -325,95 +486,33 @@ function normalizeDiscoverySummary(discovery) {
       configured: false,
       enabled: false,
       status: "unavailable",
-      statusMessage: "Discovery is unavailable.",
+      statusMessage: "Public isn’t available here yet.",
       discoveredPeers: [],
       pendingRequestCount: 0,
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Discovery isn’t available here yet.",
     };
   }
-  const configured = discovery.configured;
-  const enabled = discovery.enabled === true;
   const status = readText(discovery.status);
-  const remainingSeconds = readPositiveInteger(discovery.remaining_seconds);
-  const remoteVisibilityRemainingSeconds =
-    readPositiveInteger(discovery.remote_visibility_remaining_seconds);
   return {
-    configured,
-    enabled,
+    configured: discovery.configured,
+    enabled: discovery.enabled === true,
     status,
-    statusMessage: normalizeDiscoveryStatusMessage(
-      status,
-      readText(discovery.status_message),
-      remainingSeconds,
-      remoteVisibilityRemainingSeconds,
-    ),
+    statusMessage: PUBLIC_STATUS_TEXT[status] || readText(discovery.status_message)
+      || "Public isn’t available right now.",
     discoveredPeers: arrayValue(discovery.discovered_peers).filter((peer) => {
       return peer && typeof peer === "object" && readText(peer.display_name) && readText(peer.advertisement_id);
     }),
     pendingRequestCount: Math.max(0, Number(discovery.request_count || 0)),
-    ...discoveryEmptyState(status, configured, enabled),
   };
 }
 
-function normalizeDiscoveryStatusMessage(status, runtimeMessage, remainingSeconds, remoteVisibilityRemainingSeconds) {
-  if (status === "visible") {
-    if (remainingSeconds === null) {
-      return "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time.";
-    }
-    return `Discovery is on. Visibility lasts up to ten minutes. This window has ${remainingSeconds} seconds left, and both people must be visible at the same time.`;
-  }
-  if (status === "off_pending_expiry") {
-    if (runtimeMessage) {
-      return runtimeMessage;
-    }
-    if (remoteVisibilityRemainingSeconds !== null) {
-      return `Discovery is off on this Home. It stopped advertising locally, but may remain visible for another ${remoteVisibilityRemainingSeconds} seconds.`;
-    }
-    return "Discovery is off on this Home. It stopped advertising locally, but may remain visible for a short time.";
-  }
-  if (status === "off") {
-    return "Discovery is off.";
-  }
-  return runtimeMessage || "Discovery is unavailable.";
-}
-
-function discoveryEmptyState(status, configured, enabled) {
-  if (!configured) {
-    return {
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Discovery is not configured on this Home.",
-    };
-  }
-  if (status === "visible") {
-    return {
-      emptyTitle: "No one visible right now",
-      emptyCopy: "People appear here only while your visibility windows overlap.",
-    };
-  }
-  if (status === "off_pending_expiry") {
-    return {
-      emptyTitle: "Visibility is expiring",
-      emptyCopy: "Your last visibility window is closing.",
-    };
-  }
-  if (status === "off") {
-    return {
-      emptyTitle: "Discovery is off",
-      emptyCopy: "Turn Discovery on when you want a ten-minute visibility window.",
-    };
-  }
-  if (enabled) {
-    return {
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Runtime will retry when Discovery is unavailable.",
-    };
-  }
-  return {
-    emptyTitle: "Discovery unavailable",
-    emptyCopy: "Discovery isn’t available here yet.",
-  };
-}
+// No countdown: a listing renews while you are signed in, and the seconds
+// left after turning off are nothing a person can act on.
+const PUBLIC_STATUS_TEXT = {
+  visible: "Public is on.",
+  connecting: "Public is on.",
+  off_pending_expiry: "Public is off. You may stay listed for a few minutes.",
+  off: "Public is off.",
+};
 
 /* The Runtime emits exactly these today. A state this build does not know is
    a state it cannot describe, so it says so rather than picking the friendliest
@@ -453,12 +552,17 @@ function reachabilityLabel(contact) {
 
 function contactMarkup(contact) {
   const name = readText(contact?.display_name);
-  const relationship = relationshipLabel(contact?.relationship);
-  const handle = readText(contact?.handle);
-  const details = [relationship, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
-    .filter(Boolean)
-    .map((value) => `<span>${escapeHtml(value)}</span>`)
-    .join("");
+  const relationship = readText(contact?.relationship);
+  // Each row is a name and one short status. A request the Community node
+  // cannot deliver says Not delivered. Presence is shown only for a
+  // connected contact.
+  const status = relationship === "requested"
+    ? (readText(contact.delivery_detail) ? "Not delivered" : "Request sent")
+    : (relationship === "connected" ? reachabilityLabel(contact) : relationshipLabel(relationship));
+  // A request sent by DID before this Home holds their signed Profile has no
+  // name to show, so the status stands in its place.
+  const unnamed = !name && relationship === "requested";
+  const details = status && !unnamed ? `<span>${escapeHtml(status)}</span>` : "";
   const conversationId = readText(contact?.conversation_id);
   const chat = contact?.can_message === true && conversationId
     ? `<button type="button" data-action="chat" data-conversation-id="${escapeHtml(conversationId)}">Message</button>`
@@ -466,49 +570,86 @@ function contactMarkup(contact) {
   // Remove ends an accepted relationship; the other states have nothing to
   // end. Removed pairs stay visible read-only until a fresh request through
   // Inbox reopens them.
-  const remove = readText(contact?.relationship) === "connected"
-    ? `<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(readText(contact?.contact_id))}" data-contact-name="${escapeHtml(name)}">Remove</button>`
+  const contactId = readText(contact.contact_id);
+  const disabled = removingContactId ? " disabled" : "";
+  const confirming = pendingRemoveId === contactId;
+  const remove = readText(contact?.relationship) === "connected" && !confirming
+    ? `<button class="danger" type="button" data-action="remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Remove</button>`
     : "";
+  const confirmation = confirming ? `
+    <div class="person-confirm" role="group" aria-label="Remove contact">
+      <p>Remove ${escapeHtml(name)} from People?</p>
+      <div class="person-confirm-actions">
+        <button type="button" data-action="cancel-remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Cancel</button>
+        <button class="danger" type="button" data-action="confirm-remove" data-contact-id="${escapeHtml(contactId)}"${disabled}>Remove</button>
+      </div>
+    </div>` : "";
   return personCard({
-    name,
+    name: unnamed ? status : name,
+    initial: unnamed ? "" : name,
     details,
-    actions: `${chat}${remove}`,
+    actions: confirming ? "" : `${chat}${remove}`,
+    confirmation,
   });
 }
 
 function isValidContact(contact) {
-  return Boolean(readText(contact?.contact_id) && readText(contact?.display_name));
+  return Boolean(readText(contact?.contact_id)
+    && (readText(contact?.display_name) || readText(contact?.relationship) === "requested"));
 }
+
+// Runtime stamps each public person with their relationship; only someone
+// with none yet (`visible`) can be added.
+const DISCOVERY_RELATIONSHIP_TEXT = {
+  contact: "Contact",
+  requested: "Request sent",
+  pending: "Wants to add you",
+};
 
 function discoveryPeerMarkup(person) {
   const name = readText(person.display_name);
-  const handle = readText(person.handle);
+  const status = readText(person.status);
+  const addable = status === "visible";
+  // Add contact says what can be done; others get one relationship word.
+  const detail = !addable && Object.hasOwn(DISCOVERY_RELATIONSHIP_TEXT, status)
+    ? DISCOVERY_RELATIONSHIP_TEXT[status]
+    : "";
   return personCard({
     name,
-    details: `<span>${escapeHtml(handle && handle !== name ? handle : "Visible now")}</span>`,
-    actions: `<button type="button" data-action="discovery-request" data-advertisement-id="${escapeHtml(readText(person.advertisement_id))}">Add contact</button>`,
+    initial: name,
+    details: detail ? `<span>${escapeHtml(detail)}</span>` : "",
+    actions: addable
+      ? `<button type="button" data-action="discovery-request" data-advertisement-id="${escapeHtml(readText(person.advertisement_id))}">Add contact</button>`
+      : "",
   });
 }
 
-function personCard({ name, details, actions }) {
+function focusContactAction(action, contactId) {
+  const buttons = peopleList?.querySelectorAll("[data-action][data-contact-id]") || [];
+  [...buttons].find((button) => button.dataset.action === action
+    && button.dataset.contactId === contactId)?.focus();
+}
+
+function personCard({ name, initial, details, actions, confirmation = "" }) {
   const displayName = readText(name);
   if (!displayName) {
     return "";
   }
   return `
-    <article class="person-card">
-      <div class="person-avatar" aria-hidden="true">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</div>
+    <article class="person-card${confirmation ? " is-confirming" : ""}">
+      <div class="person-avatar" aria-hidden="true">${escapeHtml(readText(initial).slice(0, 1).toUpperCase())}</div>
       <div class="person-copy">
         <h4>${escapeHtml(displayName)}</h4>
-        <p class="person-details">${details}</p>
+        ${details ? `<p class="person-details">${details}</p>` : ""}
       </div>
       <div class="person-actions">${actions}</div>
+      ${confirmation}
     </article>
   `;
 }
 
-function emptyMarkup(title, copy) {
-  return `<div class="empty-state"><div><h4>${escapeHtml(title)}</h4><p>${escapeHtml(copy)}</p></div></div>`;
+function emptyMarkup(text) {
+  return `<p class="empty-state">${escapeHtml(text)}</p>`;
 }
 
 async function saveProfile() {
@@ -554,7 +695,7 @@ async function mutatePeople(path, body, message, button) {
   }
 }
 
-async function mutateDiscovery(path, body, message, button) {
+async function mutateDiscovery(path, body, button) {
   button.disabled = true;
   try {
     const discovery = await fetchJson(path, {
@@ -563,7 +704,6 @@ async function mutateDiscovery(path, body, message, button) {
     });
     renderDiscovery(discovery);
     await refreshPeople({ quiet: true });
-    showStatus(message, "ok");
   } finally {
     button.disabled = false;
   }
@@ -580,7 +720,6 @@ function openChat(conversationId) {
     query: { conversation_id: selector },
     homeToken,
   }, homeParentOrigin);
-  showStatus("Opening Chat.", "ok");
 }
 
 function setBusy(busy) {
@@ -625,7 +764,7 @@ async function fetchJson(path, options = {}) {
 
 function publicError(error, fallback) {
   const message = readText(error?.message);
-  return !message || /\b(schema|projection|provider|capability|launch token|hostcall|unauthorized|forbidden|[45]\d\d)\b/i.test(message)
+  return ![400, 409].includes(error?.status) || !message || /\b(schema|projection|provider|capability|launch token|hostcall|unauthorized|forbidden|[45]\d\d)\b/i.test(message)
     ? fallback
     : message;
 }
@@ -636,11 +775,6 @@ function objectValue(value) {
 
 function arrayValue(value) {
   return Array.isArray(value) ? value : [];
-}
-
-function readPositiveInteger(value) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 0 ? number : null;
 }
 
 function readText(value) {

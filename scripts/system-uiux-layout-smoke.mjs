@@ -9,6 +9,7 @@ import {
   makeSystemSummary,
   startSystemFixtureServer,
 } from "./system-uiux-fixture.mjs";
+import { assertPhoneDrawer } from "./lib/phone-drawer-assert.mjs";
 
 function appearanceRecord() {
   return makeAppearanceRecord({
@@ -240,7 +241,11 @@ async function assertScenario(page, width, height, screenshotPath) {
     await ensureSidebarVisible(frame);
   }
 
-  for (const tab of ["account", "personalization", "shell", "security", "catalog", "about"]) {
+  const tabs = ["account", "personalization", "shell", "security", "models", "about"];
+  const sidebarTabs = await frame.evaluate(() =>
+    [...document.querySelectorAll(".settings-sidebar-item")].map((node) => node.dataset.settings));
+  assert(sidebarTabs.join() === tabs.join(), "System sidebar tabs changed", { sidebarTabs });
+  for (const tab of tabs) {
     await activateTab(frame, tab);
   }
   await ensureSidebarVisible(frame);
@@ -325,6 +330,105 @@ async function assertScenario(page, width, height, screenshotPath) {
   await frame.locator("body").screenshot({ path: screenshotPath });
 }
 
+// Closing the file picker refocuses the hidden file input. In a short window
+// the input sits below the fold; focusing it must not scroll the settings
+// container (which is overflow: hidden, so the content would stay shifted).
+async function assertFileInputFocusKeepsLayout(page) {
+  await page.setViewportSize({ width: 1280, height: 620 });
+  await page.goto(page.url(), { waitUntil: "networkidle" });
+  const frame = await waitForSystemFrame(page);
+  await activateTab(frame, "personalization");
+  const shift = await frame.evaluate(() => {
+    const container = document.querySelector(".settings-container");
+    const content = document.querySelector(".settings-content-container");
+    const sidebar = document.querySelector(".settings-sidebar");
+    const input = document.querySelector("#background-input");
+    if (
+      !(container instanceof HTMLElement) ||
+      !(content instanceof HTMLElement) ||
+      !(sidebar instanceof HTMLElement) ||
+      !(input instanceof HTMLElement)
+    ) {
+      throw new Error("missing settings container, content, sidebar or #background-input");
+    }
+    content.scrollTo({ top: 0, left: 0 });
+    const before = {
+      containerScrollTop: container.scrollTop,
+      contentScrollTop: content.scrollTop,
+      sidebarTop: sidebar.getBoundingClientRect().top,
+    };
+    input.focus();
+    return {
+      before,
+      after: {
+        containerScrollTop: container.scrollTop,
+        contentScrollTop: content.scrollTop,
+        sidebarTop: sidebar.getBoundingClientRect().top,
+      },
+      focused: document.activeElement === input,
+      inputPosition: getComputedStyle(input).position,
+    };
+  });
+  assert(shift.focused, "System background file input did not take focus", shift);
+  assert(
+    shift.after.containerScrollTop === shift.before.containerScrollTop &&
+      shift.after.contentScrollTop === shift.before.contentScrollTop &&
+      Math.abs(shift.after.sidebarTop - shift.before.sidebarTop) < 0.5,
+    "Focusing the hidden background file input scrolls the System content",
+    shift,
+  );
+}
+
+// Phone stage: the menu button sits on the leading edge, on the same line as
+// the page title, as a 44 px target.
+async function assertPhoneTitleRow(page, screenshotPath) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(page.url(), { waitUntil: "networkidle" });
+  const frame = await waitForSystemFrame(page);
+  await frame.evaluate(() => document.documentElement.setAttribute("data-el-form-factor", "phone"));
+  const row = await frame.evaluate(() => {
+    const box = (selector) => document.querySelector(selector).getBoundingClientRect();
+    const toggle = box(".sidebar-toggle");
+    const title = box("#accounts-title");
+    return {
+      toggleLeft: Math.round(toggle.left),
+      toggleWidth: Math.round(toggle.width),
+      toggleHeight: Math.round(toggle.height),
+      toggleCenter: Math.round(toggle.top + toggle.height / 2),
+      titleCenter: Math.round(title.top + title.height / 2),
+      titleLeft: Math.round(title.left),
+      toggleRight: Math.round(toggle.right),
+      sharedIcon: getComputedStyle(document.querySelector(".sidebar-toggle"), "::before").maskImage !== "none",
+      hamburgerHidden: getComputedStyle(document.querySelector(".sidebar-toggle-button")).display === "none",
+    };
+  });
+  await frame.locator("body").screenshot({ path: screenshotPath });
+  assert(
+    row.toggleLeft <= 8 && row.toggleWidth >= 44 && row.toggleHeight >= 44,
+    "System phone menu button must be a 44 px target on the leading edge",
+    row,
+  );
+  assert(
+    Math.abs(row.toggleCenter - row.titleCenter) <= 2 && row.titleLeft >= row.toggleRight - 6,
+    "System phone menu button must share the page title's line",
+    row,
+  );
+  assert(
+    row.sharedIcon && row.hamburgerHidden,
+    "System phone menu button must draw the shared drawer icon, as the other capsules do",
+    row,
+  );
+  await assertPhoneDrawer(page, frame, {
+    label: "System",
+    drawer: "#system-sidebar",
+    room: ".settings-content-container",
+    closeTarget: '.settings-sidebar-item[data-settings="personalization"]',
+    screenshot: "/tmp/system-uiux-phone-drawer-390x844.png",
+  });
+  const activeTab = await frame.evaluate(() => document.querySelector(".settings-content.active")?.dataset.settings);
+  assert(activeTab === "personalization", "System phone: picking a section in the drawer must open it", { activeTab });
+}
+
 async function main() {
   const server = await startServer();
   const pageErrors = [];
@@ -358,8 +462,11 @@ async function main() {
     await page.goto(`${server.baseUrl}/fixture`, { waitUntil: "networkidle" });
     const desktopScreenshot = "/tmp/system-uiux-desktop-1280x900.png";
     const narrowScreenshot = "/tmp/system-uiux-narrow-640x900.png";
+    const phoneScreenshot = "/tmp/system-uiux-phone-390x844.png";
     await assertScenario(page, 1280, 900, desktopScreenshot);
     await assertScenario(page, 640, 900, narrowScreenshot);
+    await assertPhoneTitleRow(page, phoneScreenshot);
+    await assertFileInputFocusKeepsLayout(page);
 
     assert(
       server.requestFailures.length === 0,
@@ -384,7 +491,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          screenshots: [desktopScreenshot, narrowScreenshot],
+          screenshots: [desktopScreenshot, narrowScreenshot, phoneScreenshot],
         },
         null,
         2,

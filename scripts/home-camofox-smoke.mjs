@@ -46,13 +46,8 @@ function isDocumentPublishUnavailable(state) {
   return /publishing is unavailable/i.test(String(state?.status || ""));
 }
 
-function isPublishedDocumentLinkReady(state) {
-  return state?.ok
-    && state.status === "Published."
-    && String(state.uri || "").startsWith("elastos://")
-    && state.text === "Copy link"
-    && state.hidden === false
-    && state.disabled === false;
+function isDocumentPublished(state) {
+  return state?.ok && state.published === true;
 }
 
 async function request(path, options = {}) {
@@ -375,7 +370,7 @@ async function shellState(tabId) {
     })),
     topToolbar: {
       launcherPresent: !!document.querySelector("#toolbar-launcher"),
-      fullscreenPresent: !!document.querySelector("#control-centre-fullscreen"),
+      fullscreenPresent: !!document.querySelector("#toolbar-fullscreen"),
       searchPresent: !!document.querySelector("#toolbar-search"),
       identityPresent: !!document.querySelector("#identity-button"),
       systemPresent: !!document.querySelector("#toolbar-system"),
@@ -471,16 +466,42 @@ async function openShellTarget(tabId, target, query = {}) {
   })()`);
 }
 
-async function openElastosUri(tabId, uri, preferredViewer = "documents") {
-  const message = JSON.stringify({
-    type: "home:open-uri",
-    uri,
-    preferredViewer,
-  });
-  return evaluate(tabId, `(() => {
-    window.postMessage(${message}, window.location.origin);
-    return { ok: true };
-  })()`);
+async function confirmSharedFile(tabId, uri, allowMissing = false) {
+  const ready = await waitFor(async () => evaluate(tabId, `(() => {
+    const prompt = document.querySelector("#home-link-prompt");
+    const button = document.querySelector("#home-link-open");
+    const missing = button.disabled && document.querySelector("#home-link-status")?.textContent === "This file isn't on your Home.";
+    return !!prompt && !prompt.hidden &&
+      document.querySelector("#home-link-address")?.textContent === ${JSON.stringify(uri)} &&
+      ((!button.disabled && button.textContent === "Open") || (${allowMissing} && missing));
+  })()`), 12000, 250);
+  assert(ready, "Home did not offer the local shared file", await shellState(tabId));
+  const missing = await evaluate(tabId, `document.querySelector("#home-link-open").disabled`);
+  if (missing) {
+    await click(tabId, "#home-link-cancel");
+    const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window-frame')].map(frame => frame.getAttribute("src") || ""))()`);
+    assert(!routes.some(route => route.includes("cid=" + uri.slice("elastos://".length))), "Missing content opened a viewer", routes);
+    return false;
+  }
+  await delay(600);
+  await click(tabId, "#home-link-open");
+  return true;
+}
+
+async function openElastosUri(tabId, uri) {
+  await openShellTarget(tabId, "chat-room");
+  const sent = await waitFor(async () => {
+    const result = await frameState(tabId, "chat-room", `(() => {
+      const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
+      if (!homeToken) return { ok: false };
+      const message = { type: "home:open-uri", uri: ${JSON.stringify(uri)}, homeToken };
+      win.eval("window.parent.postMessage(" + JSON.stringify(message) + ", window.location.origin)");
+      return { ok: true };
+    })()`);
+    return result.ok;
+  }, 7000, 300);
+  assert(sent, "Chat could not request the shared file");
+  return confirmSharedFile(tabId, uri, true);
 }
 
 async function frameState(tabId, targetId, expression) {
@@ -503,7 +524,7 @@ async function framePublicCopyState(tabId, targetId) {
   return frameState(tabId, targetId, `(() => {
     const text = doc.body?.innerText?.replace(/\\s+/g, " ").trim() || "";
     const headings = [...doc.querySelectorAll("h1, h2, h3")]
-      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details"))
       .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
       .filter(Boolean);
     return { ok: true, text, headings };
@@ -520,7 +541,7 @@ async function directPublicCopyState(tabId, path) {
   await delay(600);
   return evaluate(tabId, `(() => {
     const headings = [...document.querySelectorAll("h1, h2, h3")]
-      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details"))
       .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
       .filter(Boolean);
     return {
@@ -548,7 +569,7 @@ async function deleteDocumentWorkingCopy(tabId, docDid) {
     return { ok: true, skipped: true };
   }
   return frameState(tabId, "documents", `(async () => {
-    const homeToken = new URL(win.location.href).searchParams.get("home_token") || "";
+    const homeToken = new URLSearchParams(win.location.hash.replace(/^#/, "")).get("home_token") || "";
     const response = await fetch("/api/provider/documents/delete", {
       method: "POST",
       headers: {
@@ -609,7 +630,7 @@ async function main() {
       assert(duplicateHomeHeadings.length === 0, "Home GUI renders duplicate visible headings", { duplicateHomeHeadings, publicState });
       assert(state.pageTitle === "Home · ElastOS", "Home page title mismatch", state);
       assert(state.topToolbar.launcherPresent === false, "top toolbar should not show a launcher button", state);
-      assert(state.topToolbar.fullscreenPresent === true, "top toolbar should expose fullscreen as a working mobile control", state);
+      assert(state.topToolbar.fullscreenPresent === true, "top toolbar should carry the full screen toggle", state);
       assert(state.topToolbar.searchPresent === false, "top toolbar should not show a search button", state);
       assert(state.topToolbar.identityPresent === false, "top toolbar should not show a local identity button", state);
       assert(state.topToolbar.systemPresent === true, "top toolbar should expose the canonical system menu", state);
@@ -663,7 +684,6 @@ async function main() {
         "/apps/home-cli/",
         "/apps/system/",
         "/apps/marketplace/",
-        "/apps/services/",
         "/apps/inbox/",
         "/apps/library/",
         "/apps/documents/",
@@ -689,7 +709,7 @@ async function main() {
     }
 
     await runCase("ordinary-app-copy-stays-plain-and-heading-unique", async (tabId) => {
-      for (const target of ["system", "marketplace", "services", "inbox", "library", "documents", "wallet", "browser"]) {
+      for (const target of ["system", "marketplace", "inbox", "library", "documents", "wallet", "browser"]) {
         await openShellTarget(tabId, target);
         const ready = await waitFor(async () => (await framePublicCopyState(tabId, target)).ok, 15_000, 300);
         assert(ready, `${target} did not render for the public-copy visual check`, await shellState(tabId));
@@ -744,7 +764,7 @@ async function main() {
         ok: true,
         title: doc.title || "",
         heading: [...doc.querySelectorAll("h1")].find((node) => node.offsetParent !== null)?.textContent?.trim() || "",
-        panelLabels: [...doc.querySelectorAll(".pc2-section-title, #catalog-title")].map((node) => node.textContent?.trim() || ""),
+        panelLabels: [...doc.querySelectorAll(".pc2-section-title, .settings-content h1")].map((node) => node.textContent?.trim() || ""),
         fieldLabels: [...doc.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
         aboutFieldLabels: [...doc.querySelectorAll('[data-settings="about"] .system-fields dt')].map((node) => node.textContent?.trim() || ""),
         walletControlsRemoved: !doc.querySelector("#wallet-create") && !doc.querySelector("#wallet-approvals"),
@@ -795,7 +815,7 @@ async function main() {
       assert(system.panelLabels.includes("Recovery"), "System frame is missing Recovery", system);
       assert(system.panelLabels.includes("Access"), "System frame is missing Access", system);
       assert(!system.panelLabels.includes("Elastos Webspace"), "System must not present app inventory as a WebSpace", system);
-      assert(system.panelLabels.includes("Apps & Services"), "System frame is missing Apps & Services", system);
+      assert(!system.panelLabels.includes("Apps & Services"), "System frame still has Apps & Services", system);
       assert(system.panelLabels.includes("This Device"), "System frame is missing This Device", system);
       assert(!system.panelLabels.includes("Profile"), "System frame should keep People profile settings out of System", system);
       assert(system.fieldLabels.includes("Device identity"), "System frame is missing the Device identity section", system);
@@ -1299,17 +1319,12 @@ async function main() {
         sidebarSubtitleExists: !!doc.querySelector("#documents-sidebar .sidebar-subtitle"),
         actionLabels: [...doc.querySelectorAll(".toolbar-actions button")]
           .filter((button) => !button.classList.contains("hidden") && win.getComputedStyle(button).display !== "none")
-          .map((button) => button.getAttribute("aria-label") || ""),
+          .map((button) => button.getAttribute("aria-label") || button.querySelector(".switch-label")?.textContent?.trim() || ""),
         actionCount: doc.querySelectorAll(".toolbar-actions .action-icon-button").length,
         editorWidth: doc.querySelector(".editor-pane")?.getBoundingClientRect().width || 0,
         previewWidth: doc.querySelector(".preview-pane")?.getBoundingClientRect().width || 0,
         editorHeaderHeight: doc.querySelector(".editor-pane .pane-header")?.getBoundingClientRect().height || 0,
         inspectorHeaderHeight: doc.querySelector(".inspector-pane .pane-header")?.getBoundingClientRect().height || 0,
-        historyInside: (() => {
-          const history = doc.querySelector("#pane-history")?.getBoundingClientRect();
-          const pane = doc.querySelector(".inspector-pane .pane-header")?.getBoundingClientRect();
-          return !!history && !!pane && history.right <= pane.right + 1;
-        })(),
         hasDocumentPill: !!doc.querySelector("#object-uri-pill"),
         hasPublishedPill: !!doc.querySelector("#published-pill"),
         hasLocalStateChip: !!doc.querySelector("#local-state-chip"),
@@ -1320,7 +1335,6 @@ async function main() {
         editorDisabled: !!doc.querySelector("#editor")?.disabled,
         saveDisabled: !!doc.querySelector("#save-button")?.disabled,
         saveAsDisabled: !!doc.querySelector("#save-as-button")?.disabled,
-        unpublishDisabled: !!doc.querySelector("#unpublish-button")?.disabled,
         activeDocDid: doc.querySelector(".document-list-item.active")?.dataset.docDid || "",
       })`);
       assert(viewer.ok, "documents frame was not reachable", viewer);
@@ -1328,7 +1342,7 @@ async function main() {
       assert(viewer.currentTitle === "", "Documents launcher open should not silently select a document", viewer);
       assert(viewer.activeDocDid === "", "Documents launcher open should not leave an active document selected", viewer);
       assert(!viewer.titleDisabled && !viewer.editorDisabled, "Documents launcher open should start an editable unsaved draft", viewer);
-      assert(viewer.saveDisabled && viewer.saveAsDisabled && viewer.unpublishDisabled, "Empty Documents draft should not expose persisted-document actions", viewer);
+      assert(viewer.saveDisabled && viewer.saveAsDisabled, "Empty Documents draft should not expose persisted-document actions", viewer);
       assert(!viewer.hasDocumentPill && !viewer.hasPublishedPill, "Documents toolbar should not render duplicate document/published pills", viewer);
       assert(!viewer.hasLocalStateChip && !viewer.hasUpdatedText, "Documents title area should not render duplicate draft or last-saved text", viewer);
       assert(!viewer.toolbarText.includes("localhost://Users/self/Documents/"), "documents foregrounded raw working-copy storage", viewer);
@@ -1337,20 +1351,19 @@ async function main() {
       assert(viewer.hasSidebarControls && viewer.newButtonText === "+" && viewer.newButtonLabel === "New document", "Documents sidebar should use compact create control beside search", viewer);
       assert(!viewer.sidebarMetaExists && !viewer.documentsCountExists, "Documents sidebar should not duplicate collection labels or counts", viewer);
       assert(viewer.hasWriteMode && viewer.hasSplitMode && viewer.hasReadMode, "documents workspace mode controls are incomplete", viewer);
-      assert(viewer.hasOutlineTab && viewer.hasHistoryTab, "documents inspector tabs are incomplete", viewer);
+      assert(viewer.hasOutlineTab && !viewer.hasHistoryTab, "documents inspector tabs must be Preview and Outline only", viewer);
       assert(viewer.workspaceView === "split", "documents should default to split view on desktop shell", viewer);
       assert(!viewer.sidebarTitleExists && !viewer.sidebarSubtitleExists, "Documents sidebar should not duplicate title copy", viewer);
-      assert(viewer.actionLabels.join("|") === "Save|Save as|Publish|Unpublish|Delete|Hide list", "Documents toolbar actions drifted", viewer);
-      assert(viewer.actionCount === 6, "Documents toolbar actions should be compact icon buttons", viewer);
-      assert(viewer.actionLabels.at(-1) === "Hide list", "Documents Hide list control should stay at the far right of toolbar actions", viewer);
+      // Desktop shows the view toggle, Save, the labeled Autosave switch, Save as and Delete; More is phone-only.
+      assert(viewer.actionLabels.join("|") === "Write — edit markdown|Split — edit and preview|Read — preview only|Save|Autosave|Save as|Delete", "Documents toolbar actions drifted", viewer);
+      assert(viewer.actionCount === 4, "Documents Save, More, Save as and Delete should be compact icon buttons", viewer);
       assert(Math.abs(viewer.editorWidth - viewer.previewWidth) <= 2, "Documents split view should be even", viewer);
       assert(Math.abs(viewer.editorHeaderHeight - viewer.inspectorHeaderHeight) <= 2, "Documents inspector tabs should not make the header taller than Write", viewer);
-      assert(viewer.historyInside, "Documents History tab overflowed the inspector header", viewer);
     });
 
-    await runCase("elastos-document-uri-opens-documents-viewer", async (tabId) => {
+    await runCase("elastos-file-uri-offers-local-open-or-recovery", async (tabId) => {
       const uri = `elastos://${TEST_DOCUMENT_CID}`;
-      await openElastosUri(tabId, uri);
+      if (!await openElastosUri(tabId, uri)) return;
       const opened = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);
@@ -1394,10 +1407,9 @@ async function main() {
         return {
           ok: true,
           saveDisabled: doc.querySelector("#save-button")?.disabled ?? true,
-          publishDisabled: doc.querySelector("#publish-button")?.disabled ?? true,
         };
       })()`);
-      assert(drafted.ok && !drafted.saveDisabled && !drafted.publishDisabled, "Documents draft was not ready to save and publish", drafted);
+      assert(drafted.ok && !drafted.saveDisabled, "Documents draft was not ready to save", drafted);
 
       const saved = await clickInFrame(tabId, "documents", "#save-button");
       assert(saved.ok, "Documents Save action was not clickable", saved);
@@ -1409,51 +1421,49 @@ async function main() {
           activeDocDid: doc.querySelector(".document-list-item.active")?.dataset.docDid || "",
           saveDisabled: doc.querySelector("#save-button")?.disabled ?? false,
         })`);
-        return savedDocument.ok && savedDocument.status === "Saved." && savedDocument.activeDocDid.length > 0 && savedDocument.saveDisabled;
+        return savedDocument.ok && savedDocument.status === "" && savedDocument.activeDocDid.length > 0 && savedDocument.saveDisabled;
       }, 12000, 500);
       assert(savedDocument?.activeDocDid, "Documents did not expose the saved document DID", savedDocument);
 
-      const published = await clickInFrame(tabId, "documents", "#publish-button");
-      assert(published.ok, "Documents Publish action was not clickable", published);
-      let publishedLink = null;
-      const publishResolved = await waitFor(async () => {
-        publishedLink = await frameState(tabId, "documents", `({
-          ok: true,
-          status: doc.querySelector("#status-text")?.textContent?.trim() || "",
-          uri: doc.querySelector("#copy-published-link")?.dataset.copyUri || "",
-          text: doc.querySelector("#copy-published-link")?.textContent?.trim() || "",
-          hidden: doc.querySelector("#copy-published-link")?.classList.contains("hidden") ?? true,
-          disabled: doc.querySelector("#copy-published-link")?.disabled ?? true,
-        })`);
-        return isPublishedDocumentLinkReady(publishedLink) || isDocumentPublishUnavailable(publishedLink);
-      }, 45_000, 1000);
-      if (isDocumentPublishUnavailable(publishedLink)) {
+      // Documents offers no Publish control; publish through the provider so the
+      // receiving path for documents published earlier stays covered.
+      const publishState = await frameState(tabId, "documents", `(async () => {
+        const homeToken = new URLSearchParams(win.location.hash.replace(/^#/, "")).get("home_token") || "";
+        const response = await fetch("/api/provider/documents/publish", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-elastos-home-token": homeToken,
+          },
+          body: JSON.stringify({ doc_did: ${JSON.stringify(savedDocument.activeDocDid)} }),
+        });
+        const body = await response.json().catch(() => null);
+        return { ok: true, published: response.ok && body?.status !== "error", status: body?.message || "" };
+      })()`);
+      if (isDocumentPublishUnavailable(publishState)) {
         const deletedLocal = await deleteDocumentWorkingCopy(tabId, savedDocument.activeDocDid);
         assert(deletedLocal.ok, "Documents smoke could not remove its local working copy", deletedLocal);
-        assert(!REQUIRE_DOCUMENT_PUBLISH, "Documents publishing is unavailable in strict publish mode", publishedLink);
-        throw new SkipCase("document publishing is unavailable on this device", publishedLink);
+        assert(!REQUIRE_DOCUMENT_PUBLISH, "Documents publishing is unavailable in strict publish mode", publishState);
+        throw new SkipCase("document publishing is unavailable on this device", publishState);
       }
-      assert(publishResolved && isPublishedDocumentLinkReady(publishedLink), "Documents did not publish an elastos:// revision", publishedLink);
+      assert(isDocumentPublished(publishState), "Documents did not publish a revision", publishState);
 
-      const uri = publishedLink.uri;
-      const cid = uri.slice("elastos://".length);
-      const copied = await frameState(tabId, "documents", `(() => {
-        const button = doc.querySelector("#copy-published-link");
-        if (!button) return { ok: false, reason: "missing-copy-button" };
-        button.click();
-        return { ok: true };
+      const publishedRecord = await frameState(tabId, "documents", `(async () => {
+        const homeToken = new URLSearchParams(win.location.hash.replace(/^#/, "")).get("home_token") || "";
+        const response = await fetch("/api/provider/documents/get", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-elastos-home-token": homeToken,
+          },
+          body: JSON.stringify({ doc_did: ${JSON.stringify(savedDocument.activeDocDid)} }),
+        });
+        const body = response.ok ? await response.json() : null;
+        return { ok: response.ok, cid: body?.data?.document?.latest_published_cid || "" };
       })()`);
-      assert(copied.ok, "Documents Copy link action could not be started", copied);
-      let copiedState = null;
-      const didCopy = await waitFor(async () => {
-        copiedState = await frameState(tabId, "documents", `({
-          ok: true,
-          copiedUri: doc.querySelector("#copy-published-link")?.dataset.copyUri || "",
-          status: doc.querySelector("#status-text")?.textContent?.trim() || "",
-        })`);
-        return copiedState.ok && copiedState.copiedUri === uri && copiedState.status === "Copied link.";
-      }, 4000, 250);
-      assert(didCopy, "Documents Copy link did not copy the elastos:// URI", copiedState);
+      assert(publishedRecord.ok && publishedRecord.cid, "Documents did not record the published revision", publishedRecord);
+      const cid = publishedRecord.cid;
+      const uri = "elastos://" + cid;
 
       await openShellTarget(tabId, "chat-room");
       await waitFor(async () => {
@@ -1502,6 +1512,27 @@ async function main() {
         return !state.windows.some((window) => window.target === "library");
       }, 6000, 250);
 
+      // Chat asks before posting the attached file in Community.
+      let postSheet = null;
+      const postAsked = await waitFor(async () => {
+        postSheet = await frameState(tabId, "chat-room", `(() => {
+          const sheet = doc.querySelector("#library-post");
+          const confirm = doc.querySelector("#library-post-confirm");
+          return {
+            ok: true,
+            visible: !!sheet && !sheet.hidden,
+            title: doc.querySelector("#library-post-title")?.textContent?.trim() || "",
+            confirmVisible: !!confirm && !confirm.hidden,
+            confirmText: confirm?.textContent?.trim() || "",
+          };
+        })()`);
+        return postSheet.ok && postSheet.visible && postSheet.confirmVisible;
+      }, 12000, 500);
+      assert(postAsked, "Chat Room did not ask before posting the attached document", postSheet);
+      assert(/^Post ".+" in Community\?$/.test(postSheet.title) && postSheet.confirmText === "Post", "Chat Room Post sheet copy drifted", postSheet);
+      const posted = await clickInFrame(tabId, "chat-room", "#library-post-confirm");
+      assert(posted.ok, "Chat Room Post was not clickable", posted);
+
       let linkCard = null;
       const renderedLink = await waitFor(async () => {
         linkCard = await frameState(tabId, "chat-room", `(() => {
@@ -1511,18 +1542,18 @@ async function main() {
             ok: true,
             found: !!anchor,
             href: anchor?.getAttribute("href") || "",
-            title: anchor?.querySelector(".link-title")?.textContent?.trim() || "",
-            detail: anchor?.querySelector(".link-detail")?.textContent?.trim() || "",
+            role: anchor?.getAttribute("role") || "",
             target: anchor?.getAttribute("target") || "",
           };
         })()`);
         return linkCard.ok && linkCard.found;
       }, 12000, 500);
       assert(renderedLink, "Chat Room did not render the elastos:// document as an openable link", linkCard);
-      assert(linkCard.href === uri && linkCard.detail === "Documents" && linkCard.target === "", "Chat Room document link chrome drifted", linkCard);
+      assert(linkCard.href === "" && linkCard.role === "link" && linkCard.target === "", "Chat Room document link chrome drifted", linkCard);
 
       const opened = await clickInFrame(tabId, "chat-room", `#message-list [data-open-uri="${uri}"]`);
       assert(opened.ok, "Chat Room document link was not clickable", opened);
+      await confirmSharedFile(tabId, uri);
       const openedViewer = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);
@@ -1581,7 +1612,7 @@ async function main() {
             query: {},
             homeToken: "not-a-valid-token",
           });
-          const homeToken = new URL(win.location.href).searchParams.get("home_token") || "";
+          const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
           sendFromFrame({
             type: "home:open-target",
             target: "system",
@@ -1602,14 +1633,14 @@ async function main() {
       );
 
       const uri = `elastos://${TEST_DOCUMENT_CID}`;
+      await openShellTarget(tabId, "chat-room");
       let authorized = null;
       const authorizedSent = await waitFor(async () => {
-        authorized = await frameState(tabId, "documents", `(() => {
-          const homeToken = new URL(win.location.href).searchParams.get("home_token") || "";
+        authorized = await frameState(tabId, "chat-room", `(() => {
+          const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
           const message = {
             type: "home:open-uri",
             uri: ${JSON.stringify(uri)},
-            preferredViewer: "documents",
             homeToken,
           };
           win.eval("window.parent.postMessage(" + JSON.stringify(message) + ", window.location.origin)");
@@ -1617,7 +1648,8 @@ async function main() {
         })()`);
         return authorized.ok;
       }, 7000, 300);
-      assert(authorizedSent, "Documents frame could not send authorized open-uri message", authorized);
+      assert(authorizedSent, "Chat frame could not send authorized open-uri message", authorized);
+      if (!await confirmSharedFile(tabId, uri, true)) return;
       const opened = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);
@@ -1627,7 +1659,7 @@ async function main() {
         ));
       }, 12000, 500);
       state = await shellState(tabId);
-      assert(opened, "Home rejected an authorized Documents open-uri message", state);
+      assert(opened, "Home rejected an authorized Chat open-uri message", state);
     });
 
     await runCase("documents-delete-removes-current-document", async (tabId) => {
@@ -1710,7 +1742,7 @@ async function main() {
           deleteDisabled: !!doc.querySelector("#delete-button")?.disabled,
         })`);
         return viewer.ok
-          && viewer.status === "Deleted."
+          && viewer.status === ""
           && viewer.activeDocDid === ""
           && !viewer.docDids.includes(created.activeDocDid)
           && !viewer.titleDisabled
@@ -1889,8 +1921,10 @@ async function main() {
       assert(desktopTargets.includes("inbox"), "Inbox should be exposed as a Home desktop shortcut", desktopTargets);
       assert(launcherTargets.includes("library"), "Library should be exposed in the Home launcher", launcherTargets);
       assert(desktopTargets.includes("library"), "Library should be exposed as a Home desktop shortcut", desktopTargets);
-      assert(launcherTargets.includes("archive-manager"), "Archive should be exposed in the Home launcher", launcherTargets);
-      assert(desktopTargets.includes("archive-manager"), "Archive should be exposed as a Home desktop shortcut", desktopTargets);
+      assert(!launcherTargets.includes("archive-manager"), "Archive opens from Library and must not be in the Home launcher", launcherTargets);
+      assert(!desktopTargets.includes("archive-manager"), "Archive opens from Library and must not be a Home desktop shortcut", desktopTargets);
+      assert(!launcherTargets.includes("services"), "Services is hidden and must not be in the Home launcher", launcherTargets);
+      assert(!desktopTargets.includes("services"), "Services is hidden and must not be a Home desktop shortcut", desktopTargets);
       assert(state.launcherHeading === "Apps", "Home launcher heading should match the canonical Apps launcher", state);
       assert(state.launcherSearchPlaceholder === "Search", "Home launcher search placeholder should match the canonical launcher copy", state);
       assert(!state.launcherGroupHeadings.includes("All Apps"), "Home launcher should not describe mixed targets as apps", state);
@@ -1912,11 +1946,6 @@ async function main() {
         state,
       );
       assert(
-        state.launcherCards.some((card) => card.target === "archive-manager" && card.title === "Archive"),
-        "Home launcher did not label Archive as Archive",
-        state,
-      );
-      assert(
         state.launcherCards.some((card) => card.target === "inbox" && card.title === "Inbox"),
         "Home launcher did not label inbox as Inbox",
         state,
@@ -1929,11 +1958,6 @@ async function main() {
       assert(
         state.desktopShortcuts.some((shortcut) => shortcut.target === "library" && shortcut.label === "Library"),
         "Home desktop did not label library as Library",
-        state,
-      );
-      assert(
-        state.desktopShortcuts.some((shortcut) => shortcut.target === "archive-manager" && shortcut.label === "Archive"),
-        "Home desktop did not label Archive as Archive",
         state,
       );
       assert(

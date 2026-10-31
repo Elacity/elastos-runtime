@@ -159,9 +159,8 @@ async function settle() {
 }
 
 function extractInboxScript(html) {
-  const match = html.match(/<script>([\s\S]*)<\/script>\s*<\/body>/);
-  assert(match, "Inbox inline script not found");
-  return match[1];
+  assert(html.includes('<script src="./inbox.js"></script>'), "Inbox script reference not found");
+  return fs.readFileSync(new URL("../capsules/inbox/browser/inbox.js", import.meta.url), "utf8");
 }
 
 async function runInboxHomeChromeSmoke() {
@@ -264,7 +263,7 @@ async function runInboxHomeChromeSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -309,6 +308,24 @@ async function runInboxHomeChromeSmoke() {
     assert.equal(Boolean(end), status === "pending" || status === "approved");
     if (end) assert.equal(end.type, "button");
   }
+  // Community presence: four answers, no Dismiss; the Runtime keeps the card
+  // until the person decides.
+  {
+    const actions = new FakeElement("div");
+    context.fillEntryActions(actions, {
+      id: "community-presence-request:42", kind: "community_presence_request",
+      source_app: "chat-room", title: "Show yourself in Community?", body: "",
+      action_ref: { app: "inbox", action_id: "community-presence-always:42" },
+    });
+    const decisions = actions.children.filter(node => node.dataset.actionId).map(node => [node.textContent, node.dataset.actionId]);
+    assert.deepEqual(decisions, [
+      ["Always while Home is online", "community-presence-always:42"],
+      ["Only while Community is open", "community-presence-open:42"],
+      ["Later", "community-presence-later:42"],
+      ["Never", "community-presence-never:42"],
+    ]);
+    assert(!actions.children.some(node => String(node.dataset.actionId || "").startsWith("notification-dismiss:")));
+  }
   context.setStatus("unauthorized provider");
   assert.equal(nodes.get("status-text").textContent, "Inbox action could not be completed.");
 
@@ -335,7 +352,7 @@ async function runInboxHomeChromeSmoke() {
         {
           title: "View",
           items: [
-            { label: "All Pending", cmd: "filter-all" },
+            { label: "All", cmd: "filter-all" },
             { label: "Needs Review", cmd: "filter-review" },
           ],
         },
@@ -458,7 +475,7 @@ async function runInboxHomeChromeSmoke() {
     return jsonResponse({ notifications: { entries: [{
       id: "entry-service", kind: "service_access_request", title: "Browser Exit access",
       body: "A contact requests Browser Exit access.", severity: "attention", read: false,
-      source_app: "services", action_ref: { action_id: "service-approve-request:service-1" },
+      source_app: "inbox", action_ref: { app: "inbox", action_id: "service-approve-request:service-1" },
     }] } });
   };
   for (const callback of windowListeners.get("message") || []) {
@@ -467,8 +484,9 @@ async function runInboxHomeChromeSmoke() {
   }
   await settle();
   const buttons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
-  assert.deepEqual(buttons.map(button => button.textContent), ["Open", "Approve", "Deny"]);
-  assert.deepEqual(serviceActions, [], "Viewing a Services request must preserve its pending state");
+  // Services is hidden, so a service request offers no Open; Inbox decides it.
+  assert.deepEqual(buttons.map(button => button.textContent), ["Approve", "Deny"]);
+  assert.deepEqual(serviceActions, [], "Viewing a service request must preserve its pending state");
   for (const label of ["Approve", "Deny"]) {
     const button = descendants(nodes.get("entry-rows")).find(node => node.tagName === "BUTTON" && node.textContent === label);
     for (const callback of button.listeners.get("click") || []) callback();
@@ -485,7 +503,7 @@ async function runInboxHomeChromeSmoke() {
     body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
     severity: "info",
     read: true,
-    source_app: "services",
+    source_app: "inbox",
     action_ref: { action_id: "service-deny-request:grant-1" },
   };
   context.fetch = async (path, options = {}) => {
@@ -515,9 +533,12 @@ async function runInboxHomeChromeSmoke() {
   }
   await settle();
   assert.equal(nodes.get("pending-count").textContent, "0");
+  // The All list holds a grant card; the count beside it names only pending requests.
+  assert.equal(filterAll.getAttribute("aria-label"), "All, 0 pending requests");
+  assert.equal(nodes.get("list-title").textContent, "All");
   assert.equal(nodes.get("review-count").textContent, "0");
   const grantButtons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
-  assert.deepEqual(grantButtons.map(button => button.textContent), ["Open", "Revoke access"]);
+  assert.deepEqual(grantButtons.map(button => button.textContent), ["Revoke access"]);
   assert.deepEqual(grantActions, [], "Viewing an approved grant must preserve its access");
   const revoke = grantButtons.find(button => button.textContent === "Revoke access");
   for (const callback of revoke.listeners.get("click") || []) callback();
@@ -548,7 +569,7 @@ async function runInboxHomeChromeSmoke() {
         body: "A contact requests Browser Exit access.",
         severity: "attention",
         read: false,
-        source_app: "services",
+        source_app: "inbox",
         action_ref: { action_id: "service-approve-request:service-1" },
       },
       {
@@ -558,7 +579,7 @@ async function runInboxHomeChromeSmoke() {
         body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
         severity: "info",
         read: true,
-        source_app: "services",
+        source_app: "inbox",
         action_ref: { action_id: "service-deny-request:grant-1" },
       },
     ],
@@ -569,6 +590,7 @@ async function runInboxHomeChromeSmoke() {
   }
   await settle();
   assert.equal(nodes.get("pending-count").textContent, "1");
+  assert.equal(filterAll.getAttribute("aria-label"), "All, 1 pending request");
   assert.equal(nodes.get("review-count").textContent, "1");
 }
 
@@ -644,7 +666,7 @@ async function runInboxLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -728,7 +750,7 @@ async function runInboxMissingLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -827,7 +849,7 @@ async function runInboxRemovedLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
   await nodes.get("refresh").listeners.get("click")[0]();
@@ -927,7 +949,7 @@ async function runInboxRequestedSelectionAppearsLaterSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 

@@ -14,11 +14,14 @@ import {
   SYSTEM_APP_ID,
   homeActiveShellName,
   hasHomeAuthorityToken,
+  clearHomeAuthorityToken,
   shellState,
   fetchJson,
+  createHomeBackgroundImageReader,
   targetById,
-} from "./shell-core.js?v=home-20260802a";
+} from "./shell-core.js?v=home-wallpaper-20261030b";
 import {
+  addAccountPasskey,
   bindHomeUnlock,
   hideHomeUnlock,
   isHomeAuthError,
@@ -27,27 +30,42 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260802a";
+} from "./shell-auth.js?v=home-wallpaper-20261030b";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260802a";
+} from "./home-wallet-connector-host.js?v=home-wallpaper-20261030b";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
   createHomeClipboardPrompt,
   homeClipboardTargetSupported,
-} from "./home-clipboard-host.js?v=home-20260726a";
+} from "./home-clipboard-host.js?v=home-20261017a";
 import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260805a";
+import {
+  FORM_FACTOR_MESSAGE,
+  applyPhoneViewport,
+  bindKeyboardInsetRelay,
+} from "./home-keyboard-inset.js?v=home-20260924a";
+import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
+import {
+  createHomeExternalLinkPrompt,
+  requestHomeSharedContent,
+  openHomeSharedFile,
+  EXTERNAL_LINK_REQUEST_SCHEMA,
+  HOME_OPEN_EXTERNAL_TYPE,
+  MAX_EXTERNAL_LINK_LENGTH,
+} from "./home-external-link.js?v=home-links-20261029a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
 const HOME_EVENTS_WAIT_MS = 25_000;
 const HOME_EVENTS_RETRY_MS = 2_000;
-const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
+const HOME_EVENTS_MAX_RETRY_MS = 30_000;
+const HOME_EVENTS_RECONNECT_TIMEOUT_MS = 10_000;
+const HOME_EVENTS_POLL_TIMEOUT_MS = HOME_EVENTS_WAIT_MS + HOME_EVENTS_RECONNECT_TIMEOUT_MS;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
-const PRESENCE_HEARTBEAT_MS = 15_000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const ACTIVE_SHELL_READY_TIMEOUT_MS = 5_000;
 const HOME_CLI_SHELL_ID = "home-cli";
@@ -74,19 +92,17 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "home-agent": new Set(["marketplace", "system", "inbox"]),
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
-  "chat-room": new Set(["library"]),
+  "chat-room": new Set(["library", "people", "inbox"]),
   "gba-emulator": new Set(["library"]),
   "home-cli": "visible-target",
   "home-gui": "visible-target",
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
-  people: new Set(["chat-room", "system"]),
-  services: new Set(["browser", "chat-room"]),
+  people: new Set(["chat-room", "inbox", "system"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
-const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["documents"]),
   documents: new Set(["chat-room"]),
@@ -94,7 +110,18 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 });
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
+// Archive is launchable but not in the Home summary, so the GUI may launch it
+// only for the exact open its owner app (Library) just asked for.
+const ownerLaunchGrants = [];
+const OWNER_LAUNCH_GRANT_MS = 15000;
+const OWNER_LAUNCH_GRANT_LIMIT = 8;
 const pendingBrowserAuthorityRenewals = new Map();
+let homeEventsReconnectAttempts = 0;
+let homeEventsReconnectInFlight = null;
+let homeEventsReconnectController = null;
+let homeEventsChannelActive = true;
+let homeEventsChannelGeneration = 0;
+let homeEventsPollController = null;
 const pendingActiveShellReady = {
   target: "",
   route: "",
@@ -104,16 +131,38 @@ const stalledActiveShellReady = {
   target: "",
   route: "",
 };
+// Home's two sheets (Clipboard and web link) never stack: each refuses to show
+// while the other is on screen.
+const homeClipboardPromptRoot = document.querySelector("#home-clipboard-prompt");
+const homeLinkPromptRoot = document.querySelector("#home-link-prompt");
 const homeClipboardPrompt = createHomeClipboardPrompt({
-  root: document.querySelector("#home-clipboard-prompt"),
+  root: homeClipboardPromptRoot,
   title: document.querySelector("#home-clipboard-title"),
   copy: document.querySelector("#home-clipboard-copy"),
   allowButton: document.querySelector("#home-clipboard-allow"),
   cancelButton: document.querySelector("#home-clipboard-cancel"),
+  otherSheetShown: () => !homeLinkPromptRoot.hidden,
 });
 const homeClipboardHost = createHomeClipboardHost({
   prompt: homeClipboardPrompt,
 });
+const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
+  root: homeLinkPromptRoot,
+  appName: document.querySelector("#home-link-app"),
+  host: document.querySelector("#home-link-host"),
+  address: document.querySelector("#home-link-address"),
+  openButton: document.querySelector("#home-link-open"),
+  cancelButton: document.querySelector("#home-link-cancel"),
+  eyebrow: document.querySelector("#home-link-kind"),
+  title: document.querySelector("#home-link-title"),
+  asker: document.querySelector("#home-link-copy"),
+  size: document.querySelector("#home-link-size"),
+  status: document.querySelector("#home-link-status"),
+  openSharedFile: (file, signal) => openHomeSharedFile(file, { openTarget: openTargetFromHomeGui, signal }),
+  isLive: externalLinkSenderIsLive,
+  otherSheetShown: () => !homeClipboardPromptRoot.hidden,
+});
+const homeUpdateBar = document.querySelector("#home-update-bar");
 
 function hideHostBootMask() {
   if (!homeShellBootMask) {
@@ -172,8 +221,10 @@ function retireLaunchedAppContext(homeToken) {
     return false;
   }
   cancelBrowserAuthorityRenewalsForToken(homeToken);
+  cancelChatReconnect(context);
   cancelLibraryPicker(context);
   homeClipboardHost.retireFrame(context.clipboardState);
+  homeExternalLinkPrompt.retire(homeToken);
   launchedAppContexts.delete(homeToken);
   return true;
 }
@@ -181,14 +232,57 @@ function retireLaunchedAppContext(homeToken) {
 function clearLaunchedAppContexts() {
   clearPendingBrowserAuthorityRenewals();
   for (const context of launchedAppContexts.values()) {
+    cancelChatReconnect(context);
     cancelLibraryPicker(context);
     homeClipboardHost.retireFrame(context.clipboardState);
   }
   launchedAppContexts.clear();
+  homeExternalLinkPrompt.clear();
+}
+
+function cancelChatReconnect(context) {
+  const record = context.chatReconnectPending;
+  if (!record) return;
+  context.chatReconnectPending = null;
+  window.clearTimeout(record.timeout);
+  if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+}
+
+function settleChatReconnect(old, record, error = null) {
+  if (old.chatReconnectPending !== record) return false;
+  old.chatReconnectPending = null;
+  window.clearTimeout(record.timeout);
+  if (error) {
+    if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+  } else {
+    const fresh = launchedAppContexts.get(record.freshToken);
+    if (launchedAppContexts.get(record.oldToken) !== old || old.source !== record.event.source
+      || fresh?.targetId !== "chat-room" || fresh.source || record.expiresAt <= Date.now()) {
+      if (record.freshToken) retireLaunchedAppContext(record.freshToken);
+      error = new Error("Home could not reopen this Chat window");
+    } else {
+      try {
+        requireHomeGuiActive("reconnect Chat");
+        fresh.chatReconnectCommit = { requestId: record.requestId, oldToken: record.oldToken };
+        if (!postToActiveShell({ type: "home:gui-command", command: "renew-chat-authority",
+          phase: "commit", requestId: record.requestId, homeToken: record.oldToken,
+          launched: record.launched, expiresAt: record.expiresAt })) {
+          throw new Error("Home GUI could not reopen Chat");
+        }
+        fresh.source = record.event.source;
+        retireLaunchedAppContext(record.oldToken);
+      } catch (failure) {
+        retireLaunchedAppContext(record.freshToken);
+        error = failure;
+      }
+    }
+  }
+  replyToShellRequest(record.event, record.requestId, error ? null : record.launched, error);
+  return true;
 }
 
 function enterHostAuthGate() {
-  stopHomePresenceHeartbeat();
+  document.body.dataset.homeAuthority = "unsigned";
   shellState.activeShellRootLaunchSeq += 1;
   resetActiveShellReadyState();
   shellState.pendingAppliedShellTarget = "";
@@ -432,12 +526,14 @@ async function launchHomeTarget(target, query = {}) {
       home_origin: window.location.origin,
     },
   };
+  const readBackgroundImage = [HOME_GUI_SHELL_ID, SYSTEM_APP_ID].includes(target)
+    ? createHomeBackgroundImageReader() : null;
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify(body),
   });
   if (launched?.attach_kind === "iframe") {
-    rememberLaunchedAppContext(launched);
+    rememberLaunchedAppContext(launched, readBackgroundImage);
     if (pickerOwner) {
       const token = homeLaunchTokenFromRoute(launched.route);
       if (!currentLibraryPicker(pickerOwner) || pickerOwner.pickerToken) {
@@ -825,7 +921,7 @@ function replyToShellRequest(event, requestId, result, error = null) {
   }, OPAQUE_FRAME_TARGET);
 }
 
-function rememberLaunchedAppContext(launched) {
+function rememberLaunchedAppContext(launched, readBackgroundImage) {
   const token = homeLaunchTokenFromRoute(launched?.route || "");
   if (!token || !launched?.target) {
     throw new Error("Runtime returned an incomplete isolated launch");
@@ -835,6 +931,7 @@ function rememberLaunchedAppContext(launched) {
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
+    readBackgroundImage,
     browserInstance:
       launched.target === "browser"
         ? browserInstanceFromRoute(launched.route || "")
@@ -1048,6 +1145,19 @@ async function activateDesktopShell() {
   await showHomeGuiDesktop();
 }
 
+async function resetActiveShellToDesktop(unavailableTarget) {
+  try {
+    await fetchJson("/api/apps/home/active-shell", {
+      method: "POST",
+      body: JSON.stringify({ active: HOME_GUI_SHELL_ID }),
+    });
+    requestShellSummaryRefresh({ reason: "active-shell-unavailable", delay: 0 });
+  } catch (error) {
+    console.error("active shell desktop fallback failed", error);
+    showActiveShellError(unavailableTarget, error);
+  }
+}
+
 function shellDisplayName(target) {
   const shell = normalizedActiveShellName(target);
   if (shell === HOME_GUI_SHELL_ID) {
@@ -1220,6 +1330,20 @@ function reloadHomeShellHost() {
   window.location.href = "/home/";
 }
 
+// The Runtime version that served this page's code. After an update the page,
+// the shell and every open window keep running the code they loaded until the
+// page reloads (Home's files are never cached, so one reload loads it all).
+// Home does not reload by itself: open windows would lose what is not saved.
+let homePageRuntimeVersion = "";
+
+function syncHomeUpdateBar(summary) {
+  const version = typeof summary?.runtime?.version === "string" ? summary.runtime.version.trim() : "";
+  homePageRuntimeVersion ||= version;
+  if (homeUpdateBar) {
+    homeUpdateBar.hidden = !homeSummarySignedIn(summary) || !version || version === homePageRuntimeVersion;
+  }
+}
+
 async function recoverToHomeGui() {
   if (!hasHomeAuthorityToken()) {
     showShellHostRecovery(shellState.activeShellRootTarget, "No Home launch token is available.", {
@@ -1345,7 +1469,18 @@ async function syncActiveShellRoot(summary, options = {}) {
 
   const candidate = activeShellCandidate(summary, target);
   if (!candidate || candidate.launchable !== true) {
-    clearActiveShellRoot();
+    clearActiveShellRoot({ resetHint: true });
+    if (
+      target !== HOME_GUI_SHELL_ID &&
+      activeShellCandidate(summary, HOME_GUI_SHELL_ID)?.launchable === true
+    ) {
+      // A saved view that can no longer start (for example Terminal after
+      // developer mode is turned off) must not strand the user: reset the
+      // saved choice so this and every later load land on the Desktop.
+      showHostBootMask();
+      void resetActiveShellToDesktop(target);
+      return "alternate";
+    }
     showActiveShellError(target, "The selected Home shell is not launchable");
     return "locked";
   }
@@ -1471,6 +1606,12 @@ function registerHomeServiceWorker() {
 }
 
 applyActiveShellBootHint();
+bindKeyboardInsetRelay({ post: postToActiveShell, frame: activeShellFrame });
+const homeLink = createHomeLinkStatus({
+  post: postToActiveShell,
+  retry: () => requestShellSummaryRefresh({ reason: "reconnect", delay: 0 }),
+});
+activeShellFrame?.addEventListener("load", () => homeLink.replay());
 
 boot().catch((error) => {
   document.body.dataset.homeStatus = "error";
@@ -1494,6 +1635,10 @@ shellHostRecoveryReloadButton?.addEventListener("click", () => {
   reloadHomeShellHost();
 });
 
+document.querySelector("#home-update-reload")?.addEventListener("click", () => {
+  reloadHomeShellHost();
+});
+
 shellHostRecoverySignOutButton?.addEventListener("click", () => {
   signOutFromShellHostRecovery().catch((error) => {
     console.error("shell host recovery sign out failed", error);
@@ -1506,12 +1651,38 @@ window.addEventListener("message", (event) => {
   if (!context) {
     return;
   }
+  if (data.type === "home:background-image") {
+    if (!hasExactMessageKeys(data, ["type", "requestId", "homeToken"])
+      || typeof data.requestId !== "string" || !data.requestId || data.requestId.length > 128
+      || !((context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID)
+        || (context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID))) return;
+    const launched = launchedAppContexts.get(context.homeToken);
+    if (!launched?.readBackgroundImage) return;
+    const reply = (blob) => {
+      const current = homeMessageContext(event, data);
+      if (current?.kind !== context.kind || current?.targetId !== context.targetId
+        || current?.homeToken !== context.homeToken
+        || launchedAppContexts.get(context.homeToken) !== launched) return;
+      event.source.postMessage({ type: "home:background-image-result",
+        requestId: data.requestId, blob }, OPAQUE_FRAME_TARGET);
+    };
+    launched.readBackgroundImage().then(reply, () => reply(null));
+    return;
+  }
   if (data.type === "home:navigation-hint") {
     relayHomeNavigation(context, data);
     return;
   }
+  if (data.type === FORM_FACTOR_MESSAGE) {
+    if (context.kind === "shell-frame") {
+      applyPhoneViewport(data.phone === true);
+    }
+    return;
+  }
   if (data.type === "home:shell-ready") {
     if (context.kind === "shell-frame") {
+      // A reloaded Home CLI cannot inherit its earlier link request.
+      homeExternalLinkPrompt.retire(context.homeToken);
       settleActiveShellReady(context);
       if (context.targetId === HOME_GUI_SHELL_ID) {
         let browserContextId = "";
@@ -1543,6 +1714,8 @@ window.addEventListener("message", (event) => {
         homeToken: context.homeToken, navigation: null });
     }
     if (context.kind === "app-frame") {
+      // A reloaded app document cannot inherit its earlier link request.
+      homeExternalLinkPrompt.retire(context.homeToken);
       const app = launchedAppContexts.get(context.homeToken);
       if (app?.pickerRequest) cancelLibraryPicker(app);
       if (app?.pickerOwner?.phase === "delivering") settleLibraryPicker(app.pickerOwner, false);
@@ -1580,15 +1753,88 @@ window.addEventListener("message", (event) => {
     }
     return;
   }
+  if (data.type === "home:chat-authority-renewed") {
+    if (context.kind !== "shell-frame" || context.targetId !== HOME_GUI_SHELL_ID
+      || !hasExactMessageKeys(data, ["type", "requestId", "oldHomeToken", "freshHomeToken", "ok", "homeToken"])) return;
+    const old = launchedAppContexts.get(data.oldHomeToken);
+    const record = old?.chatReconnectPending;
+    if (!record || record.requestId !== data.requestId || record.freshToken !== data.freshHomeToken
+      || !record.launched || typeof data.ok !== "boolean") return;
+    settleChatReconnect(old, record, data.ok ? null : new Error("Home could not reopen this Chat window"));
+    return;
+  }
+  if (data.type === "home:chat-authority-committed") {
+    if (context.kind !== "shell-frame" || context.targetId !== HOME_GUI_SHELL_ID
+      || !hasExactMessageKeys(data, ["type", "requestId", "oldHomeToken", "freshHomeToken", "ok", "homeToken"])) return;
+    const fresh = launchedAppContexts.get(data.freshHomeToken);
+    const commit = fresh?.chatReconnectCommit;
+    if (fresh?.targetId !== "chat-room" || !commit || commit.requestId !== data.requestId
+      || commit.oldToken !== data.oldHomeToken || typeof data.ok !== "boolean") return;
+    delete fresh.chatReconnectCommit;
+    if (!data.ok) retireLaunchedAppContext(data.freshHomeToken);
+    return;
+  }
   if (data.type === "home:launch-target") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const target = typeof data.target === "string" ? data.target.trim() : "";
+    if (context.kind === "app-frame" && context.targetId === "chat-room") {
+      const query = data.query;
+      const keys = query && typeof query === "object" && !Array.isArray(query) ? Object.keys(query) : null;
+      const validQuery = keys && (keys.length === 0 || (keys.length === 1 && keys[0] === "conversation_id"
+        && typeof query.conversation_id === "string" && /^[A-Za-z0-9:._-]{1,512}$/.test(query.conversation_id)));
+      if (!hasExactMessageKeys(data, ["type", "requestId", "target", "query", "homeToken"])
+        || !/^[A-Za-z0-9-]{1,64}$/.test(requestId) || requestId !== data.requestId
+        || target !== "chat-room" || target !== data.target || data.homeToken !== context.homeToken || !validQuery) {
+        replyToShellRequest(event, requestId, null, new Error("Home denied the Chat reconnect"));
+        return;
+      }
+      const old = launchedAppContexts.get(context.homeToken);
+      if (old.chatReconnectPending) {
+        if (old.chatReconnectPending.requestId !== requestId) {
+          replyToShellRequest(event, requestId, null, new Error("Chat is already reconnecting"));
+        }
+        return;
+      }
+      const record = { requestId, oldToken: context.homeToken, event, freshToken: "", launched: null,
+        expiresAt: Date.now() + 20000, timeout: 0 };
+      old.chatReconnectPending = record;
+      record.timeout = window.setTimeout(() => {
+        if (old.chatReconnectPending !== record) return;
+        settleChatReconnect(old, record, new Error("Home could not reopen Chat in time"));
+      }, 25000);
+      let createdToken = "";
+      launchHomeTarget("chat-room", query).then((launched) => {
+        const freshToken = homeLaunchTokenFromRoute(launched?.route || "");
+        createdToken = freshToken;
+        const fresh = launchedAppContexts.get(freshToken);
+        if (launched?.target !== "chat-room" || launched.attach_kind !== "iframe"
+          || (launched.launch_status && launched.launch_status !== "launched")
+          || !fresh || freshToken === context.homeToken || fresh.source
+          || launchedAppContexts.get(context.homeToken) !== old || old.source !== event.source
+          || old.chatReconnectPending !== record) {
+          if (freshToken && freshToken !== context.homeToken) retireLaunchedAppContext(freshToken);
+          throw new Error("Home could not reopen this Chat window");
+        }
+        requireHomeGuiActive("reconnect Chat");
+        record.freshToken = freshToken;
+        record.launched = launched;
+        if (!postToActiveShell({ type: "home:gui-command", command: "renew-chat-authority",
+          phase: "prepare", requestId, homeToken: context.homeToken, launched, expiresAt: record.expiresAt })) {
+          throw new Error("Home GUI could not reopen Chat");
+        }
+      }).catch((error) => {
+        if (createdToken && createdToken !== context.homeToken) retireLaunchedAppContext(createdToken);
+        settleChatReconnect(old, record, error);
+      });
+      return;
+    }
     if (
       context.kind !== "shell-frame" ||
       ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId) ||
       !requestId ||
       !target ||
-      !canOpenTargetFromHomeMessage(context, target)
+      !(canOpenTargetFromHomeMessage(context, target) ||
+        (context.targetId === HOME_GUI_SHELL_ID && consumeOwnerLaunchGrant(target, data.query)))
     ) {
       replyToShellRequest(event, requestId, null, new Error("Home denied the shell launch"));
       return;
@@ -1693,6 +1939,36 @@ window.addEventListener("message", (event) => {
       }));
     return;
   }
+  if (data.type === "elastos.home.passkey-add.request/v1") {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    if (
+      context.kind !== "app-frame"
+      || context.targetId !== SYSTEM_APP_ID
+      || !hasExactMessageKeys(data, ["type", "requestId", "homeToken"])
+      || !requestId
+      || requestId.length > 128
+    ) {
+      console.warn("home ignored unauthorized passkey add request", context.targetId);
+      return;
+    }
+    const reply = (payload) => {
+      try {
+        event.source?.postMessage({
+          type: "elastos.home.passkey-add.result/v1",
+          requestId,
+          ...payload,
+        }, OPAQUE_FRAME_TARGET);
+      } catch (error) {
+        console.error("home could not return passkey add result", error);
+      }
+    };
+    addAccountPasskey(context.homeToken)
+      .then(({ role }) => reply({ role }))
+      .catch((error) => reply({
+        error: error instanceof Error ? error.message : "Home did not add the passkey.",
+      }));
+    return;
+  }
   if (data.type === "home:sign-out") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     if (
@@ -1728,23 +2004,12 @@ window.addEventListener("message", (event) => {
       .catch((error) => replyToShellRequest(event, requestId, null, error));
     return;
   }
+  if (data.type === HOME_OPEN_EXTERNAL_TYPE) {
+    requestExternalLink(context, data);
+    return;
+  }
   if (data.type === "home:open-uri") {
-    if (!canOpenUriFromHomeMessage(context)) {
-      console.warn("home ignored unauthorized open-uri message", context.targetId);
-      return;
-    }
-    const resolved = resolveOpenUri(data);
-    if (!resolved) {
-      console.warn("home could not resolve URI", data.uri);
-      return;
-    }
-    if (!targetById(shellState.currentSummary, resolved.target)) {
-      console.warn("home could not open URI because its viewer is not installed", data.uri);
-      return;
-    }
-    openTargetFromHomeGui(resolved.target, { query: resolved.query }).catch((error) => {
-      console.error("home open-uri failed", error);
-    });
+    requestHomeSharedContent({ context, data, prompt: homeExternalLinkPrompt, fetchJson });
     return;
   }
   if (data.type === "home:deliver-to-target") {
@@ -1820,6 +2085,16 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
+  if (context.targetId === "chat-room" && ["people", "inbox"].includes(target)) {
+    if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
+      || !data.query || typeof data.query !== "object" || Array.isArray(data.query)) return;
+    const keys = Object.keys(data.query);
+    const peopleDid = target === "people" && keys.length === 1 && keys[0] === "did"
+      && typeof data.query.did === "string" && data.query.did.length <= 512
+      && data.query.did === data.query.did.trim()
+      && /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(data.query.did);
+    if (keys.length !== 0 && !peopleDid) return;
+  }
   if (["assistant", "home-agent"].includes(context.targetId)) {
     if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])) return;
     const marketplace = data.target === "marketplace" && assistantModelsMarketplaceQuery(data.query);
@@ -1831,12 +2106,6 @@ window.addEventListener("message", (event) => {
   if (context.targetId === "marketplace" && target === "assistant" &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
        !marketplaceAssistantHandoffQuery(data.query))) return;
-  if (context.targetId === "marketplace" && target === "services" &&
-      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
-       || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
-       || Object.keys(data.query).join(",") !== "service_offer_id"
-       || typeof data.query.service_offer_id !== "string"
-       || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.query.service_offer_id))) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&
@@ -1867,6 +2136,10 @@ window.addEventListener("message", (event) => {
       console.warn("home ignored non-graphical shell open-target message", context.targetId, target);
     }
     return;
+  }
+  if (context.kind === "app-frame" && SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId] instanceof Set &&
+      !targetById(shellState.currentSummary, target)) {
+    grantOwnerLaunch(target, query);
   }
   openTargetFromHomeGui(target, { query }).catch((error) => {
     console.error("home open-target failed", error);
@@ -2032,8 +2305,53 @@ function isBoundedStepUpRequest(request) {
   }
 }
 
-function canOpenUriFromHomeMessage(context) {
-  return context.kind === "home" || SHELL_MESSAGE_OPEN_URI_SOURCES.has(context.targetId);
+// An app frame or Home CLI asks Home to open a web link. The Runtime names the
+// app from its signed launch and returns the one validated address; Home then
+// shows its own sheet (home-external-link.js). The app never gets a reply.
+function requestExternalLink(context, data) {
+  const sender = context.kind === "app-frame" ||
+    (context.kind === "shell-frame" && context.targetId === HOME_CLI_SHELL_ID);
+  if (
+    !sender ||
+    !hasExactMessageKeys(data, ["type", "url", "homeToken"]) ||
+    typeof data.url !== "string" ||
+    !data.url ||
+    data.url.length > MAX_EXTERNAL_LINK_LENGTH
+  ) {
+    console.warn("home ignored an open-external message");
+    return;
+  }
+  const requestId = homeExternalLinkPrompt.begin({
+    homeToken: context.homeToken,
+    appId: context.targetId,
+  });
+  if (!requestId) {
+    return;
+  }
+  fetchJson("/api/apps/home/external-link", {
+    method: "POST",
+    body: JSON.stringify({
+      schema: EXTERNAL_LINK_REQUEST_SCHEMA,
+      app_token: context.homeToken,
+      url: data.url,
+    }),
+  })
+    .then((result) => {
+      if (!homeExternalLinkPrompt.show(requestId, result)) {
+        console.warn("home ignored an open-external message");
+      }
+    })
+    .catch(() => {
+      homeExternalLinkPrompt.abandon(requestId);
+      console.warn("home ignored an open-external message");
+    });
+}
+
+function externalLinkSenderIsLive(homeToken) {
+  return launchedAppContexts.has(homeToken) || (
+    shellState.activeShellRootTarget === HOME_CLI_SHELL_ID &&
+    activeShellRootHomeToken() === homeToken
+  );
 }
 
 function canOpenTargetFromHomeMessage(context, target) {
@@ -2054,56 +2372,35 @@ function canOpenTargetFromHomeMessage(context, target) {
   return policy.has(target);
 }
 
+function ownerLaunchGrantKey(target, query) {
+  const entries = Object.entries(query && typeof query === "object" ? query : {})
+    .filter(([key]) => key.trim())
+    .map(([key, value]) => [key, typeof value === "string" ? value : String(value ?? "")])
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return JSON.stringify([target, entries]);
+}
+
+function grantOwnerLaunch(target, query) {
+  const now = Date.now();
+  const live = ownerLaunchGrants.filter((grant) => grant.expiresAt > now).slice(1 - OWNER_LAUNCH_GRANT_LIMIT);
+  ownerLaunchGrants.splice(0, ownerLaunchGrants.length, ...live,
+    { key: ownerLaunchGrantKey(target, query), expiresAt: now + OWNER_LAUNCH_GRANT_MS });
+}
+
+function consumeOwnerLaunchGrant(target, query) {
+  const key = ownerLaunchGrantKey(target, query);
+  const index = ownerLaunchGrants.findIndex((grant) => grant.key === key && grant.expiresAt > Date.now());
+  if (index < 0) return false;
+  ownerLaunchGrants.splice(index, 1);
+  return true;
+}
+
 function canDeliverTargetFromHomeMessage(context, target) {
   if (context.kind !== "app-frame" && context.kind !== "shell-frame") {
     return false;
   }
   const policy = SHELL_MESSAGE_DELIVER_TARGET_SOURCES[context.targetId];
   return !!policy && policy.has(target);
-}
-
-function resolveOpenUri(data) {
-  const uri = typeof data.uri === "string" ? data.uri.trim() : "";
-  if (!uri.startsWith("elastos://")) {
-    return null;
-  }
-  const peerInvite = resolvePeerInviteUri(uri);
-  if (peerInvite) {
-    return peerInvite;
-  }
-  const cid = uri.slice("elastos://".length).split(/[/?#]/)[0].trim();
-  if (!cid) {
-    return null;
-  }
-  const preferredViewer = typeof data.preferredViewer === "string" ? data.preferredViewer.trim() : "";
-  if (preferredViewer === "documents" || preferredViewer === "") {
-    return {
-      target: "documents",
-      query: {
-        cid,
-        uri,
-        view: "read",
-      },
-    };
-  }
-  return null;
-}
-
-function resolvePeerInviteUri(uri) {
-  try {
-    const parsed = new URL(uri);
-    const path = parsed.pathname.replace(/^\/+/, "");
-    const isPeerInvite = parsed.hostname === "peer" && path === "invite";
-    if (parsed.protocol === "elastos:" && isPeerInvite && parsed.searchParams.get("token")) {
-      return {
-        target: "chat-room",
-        query: { invite: uri },
-      };
-    }
-  } catch (_error) {
-    return null;
-  }
-  return null;
 }
 
 async function boot() {
@@ -2170,6 +2467,7 @@ function startShellTimers() {
       if (document.hidden) {
         return;
       }
+      homeEventsReconnectAttempts = 0;
       requestShellSummaryRefresh({ reason: "visibilitychange", delay: 0 });
       ensureHomeEventChannel();
     });
@@ -2188,11 +2486,16 @@ function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRES
       return;
     }
     shellState.summaryRefreshInFlight = true;
-    refreshShellSummary().catch((error) => {
+    refreshShellSummary().then(() => {
+      homeLink.reportSuccess();
+    }).catch((error) => {
       if (isHomeAuthError(error)) {
         showHostAuthGate().catch((unlockError) => {
           console.error("home unlock failed", unlockError);
         });
+        return;
+      }
+      if (homeLink.reportFailure(error)) {
         return;
       }
       console.error(`home summary refresh failed (${reason})`, error);
@@ -2213,60 +2516,6 @@ function homeSummaryHasProofBoundSession(summary) {
     typeof summary?.authority?.proof_binding_id === "string" &&
     summary.authority.proof_binding_id.trim() !== ""
   );
-}
-
-function stopHomePresenceHeartbeat() {
-  if (shellState.presenceHeartbeatTimer !== null) {
-    window.clearInterval(shellState.presenceHeartbeatTimer);
-    shellState.presenceHeartbeatTimer = null;
-  }
-}
-
-function publishHomePresence() {
-  if (
-    !homeSummaryHasProofBoundSession(shellState.currentSummary) ||
-    shellState.presenceHeartbeatInFlight
-  ) {
-    return shellState.presenceHeartbeatInFlight || Promise.resolve(null);
-  }
-  const pending = fetchJson("/api/apps/home/collaboration/presence", {
-    method: "POST",
-    body: JSON.stringify({}),
-  })
-    .catch((error) => {
-      if (isHomeAuthError(error)) {
-        stopHomePresenceHeartbeat();
-      }
-      // Presence needs a saved Profile. Before one exists the Runtime
-      // answers 409 every heartbeat, so a first run scrolls its console
-      // with a refusal it already predicted. Stop asking until something
-      // about this Home changes.
-      if (error?.status === 409) {
-        stopHomePresenceHeartbeat();
-      }
-      return null;
-    })
-    .finally(() => {
-      if (shellState.presenceHeartbeatInFlight === pending) {
-        shellState.presenceHeartbeatInFlight = null;
-      }
-    });
-  shellState.presenceHeartbeatInFlight = pending;
-  return pending;
-}
-
-function syncHomePresenceHeartbeat(summary) {
-  if (!homeSummaryHasProofBoundSession(summary)) {
-    stopHomePresenceHeartbeat();
-    return;
-  }
-  if (shellState.presenceHeartbeatTimer === null) {
-    shellState.presenceHeartbeatTimer = window.setInterval(
-      publishHomePresence,
-      PRESENCE_HEARTBEAT_MS,
-    );
-    publishHomePresence();
-  }
 }
 
 function refreshSignedHomeSession() {
@@ -2290,13 +2539,13 @@ function refreshSignedHomeSession() {
 async function refreshShellSummary({
   deferHomeGuiForBootHint = false,
   deferHomeGuiForRuntimeSettle = false,
+  signal,
 } = {}) {
-  const summary = await fetchJson("/api/apps/home/summary");
+  const summary = await fetchJson("/api/apps/home/summary", { signal });
   shellState.currentSummary = summary;
+  syncHomeUpdateBar(summary);
   shellState.requestSummaryRefresh = refreshShellSummary;
   document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
-  syncHomePresenceHeartbeat(summary);
-
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();
   } else {
@@ -2311,10 +2560,44 @@ async function refreshShellSummary({
   return summary;
 }
 
+function bindHomeEventLifecycle() {
+  window.addEventListener("pagehide", () => {
+    homeEventsChannelActive = false;
+    stopHomeEventChannel();
+  });
+  window.addEventListener("pageshow", () => {
+    homeEventsChannelActive = true;
+    ensureHomeEventChannel();
+  });
+}
+
+bindHomeEventLifecycle();
+
+async function withHomeEventRequestDeadline(controller, timeout, request) {
+  const clearDeadline = () => {
+    window.clearTimeout(timer);
+    controller.signal.removeEventListener("abort", clearDeadline);
+  };
+  const timer = window.setTimeout(() => {
+    const error = new Error("Home event request timed out.");
+    error.name = "TimeoutError";
+    controller.abort(error);
+  }, timeout);
+  controller.signal.addEventListener("abort", clearDeadline, { once: true });
+  try {
+    if (controller.signal.aborted) {
+      const error = new Error("Home event request was cancelled.");
+      error.name = "AbortError";
+      throw error;
+    }
+    return await request(controller.signal);
+  } finally {
+    clearDeadline();
+  }
+}
+
 function ensureHomeEventChannel() {
-  if (
-    !homeSummarySignedIn(shellState.currentSummary)
-  ) {
+  if (!homeEventsChannelActive || document.hidden || !homeSummarySignedIn(shellState.currentSummary)) {
     return;
   }
   if (window.EventSource && !shellState.homeEventsStreamFailed) {
@@ -2329,6 +2612,13 @@ function ensureHomeEventChannel() {
 }
 
 function stopHomeEventChannel() {
+  homeEventsChannelGeneration += 1;
+  homeEventsPollController?.abort();
+  homeEventsPollController = null;
+  homeEventsReconnectController?.abort();
+  homeEventsReconnectController = null;
+  homeEventsReconnectInFlight = null;
+  homeEventsReconnectAttempts = 0;
   shellState.homeEventsCursor = "";
   shellState.homeEventsInFlight = false;
   shellState.homeEventsStreamFailed = false;
@@ -2340,67 +2630,156 @@ function stopHomeEventChannel() {
   shellState.homeEventsTimer = null;
 }
 
-function ensureHomeEventStream() {
-  if (shellState.homeEventsSource) {
+function refreshHomeAfterEventReconnect() {
+  if (!homeEventsChannelActive || document.hidden) return Promise.resolve(null);
+  if (!homeEventsReconnectInFlight) {
+    const generation = homeEventsChannelGeneration;
+    const controller = new AbortController();
+    homeEventsReconnectController = controller;
+    const current = () => homeEventsChannelActive && generation === homeEventsChannelGeneration;
+    const pending = Promise.resolve()
+      .then(() => current() && homeSummaryHasProofBoundSession(shellState.currentSummary)
+        ? withHomeEventRequestDeadline(controller, HOME_EVENTS_RECONNECT_TIMEOUT_MS,
+          signal => refreshHomeSession({ signal })) : null)
+      .then(() => current() ? withHomeEventRequestDeadline(controller, HOME_EVENTS_RECONNECT_TIMEOUT_MS,
+        signal => refreshShellSummary({ signal })) : null)
+      .then((summary) => {
+        if (current() && homeSummarySignedIn(summary)) {
+          broadcastHomeRuntimeEvents([{
+            kind: "home.summary.changed",
+            scope: "home",
+            at: Math.floor(Date.now() / 1000),
+          }]);
+        }
+        return summary;
+      })
+      .finally(() => {
+        if (homeEventsReconnectInFlight === pending) homeEventsReconnectInFlight = null;
+        if (homeEventsReconnectController === controller) homeEventsReconnectController = null;
+      });
+    homeEventsReconnectInFlight = pending;
+  }
+  return homeEventsReconnectInFlight;
+}
+
+function retryHomeEventChannel(error) {
+  if (!homeEventsChannelActive) return;
+  if (isHomeAuthError(error)) {
+    clearHomeAuthorityToken();
+    stopHomeEventChannel();
+    showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
+      console.error("home unlock failed", unlockError);
+    });
+    return;
+  }
+  homeEventsReconnectAttempts = Math.min(homeEventsReconnectAttempts + 1, 5);
+  scheduleHomeEventPoll(Math.min(HOME_EVENTS_RETRY_MS * 2 ** (homeEventsReconnectAttempts - 1), HOME_EVENTS_MAX_RETRY_MS));
+}
+
+function ensureHomeEventStream({ refreshOnOpen = true } = {}) {
+  if (!homeEventsChannelActive || document.hidden || shellState.homeEventsSource) {
     return;
   }
   window.clearTimeout(shellState.homeEventsTimer);
   const source = new EventSource(HOME_EVENTS_STREAM_URL, { withCredentials: true });
   shellState.homeEventsSource = source;
+  const reconnect = (error) => {
+    if (shellState.homeEventsSource !== source) {
+      return;
+    }
+    source.close();
+    shellState.homeEventsSource = null;
+    if (!homeSummarySignedIn(shellState.currentSummary)) {
+      stopHomeEventChannel();
+      return;
+    }
+    shellState.homeEventsStreamFailed = true;
+    retryHomeEventChannel(error);
+  };
+  source.addEventListener("open", () => {
+    if (!refreshOnOpen || shellState.homeEventsSource !== source) {
+      return;
+    }
+    refreshHomeAfterEventReconnect()
+      .then(() => {
+        if (shellState.homeEventsSource === source) homeEventsReconnectAttempts = 0;
+      })
+      .catch(reconnect);
+  });
   source.addEventListener("runtime-events", (event) => {
+    if (shellState.homeEventsSource !== source) {
+      return;
+    }
     try {
       handleHomeEventsPayload(JSON.parse(event.data || "{}"), { broadcastInitial: true });
     } catch (error) {
       console.warn("home event stream returned invalid payload", error);
     }
   });
-  source.onerror = () => {
-    if (!homeSummarySignedIn(shellState.currentSummary)) {
-      stopHomeEventChannel();
-      return;
-    }
-    shellState.homeEventsStreamFailed = true;
-    source.close();
-    if (shellState.homeEventsSource === source) {
-      shellState.homeEventsSource = null;
-    }
-    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
-  };
+  source.onerror = reconnect;
 }
 
 async function pollHomeEvents() {
+  if (!homeEventsChannelActive || shellState.homeEventsInFlight || shellState.homeEventsSource) {
+    return;
+  }
   if (!homeSummarySignedIn(shellState.currentSummary)) {
     stopHomeEventChannel();
     return;
   }
   if (document.hidden) {
-    scheduleHomeEventPoll(HOME_EVENTS_HIDDEN_RETRY_MS);
     return;
   }
   shellState.homeEventsInFlight = true;
+  const generation = homeEventsChannelGeneration;
+  const controller = new AbortController();
+  homeEventsPollController = controller;
+  const reconnecting = shellState.homeEventsStreamFailed || homeEventsReconnectAttempts > 0;
   const params = new URLSearchParams({
-    wait_ms: String(HOME_EVENTS_WAIT_MS),
+    wait_ms: String(reconnecting ? 0 : HOME_EVENTS_WAIT_MS),
   });
   if (shellState.homeEventsCursor) {
     params.set("cursor", shellState.homeEventsCursor);
   }
   const hadCursor = Boolean(shellState.homeEventsCursor);
+  let restartStream = false;
   try {
-    const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`);
-    handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
-    scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
-  } catch (error) {
-    if (isHomeAuthError(error)) {
-      stopHomeEventChannel();
-      showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
-        console.error("home unlock failed", unlockError);
-      });
+    const payload = await withHomeEventRequestDeadline(controller,
+      reconnecting ? HOME_EVENTS_RECONNECT_TIMEOUT_MS : HOME_EVENTS_POLL_TIMEOUT_MS,
+      signal => fetchJson(`/api/apps/home/events?${params.toString()}`, { signal }));
+    if (generation !== homeEventsChannelGeneration) {
       return;
     }
-    console.warn("home event channel failed", error);
-    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
+    homeLink.reportSuccess();
+    if (reconnecting) {
+      await refreshHomeAfterEventReconnect();
+    }
+    if (generation !== homeEventsChannelGeneration || !homeSummarySignedIn(shellState.currentSummary)) {
+      return;
+    }
+    handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
+    homeEventsReconnectAttempts = 0;
+    if (window.EventSource) {
+      shellState.homeEventsStreamFailed = false;
+      restartStream = homeSummarySignedIn(shellState.currentSummary);
+    } else {
+      scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
+    }
+  } catch (error) {
+    if (generation === homeEventsChannelGeneration) {
+      if (!homeLink.reportFailure(error)) {
+        console.warn("home event channel failed", error);
+      }
+      retryHomeEventChannel(error);
+    }
   } finally {
-    shellState.homeEventsInFlight = false;
+    if (homeEventsPollController === controller) {
+      homeEventsPollController = null;
+      shellState.homeEventsInFlight = false;
+    }
+  }
+  if (restartStream) {
+    ensureHomeEventStream({ refreshOnOpen: false });
   }
 }
 
@@ -2439,6 +2818,8 @@ function homeEventsRequireShellSummary(events) {
 
 function scheduleHomeEventPoll(delayMs) {
   window.clearTimeout(shellState.homeEventsTimer);
+  shellState.homeEventsTimer = null;
+  if (!homeEventsChannelActive || document.hidden || !homeSummarySignedIn(shellState.currentSummary)) return;
   shellState.homeEventsTimer = window.setTimeout(
     pollHomeEvents,
     Math.max(250, Number(delayMs) || HOME_EVENTS_RETRY_MS),

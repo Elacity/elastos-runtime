@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/marketplace/browser");
@@ -32,6 +33,11 @@ const mediaAvailability = {
   recheck_before_buy: true,
   recheck_before_open: true,
 };
+const modelCid = `bafybei${"m".repeat(52)}`;
+const modelTitle = "Fixture model with a long title for clear phone detail controls";
+const sharedOfferId = "remote:grant-one:model:writer";
+const contactOfferId = "contact-ai";
+const marketplaceManifest = JSON.parse(await readFile(join(repoRoot, "capsules/marketplace/capsule.json"), "utf8"));
 
 function mediaListing({ mintId, displayName, accessState, quantity, price, codecs = "avc1.640028" }) {
   return {
@@ -95,6 +101,7 @@ const catalogCapsules = [
     accepted_content: [{ name: "markdown", title: "Markdown" }],
     requires: [{ name: "people" }],
     viewer_title: "Documents",
+    publisher_did: "did:key:z6MkFixtureReleasePublisher",
   },
   {
     name: "object-provider",
@@ -117,7 +124,8 @@ const catalogCapsules = [
     category: "apps",
     role: "app",
     installed: false,
-    launchable: false,
+    launchable: true,
+    launch_target: "bad-icons",
     type: "wasm",
     icon: [
       { size: 128, route: "/apps/not-allowed/icons/icon-128.png" },
@@ -135,6 +143,21 @@ const catalogCapsules = [
     launchable: false,
     type: "wasm",
     accepted_content: [{ name: "zip", title: "ZIP archives" }],
+  },
+  {
+    name: "fixture-model",
+    title: modelTitle,
+    description: "Small model for quick answers.",
+    role: "content",
+    source: "signed-model-catalog",
+    installed: false,
+    launchable: false,
+    cid: modelCid,
+    publisher_did: "did:key:z6MkFixtureModelPublisher",
+    content_size_bytes: 1_320_000_000,
+    signature_state: "catalog-signature-verified",
+    model_memory_fit: "fits",
+    model_runtime: { admitted: false, kept: false, dispatch_ready: false, dispatch_unavailable_reason: null, offer_id: null, preparation: null },
   },
 ];
 
@@ -190,6 +213,12 @@ const interfaceEntries = [
     },
     bindings: [],
   },
+  // The model controls bind Marketplace's own typed content methods.
+  ...marketplaceManifest.interfaces.map((entry) => ({
+    capsule: "marketplace",
+    interface: entry,
+    bindings: entry.methods.map((method) => ({ method: method.id, executable: true })),
+  })),
 ];
 
 function assert(condition, message, details = undefined) {
@@ -264,7 +293,7 @@ function buildShellDocument(appSrc) {
   return `<!doctype html>
 <html>
 <body style="margin:0">
-  <iframe id="app" title="Apps" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${appSrc}" style="border:0;width:100%;height:100vh"></iframe>
+  <iframe id="app" title="Marketplace" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${appSrc}" style="border:0;width:100%;height:100vh"></iframe>
   <script>
     window.addEventListener("message", (event) => {
       if (event.data?.type !== "fixture:post-to-app") return;
@@ -429,7 +458,7 @@ function startServer() {
           json(response, { message: "provider launch failed" }, 500);
           return;
         }
-        json(response, { capsules: catalogCapsules });
+        json(response, { schema: "elastos.capsules.catalog/v1", capsules: catalogCapsules, model_catalog_state: "verified", policy: { protected_content: true } });
         return;
       }
       if (url.pathname === "/api/capsules/interfaces") {
@@ -440,6 +469,30 @@ function startServer() {
           await state[normalToken].initialInterfacesBarrier.promise;
         }
         json(response, { interfaces: interfaceEntries });
+        return;
+      }
+      // A contact's Services offer: Services is hidden, so Marketplace must not show it.
+      if (url.pathname === "/api/apps/services/summary") {
+        json(response, {
+          remote_offers: [],
+          available_remote_offers: [{ service_kind: "remote_model", offer_id: contactOfferId, display_name: "Contact AI", status: "requestable" }],
+        });
+        return;
+      }
+      if (url.pathname === "/api/provider/model/offers_list") {
+        json(response, {
+          status: "ok",
+          data: {
+            remote_services: [],
+            offers: [{
+              id: sharedOfferId, title: "Shared writing model", operation: "text.generate",
+              input_modalities: ["text/plain"], output_modalities: ["text/plain"],
+              remote_service: { grant_id: "grant-one", display_name: "Owner Home", expires_at: 4_000_000_000 },
+              hosted: { backend_provider_label: "Venice", requested_selector: "writing-model", payer: "this Home" },
+              policy: { concurrency_limit: 1, input_bytes_limit: 4096, runtime_ms_limit: 30000 },
+            }],
+          },
+        });
         return;
       }
       if (url.pathname === "/api/provider/object/list_runtime_custody") {
@@ -530,6 +583,15 @@ async function readHomeMessages(page) {
   );
 }
 
+const PHONE_SCREENSHOT = "/tmp/marketplace-phone-390x844.png";
+const PHONE_DRAWER_SCREENSHOT = "/tmp/marketplace-phone-drawer-390x844.png";
+const PHONE_TOUCH_TARGET_PX = 44;
+const MODELS_SCREENSHOT = "/tmp/marketplace-models-1280x900.png";
+const MODEL_DETAIL_SCREENSHOT = "/tmp/marketplace-model-detail-1280x900.png";
+const MODELS_PHONE_SCREENSHOT = "/tmp/marketplace-models-phone-390x844.png";
+const MODEL_DETAIL_PHONE_SCREENSHOT = "/tmp/marketplace-model-detail-phone-390x844.png";
+// Longer than the detail modal's 0.16 s fade, so screenshots show it settled.
+const MODAL_FADE_MS = 250;
 async function waitForFrameWidth(frame, expectedWidth) {
   await frame.waitForFunction((width) => window.innerWidth === width, expectedWidth);
 }
@@ -562,6 +624,210 @@ async function assertNoHorizontalOverflow(frame, label) {
   assert(overflow.doc <= 1, `${label}: document overflowed horizontally`, overflow);
   assert(overflow.main <= 1, `${label}: main overflowed horizontally`, overflow);
   assert(overflow.shell <= 1, `${label}: shell overflowed horizontally`, overflow);
+}
+
+// Box facts that make two items look the same; runs in the page.
+function readBoxStyle(node) {
+  const style = getComputedStyle(node);
+  return {
+    display: style.display,
+    firstTrack: style.gridTemplateColumns.split(" ")[0],
+    minHeight: style.minHeight,
+    padding: style.padding,
+    border: style.borderBottom,
+    radius: style.borderRadius,
+    background: style.backgroundColor,
+    color: style.color,
+    font: `${style.fontSize} ${style.fontWeight}`,
+  };
+}
+
+async function lastOpenTarget(page) {
+  return (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").at(-1);
+}
+
+// Element structure of a store row, in the page: the same element, icon slot,
+// text block and an optional action button for every kind of item.
+function storeRowShape(node) {
+  return {
+    row: `${node.tagName}.${node.classList.contains("store-row")}`,
+    children: [...node.children].map((child) => child.classList.contains("app-icon") ? `icon.${child.classList.contains("store-row-icon")}` : child.tagName === "BUTTON" ? null : child.className).filter(Boolean),
+    text: [...node.querySelector(".store-row-text").children].map((child) => child.className),
+    actionSlot: [...node.querySelectorAll(":scope > button")].every((child) => child.className === "store-pill"),
+  };
+}
+
+// Section structure of the open detail, in the page: header, the body's
+// sections in order (Works with is optional) and the footer.
+function detailShape() {
+  const content = document.querySelector("#detail-content");
+  const classes = (nodes) => [...nodes].map((node) => node.classList.contains("app-icon") ? "icon" : `${node.tagName.toLowerCase()}.${node.className}`);
+  return {
+    header: classes(content.querySelector(".modal-header").children),
+    title: classes(content.querySelectorAll(".modal-title-section > :not(.modal-version)")),
+    sections: [...content.querySelector(".modal-body").children]
+      .filter((section) => section.querySelector(".modal-section-title")?.textContent.trim() !== "Works with")
+      .map((section) => `${section.tagName.toLowerCase()}.${section.className}:${section.querySelector(".modal-section-title")?.textContent.trim()}:${classes([...section.children].slice(1)).join("+")}`),
+    footer: classes(content.querySelector(".modal-footer").children),
+    actions: classes(content.querySelectorAll(".modal-footer-actions button")).map((name) => name.replace(/^button\.modal-btn (secondary|primary).*$/, "button.modal-btn $1")),
+  };
+}
+
+// Models are ordinary Marketplace items: store rows, the app detail modal and
+// its footer actions, with size and device fit in the row's facts line.
+async function assertModelsLayout(page, frame, { appPrimaryStyle, appRowStyle }) {
+  await frame.locator('#category-list [data-destination="apps"]').click();
+  const appRow = frame.locator('.store-row[data-app="documents"]').first();
+  await appRow.waitFor();
+  const appRowShape = await appRow.evaluate(storeRowShape);
+  await appRow.click();
+  await frame.locator("#detail-modal.active").waitFor();
+  const appDetailShape = await frame.evaluate(detailShape);
+  await page.keyboard.press("Escape");
+  await frame.locator("#detail-modal:not(.active)").waitFor({ state: "attached" });
+  await frame.locator('#category-list [data-destination="models"]').click();
+  const modelRow = frame.locator(`.store-row[data-app="model:${modelCid}"]`);
+  await modelRow.waitFor();
+  const heads = await frame.locator("#store-sections .store-section-head, #store-sections [data-action=\"refresh-shared-models\"]").count();
+  assert(heads === 0, "Models must list one row set like every category, with no group headings or Refresh", { heads });
+  await frame.locator('.store-row[data-action="shared-detail"]').waitFor();
+  const ownComponents = await frame.locator(
+    ".shared-model-card, .store-models-settings, .shared-model-facts, #store-sections .store-section > p:not(.store-inline-note)",
+  ).count();
+  assert(ownComponents === 0, "Models must not use their own cards, settings bar or intro copy", { ownComponents });
+  const rows = await frame.locator("#store-sections .store-row").evaluateAll((nodes) => nodes.map((node) => ({
+    title: node.querySelector(".store-row-title")?.textContent.trim() || "",
+    sub: node.querySelector(".store-row-sub")?.textContent.trim() || "",
+    pill: node.querySelector(".store-pill")?.textContent.trim() || "",
+    icon: Boolean(node.querySelector(".store-row-icon")),
+  })));
+  assert(
+    JSON.stringify(rows) === JSON.stringify([
+      { title: modelTitle, sub: "1.32 GB · Fits this device", pill: "", icon: true },
+      { title: "Shared writing model", sub: "Shared by Owner Home", pill: "Open", icon: true },
+    ]),
+    "Model rows must carry a title, one facts line and at most one row action",
+    rows,
+  );
+  // A model row is the app row: same element, icon slot, text block and action slot.
+  for (const row of await frame.locator("#store-sections .store-row").all()) {
+    const shape = await row.evaluate(storeRowShape);
+    assert(JSON.stringify(shape) === JSON.stringify(appRowShape), "Model rows must share the app row structure", { shape, appRowShape });
+  }
+  const modelRowStyle = await modelRow.evaluate(readBoxStyle);
+  assert(JSON.stringify(modelRowStyle) === JSON.stringify(appRowStyle), "Model rows must use the app row layout", { modelRowStyle, appRowStyle });
+  await assertNoHorizontalOverflow(frame, "Marketplace Models");
+  await page.screenshot({ path: MODELS_SCREENSHOT });
+
+  await modelRow.focus();
+  await modelRow.press("Enter");
+  await frame.locator("#detail-modal.active").waitFor();
+  const get = frame.locator('.modal-footer-actions [data-model-control="use"]');
+  await get.waitFor();
+  await frame.getByRole("group", { name: "Model status" }).waitFor();
+  const detail = await frame.evaluate(() => ({
+    developer: document.querySelector(".modal-developer")?.textContent.trim(),
+    status: [...document.querySelectorAll("[data-model-management] li:not([hidden])")].map((node) => node.textContent.trim()),
+    actions: [...document.querySelectorAll(".modal-body .modal-section:nth-child(3) li")].map((node) => node.textContent.trim()),
+    footer: [...document.querySelectorAll(".modal-footer-actions button")].map((node) => node.textContent.trim()),
+    chip: document.querySelector(".modal-footer .trust-chip")?.textContent.trim(),
+  }));
+  assert(
+    JSON.stringify(detail) === JSON.stringify({
+      developer: "Verified publisher",
+      status: ["Not on this device yet", "Download size: 1.32 GB", "Fits this device's memory. It needs some free memory to reply."],
+      actions: ["Get and keep on this device", "Open in Assistant", "Remove in System → Models"],
+      footer: ["Close", "Get"],
+      chip: "Catalog signature verified",
+    }),
+    "The model detail must use the app detail layout with Get next to Close",
+    detail,
+  );
+  const modelDetailShape = await frame.evaluate(detailShape);
+  assert(JSON.stringify(modelDetailShape) === JSON.stringify(appDetailShape), "A model detail must share the app detail structure", { modelDetailShape, appDetailShape });
+  const getStyle = await get.evaluate(readBoxStyle);
+  assert(JSON.stringify(getStyle) === JSON.stringify(appPrimaryStyle), "Get must look like an app's Open button", { getStyle, appPrimaryStyle });
+  await page.waitForTimeout(MODAL_FADE_MS);
+  await page.screenshot({ path: MODEL_DETAIL_SCREENSHOT });
+  let summaryFocused = false;
+  for (let step = 0; step < 8 && !summaryFocused; step += 1) {
+    await page.keyboard.press("Tab");
+    summaryFocused = await frame.evaluate(() => document.activeElement?.matches(".technical-details > summary") === true);
+  }
+  assert(summaryFocused, "Tab must reach Technical details in the model detail");
+  await page.keyboard.press("Tab");
+  const closedDetailsNext = await frame.evaluate(() => document.activeElement?.textContent.trim());
+  assert(closedDetailsNext === "Close", "Tab must skip the contents of closed Technical details", { closedDetailsNext });
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Enter");
+  const technical = await frame.locator(".technical-details li").allInnerTexts();
+  assert(technical.some((line) => line.trim() === "Publisher: did:key:z6MkFixtureModelPublisher"), "Technical details must name the publisher", technical);
+  await page.keyboard.press("Escape");
+  const restoredFocus = await frame.evaluate(() => document.activeElement?.getAttribute("data-app") || "");
+  assert(restoredFocus === `model:${modelCid}`, "Closing the model detail must return focus to its row", { restoredFocus });
+
+  await frame.locator('.store-row[data-action="shared-detail"]').click();
+  await frame.locator("#detail-modal.active").waitFor();
+  const shared = await frame.evaluate(() => ({
+    developer: document.querySelector(".modal-developer")?.textContent.trim(),
+    footer: [...document.querySelectorAll(".modal-footer-actions button")].map((node) => node.textContent.trim()),
+  }));
+  assert(
+    JSON.stringify(shared) === JSON.stringify({ developer: "Shared by Owner Home", footer: ["Close", "Open in Assistant"] }),
+    "A shared model must open the same detail with Open in Assistant next to Close",
+    shared,
+  );
+  const sharedDetailShape = await frame.evaluate(detailShape);
+  assert(JSON.stringify(sharedDetailShape) === JSON.stringify(appDetailShape), "A shared model detail must share the app detail structure", { sharedDetailShape, appDetailShape });
+  await frame.locator('#detail-content [data-action="use-shared-model"]').click();
+  const sharedOpen = await lastOpenTarget(page);
+  assert(
+    sharedOpen?.target === "assistant" && JSON.stringify(sharedOpen.query) === JSON.stringify({ offer_id: sharedOfferId }),
+    "Open in Assistant must hand the exact shared offer to Home",
+    sharedOpen,
+  );
+  const sharedDetailOpen = await frame.locator("#detail-modal").evaluate((node) => node.classList.contains("active"));
+  assert(!sharedDetailOpen, "Opening a shared model must close its detail");
+}
+
+async function assertModelsPhone(page, frame) {
+  await frame.locator("[data-el-drawer-toggle]").first().click();
+  await page.waitForTimeout(DRAWER_SETTLE_MS);
+  await frame.locator('#category-list [data-destination="models"]').click();
+  await page.waitForTimeout(DRAWER_SETTLE_MS);
+  const modelRow = frame.locator(`.store-row[data-app="model:${modelCid}"]`);
+  await modelRow.waitFor();
+  await frame.locator('.store-row[data-action="shared-detail"]').waitFor();
+  await assertNoHorizontalOverflow(frame, "phone Marketplace Models");
+  const pills = await frame.locator("#store-sections .store-pill").evaluateAll((nodes) =>
+    nodes.map((node) => ({ label: node.textContent.trim(), height: Math.round(node.getBoundingClientRect().height) })));
+  assert(
+    pills.length === 1 && pills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
+    "phone model row actions must be 44 px targets",
+    pills,
+  );
+  await page.screenshot({ path: MODELS_PHONE_SCREENSHOT });
+  await modelRow.click();
+  await frame.locator('.modal-footer-actions [data-model-control="use"]').waitFor();
+  const detailTargets = await frame.locator("#detail-content button, #detail-content .technical-details > summary").evaluateAll((nodes) => nodes.filter((node) => node.checkVisibility()).map((node) => {
+    const box = node.getBoundingClientRect();
+    return { label: node.textContent.trim() || node.getAttribute("aria-label"), width: box.width, height: box.height };
+  }));
+  assert(detailTargets.every((target) => target.width >= PHONE_TOUCH_TARGET_PX && target.height >= PHONE_TOUCH_TARGET_PX),
+    "phone model detail controls must be 44 px targets", detailTargets);
+  const detailFits = await frame.locator("#detail-content").evaluate((node) => node.scrollWidth <= node.clientWidth + 1);
+  assert(detailFits, "phone model detail must not overflow sideways");
+  const titleClearance = await frame.evaluate(() => ({
+    title: document.querySelector(".modal-title").getBoundingClientRect().toJSON(),
+    close: document.querySelector(".modal-close").getBoundingClientRect().toJSON(),
+  }));
+  assert(titleClearance.title.right <= titleClearance.close.left
+    || titleClearance.title.bottom <= titleClearance.close.top
+    || titleClearance.title.top >= titleClearance.close.bottom,
+  "phone detail Close must leave the long model title clear", titleClearance);
+  await page.waitForTimeout(MODAL_FADE_MS);
+  await page.screenshot({ path: MODEL_DETAIL_PHONE_SCREENSHOT });
+  await page.keyboard.press("Escape");
 }
 
 async function run() {
@@ -615,9 +881,9 @@ async function run() {
     await frame.locator(".store-row-skeleton").first().waitFor();
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/catalog", 1);
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/interfaces", 1);
-    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     state[normalToken].initialCatalogBarrier.release();
     state[normalToken].initialInterfacesBarrier.release();
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     await frame.locator(".store-row").filter({ hasText: "People" }).first().waitFor();
     const discoverTextWhileMediaPending = await frame.locator("#store-main").textContent();
     assert(
@@ -666,17 +932,21 @@ async function run() {
     );
 
     const installedBadge = await frame.locator("#installed-badge").textContent();
-    assert(installedBadge?.trim() === "3", "Marketplace installed count must come from catalog installed fields", { installedBadge });
+    assert(installedBadge?.trim() === "2", "Marketplace installed count must come from listed catalog installed fields", { installedBadge });
 
     const discoverTitles = await frame.locator(".store-section-title").evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() || ""));
     assert(discoverTitles.includes("Installed"), "Marketplace Discover must include the Installed section", discoverTitles);
     assert(discoverTitles.includes("Apps"), "Marketplace Discover must include app category sections", discoverTitles);
-    assert(discoverTitles.includes("Services"), "Marketplace Discover must include service category sections", discoverTitles);
+    assert(!discoverTitles.includes("Services") && !discoverTitles.includes("Home views"), "Marketplace must not list services or Home views", discoverTitles);
+    for (const hidden of ["object-provider", "zip-viewer"]) {
+      const count = await frame.locator(`.store-row[data-app="${hidden}"]`).count();
+      assert(count === 0, "Marketplace must list only what Home can open or get", { hidden, count });
+    }
 
-    await frame.locator('.store-see-all[data-destination="providers"]').click();
+    await frame.locator('.store-see-all[data-destination="apps"]').click();
     await frame.locator("#store-title").waitFor({ state: "visible" });
-    const providerTitle = await frame.locator("#store-title").textContent();
-    assert(providerTitle?.trim() === "Services", "Marketplace See All must route through the category destination", { providerTitle });
+    const categoryTitle = await frame.locator("#store-title").textContent();
+    assert(categoryTitle?.trim() === "Apps", "Marketplace See All must route through the category destination", { categoryTitle });
 
     await frame.locator('[data-destination="discover"]').click();
     await frame.locator("#search-input").fill("documents");
@@ -797,6 +1067,8 @@ async function run() {
     await frame.locator('.store-row[data-app="documents"]').first().focus();
     await frame.locator('.store-row[data-app="documents"]').first().click();
     await frame.locator("#detail-modal.active").waitFor();
+    const appPrimaryStyle = await frame.locator('#detail-content .modal-footer-actions .modal-btn.primary').evaluate(readBoxStyle);
+    const appRowStyle = await frame.locator('.store-row[data-app="documents"]').first().evaluate(readBoxStyle);
     const modalText = await frame.locator("#detail-content").textContent();
     assert(/Status/.test(modalText || ""), "Marketplace detail modal must expose trust and status", { modalText });
     assert(/Works with/.test(modalText || ""), "Marketplace detail modal must expose accepted content and dependencies", { modalText });
@@ -821,15 +1093,6 @@ async function run() {
     const latestOpen = openMessagesAfter.filter((entry) => entry.type === "home:open-target").at(-1);
     assert((openMessagesAfter.filter((entry) => entry.type === "home:open-target").length) === openMessagesBefore + 1, "Marketplace must launch only through Home open-target", openMessagesAfter);
     assert(latestOpen?.target === "people", "Marketplace must use the catalog launch_target", latestOpen);
-
-    const openCountBeforeBad = openMessagesAfter.filter((entry) => entry.type === "home:open-target").length;
-    await frame.locator('.store-row[data-app="bad-icons"]').first().click();
-    await frame.locator("#detail-modal.active").waitFor();
-    const badOpenButtonCount = await frame.locator('#detail-content [data-action="open"]').count();
-    assert(badOpenButtonCount === 0, "Marketplace must not offer Open for non-launchable entries");
-    await frame.locator('#detail-content [data-action="close-detail"]').last().click();
-    const openCountAfterBad = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
-    assert(openCountAfterBad === openCountBeforeBad, "Marketplace non-launchable entries must not send launch messages");
 
     await frame.locator('[data-destination="discover"]').focus();
     await page.keyboard.press("ArrowDown");
@@ -871,6 +1134,8 @@ async function run() {
       { countsBeforeInvalidRefresh, countsAfterRefresh },
     );
 
+    await assertModelsLayout(page, frame, { appPrimaryStyle, appRowStyle });
+
     await page.setViewportSize({ width: 1280, height: 900 });
     await waitForFrameWidth(frame, 1280);
     await frame.locator('[data-destination="media"]').click();
@@ -880,6 +1145,37 @@ async function run() {
     await page.setViewportSize({ width: 640, height: 900 });
     await waitForFrameWidth(frame, 640);
     await assertNoHorizontalOverflow(frame, "narrow Marketplace layout");
+    const narrowTitleTop = await frame.locator(".store-product-name").evaluate((node) => node.getBoundingClientRect().top);
+    assert(narrowTitleTop >= 52, "The narrow Marketplace title must clear the Home window controls", { narrowTitleTop });
+
+    await frame.locator('[data-destination="discover"]').click();
+    await frame.locator('.store-row[data-app="people"]').first().waitFor();
+    await page.setViewportSize(PHONE_VIEWPORT);
+    await waitForFrameWidth(frame, PHONE_VIEWPORT.width);
+    await setPhoneFormFactor(frame);
+    await page.waitForTimeout(DRAWER_SETTLE_MS);
+    await assertNoHorizontalOverflow(frame, "phone Marketplace layout");
+    await page.screenshot({ path: PHONE_SCREENSHOT });
+    const phonePills = await frame.locator(".store-pill").evaluateAll((pills) =>
+      pills.map((pill) => {
+        const rect = pill.getBoundingClientRect();
+        return { label: pill.textContent.trim(), height: Math.round(rect.height) };
+      }),
+    );
+    assert(
+      phonePills.length > 0 && phonePills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
+      "phone row actions must be 44 px targets",
+      phonePills,
+    );
+    await assertPhoneDrawer(page, frame, {
+      label: "Marketplace",
+      drawer: "#store-sidebar",
+      room: "#store-main",
+      closeTarget: '[data-destination="installed"]',
+      screenshot: PHONE_DRAWER_SCREENSHOT,
+    });
+    await assertModelsPhone(page, frame);
+    await setPhoneFormFactor(frame, false);
 
     await page.goto(`http://127.0.0.1:${port}/fixture-media-error`);
     const mediaErrorFrame = await waitForMarketplaceFrame(page);

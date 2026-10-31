@@ -1,9 +1,10 @@
 # Home journey audit
 
-This workbook is the standing stability and correctness reference for any PR
-or release. The working rules and a dependency-free reader live in the
-[e2e-audit skill](../../.claude/skills/e2e-audit/SKILL.md); the
-standing gate is in [AGENTS.md](../../AGENTS.md).
+This workbook is a historical snapshot and test input. It is not updated and
+is not the current acceptance record: each owning GitHub issue keeps that
+record (see [AGENTS.md](../../AGENTS.md#journey-register-gate)), and #93 owns
+the release gates. A dependency-free reader lives in the
+[e2e-audit skill](../../.claude/skills/e2e-audit/SKILL.md).
 
 [ElastOS-Home-Journey-Audit.xlsx](ElastOS-Home-Journey-Audit.xlsx) contains the
 Home audit snapshot reviewed on 31 August 2026: 61 findings, the journey and
@@ -27,8 +28,8 @@ The latest installed evidence in this snapshot is E-105/E-106, from source
 `b233d8322a44c11e9432f95404d31e35a0517753`, tree
 `3f073277ba791a659adb2cde9885d9b310d08ba7`. Earlier source and installation refs
 remain attached to their original observations. Subsequent PR39 source changes
-need their own installed checks. See [current state](../../state.md) and
-[open work](../../TASKS.md) for the current integration status.
+need their own installed checks. See [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for the
+current integration status.
 
 This public copy retains all seven sheets, findings and formulas. Local evidence
 paths have been replaced with private-evidence labels; the evidence files,

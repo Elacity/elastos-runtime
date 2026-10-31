@@ -11,7 +11,9 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroizing;
 
 #[path = "store_files.rs"]
@@ -82,6 +84,21 @@ const DID_KEY_PREFIX: &str = "did:key:z";
 const DID_KEY_ED25519_PREFIX: &str = "did:key:z6Mk";
 const DID_KEY_ED25519_LEN: usize = 56;
 const DID_KEY_DECODED_BYTES: usize = 34;
+const CANONICAL_KEY_CACHE_CAPACITY: usize = 64;
+static CANONICAL_KEYS: OnceLock<Mutex<VecDeque<ed25519_dalek::VerifyingKey>>> = OnceLock::new();
+
+fn remember_canonical_key(
+    keys: &mut VecDeque<ed25519_dalek::VerifyingKey>,
+    key: ed25519_dalek::VerifyingKey,
+) {
+    if keys.iter().any(|known| known == &key) {
+        return;
+    }
+    if keys.len() == CANONICAL_KEY_CACHE_CAPACITY {
+        keys.pop_front();
+    }
+    keys.push_back(key);
+}
 
 fn encode_canonical_did_key_bytes(key_bytes: [u8; 32]) -> String {
     let mut encoded = Vec::with_capacity(34);
@@ -106,6 +123,15 @@ pub fn encode_did_key(verifying_key: &ed25519_dalek::VerifyingKey) -> anyhow::Re
 pub fn validate_canonical_ed25519_verifying_key_bytes(
     bytes: [u8; 32],
 ) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    // Only deterministic public-key mathematics is reused. Callers still own
+    // current signatures, grants, expiry, revocation and Profile authority.
+    let keys = CANONICAL_KEYS
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(CANONICAL_KEY_CACHE_CAPACITY)));
+    if let Ok(known) = keys.lock() {
+        if let Some(key) = known.iter().find(|key| key.as_bytes() == &bytes) {
+            return Ok(*key);
+        }
+    }
     let compressed = CompressedEdwardsY(bytes);
     let point = compressed
         .decompress()
@@ -119,8 +145,12 @@ pub fn validate_canonical_ed25519_verifying_key_bytes(
     if !point.is_torsion_free() {
         anyhow::bail!("Ed25519 key must be torsion free");
     }
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-        .map_err(|error| anyhow::anyhow!("invalid Ed25519 verifying key: {error}"))
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Ed25519 verifying key: {error}"))?;
+    if let Ok(mut known) = keys.lock() {
+        remember_canonical_key(&mut known, key);
+    }
+    Ok(key)
 }
 
 /// Decode the one canonical Ed25519 `did:key` representation.
@@ -1223,6 +1253,88 @@ mod tests {
         assert!(
             validate_canonical_ed25519_verifying_key_bytes(non_torsion_free_public_key_bytes())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_key_cache_keeps_only_a_bounded_set_of_validated_public_keys() {
+        let mut keys = VecDeque::new();
+        let first = ed25519_dalek::SigningKey::from_bytes(&[0; 32]).verifying_key();
+        for seed in 0..=CANONICAL_KEY_CACHE_CAPACITY {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed as u8; 32]).verifying_key();
+            let validated = validate_canonical_ed25519_verifying_key_bytes(key.to_bytes()).unwrap();
+            remember_canonical_key(&mut keys, validated);
+            remember_canonical_key(&mut keys, validated);
+            assert!(keys.len() <= CANONICAL_KEY_CACHE_CAPACITY);
+        }
+        assert_eq!(keys.len(), CANONICAL_KEY_CACHE_CAPACITY);
+        assert!(!keys.contains(&first));
+        // Eviction only repeats the canonical checks; it changes no authority.
+        assert_eq!(
+            validate_canonical_ed25519_verifying_key_bytes(first.to_bytes()).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn warm_canonical_key_cache_still_rejects_invalid_keys_and_did_aliases() {
+        let generated = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        for _ in 0..3 {
+            assert_eq!(
+                validate_canonical_ed25519_verifying_key_bytes(generated.to_bytes()).unwrap(),
+                generated
+            );
+            assert!(decode_did_key(
+                &(encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32])) + "x")
+            )
+            .is_err());
+            let (canonical_alias, noncanonical_alias) = alias_pair();
+            for invalid in [
+                canonical_alias,
+                noncanonical_alias,
+                weak_public_key_bytes(),
+                non_torsion_free_public_key_bytes(),
+            ] {
+                assert!(validate_canonical_ed25519_verifying_key_bytes(invalid).is_err());
+                assert!(!CANONICAL_KEYS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key.as_bytes() == &invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_public_key_validation_remains_correct_during_concurrent_eviction() {
+        let workers: Vec<_> = (0..4)
+            .map(|offset| {
+                std::thread::spawn(move || {
+                    for index in 0..72 {
+                        let mut seed = [index; 32];
+                        seed[0] = offset;
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                        let expected = signing_key.verifying_key();
+                        assert_eq!(
+                            validate_canonical_ed25519_verifying_key_bytes(expected.to_bytes())
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            decode_did_key(&encode_signing_key_did(&signing_key)).unwrap(),
+                            expected
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            CANONICAL_KEYS.get().unwrap().lock().unwrap().len() <= CANONICAL_KEY_CACHE_CAPACITY
         );
     }
 

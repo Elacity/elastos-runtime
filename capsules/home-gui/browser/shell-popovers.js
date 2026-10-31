@@ -55,6 +55,62 @@ export function handleShellEscape() {
   return true;
 }
 
+/* Back layers (the phone's system Back). Every surface a person can dismiss
+   registers once, next to its own close function:
+   - selector: the element whose stacking order ranks the layer; it also ties
+     the layer to HOME_GUI_HOST_SELECTORS so a host surface cannot be missed;
+   - state (optional): the owner's own report, one of LAYER_STATE, read from
+     the element that actually animates. The default is for a surface whose
+     registered element is the one that animates: closed while not shown,
+     closing while its dismissWithMotion leave plays, open otherwise;
+   - close: the same dismissal as the surface's own Close (animation included).
+   The phone stage closes exactly one layer per Back. The layer it took stops
+   counting until it reports closed, or reports open again after it reported
+   closing (a reopen mid-dismiss is a fresh open layer). No Escape is
+   synthesised: a raw Escape would also reach the ordered stack above (and,
+   say, leave a fullscreen Space). */
+export const LAYER_STATE = Object.freeze({ open: "open", closing: "closing", closed: "closed" });
+const stageLayers = new Map();
+
+export function registerStageLayer(id, { selector, state = null, close } = {}) {
+  if (typeof id !== "string" || !id || typeof selector !== "string" || !selector || typeof close !== "function") {
+    return;
+  }
+  stageLayers.set(id, { id, selector, state: typeof state === "function" ? state : null, close });
+}
+
+export function registeredStageLayers() {
+  return [...stageLayers.values()];
+}
+
+/* Gestures in progress (title-bar swipe, long-press, drag handles, window
+   drags). Each registers a cancel next to its own state; a stage reset calls
+   every cancel before it blocks input, so a press that began in the old form
+   factor never completes, or moves anything, in the new one. A cancel with
+   nothing in progress is a no-op. */
+const stageGestures = new Map();
+
+export function registerStageGesture(id, cancel) {
+  if (typeof id !== "string" || !id || typeof cancel !== "function") {
+    return;
+  }
+  stageGestures.set(id, cancel);
+}
+
+export function registeredStageGestures() {
+  return [...stageGestures.keys()];
+}
+
+export function cancelStageGestures() {
+  for (const cancel of stageGestures.values()) {
+    try {
+      cancel();
+    } catch (_error) {
+      // One gesture failing to cancel must not keep the others running.
+    }
+  }
+}
+
 export function closeOtherShellPopovers(exceptId) {
   for (const [id, close] of registry) {
     if (id === exceptId) {

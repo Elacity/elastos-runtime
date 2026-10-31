@@ -731,7 +731,7 @@ async fn inspect_action_rejects_stale_step_up_before_dispatch() {
         .unwrap();
     let message = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(status, StatusCode::FORBIDDEN, "{message}");
-    assert!(message.contains("auth session"));
+    assert!(message.contains("admitted host and caller"));
     assert!(calls.lock().await.is_empty());
 }
 
@@ -1309,6 +1309,9 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         Some("other"),
         crate::auth::RuntimePrincipalRole::Guest,
     );
+    let (mut requester_cursor, mut other_cursor) = (String::new(), String::new());
+    home_inbox_changed(&app, &requester.home_token, &mut requester_cursor).await;
+    home_inbox_changed(&app, &other.home_token, &mut other_cursor).await;
 
     let requested = app
         .clone()
@@ -1331,6 +1334,19 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         .unwrap();
     let request_payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let request_id = request_payload["request_id"].as_str().unwrap();
+    // The request reaches the requester's Home promptly and counts in its badge;
+    // another person's Home sees nothing.
+    assert!(home_inbox_changed(&app, &requester.home_token, &mut requester_cursor).await);
+    assert!(!home_inbox_changed(&app, &other.home_token, &mut other_cursor).await);
+    let requester_home = home_summary_notifications(&app, &requester.home_token).await;
+    assert_eq!(
+        home_entries_of_kind(&requester_home, "inspect_action_request").len(),
+        1,
+        "{requester_home}"
+    );
+    assert_eq!(requester_home["attention_count"], 1, "{requester_home}");
+    let other_home = home_summary_notifications(&app, &other.home_token).await;
+    assert!(home_entries_of_kind(&other_home, "inspect_action_request").is_empty());
 
     let other_inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &other);
     let other_inbox = app
@@ -1429,6 +1445,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         &json!({ "request_id": request_id }),
     );
     let approved = app
+        .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
                 .method("POST")
@@ -1445,6 +1462,8 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         .unwrap();
     assert_eq!(approved.status(), StatusCode::OK);
     assert_eq!(calls.lock().await.len(), 1);
+    let requester_home = home_summary_notifications(&app, &requester.home_token).await;
+    assert!(home_entries_of_kind(&requester_home, "inspect_action_request").is_empty());
 }
 
 #[tokio::test]

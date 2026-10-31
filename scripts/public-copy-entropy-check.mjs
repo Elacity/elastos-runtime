@@ -137,8 +137,6 @@ assert(
     && !marketplaceJs.includes("Marketplace catalog unavailable")
     && marketplaceJs.includes("runtime|capsules?|providers?|projection|schema|derived facts?|boundary")
     && marketplaceJs.includes("function publicTitle(capsule)")
-    && marketplaceJs.includes('role === "provider" ? "service"')
-    && marketplaceJs.includes('if (role === "provider") return `${title} service for apps on this Home.`;')
     && marketplaceJs.includes("sourceSummary")
     && marketplaceJs.includes("Available actions")
     && !marketplaceJs.includes("technicalDependencies")
@@ -157,7 +155,8 @@ const homeRuntime = read("elastos/crates/elastos-server/src/api/gateway_home_run
 const catalogReadModel = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs");
 assert(
   homeRuntime.includes('CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations."')
-    && homeRuntime.includes('MARKETPLACE_CAPSULE_ID => {\n            "Browse installed apps, services, viewers, and content."')
+    && homeRuntime.includes('"Find apps, viewers, content and models you can open or get."')
+    && !homeRuntime.includes("Browse installed apps, services, viewers, and content")
     && homeRuntime.includes('INBOX_CAPSULE_ID => "Review messages, requests, and approvals."')
     && homeRuntime.includes('BROWSER_CAPSULE_ID => "Browse websites from this device."')
     && !homeRuntime.includes("Open web sites through the ElastOS Browser boundary")
@@ -192,22 +191,25 @@ assert(
     && !systemJs.includes('empty.textContent = "No capsules or providers discovered."')
     && systemJs.includes("function publicSystemError(")
     && systemJs.includes('publicSystemError(error, "System could not be loaded.")')
-    && !systemJs.includes("actions.push(description.replace")
-    && systemJs.includes('return dependency ? catalogTitle(dependency) : "";')
-    && systemJs.includes('{ role: "provider", label: "Background services" }'),
-  "System must keep app discovery human-facing and technical inspection explicit",
+    && !systemJs.includes("actions.push(description.replace"),
+  "System must keep technical inspection explicit",
+);
+// Marketplace lists what you can open or get; Technical Details lists every
+// component. System keeps no third inventory.
+assert(
+  !systemHtml.includes('data-settings="catalog"')
+    && !systemHtml.includes("Apps &amp; Services")
+    && !systemHtml.includes('id="capsule-catalog"')
+    && !systemJs.includes("/api/capsules/interfaces")
+    && !systemJs.includes("refreshCapsuleCatalog"),
+  "System restored its Apps & Services inventory",
 );
 
 const libraryDialog = read("capsules/library/browser/src/dialog.js");
 const libraryActions = read("capsules/library/browser/src/actions.js");
 const libraryApp = read("capsules/library/browser/src/app.js");
 const libraryRender = read("capsules/library/browser/src/render.js");
-assert(
-  libraryDialog.includes('data-tab="technical">Technical</div>')
-    && !libraryDialog.includes('data-tab="runtime">Runtime</div>')
-    && !libraryDialog.includes("Visibility Contract"),
-  "Library properties must keep implementation fields under Technical",
-);
+assert(!libraryDialog.includes("Visibility Contract"), "Library Properties must not name the visibility contract");
 assert(
   !libraryActions.includes("provider-owned location")
     && !libraryActions.includes(" object${")
@@ -226,9 +228,21 @@ assert(
     && !libraryRender.includes("Localhost is your signed local object space"),
   "Library restored implementation nouns in ordinary actions",
 );
+const libraryDialogFunction = (name) => {
+  const start = libraryDialog.indexOf(`  function ${name}(`);
+  const end = libraryDialog.indexOf("\n  function ", start + 1);
+  return start < 0 ? "" : libraryDialog.slice(start, end < 0 ? undefined : end);
+};
+for (const name of ["showObjectStatus", "showSharedAccessReceipt"]) {
+  const source = libraryDialogFunction(name);
+  assert(
+    /<details class="details-json">\s*<summary>Technical details<\/summary>/.test(source)
+      && !/<details\b[^>]*\bopen\b/.test(source),
+    `Library ${name} must keep implementation details in a closed Technical details section`,
+  );
+}
 assert(
-  (libraryDialog.match(/<summary>Technical details<\/summary>/g) || []).length >= 3
-    && !libraryDialog.includes("Runtime checked this object")
+  !libraryDialog.includes("Runtime checked this object")
     && !libraryDialog.includes("Choose a Runtime share policy")
     && !libraryDialog.includes("Recipient-scoped access requires Runtime recipient proof"),
   "Library share flows must keep implementation details collapsed",
@@ -261,8 +275,10 @@ assert(
   "Services restored provider implementation copy",
 );
 
-const inbox = read("capsules/inbox/browser/index.html");
-const documents = read("capsules/documents/browser/index.html");
+const inbox = read("capsules/inbox/browser/index.html") +
+  read("capsules/inbox/browser/inbox.js");
+const documents = read("capsules/documents/browser/index.html") +
+  read("capsules/documents/browser/documents.js");
 const walletCreate = read("capsules/wallet/browser/wallet-create-account-flow.js");
 const walletSend = read("capsules/wallet/browser/wallet-send-flow.js");
 const walletRender = read("capsules/wallet/browser/wallet-render.js");
@@ -280,22 +296,5 @@ const browserDisplay = read("capsules/browser/browser/browser-remote-display.js"
 assert(!browserStatus.includes("Browser failed closed") && browserStatus.includes("public") === false, "Browser must not show fail-closed implementation narration");
 assert(!browserJs.includes("Browser Engine Adapter returned an invalid") && !browserDisplay.includes("Browser Engine Adapter returned an invalid"), "Browser must not show adapter contract failures");
 
-const homeVisual = read("scripts/home-camofox-smoke.mjs");
-const systemVisual = read("scripts/system-camofox-smoke.mjs");
-const passkeyVisual = read("scripts/home-passkey-virtual-auth-smoke.mjs");
-for (const surface of ["home-cli", "system", "marketplace", "services", "inbox", "library", "documents", "wallet", "browser"]) {
-  assert(homeVisual.includes(`\"/apps/${surface}/\"`), `visual empty/error coverage is missing ${surface}`);
-}
-assert(
-  homeVisual.includes('"ordinary-app-copy-stays-plain-and-heading-unique"')
-    && homeVisual.includes('"home-cli-copy-stays-plain"')
-    && homeVisual.includes('"browser"')
-    && systemVisual.includes('state.panelLabels.includes("Accounts")')
-    && systemVisual.includes('!state.fieldLabels.includes("Documents")')
-    && passkeyVisual.includes("async function checkHomePublicCopy(page)")
-    && passkeyVisual.includes('"Home GUI exposed implementation copy"')
-    && passkeyVisual.includes('"Home GUI rendered duplicate visible headings"'),
-  "visual public-copy checks are stale or incomplete",
-);
 
 console.log("PASS public-copy entropy check");

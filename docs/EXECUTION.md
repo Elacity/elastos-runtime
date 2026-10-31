@@ -11,10 +11,8 @@ artifacts. A public download version has a separate verification record.
 
 | Record | Owns |
 | --- | --- |
-| Approved release plan linked from TASKS.md | User outcomes, required acceptance and scope decisions |
-| TASKS.md on the active work branch | Goal status, dependencies, owner and next work |
-| state.md | Current source, installed and public evidence, with its date |
-| Journey audit workbook | User journeys, regression expectations and findings |
+| [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) | Scope, acceptance, status, dependencies, owner and proof |
+| Journey audit workbook | Historical journey and finding snapshot; test input only |
 | Private current checkpoint and receipts | Worktree/target coordinates, resource owners, exact commands and raw proof |
 | Notion overview | Accepted milestone summaries and links to reviewed source |
 
@@ -52,15 +50,15 @@ or one installed interaction. Then run the changed surface through its consumer.
 
 ```sh
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 node scripts/website-truth-check.mjs
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 ```
 
 The owner adds narrow route tests and the existing Home/browser smoke checks
-that cover the change. The journey workbook records expected route changes in
-the same diff. Preserve existing Pass expectations and each failed run's scope.
+that cover the change. The owning issue records expected route changes and
+results. Preserve existing Pass expectations and each failed run's scope.
 Source checks qualify source; installed and public claims require matching
 artifacts and real target behavior.
 

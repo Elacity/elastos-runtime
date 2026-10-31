@@ -575,6 +575,10 @@ async fn create_runtime_custody_publish_directory(
     (init, segments)
 }
 
+fn enable_protected_content(data_dir: &std::path::Path) {
+    std::fs::write(data_dir.join("config.toml"), "protected_content = true\n").unwrap();
+}
+
 async fn publish_runtime_custody(
     app: &axum::Router,
     token: &str,
@@ -888,7 +892,7 @@ fn zip_text_files(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().into_owned();
         let mut body = String::new();
         entry.read_to_string(&mut body).unwrap();
         files.insert(name, body);
@@ -1332,6 +1336,70 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     assert_eq!(save["status"], "ok");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_documents_viewer_route_refuses_a_file_reached_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("Secret.txt"), b"outside secret").unwrap();
+    let documents_path = library_object_path(dir.path(), &format!("{root}/Documents"));
+    std::fs::create_dir_all(&documents_path).unwrap();
+    std::os::unix::fs::symlink(outside.path(), documents_path.join("Linked")).unwrap();
+    let uri = format!("{root}/Documents/Linked/Secret.txt");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    for (method, body) in [
+        ("GET", Body::empty()),
+        (
+            "PUT",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"overwritten"),
+                }))
+                .unwrap(),
+            ),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method(method)
+                    .uri(format!(
+                        "/api/viewers/documents/library-object?uri={encoded_uri}"
+                    ))
+                    .header("x-elastos-home-token", documents_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {text}");
+        assert!(text.contains("linked folder"), "{method}: {text}");
+    }
+    assert_eq!(
+        std::fs::read(outside.path().join("Secret.txt")).unwrap(),
+        b"outside secret"
+    );
+}
+
 #[tokio::test]
 async fn test_library_provider_rejects_unknown_operation() {
     let dir = tempfile::tempdir().unwrap();
@@ -1392,6 +1460,95 @@ async fn test_gateway_provider_proxy_rejects_predeclared_runtime_metadata() {
         assert!(message.contains("provider request must not predeclare Runtime metadata field"));
         assert!(message.contains(reserved));
     }
+}
+
+#[tokio::test]
+async fn test_library_public_root_reports_whether_it_holds_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let public_root = |roots: &serde_json::Value| {
+        roots["data"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "public")
+            .cloned()
+            .expect("public Library root")
+    };
+
+    let (status, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let public = public_root(&roots);
+    assert_eq!(public["uri"], format!("{root}/Public"));
+    assert_eq!(public["metadata"]["empty"], true, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 0, "{public}");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Public" }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": format!("{root}/Public/draft.txt"),
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"draft"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let (_, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    let public = public_root(&roots);
+    assert_eq!(public["metadata"]["empty"], false, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 1, "{public}");
+}
+
+#[tokio::test]
+async fn test_library_stat_of_an_untouched_place_is_the_empty_folder_list_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let pictures_uri = format!("{root}/Pictures");
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": pictures_uri })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["data"]["objects"], json!([]), "{list}");
+
+    let (stat_status, stat) =
+        post_library(app.clone(), &token, "stat", json!({ "uri": pictures_uri })).await;
+    assert_eq!(stat_status, StatusCode::OK, "{stat}");
+    let object = &stat["data"]["object"];
+    assert_eq!(object["uri"], pictures_uri, "{stat}");
+    assert_eq!(object["name"], "Pictures", "{stat}");
+    assert_eq!(object["kind"], "directory", "{stat}");
+    assert_eq!(object["modified_at"], 0, "{stat}");
+    assert_eq!(object["created_at"], 0, "{stat}");
+
+    // Only a place stands in for a missing directory; any other missing path
+    // still fails.
+    let (missing_status, missing) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({ "uri": format!("{root}/Pictures/Missing") }),
+    )
+    .await;
+    assert!(
+        missing_status != StatusCode::OK || missing["status"] != "ok",
+        "{missing}"
+    );
 }
 
 #[tokio::test]
@@ -3866,6 +4023,1062 @@ async fn test_library_provider_rejects_unsafe_zip_entries() {
         .contains("relative and safe"));
 }
 
+/// Every path under `root` (files, folders and symlinks, not followed).
+fn walk_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_library_provider_extract_zip_refuses_absolute_dotdot_and_symlink_entries() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Documents" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": documents_uri, "name": "Imports" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // Each archive holds one hostile entry. The whole-archive extract must
+    // refuse it and write nothing for it, inside or outside the Library.
+    // (archive name, entry kind, entry name, symlink target, expected message)
+    let cases: [(&str, &str, &str, &str, &str); 9] = [
+        (
+            "Absolute.zip",
+            "file",
+            "/absolute-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "DotDot.zip",
+            "file",
+            "../dotdot-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Inner.zip",
+            "file",
+            "Nested/../inner-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Backslash.zip",
+            "file",
+            "..\\backslash-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        // Windows path forms. Linux and macOS read each as an ordinary name,
+        // so the extract must refuse them by its own rule.
+        (
+            "DriveBackslash.zip",
+            "file",
+            "C:\\drive-backslash-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "DriveSlash.zip",
+            "file",
+            "C:/drive-slash-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Unc.zip",
+            "file",
+            "\\\\server\\share\\unc-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Verbatim.zip",
+            "file",
+            "\\\\?\\C:\\verbatim-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Symlink.zip",
+            "symlink",
+            "symlink-escape.txt",
+            "/etc/passwd",
+            "non-file",
+        ),
+    ];
+    for (archive_name, kind, entry_name, link_target, expected) in cases {
+        let archive_bytes = {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            if kind == "symlink" {
+                writer
+                    .add_symlink(entry_name, link_target, options)
+                    .unwrap();
+            } else {
+                writer.start_file(entry_name, options).unwrap();
+                writer.write_all(b"escape").unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        let zip_uri = format!("{documents_uri}/{archive_name}");
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": zip_uri,
+                "mime": "application/zip",
+                "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(write["status"], "ok", "{archive_name}: {write}");
+
+        let (extract_status, extracted) = post_library(
+            app.clone(),
+            &token,
+            "extract_archive",
+            json!({ "uri": zip_uri }),
+        )
+        .await;
+        assert_eq!(extract_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(
+            extracted["status"], "error",
+            "{archive_name}: hostile entry {entry_name:?} was not refused: {extracted}"
+        );
+        assert!(
+            extracted["message"].as_str().unwrap().contains(expected),
+            "{archive_name}: {extracted}"
+        );
+
+        if kind == "symlink" {
+            // The listing marks it blocked and a selected extract refuses it.
+            let (list_status, listed) = post_library(
+                app.clone(),
+                &token,
+                "archive_entries",
+                json!({ "uri": zip_uri }),
+            )
+            .await;
+            assert_eq!(list_status, StatusCode::OK);
+            let rows = listed["data"]["entries"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|entry| entry["path"] == entry_name
+                    && entry["kind"] == "blocked"
+                    && entry["safety"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("non-file")),
+                "{listed}"
+            );
+            let (select_status, selected) = post_library(
+                app.clone(),
+                &token,
+                "archive_extract_entries",
+                json!({
+                    "uri": zip_uri,
+                    "destination_uri": imports_uri,
+                    "entries": [entry_name],
+                }),
+            )
+            .await;
+            assert_eq!(select_status, StatusCode::OK);
+            assert_eq!(selected["status"], "ok", "{selected}");
+            assert_eq!(
+                selected["data"]["receipt"]["progress"]["blocked_entries"],
+                1
+            );
+            assert!(selected["data"]["blocked"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("non-file"));
+        }
+    }
+
+    // Nothing from any hostile entry exists anywhere under the data dir, and
+    // no symlink was created.
+    for path in walk_paths(dir.path()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            !name.contains("escape"),
+            "hostile entry was written: {}",
+            path.display()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink was created: {}",
+            path.display()
+        );
+    }
+}
+
+/// A tar archive whose entry names are kept byte for byte. `tar::Builder`
+/// refuses `..` and absolute names, so the header name is written directly.
+fn tar_with_raw_entry_names(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, body) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, *body).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[tokio::test]
+async fn test_library_provider_every_archive_reader_refuses_root_drive_unc_and_climb_names() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+    for (parent_uri, name) in [
+        (root.as_str(), "Documents"),
+        (documents_uri.as_str(), "Imports"),
+    ] {
+        let (status, _) = post_library(
+            app.clone(),
+            &token,
+            "mkdir",
+            json!({ "parent_uri": parent_uri, "name": name }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // One rule for every reader: list, preview, selected extract and
+    // whole-archive extract, for ZIP and for tar. Each archive holds one
+    // hostile entry and one safe entry.
+    let hostile = [
+        "C:/drive-slash-escape.txt",
+        "C:\\drive-backslash-escape.txt",
+        "\\\\server\\share\\unc-escape.txt",
+        "/etc/absolute-escape.txt",
+        "../dotdot-escape.txt",
+    ];
+    let unsafe_reason = "library archive entry path must be relative and safe";
+    let mut failures = Vec::new();
+    for (case, entry_name) in hostile.into_iter().enumerate() {
+        let leaf = entry_name.rsplit(['/', '\\']).next().unwrap();
+        for format in ["zip", "tar"] {
+            let label = format!("{format} {entry_name:?}");
+            let (bytes, mime) = if format == "zip" {
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+                writer.start_file(entry_name, options).unwrap();
+                writer.write_all(b"escape").unwrap();
+                writer.start_file("safe.txt", options).unwrap();
+                writer.write_all(b"safe").unwrap();
+                (writer.finish().unwrap().into_inner(), "application/zip")
+            } else {
+                (
+                    tar_with_raw_entry_names(&[(entry_name, b"escape"), ("safe.txt", b"safe")]),
+                    "application/x-tar",
+                )
+            };
+            let archive_uri = format!("{documents_uri}/Case{case}.{format}");
+            let (status, write) = post_library(
+                app.clone(),
+                &token,
+                "write",
+                json!({
+                    "uri": archive_uri,
+                    "mime": mime,
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{label}");
+            assert_eq!(write["status"], "ok", "{label}: {write}");
+
+            // List: the archive is still shown; the hostile entry is a
+            // blocked row with the rule's reason, never a safe row.
+            let (_, listed) = post_library(
+                app.clone(),
+                &token,
+                "archive_entries",
+                json!({ "uri": archive_uri }),
+            )
+            .await;
+            let rows = listed["data"]["entries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let hostile_rows: Vec<_> = rows
+                .iter()
+                .filter(|row| row["path"] != "safe.txt")
+                .collect();
+            let blocked_by_rule = hostile_rows.len() == 1
+                && hostile_rows[0]["kind"] == "blocked"
+                && hostile_rows[0]["safety"]["status"] == "blocked"
+                && hostile_rows[0]["safety"]["reason"] == unsafe_reason;
+            if !blocked_by_rule {
+                failures.push(format!("{label} list: {hostile_rows:?}"));
+            }
+
+            // Preview: the name is refused as a request, and its last part
+            // matches nothing; neither gives the bytes.
+            for (requested, message) in [
+                (entry_name, unsafe_reason),
+                (leaf, "library archive preview entry not found"),
+            ] {
+                let (_, preview) = post_library(
+                    app.clone(),
+                    &token,
+                    "archive_preview_entry",
+                    json!({ "uri": archive_uri, "entry": requested }),
+                )
+                .await;
+                if preview["status"] != "error" || preview["message"] != message {
+                    failures.push(format!(
+                        "{label} preview {requested:?}: status={} message={} text={}",
+                        preview["status"], preview["message"], preview["data"]["preview"]["text"]
+                    ));
+                }
+            }
+
+            // Selected extract: the name is refused as a selection, and the
+            // last part matches nothing; the entry is reported as blocked.
+            let (_, selected) = post_library(
+                app.clone(),
+                &token,
+                "archive_extract_entries",
+                json!({
+                    "uri": archive_uri,
+                    "destination_uri": imports_uri,
+                    "entries": [entry_name],
+                }),
+            )
+            .await;
+            if selected["status"] != "error" || selected["message"] != unsafe_reason {
+                failures.push(format!(
+                    "{label} selected {entry_name:?}: status={} message={} written={}",
+                    selected["status"], selected["message"], selected["data"]["written"]
+                ));
+            }
+            let (_, selected) = post_library(
+                app.clone(),
+                &token,
+                "archive_extract_entries",
+                json!({
+                    "uri": archive_uri,
+                    "destination_uri": imports_uri,
+                    "entries": [leaf],
+                }),
+            )
+            .await;
+            let blocked = &selected["data"]["blocked"];
+            if selected["data"]["receipt"]["progress"]["written_entries"] != 0
+                || blocked.as_array().map(Vec::len) != Some(1)
+                || blocked[0]["reason"] != unsafe_reason
+            {
+                failures.push(format!(
+                    "{label} selected {leaf:?}: written={} blocked={blocked}",
+                    selected["data"]["written"]
+                ));
+            }
+
+            // Whole-archive extract: refused with the rule's message.
+            let (_, extracted) = post_library(
+                app.clone(),
+                &token,
+                "extract_archive",
+                json!({ "uri": archive_uri }),
+            )
+            .await;
+            if extracted["status"] != "error" || extracted["message"] != unsafe_reason {
+                failures.push(format!(
+                    "{label} extract: status={} message={}",
+                    extracted["status"], extracted["message"]
+                ));
+            }
+        }
+    }
+
+    for path in walk_paths(dir.path()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.contains("escape") {
+            failures.push(format!("hostile entry was written: {}", path.display()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} reader checks failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The sentence a Library write gets when it would put a folder deeper than
+/// Home starts with (#449).
+fn too_deep_refusal(relative: &str) -> String {
+    format!(
+        "{relative} was not saved: it would be more than 16 folders deep in Documents, and Home \
+         does not start with folders that deep. Save it fewer folders down."
+    )
+}
+
+/// `Documents/1/2/…/levels` relative to the Home root.
+fn numbered_folders(levels: usize) -> String {
+    let mut path = String::from("Documents");
+    for level in 1..=levels {
+        path.push_str(&format!("/{level}"));
+    }
+    path
+}
+
+#[tokio::test]
+async fn test_library_writes_refuse_folders_deeper_than_home_starts_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = |relative: &str| format!("{root}/{relative}");
+    let mkdir = |parent: String, name: &str| {
+        post_library(
+            app.clone(),
+            &token,
+            "mkdir",
+            json!({ "parent_uri": parent, "name": name }),
+        )
+    };
+    let write = |relative: String| {
+        post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri(&relative),
+                "data": base64::engine::general_purpose::STANDARD.encode(b"deep"),
+            }),
+        )
+    };
+
+    // The start walk allows 15 folders below Documents and refuses a 16th.
+    let (_, made) = mkdir(root.clone(), "Documents").await;
+    assert_eq!(made["status"], "ok", "{made}");
+    for level in 1..=15 {
+        let (_, made) = mkdir(uri(&numbered_folders(level - 1)), &level.to_string()).await;
+        assert_eq!(made["status"], "ok", "level {level}: {made}");
+    }
+    let deepest = numbered_folders(15);
+    let (_, refused) = mkdir(uri(&deepest), "16").await;
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(
+        refused["message"],
+        too_deep_refusal(&format!("{deepest}/16"))
+    );
+    assert!(!library_object_path(dir.path(), &uri(&format!("{deepest}/16"))).exists());
+
+    // A file in the deepest folder is saved; one that needs a 16th folder is
+    // refused, and no folder is made for it.
+    let (_, saved) = write(format!("{deepest}/a.txt")).await;
+    assert_eq!(saved["status"], "ok", "{saved}");
+    let (_, refused) = write(format!("{deepest}/16/a.txt")).await;
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(
+        refused["message"],
+        too_deep_refusal(&format!("{deepest}/16/a.txt"))
+    );
+    assert!(!library_object_path(dir.path(), &uri(&format!("{deepest}/16"))).exists());
+
+    // Another spelling of the same folder gets the same answer: empty
+    // segments, which the writer skips, and another case, which a
+    // case-insensitive volume folds.
+    let (_, refused) = write(format!("/{}", deepest.replace('/', "//") + "//16/a.txt")).await;
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(
+        refused["message"],
+        too_deep_refusal(&format!("{deepest}/16/a.txt"))
+    );
+    let folded = deepest.replacen("Documents", "dOCUMENTS", 1);
+    let (_, refused) = mkdir(uri(&folded), "16").await;
+    assert_eq!(refused["status"], "error", "{refused}");
+    assert_eq!(
+        refused["message"],
+        too_deep_refusal(&format!("{folded}/16"))
+    );
+    assert!(!library_object_path(dir.path(), &uri(&format!("{deepest}/16"))).exists());
+
+    // Copy and move check the whole folder before writing: Tree/x/y moved
+    // under 14 folders would put x 16 deep.
+    for (parent, name) in [
+        ("Documents", "Tree"),
+        ("Documents/Tree", "x"),
+        ("Documents/Tree/x", "y"),
+    ] {
+        let (_, made) = mkdir(uri(parent), name).await;
+        assert_eq!(made["status"], "ok", "{made}");
+    }
+    let (_, saved) = write("Documents/Tree/x/y/b.txt".to_string()).await;
+    assert_eq!(saved["status"], "ok", "{saved}");
+    let too_deep_parent = numbered_folders(14);
+    for op in ["copy", "move"] {
+        let (_, refused) = post_library(
+            app.clone(),
+            &token,
+            op,
+            json!({ "uri": uri("Documents/Tree"), "target_parent_uri": uri(&too_deep_parent) }),
+        )
+        .await;
+        assert_eq!(refused["status"], "error", "{op}: {refused}");
+        assert_eq!(
+            refused["message"],
+            too_deep_refusal(&format!("{too_deep_parent}/Tree/x")),
+            "{op}"
+        );
+        assert!(
+            !library_object_path(dir.path(), &uri(&format!("{too_deep_parent}/Tree"))).exists()
+        );
+        assert!(library_object_path(dir.path(), &uri("Documents/Tree/x/y/b.txt")).is_file());
+    }
+    // Two folders up, y is 15 deep: allowed.
+    let (_, copied) = post_library(
+        app.clone(),
+        &token,
+        "copy",
+        json!({ "uri": uri("Documents/Tree"), "target_parent_uri": uri(&numbered_folders(12)) }),
+    )
+    .await;
+    assert_eq!(copied["status"], "ok", "{copied}");
+}
+
+#[tokio::test]
+async fn test_library_archive_extract_refuses_folders_deeper_than_home_starts_with_and_too_many_entries(
+) {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = |relative: &str| format!("{root}/{relative}");
+    for (parent, name) in [(root.clone(), "Documents"), (uri("Documents"), "Imports")] {
+        let (_, made) = post_library(
+            app.clone(),
+            &token,
+            "mkdir",
+            json!({ "parent_uri": parent, "name": name }),
+        )
+        .await;
+        assert_eq!(made["status"], "ok", "{made}");
+    }
+    let entry = |folders: usize, file: &str| {
+        let mut name = String::new();
+        for level in 1..=folders {
+            name.push_str(&format!("{level}/"));
+        }
+        name + file
+    };
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let archive_of = |format: &str, names: &[String]| {
+        if format == "zip" {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for name in names {
+                writer.start_file(name.as_str(), options).unwrap();
+                writer.write_all(b"x").unwrap();
+            }
+            return writer.finish().unwrap().into_inner();
+        }
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for name in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder.append_data(&mut header, name, &b"x"[..]).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    let upload = |relative: String, bytes: Vec<u8>| {
+        let (app, token, target) = (app.clone(), token.clone(), uri(&relative));
+        async move { put_library_upload(app, &token, &target, Vec::leak(bytes)).await }
+    };
+    let extract = |relative: &str| {
+        post_library(
+            app.clone(),
+            &token,
+            "extract_archive",
+            json!({ "uri": uri(relative) }),
+        )
+    };
+
+    for format in ["zip", "tar.gz"] {
+        // Extracted into Documents/Deep, 15 archive folders put the last one
+        // 16 deep: refused by name, and no folder or file is left behind.
+        let deep = format!("Deep-{}", format.replace('.', "-"));
+        let (status, _, uploaded) = upload(
+            format!("Documents/{deep}.{format}"),
+            archive_of(format, &[entry(2, "shallow.txt"), entry(15, "deep.txt")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        let (_, refused) = extract(&format!("Documents/{deep}.{format}")).await;
+        assert_eq!(refused["status"], "error", "{format}: {refused}");
+        assert_eq!(
+            refused["message"],
+            too_deep_refusal(&format!("Documents/{deep}/{}", entry(15, "deep.txt"))),
+            "{format}"
+        );
+        assert!(!library_object_path(dir.path(), &uri(&format!("Documents/{deep}"))).exists());
+
+        // A selected extract lists that entry as blocked and writes the rest.
+        let (_, selected) = post_library(
+            app.clone(),
+            &token,
+            "archive_extract_entries",
+            json!({
+                "uri": uri(&format!("Documents/{deep}.{format}")),
+                "destination_uri": uri("Documents/Imports"),
+                "entries": [entry(2, "shallow.txt"), entry(15, "deep.txt")],
+            }),
+        )
+        .await;
+        assert_eq!(selected["status"], "ok", "{format}: {selected}");
+        assert_eq!(
+            selected["data"]["receipt"]["status"],
+            "completed_with_blocked_entries"
+        );
+        let blocked = selected["data"]["blocked"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1, "{selected}");
+        assert_eq!(blocked[0]["path"], entry(15, "deep.txt"));
+        assert_eq!(
+            blocked[0]["reason"],
+            too_deep_refusal(&format!("Documents/Imports/{}", entry(15, "deep.txt")))
+        );
+        assert!(!library_object_path(
+            dir.path(),
+            &uri(&format!("Documents/Imports/{}", entry(14, "15")))
+        )
+        .exists());
+
+        // 14 archive folders are allowed.
+        let allowed = format!("Allowed-{}", format.replace('.', "-"));
+        let (status, _, uploaded) = upload(
+            format!("Documents/{allowed}.{format}"),
+            archive_of(format, &[entry(14, "ok.txt")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        let (_, extracted) = extract(&format!("Documents/{allowed}.{format}")).await;
+        assert_eq!(extracted["status"], "ok", "{format}: {extracted}");
+        assert!(library_object_path(
+            dir.path(),
+            &uri(&format!("Documents/{allowed}/{}", entry(14, "ok.txt")))
+        )
+        .is_file());
+
+        // More than 10000 entries: refused by the archive's name, whole and
+        // selected, before anything is written.
+        let many = format!("Many-{}", format.replace('.', "-"));
+        let names: Vec<String> = (0..=10_000).map(|index| format!("f{index}")).collect();
+        let (status, _, uploaded) = upload(
+            format!("Documents/{many}.{format}"),
+            archive_of(format, &names),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        let (_, refused) = extract(&format!("Documents/{many}.{format}")).await;
+        assert_eq!(refused["status"], "error", "{format}: {refused}");
+        assert_eq!(
+            refused["message"],
+            format!(
+                "Documents/{many}.{format} holds more than 10000 entries; Library extracts from \
+                 archives of up to 10000 entries."
+            )
+        );
+        assert!(!library_object_path(dir.path(), &uri(&format!("Documents/{many}"))).exists());
+        let (_, refused) = post_library(
+            app.clone(),
+            &token,
+            "archive_extract_entries",
+            json!({
+                "uri": uri(&format!("Documents/{many}.{format}")),
+                "destination_uri": uri("Documents/Imports"),
+                "entries": ["f0"],
+            }),
+        )
+        .await;
+        assert_eq!(refused["status"], "error", "{format}: {refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{many}.{format} holds more than 10000 entries")),
+            "{refused}"
+        );
+        assert!(!library_object_path(dir.path(), &uri("Documents/Imports/f0")).exists());
+    }
+}
+
+/// #449: an archive is refused by what it expands to, by its declared sizes
+/// before anything is read; a whole extraction that fails while writing
+/// says so and that what it extracted before stays.
+#[tokio::test]
+async fn test_library_archive_extract_bounds_expansion_and_reports_a_stopped_extraction() {
+    use std::io::{Read as _, Write as _};
+
+    const MIB: u64 = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = |relative: &str| format!("{root}/{relative}");
+    for (parent, name) in [(root.clone(), "Documents"), (uri("Documents"), "Imports")] {
+        let (_, made) = post_library(
+            app.clone(),
+            &token,
+            "mkdir",
+            json!({ "parent_uri": parent, "name": name }),
+        )
+        .await;
+        assert_eq!(made["status"], "ok", "{made}");
+    }
+    let upload = |relative: &str, bytes: Vec<u8>| {
+        let (app, token, target) = (app.clone(), token.clone(), uri(relative));
+        async move {
+            let (status, _, uploaded) =
+                put_library_upload(app, &token, &target, Vec::leak(bytes)).await;
+            assert_eq!(status, StatusCode::OK, "{uploaded}");
+        }
+    };
+    let extract = |relative: &str| {
+        post_library(
+            app.clone(),
+            &token,
+            "extract_archive",
+            json!({ "uri": uri(relative) }),
+        )
+    };
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let zeros_zip = |name: &str, len: u64| {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file(name, deflated).unwrap();
+        std::io::copy(&mut std::io::repeat(0).take(len), &mut writer).unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+
+    // One entry of 100 MiB + 1 byte, a few hundred KiB compressed: refused
+    // by name, whole and selected, and nothing is written.
+    upload("Documents/Big.zip", zeros_zip("big.bin", 100 * MIB + 1)).await;
+    let (_, refused) = extract("Documents/Big.zip").await;
+    assert_eq!(
+        refused["message"],
+        "big.bin in Documents/Big.zip would be more than 100 MiB once extracted; Library \
+         extracts files of up to 100 MiB from an archive.",
+        "{refused}"
+    );
+    assert!(!library_object_path(dir.path(), &uri("Documents/Big")).exists());
+    let (_, refused) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": uri("Documents/Big.zip"),
+            "destination_uri": uri("Documents/Imports"),
+            "entries": ["big.bin"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["message"],
+        "big.bin in Big.zip would be more than 100 MiB once extracted; Library extracts files \
+         of up to 100 MiB from an archive.",
+        "{refused}"
+    );
+    assert!(!library_object_path(dir.path(), &uri("Documents/Imports/big.bin")).exists());
+
+    // The same entry in a tar.gz: its header is refused before its body is
+    // expanded.
+    let tar_gz = {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(100 * MIB + 1);
+        header.set_mode(0o644);
+        builder
+            .append_data(
+                &mut header,
+                "big.bin",
+                std::io::repeat(0).take(100 * MIB + 1),
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    upload("Documents/BigTar.tar.gz", tar_gz).await;
+    let (_, refused) = extract("Documents/BigTar.tar.gz").await;
+    assert_eq!(
+        refused["message"],
+        "big.bin in Documents/BigTar.tar.gz would be more than 100 MiB once extracted; Library \
+         extracts files of up to 100 MiB from an archive.",
+        "{refused}"
+    );
+    assert!(!library_object_path(dir.path(), &uri("Documents/BigTar")).exists());
+
+    // A 2 MiB GNU long name, held in memory by the tar reader before the
+    // entry it names: refused once 1 MiB of it is read.
+    let long_name = {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_size(2 * MIB);
+        header.set_mode(0o644);
+        header.as_gnu_mut().unwrap().name[..13].copy_from_slice(b"././@LongLink");
+        header.set_cksum();
+        builder
+            .append(&header, std::io::repeat(b'a').take(2 * MIB))
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_size(1);
+        file.set_mode(0o644);
+        builder.append_data(&mut file, "x.txt", &b"x"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+    upload("Documents/LongName.tar.gz", long_name).await;
+    let (_, refused) = extract("Documents/LongName.tar.gz").await;
+    assert_eq!(
+        refused["message"],
+        "Documents/LongName.tar.gz holds an entry name or header of more than 1 MiB; Library \
+         does not open archives like that.",
+        "{refused}"
+    );
+    assert!(!library_object_path(dir.path(), &uri("Documents/LongName")).exists());
+
+    // Eleven entries of 100 MiB each, 1100 MiB in all: refused as a whole.
+    let many = {
+        let base = zeros_zip("f0", 100 * MIB);
+        let mut source = zip::ZipArchive::new(std::io::Cursor::new(base)).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..11 {
+            let file = source.by_name("f0").unwrap();
+            writer
+                .raw_copy_file_rename(file, format!("f{index}"))
+                .unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    };
+    upload("Documents/Many.zip", many).await;
+    let (_, refused) = extract("Documents/Many.zip").await;
+    assert_eq!(
+        refused["message"],
+        "Documents/Many.zip would be more than 1024 MiB once extracted; Library extracts up to \
+         1024 MiB from one archive.",
+        "{refused}"
+    );
+    assert!(!library_object_path(dir.path(), &uri("Documents/Many")).exists());
+
+    // Failures the first pass cannot see stop the extraction; the message
+    // says the files extracted before stay, and they do.
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let zip_of = |entries: &[(&str, &[u8])]| {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            writer.start_file(*name, stored).unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    };
+    upload(
+        "Documents/Clash.zip",
+        zip_of(&[
+            ("ok.txt", b"ok".as_slice()),
+            ("a", b"file".as_slice()),
+            ("a/b", b"inside".as_slice()),
+        ]),
+    )
+    .await;
+    let (_, failed) = extract("Documents/Clash.zip").await;
+    assert_eq!(failed["status"], "error", "{failed}");
+    let message = failed["message"].as_str().unwrap();
+    assert!(message.starts_with("Extraction stopped: "), "{message}");
+    assert!(
+        message.ends_with(". Files extracted before this stay in Documents/Clash."),
+        "{message}"
+    );
+    assert!(library_object_path(dir.path(), &uri("Documents/Clash/ok.txt")).is_file());
+
+    let mut damaged = zip_of(&[
+        ("ok.txt", b"ok".as_slice()),
+        ("x.txt", b"0123456789abcdef".as_slice()),
+    ]);
+    let body = damaged
+        .windows(16)
+        .position(|window| window == b"0123456789abcdef")
+        .unwrap();
+    damaged[body] = b'X';
+    upload("Documents/Damaged.zip", damaged).await;
+    let (_, failed) = extract("Documents/Damaged.zip").await;
+    let message = failed["message"].as_str().unwrap();
+    assert!(message.starts_with("Extraction stopped: "), "{failed}");
+    assert!(
+        message.ends_with(". Files extracted before this stay in Documents/Damaged."),
+        "{message}"
+    );
+    assert!(library_object_path(dir.path(), &uri("Documents/Damaged/ok.txt")).is_file());
+    assert!(!library_object_path(dir.path(), &uri("Documents/Damaged/x.txt")).exists());
+}
+
+/// #432 (display only): an entry name with a line break or a bidi override
+/// is shown escaped, on one line and in order; its raw `path` stays the key
+/// that preview and extract take.
+#[tokio::test]
+async fn test_library_archive_entry_names_with_control_or_bidi_characters_are_shown_escaped() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let (_, made) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Documents" }),
+    )
+    .await;
+    assert_eq!(made["status"], "ok", "{made}");
+
+    let reversed = "Notes/evil\u{202e}txt.exe";
+    let broken = "a\nError: forged.txt";
+    let blocked = "../\u{202e}up.txt";
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for name in [reversed, broken, blocked] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(b"text").unwrap();
+    }
+    let zip_uri = format!("{documents_uri}/Names.zip");
+    let (_, written) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "data": base64::engine::general_purpose::STANDARD
+                .encode(writer.finish().unwrap().into_inner()),
+        }),
+    )
+    .await;
+    assert_eq!(written["status"], "ok", "{written}");
+
+    let (_, listed) = post_library(
+        app.clone(),
+        &token,
+        "archive_entries",
+        json!({ "uri": zip_uri }),
+    )
+    .await;
+    let rows = listed["data"]["entries"].as_array().unwrap();
+    let row = |path: &str| {
+        rows.iter()
+            .find(|row| row["path"] == path || row["display_path"] == path)
+            .unwrap_or_else(|| panic!("no row for {path:?}: {listed}"))
+    };
+    assert_eq!(row(reversed)["display_path"], "Notes/evil\\u{202e}txt.exe");
+    assert_eq!(row(reversed)["name"], "evil\\u{202e}txt.exe");
+    assert_eq!(row(broken)["display_path"], "a\\u{a}Error: forged.txt");
+    assert_eq!(row(broken)["name"], "a\\u{a}Error: forged.txt");
+    let refused = row("../\\u{202e}up.txt");
+    assert_eq!(refused["kind"], "blocked");
+    assert_eq!(refused["path"], "../\\u{202e}up.txt");
+    for entry in rows {
+        for field in ["display_path", "name"] {
+            let shown = entry[field].as_str().unwrap();
+            assert!(!shown.contains(['\n', '\u{202e}']), "{field}: {shown:?}");
+        }
+    }
+
+    // The raw path still previews and extracts the entry.
+    let (_, preview) = post_library(
+        app.clone(),
+        &token,
+        "archive_preview_entry",
+        json!({ "uri": zip_uri, "entry": reversed }),
+    )
+    .await;
+    assert_eq!(preview["status"], "ok", "{preview}");
+    assert_eq!(
+        preview["data"]["entry"]["display_path"],
+        "Notes/evil\\u{202e}txt.exe"
+    );
+    assert_eq!(preview["data"]["entry"]["name"], "evil\\u{202e}txt.exe");
+    let (_, extracted) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": zip_uri,
+            "destination_uri": documents_uri,
+            "entries": [reversed],
+        }),
+    )
+    .await;
+    assert_eq!(extracted["status"], "ok", "{extracted}");
+    assert!(library_object_path(dir.path(), &format!("{documents_uri}/{reversed}")).is_file());
+}
+
 #[tokio::test]
 async fn test_library_gateway_reads_webspace_files_through_runtime_provider() {
     let dir = tempfile::tempdir().unwrap();
@@ -5426,6 +6639,393 @@ async fn test_library_provider_auto_protects_plaintext_legacy_objects() {
     assert_eq!(decoded, b"plaintext from an older runtime");
 }
 
+fn library_listed_object<'a>(list: &'a Value, uri: &str) -> &'a Value {
+    list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["uri"] == uri)
+        .unwrap_or_else(|| panic!("{uri} is listed"))
+}
+
+#[tokio::test]
+async fn listing_blocks_damaged_items_and_lists_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let folder = format!("{root}/Documents/mixed");
+    let names = [
+        "good-1.txt",
+        "good-2.txt",
+        "good-3.txt",
+        "flipped.txt",
+        "header.txt",
+        "forged.txt",
+        "padded.txt",
+    ];
+    for name in names {
+        write_library_bytes(&app, &token, &format!("{folder}/{name}"), name.as_bytes()).await;
+    }
+    let path_of =
+        |name: &str| rooted_localhost_fs_path(dir.path(), &format!("{folder}/{name}")).unwrap();
+    let mut envelope: Value =
+        serde_json::from_slice(&std::fs::read(path_of("flipped.txt")).unwrap()).unwrap();
+    let ciphertext = envelope["ciphertext"].as_str().unwrap().to_string();
+    let replacement = if ciphertext.starts_with('A') {
+        "B"
+    } else {
+        "A"
+    };
+    envelope["ciphertext"] = Value::String(format!("{replacement}{}", &ciphertext[1..]));
+    std::fs::write(
+        path_of("flipped.txt"),
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+    let mut header = std::fs::read(path_of("header.txt")).unwrap();
+    header[9] = 0xff;
+    std::fs::write(path_of("header.txt"), &header).unwrap();
+    let mut forged: Value =
+        serde_json::from_slice(&std::fs::read(path_of("forged.txt")).unwrap()).unwrap();
+    let forged_len = forged["ciphertext"].as_str().unwrap().len();
+    forged["ciphertext"] = Value::String("Q".repeat(forged_len));
+    std::fs::write(
+        path_of("forged.txt"),
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+    let mut padded = std::fs::read(path_of("padded.txt")).unwrap();
+    padded.extend_from_slice(b"\n\n");
+    std::fs::write(path_of("padded.txt"), &padded).unwrap();
+    let before: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(path_of(name)).unwrap())
+        .collect();
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": folder })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["status"], "ok");
+    assert_eq!(list["data"]["objects"].as_array().unwrap().len(), 7);
+    for name in ["flipped.txt", "header.txt", "forged.txt"] {
+        let object = library_listed_object(&list, &format!("{folder}/{name}"));
+        assert_eq!(
+            object["blocked_reason"], "protected_principal_root_object_damaged",
+            "{name}"
+        );
+        assert_eq!(object["capabilities"], json!(["properties"]), "{name}");
+        assert!(object["content_cid"].is_null(), "{name}");
+        let (_, read) = post_library(
+            app.clone(),
+            &token,
+            "read",
+            json!({ "uri": format!("{folder}/{name}") }),
+        )
+        .await;
+        assert_ne!(read["status"], "ok", "{name}");
+        assert!(
+            read.to_string()
+                .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED),
+            "{name}: {read}"
+        );
+    }
+    for name in ["good-1.txt", "good-2.txt", "good-3.txt", "padded.txt"] {
+        let uri = format!("{folder}/{name}");
+        assert!(library_listed_object(&list, &uri)["blocked_reason"].is_null());
+        let (read_status, read) =
+            post_library(app.clone(), &token, "read", json!({ "uri": uri })).await;
+        assert_eq!(read_status, StatusCode::OK, "{name}: {read}");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, name.as_bytes());
+    }
+    let after: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(path_of(name)).unwrap())
+        .collect();
+    assert_eq!(after, before, "List and Read change no bytes");
+}
+
+#[tokio::test]
+async fn lazy_protection_bounds_size_and_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let folder = format!("{root}/Documents");
+    let small_uri = format!("{folder}/legacy-2mib.bin");
+    let large_uri = format!("{folder}/legacy-17mib.bin");
+    let small_path = rooted_localhost_fs_path(dir.path(), &small_uri).unwrap();
+    let large_path = rooted_localhost_fs_path(dir.path(), &large_uri).unwrap();
+    std::fs::create_dir_all(small_path.parent().unwrap()).unwrap();
+    let small = vec![0x42u8; 2 * 1024 * 1024];
+    std::fs::write(&small_path, &small).unwrap();
+    let large = std::fs::File::create(&large_path).unwrap();
+    large.set_len(17 * 1024 * 1024).unwrap();
+    drop(large);
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": folder })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert!(library_listed_object(&list, &small_uri)["blocked_reason"].is_null());
+    assert_ne!(
+        std::fs::read(&small_path).unwrap(),
+        small,
+        "2 MiB is encrypted"
+    );
+    let (read_status, read) =
+        post_library(app.clone(), &token, "read", json!({ "uri": small_uri })).await;
+    assert_eq!(read_status, StatusCode::OK);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, small);
+
+    let large_object = library_listed_object(&list, &large_uri);
+    assert_eq!(
+        large_object["blocked_reason"],
+        "protected_principal_root_object_not_encrypted"
+    );
+    let (_, read) = post_library(app.clone(), &token, "read", json!({ "uri": large_uri })).await;
+    assert!(
+        read.to_string()
+            .contains("Documents/legacy-17mib.bin is not encrypted and is larger than 16 MiB"),
+        "{read}"
+    );
+    let metadata = std::fs::metadata(&large_path).unwrap();
+    assert_eq!(metadata.len(), 17 * 1024 * 1024);
+    let mut head = vec![0u8; 4096];
+    std::io::Read::read_exact(&mut std::fs::File::open(&large_path).unwrap(), &mut head).unwrap();
+    assert!(head.iter().all(|byte| *byte == 0), "17 MiB file unchanged");
+}
+
+/// Download and Compress refuse before reading content above their archive
+/// budgets (#481). Sparse files keep the fixture free; a refused archive
+/// never reads them, and an admitted one stops at their unencrypted bytes.
+#[tokio::test]
+async fn archive_creation_refuses_above_its_budget_before_reading() {
+    const DOWNLOAD_REFUSAL: &str = "Too large to download at once (limit 1 GB, and no file \
+                                    over 100 MB). Choose fewer or smaller items.";
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let sparse = |uri: &str, stored_mib: u64| {
+        let path = rooted_localhost_fs_path(dir.path(), uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(stored_mib * 1024 * 1024)
+            .unwrap();
+    };
+    let compress = |body: serde_json::Value| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (_, compressed) = post_library(app, &token, "compress_archive", body).await;
+            assert_eq!(compressed["status"], "error", "{compressed}");
+            compressed["message"].as_str().unwrap().to_string()
+        }
+    };
+    let download = |uris: Vec<String>, archive: Option<&'static str>| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let (status, _, body) =
+                get_library_download_many_with_archive(app, &token, &uris, archive).await;
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+    };
+    // These files are not envelopes, so each counts its whole length. One
+    // of 101 MiB is over Compress's 100 MB and over one download entry.
+    let trip = format!("{root}/Videos/Trip");
+    sparse(&format!("{trip}/a.mp4"), 101);
+    // Eleven of 96 MiB: each fits, 1056 MiB in all does not.
+    let many_folder = format!("{root}/Videos/Many");
+    let many: Vec<String> = (0..11)
+        .map(|i| format!("{many_folder}/{i:02}.mp4"))
+        .collect();
+    for uri in &many {
+        sparse(uri, 96);
+    }
+
+    for body in [
+        json!({ "uri": trip }),
+        json!({ "uri": many_folder }),
+        json!({ "uris": [many[0], many[1]] }),
+    ] {
+        assert!(compress(body).await.contains(ARCHIVE_COMPRESS_REFUSAL));
+    }
+    for uris in [vec![trip.clone()], vec![many_folder.clone()], many.clone()] {
+        for archive in [None, Some("zip")] {
+            let (status, body) = download(uris.clone(), archive).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body, DOWNLOAD_REFUSAL);
+        }
+    }
+    for (folder, count) in [(&trip, 1), (&many_folder, 11)] {
+        let path = rooted_localhost_fs_path(dir.path(), folder).unwrap();
+        assert_eq!(
+            std::fs::read_dir(path).unwrap().count(),
+            count,
+            "no archive written"
+        );
+    }
+
+    // Within budget the archive is attempted: 96 MiB to compress, 960 MiB
+    // to download. It then stops at the first unencrypted sparse file.
+    assert!(!compress(json!({ "uri": many[0] }))
+        .await
+        .contains("Too large"));
+    let (status, body) = download(many[..10].to_vec(), Some("zip")).await;
+    assert_ne!(status, StatusCode::OK);
+    assert!(!body.contains("Too large"), "{body}");
+}
+
+const ARCHIVE_COMPRESS_REFUSAL: &str =
+    "Too large to compress at once (limit 100 MB). Choose fewer or smaller items.";
+const MIB: u64 = 1024 * 1024;
+
+fn sparse_library_file(data_dir: &std::path::Path, uri: &str, len: u64) -> std::path::PathBuf {
+    let path = rooted_localhost_fs_path(data_dir, uri).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    path
+}
+
+fn opened_among(data_dir: &std::path::Path, uris: &[String]) -> Vec<String> {
+    crate::auth::principal_root_object_opens(data_dir)
+        .into_iter()
+        .filter(|uri| uris.contains(uri))
+        .collect()
+}
+
+/// Legacy plaintext of up to 16 MiB is read whole, so the archive budget
+/// counts its whole length, not an envelope's three quarters (#481).
+#[tokio::test]
+async fn archive_budget_counts_legacy_plaintext_whole_without_reading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    // Nine readable legacy plaintext files of 12 MiB: 108 MiB of content.
+    let folder = format!("{root}/Documents/Legacy");
+    let legacy: Vec<String> = (0..9).map(|i| format!("{folder}/{i}.bin")).collect();
+    let paths: Vec<_> = legacy
+        .iter()
+        .map(|uri| sparse_library_file(dir.path(), uri, 12 * MIB))
+        .collect();
+
+    for body in [json!({ "uri": folder }), json!({ "uris": legacy })] {
+        let (_, compressed) = post_library(app.clone(), &token, "compress_archive", body).await;
+        assert_eq!(compressed["status"], "error", "{compressed}");
+        let message = compressed["message"].as_str().unwrap();
+        assert!(message.contains(ARCHIVE_COMPRESS_REFUSAL), "{compressed}");
+    }
+    assert_eq!(opened_among(dir.path(), &legacy), Vec::<String>::new());
+    for path in &paths {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            12 * MIB,
+            "unchanged"
+        );
+    }
+    let folder_path = rooted_localhost_fs_path(dir.path(), &folder).unwrap();
+    assert_eq!(
+        std::fs::read_dir(folder_path).unwrap().count(),
+        9,
+        "no archive"
+    );
+}
+
+/// The UI sends a revision with a single-item Compress; checking it reads the
+/// whole object, so the archive budget refuses first (#481).
+#[tokio::test]
+async fn compress_checks_the_archive_budget_before_reading_for_the_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let big = format!("{root}/Videos/big.mp4");
+    sparse_library_file(dir.path(), &big, 101 * MIB);
+
+    let (_, compressed) = post_library(
+        app,
+        &token,
+        "compress_archive",
+        json!({ "uri": big, "if_revision": "rev:stale" }),
+    )
+    .await;
+    assert_eq!(compressed["status"], "error", "{compressed}");
+    let message = compressed["message"].as_str().unwrap();
+    assert!(message.contains(ARCHIVE_COMPRESS_REFUSAL), "{compressed}");
+    assert_eq!(opened_among(dir.path(), &[big]), Vec::<String>::new());
+}
+
+/// An envelope counts three quarters of its length, never less than its
+/// content; anything else counts its whole length (#481).
+#[tokio::test]
+async fn archive_content_bound_never_undercounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let note = format!("{root}/Documents/note.txt");
+    let content = vec![b'n'; 4096];
+    let (status, _) = post_library(
+        app,
+        &token,
+        "write",
+        json!({
+            "uri": note,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(&content),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let plain = format!("{root}/Documents/plain.bin");
+    sparse_library_file(dir.path(), &plain, 12 * MIB);
+    let protection =
+        crate::auth::load_principal_root_protection(dir.path(), &authority.principal_id, &root)
+            .unwrap()
+            .unwrap();
+    let bound = |uri: &str, data_key_id: Option<&str>| {
+        let path = rooted_localhost_fs_path(dir.path(), uri).unwrap();
+        crate::auth::principal_root_object_content_bound(
+            &authority.principal_id,
+            &root,
+            uri,
+            &path,
+            data_key_id,
+        )
+        .unwrap()
+    };
+    let key = Some(protection.data_key_id.as_str());
+    let stored = std::fs::metadata(rooted_localhost_fs_path(dir.path(), &note).unwrap())
+        .unwrap()
+        .len();
+    assert_eq!(bound(&note, key), stored / 4 * 3);
+    assert!(bound(&note, key) >= content.len() as u64);
+    // Without protection an envelope is read raw, so it counts whole.
+    assert_eq!(bound(&note, None), stored);
+    assert_eq!(bound(&plain, key), 12 * MIB);
+}
+
 #[tokio::test]
 async fn test_library_provider_publish_fails_closed_without_content_provider() {
     let dir = tempfile::tempdir().unwrap();
@@ -5459,10 +7059,11 @@ async fn test_library_provider_publish_fails_closed_without_content_provider() {
     .await;
     assert_eq!(publish_status, StatusCode::OK);
     assert_eq!(publish["status"], "error");
-    assert!(publish["message"]
-        .as_str()
-        .unwrap()
-        .contains("content provider unavailable"));
+    assert_eq!(publish["code"], "unavailable");
+    assert_eq!(
+        publish["message"],
+        "Publishing isn't available right now. Try again."
+    );
 }
 
 #[tokio::test]
@@ -6020,6 +7621,7 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
 #[tokio::test]
 async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_protection_fields() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -6100,6 +7702,7 @@ async fn test_library_provider_runtime_custody_publish_fails_closed_without_comp
 ) {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let protected_content_root = dir.path().join("protected-content");
     std::fs::create_dir_all(&protected_content_root).unwrap();
@@ -8480,6 +10083,7 @@ async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
 async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
     let registry = state.provider_registry.as_ref().unwrap().clone();
@@ -8961,6 +10565,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
 
     let shared_content = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let runtime_a = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_a.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_a.path(), 0x5a);
     let content_a = TwoRuntimeContentProvider::new(0x5a, shared_content.clone());
     let (state_a, wallet_a) = wallet_chain_test_state_with_observer(runtime_a.path()).await;
@@ -9117,6 +10722,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
     assert_eq!(publish_requests[2]["links"].as_array().unwrap().len(), 2);
 
     let runtime_b = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_b.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_b.path(), 0x5b);
     let content_b = TwoRuntimeContentProvider::new(0x5b, shared_content);
     assert_ne!(content_a.signer_did(), content_b.signer_did());
@@ -9656,8 +11262,31 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
 }
 
 #[tokio::test]
+async fn test_library_provider_refuses_protected_publish_until_protected_content_is_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protection-not-released");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &uri, 0x40).await;
+
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &uri,
+        "protected content is not available in this release",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -9948,6 +11577,7 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
 async fn test_library_provider_runtime_custody_publish_passes_one_file_to_runtime_media_boundary() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     // The creator wallet/chain binding gate runs ahead of the media gate, so
     // the state must carry wallet + chain providers plus a seeded managed
     // default account for this test to reach the media preparation boundary
@@ -10050,10 +11680,7 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         .unwrap()
         .starts_with("bafkrei"));
     assert_eq!(unpublish["data"]["object"].get("published_cid"), None);
-    assert_eq!(
-        unpublish["data"]["object"]["availability"],
-        "local_unpinned"
-    );
+    assert_eq!(unpublish["data"]["object"]["availability"], "withdrawn");
 
     let (repair_status, repair) = post_library(
         app.clone(),
@@ -10084,4 +11711,97 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         status["data"]["published"]["availability"]["status"],
         "local_pinned"
     );
+}
+
+#[tokio::test]
+async fn unpublishing_one_persons_publication_keeps_another_persons_identical_bytes_shared() {
+    // Publishes here count in the shared mock Content the protected tests check.
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let alma = passkey_authority_with_name(dir.path(), Some("alma"));
+    let bruno = passkey_authority_with_name_role(
+        dir.path(),
+        Some("bruno"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    assert_ne!(alma.principal_id, bruno.principal_id);
+    let mut people = Vec::new();
+    for authority in [&alma, &bruno] {
+        let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, authority);
+        let root = crate::auth::principal_localhost_root(&authority.principal_id);
+        let uri = format!("{root}/Documents/same.txt");
+        let (_, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"same bytes"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let (_, publish) =
+            post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+        assert_eq!(publish["data"]["cid"], TEST_CIDV1, "{publish}");
+        people.push((token, uri));
+    }
+
+    // Alma withdraws: Bruno's publication of the same CID stays served.
+    let (token, uri) = &people[0];
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert_eq!(unpublish["data"]["availability"]["status"], "withdrawn");
+    assert!(crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
+    let (token, uri) = &people[1];
+    let (_, status) = post_library(app.clone(), token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], true, "{status}");
+
+    // Bruno withdraws last: nothing on this Home shares the CID any more.
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert!(!crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
+}
+
+#[tokio::test]
+async fn a_publication_withdrawn_by_an_older_release_is_not_served_after_the_update() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("alma"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/undo.txt");
+    let (_, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"undo bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write["status"], "ok", "{write}");
+    let (_, publish) = post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+    let cid = publish["data"]["cid"].as_str().unwrap().to_string();
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Undo to alpha.25, which stops sharing and rewrites the record without
+    // the publication id; the index it never knew keeps the old entry.
+    crate::library::withdraw_as_alpha25_for_test(dir.path(), &authority.principal_id, &uri);
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Update back: the start rebuild serves only what an active record backs.
+    crate::library::reconcile_published_cids(dir.path());
+    assert!(!crate::library::cid_is_published_here(dir.path(), &cid));
+    let (_, status) = post_library(app, &token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], false, "{status}");
 }

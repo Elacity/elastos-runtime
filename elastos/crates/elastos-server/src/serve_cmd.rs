@@ -69,6 +69,15 @@ pub async fn run_serve(
                 .validate()
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
+            if matches!(
+                manifest.execution_type(),
+                elastos_common::CapsuleType::WebProjection
+                    | elastos_common::CapsuleType::NativeProvider
+                    | elastos_common::CapsuleType::NativeHost
+            ) {
+                anyhow::bail!("Web projections and native helpers use their existing Runtime-owned host paths");
+            }
+
             if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
                 tracing::info!("Launching MicroVM capsule: {}", manifest.name);
 
@@ -94,9 +103,7 @@ pub async fn run_serve(
                     .map_err(|e| anyhow::anyhow!("Failed to load capsule: {}", e))?;
 
                 if let Some(vm_id) = vm_provider.get_vm_id(&handle.id).await {
-                    let shell_session = session_registry
-                        .create_session(session::SessionType::Shell, Some(vm_id.clone()))
-                        .await;
+                    let vm_session = create_initial_vm_session(&session_registry, &vm_id).await;
 
                     let needs_tap = manifest.permissions.guest_network;
                     if needs_tap {
@@ -121,14 +128,14 @@ pub async fn run_serve(
                             .ok_or_else(|| anyhow::anyhow!("network not configured"))?;
                         let api_addr = format!("http://{}:{}", net.host_ip, api_port);
                         vm_provider
-                            .set_session_for_vm(&handle.id, &shell_session.token, &api_addr)
+                            .set_session_for_vm(&handle.id, &vm_session.token, &api_addr)
                             .await
                             .map_err(|e| anyhow::anyhow!("Failed to set session: {}", e))?;
                     } else {
                         vm_provider
                             .append_boot_args_for_vm(
                                 &handle.id,
-                                &format!("elastos.token={}", shell_session.token),
+                                &format!("elastos.token={}", vm_session.token),
                             )
                             .await
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
@@ -173,7 +180,7 @@ pub async fn run_serve(
                 println!("MicroVM capsule '{}' started", handle.manifest.name);
                 println!("  API server: {}://{}", scheme, addr);
                 println!("  VM service: {}://localhost:{}", scheme, vm_port);
-                println!("  Session: configured (shell mode)");
+                println!("  Session: configured (capsule mode)");
                 println!("Press Ctrl+C to stop...");
 
                 let api_bind_addr = if addr.starts_with("127.0.0.1:") {
@@ -323,22 +330,13 @@ pub async fn run_serve(
             None
         } else {
             let api_url = format!("http://{}", addr);
-            let shell_mode = std::env::var("ELASTOS_SHELL_MODE").unwrap_or_else(|_| "auto".into());
-            let stdin_cfg = if shell_mode == "cli" {
-                std::process::Stdio::inherit()
-            } else {
-                std::process::Stdio::piped()
-            };
-            match tokio::process::Command::new(&shell_path)
-                .env("ELASTOS_API", &api_url)
-                .env("ELASTOS_TOKEN", &shell_session.token)
-                .env("ELASTOS_SHELL_MODE", &shell_mode)
-                .stdin(stdin_cfg)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::inherit())
-                .kill_on_drop(true)
-                .spawn()
-            {
+            let (mut command, shell_mode) = shell_capsule_command(
+                &shell_path,
+                &api_url,
+                &shell_session.token,
+                std::env::var("ELASTOS_SHELL_MODE").ok(),
+            );
+            match command.spawn() {
                 Ok(child) => {
                     tracing::info!(
                         "Spawned shell capsule (PID {}, mode={})",
@@ -426,6 +424,8 @@ pub async fn run_serve(
         binary_sha256,
         policy_sha256,
         dependency_sha256,
+        generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
+        home_url: String::new(),
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {
@@ -433,7 +433,7 @@ pub async fn run_serve(
     } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
         eprintln!("[serve] Managed chat runtime ready");
     } else {
-        eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");
+        eprintln!("[serve] Attach commands (elastos run, elastos capsule) ready");
     }
 
     {
@@ -488,9 +488,156 @@ pub async fn run_serve(
     Ok(())
 }
 
+/// The command that starts the shell capsule for a server's own API, and the
+/// decision mode it runs in. `requested_mode` is `ELASTOS_SHELL_MODE`.
+///
+/// The shell gets the terminal only for an explicit `cli`; otherwise its stdin
+/// is a pipe, so without a requested mode the shell's own default (no TTY)
+/// is `agent`: grants come only from the policy file. Pass `agent` explicitly so
+/// the logged mode is the one the shell runs. Any explicit mode, including
+/// `auto` for development, is passed through unchanged.
+pub(crate) fn shell_capsule_command(
+    shell_path: &std::path::Path,
+    api_url: &str,
+    token: &str,
+    requested_mode: Option<String>,
+) -> (tokio::process::Command, String) {
+    let mode = requested_mode
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or_else(|| "agent".into());
+    let stdin = if mode == "cli" {
+        std::process::Stdio::inherit()
+    } else {
+        std::process::Stdio::piped()
+    };
+    let mut command = tokio::process::Command::new(shell_path);
+    command
+        .env("ELASTOS_API", api_url)
+        .env("ELASTOS_TOKEN", token)
+        .env("ELASTOS_SHELL_MODE", &mode)
+        .stdin(stdin)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    (command, mode)
+}
+
+/// The first VM capsule gets the same Capsule session the supervisor gives every
+/// capsule other than the shell. Its token is readable inside the guest.
+async fn create_initial_vm_session(
+    registry: &session::SessionRegistry,
+    vm_id: &str,
+) -> session::Session {
+    registry
+        .create_session(session::SessionType::Capsule, Some(vm_id.to_string()))
+        .await
+}
+
 fn current_binary_sha256() -> anyhow::Result<String> {
     let self_exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let bytes = std::fs::read(self_exe)?;
     Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::{middleware as axum_middleware, routing::post, Router};
+    use elastos_runtime::primitives::audit::AuditLog;
+    use elastos_server::api::middleware::{auth_middleware, shell_only_middleware, ApiState};
+    use tower::ServiceExt;
+
+    async fn shell_route_status(
+        registry: Arc<session::SessionRegistry>,
+        token: &str,
+    ) -> StatusCode {
+        let app = Router::new()
+            .route("/api/capability/grant", post(|| async { "granted" }))
+            .layer(axum_middleware::from_fn(shell_only_middleware))
+            .layer(axum_middleware::from_fn_with_state(
+                ApiState {
+                    session_registry: registry,
+                },
+                auth_middleware,
+            ));
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/capability/grant")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn initial_vm_token_is_a_vm_bound_capsule_session_refused_by_shell_routes() {
+        let registry = Arc::new(session::SessionRegistry::new(Arc::new(AuditLog::new())));
+
+        let vm_session = create_initial_vm_session(&registry, "vm-initial").await;
+        let resolved = registry
+            .validate_token(&vm_session.token)
+            .await
+            .expect("initial VM token resolves");
+        assert_eq!(resolved.session_type, session::SessionType::Capsule);
+        assert!(!resolved.is_shell());
+        assert_eq!(resolved.vm_id.as_deref(), Some("vm-initial"));
+        assert_eq!(
+            shell_route_status(registry.clone(), &vm_session.token).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let shell = registry
+            .create_session(session::SessionType::Shell, None)
+            .await;
+        assert_eq!(
+            shell_route_status(registry, &shell.token).await,
+            StatusCode::OK
+        );
+    }
+
+    fn shell_env(command: &tokio::process::Command, key: &str) -> Option<String> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn spawned_shell_without_a_requested_mode_runs_agent_not_auto() {
+        let shell = std::path::Path::new("/nonexistent/shell");
+        for requested in [None, Some(String::new())] {
+            let (command, mode) =
+                shell_capsule_command(shell, "http://127.0.0.1:1", "tok", requested.clone());
+            assert_eq!(mode, "agent", "{requested:?}");
+            assert_eq!(
+                shell_env(&command, "ELASTOS_SHELL_MODE").as_deref(),
+                Some("agent"),
+                "{requested:?}"
+            );
+        }
+        for explicit in ["auto", "cli", "agent"] {
+            let (command, mode) =
+                shell_capsule_command(shell, "http://127.0.0.1:1", "tok", Some(explicit.into()));
+            assert_eq!(mode, explicit);
+            assert_eq!(
+                shell_env(&command, "ELASTOS_SHELL_MODE").as_deref(),
+                Some(explicit)
+            );
+        }
+        let (command, _) = shell_capsule_command(shell, "http://127.0.0.1:1", "tok", None);
+        assert_eq!(
+            shell_env(&command, "ELASTOS_API").as_deref(),
+            Some("http://127.0.0.1:1")
+        );
+        assert_eq!(shell_env(&command, "ELASTOS_TOKEN").as_deref(), Some("tok"));
+    }
 }

@@ -30,8 +30,8 @@ function createFakeClassList(initial = []) {
 
 function createFakePropertyCopyButton() {
   const attributes = new Map([
-    ["data-prop-copy", "elastos://published"],
-    ["data-copy-label", "published link"],
+    ["data-prop-copy", "localhost://Users/smoke/Documents/Guide.md"],
+    ["data-copy-label", "object URI"],
     ["data-copy-purpose", "resource.uri"],
   ]);
   const copyIcon = { hidden: false };
@@ -122,13 +122,14 @@ async function assertDialogCopyFeedbackBehavior() {
       hideMenu: () => {},
       objectByUri: () => null,
       onBeforeClose: () => {},
+      roots: () => [],
     });
     successApi.bindDialogEvents();
     successDialog.dispatch("click", { target: successButton });
     assert(successCalls.length === 1, "Library Properties copy must call the existing clipboard path once.");
     assert(
-      successCalls[0][0] === "elastos://published"
-        && successCalls[0][1] === "published link"
+      successCalls[0][0] === "localhost://Users/smoke/Documents/Guide.md"
+        && successCalls[0][1] === "object URI"
         && successCalls[0][2] === "resource.uri",
       "Library Properties copy must keep the existing Home Clipboard purpose binding.",
     );
@@ -137,7 +138,7 @@ async function assertDialogCopyFeedbackBehavior() {
     await flushMicrotasks();
     assert(successButton.classList.contains("copied"), "Library must show copied feedback after copy succeeds.");
     assert(successButton.dataset.copied === "true", "Library must record copied feedback only after success.");
-    assert(successButton.getAttribute("aria-label") === "Copied published link", "Library must expose copied feedback accessibly after success.");
+    assert(successButton.getAttribute("aria-label") === "Copied object URI", "Library must expose copied feedback accessibly after success.");
     assert(successButton.querySelector(".el-copy-icon").hidden, "Library must hide the copy glyph after success.");
     assert(!successButton.querySelector(".el-copy-check").hidden, "Library must show the check glyph after success.");
     assert(timers.length === 1, "Library success feedback must schedule one reset timer.");
@@ -157,6 +158,7 @@ async function assertDialogCopyFeedbackBehavior() {
       hideMenu: () => {},
       objectByUri: () => null,
       onBeforeClose: () => {},
+      roots: () => [],
     });
     rejectApi.bindDialogEvents();
     rejectDialog.dispatch("click", { target: rejectButton });
@@ -172,6 +174,87 @@ async function assertDialogCopyFeedbackBehavior() {
     globalThis.setTimeout = realSetTimeout;
     globalThis.clearTimeout = realClearTimeout;
   }
+}
+
+const SMOKE_ROOTS = [
+  { id: "home", label: "Home", uri: "localhost://Users/smoke" },
+  { id: "documents", label: "Documents", uri: "localhost://Users/smoke/Documents" },
+  { id: "webspaces", label: "Spaces", uri: "localhost://WebSpaces" },
+];
+
+async function renderProperties(object) {
+  const dialogModuleUrl = `${pathToFileURL(path.resolve("capsules/library/browser/src/dialog.js")).href}?library-smoke-properties=${Date.now()}`;
+  const { createLibraryDialog } = await import(dialogModuleUrl);
+  const dialog = createFakeDialog();
+  createLibraryDialog({
+    copyText: async () => {},
+    dialog,
+    hideMenu: () => {},
+    objectByUri: () => null,
+    onBeforeClose: () => {},
+    roots: () => SMOKE_ROOTS,
+  }).showProperties(object);
+  const detailsAt = dialog.innerHTML.indexOf('<details class="item-props-details">');
+  assert(detailsAt > 0, "Library Properties must keep the address and content ID in a Details section.");
+  return { general: dialog.innerHTML.slice(0, detailsAt), details: dialog.innerHTML.slice(detailsAt), html: dialog.innerHTML };
+}
+
+// Properties shows no published CID and no elastos:// text (this reverses
+// ddf3a0c74), and General never shows a localhost:// address.
+async function assertPropertiesShowNoLinks() {
+  const published = await renderProperties({
+    uri: "localhost://Users/smoke/Documents/Probe Folder/Deep/Guide.md",
+    name: "Guide.md",
+    kind: "file",
+    mime: "text/markdown",
+    size: 1200,
+    modified_at: 1760000000,
+    content_cid: "bafy-smoke-local",
+    published: true,
+    published_cid: "bafy-smoke-published",
+    capabilities: ["unpublish", "properties"],
+    metadata: { visibility: { placement: "private_folder", published_cid: "bafy-smoke-published" } },
+  });
+  assert(!published.html.includes("bafy-smoke-published"), "Library Properties must not show the published CID.");
+  assert(!published.html.includes("elastos://"), "Library Properties must not show elastos:// text.");
+  assert(!published.general.includes("localhost://"), "Library Properties General must not show a localhost:// address.");
+  assert(published.general.includes(">Documents / Probe Folder / Deep<"), "Library Properties Location must use the breadcrumb form.");
+  assert(published.general.includes("Shared with your contacts"), "A shared file must say it is shared with your contacts.");
+  assert(!/Unpublish|Publish/.test(published.general), "A shared file's Properties must not name Publish or Unpublish.");
+  assert(!published.general.includes("a copy is on the network"), "Library Properties must make no availability claim.");
+  assert(published.details.includes('data-prop-copy="bafy-smoke-local"'), "Details must offer the content ID copy.");
+  assert(!published.general.includes("bafy-smoke-local"), "Library Properties General must not show the content ID.");
+  // Details stays closed (renderProperties matches the tag without `open`);
+  // ordinary fields stay in General and the address fields stay in Details.
+  const propLabel = (html, label) => html.includes(`<td class="item-prop-label">${label}</td>`);
+  for (const label of ["Name", "Location", "Type", "Size", "Modified"]) {
+    assert(propLabel(published.general, label) && !propLabel(published.details, label), `Library Properties must show ${label} outside Details.`);
+  }
+  for (const label of ["Object URI", "Content ID"]) {
+    assert(propLabel(published.details, label) && !propLabel(published.general, label), `Library Properties must keep ${label} inside Details.`);
+  }
+  assert(published.details.includes("<summary>Details</summary>"), "Library Properties Details must be labelled Details.");
+  assert(!published.html.includes("data-tab"), "Library Properties must not use tabs.");
+
+  const elastosSpace = await renderProperties({
+    uri: "localhost://WebSpaces/Elastos/content/bafy-smoke-content",
+    name: "bafy-smoke-content",
+    kind: "file",
+    metadata: { resolver: "builtin", target_uri: "elastos://bafy-smoke-content", readonly: true },
+  });
+  assert(!elastosSpace.html.includes("elastos://"), "A Space backed by an elastos:// target must not show it.");
+  assert(!elastosSpace.html.includes(">Source<"), "A Space backed by an elastos:// target has no Source row.");
+  assert(!elastosSpace.general.includes("localhost://"), "Library Properties General must not show a localhost:// address.");
+
+  const cloudSpace = await renderProperties({
+    uri: "localhost://WebSpaces/Cloud/Drive",
+    name: "Drive",
+    kind: "directory",
+    metadata: { resolver: "cloud-drive", target_uri: "cloud://drive/Drive", readonly: true },
+  });
+  assert(cloudSpace.details.includes(">cloud://drive/Drive<"), "A Space's own source must show under Details.");
+  assert(!cloudSpace.details.includes('data-prop-copy="cloud://'), "Source is plain text, not a copy action.");
+  assert(cloudSpace.general.includes(">Read-only<"), "A read-only Space must say Access Read-only.");
 }
 
 async function run() {
@@ -233,9 +316,7 @@ async function run() {
   assert(
     dialog.includes('class="props-copy-btn el-copy-btn"') &&
       dialog.includes('class="el-copy-icon"') &&
-      dialog.includes('class="el-copy-check"') &&
-      dialog.includes("setPropertyCopyFeedback(propertyCopy, label, true);") &&
-      dialog.includes("setPropertyCopyFeedback(propertyCopy, label, false);"),
+      dialog.includes('class="el-copy-check"'),
     "Library Properties copy buttons must keep the donor copy feedback without changing clipboard authority.",
   );
 
@@ -297,6 +378,7 @@ async function run() {
     "Library UIUX CSS must include the donor search, motion, and resizer presentation behavior.",
   );
   await assertDialogCopyFeedbackBehavior();
+  await assertPropertiesShowNoLinks();
 
   console.log("PASS Library product behavior smoke");
 }

@@ -17,7 +17,7 @@ const require = createRequire(
   new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url),
 );
 
-export const { chromium } = require("playwright");
+export const { chromium } = require(process.env.ELASTOS_PLAYWRIGHT_MODULE || "playwright");
 
 export const CORS_HEADERS = Object.freeze({
   "access-control-allow-origin": "null",
@@ -121,9 +121,6 @@ export function inertSystemApiResponse(pathname) {
       ],
     };
   }
-  if (pathname === "/api/auth/passkey/status") {
-    return { registered: true };
-  }
   if (pathname === "/api/auth/passkeys") {
     return { passkeys: [] };
   }
@@ -143,17 +140,23 @@ export function inertSystemApiResponse(pathname) {
   if (pathname === "/api/provider/chain/networks") {
     return { status: "ok", data: { networks: [] } };
   }
+  if (pathname === "/api/apps/system/community") {
+    return { schema: "elastos.community-membership/v1", configured: false, joined: false, detail: "" };
+  }
+  if (pathname === "/api/apps/system/community/presence") {
+    return { schema: "elastos.community-presence/v1", configured: false, joined: false, community_presence: null };
+  }
   if (pathname === "/api/apps/system/ai-provider") {
     return {
       hosted_external_https: "paused",
-      approval_lens_offer_id: "model:hosted-11111111111111111111111111111111",
+      // A decision model saved by an earlier release is listed so it can be disconnected.
       connections: [
         { id: "model:hosted-11111111111111111111111111111111", name: "Jev", provider: "openrouter",
           processor_label: "OpenRouter", selected_model: "typesafe/jev-1.13", operation: "decision.evaluate",
           connected: true, egress_state: "paused" },
         { id: "model:hosted-22222222222222222222222222222222", name: "VeniceQwen3.8F", provider: "venice",
           processor_label: "Venice", selected_model: "qwen-3-8-flash", operation: "text.generate",
-          connected: true, approval_state: "approved", share_enabled: true, egress_state: "paused" },
+          connected: true, approval_state: "approved", egress_state: "paused" },
       ],
     };
   }
@@ -223,6 +226,7 @@ async function serveStaticAsset(response, url, host, fixtureOptions) {
         ? "index.html"
         : pathname.slice("/apps/system/".length);
   } else if (
+    pathname === "/apps/home/home-background-image.js" ||
     pathname === "/apps/home/home-clipboard-client.js" ||
     pathname === "/apps/home/home-clipboard-protocol.js"
   ) {

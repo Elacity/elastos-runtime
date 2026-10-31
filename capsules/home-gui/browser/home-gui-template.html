@@ -47,7 +47,7 @@
       </button>
       <button id="identity-menu-marketplace" class="toolbar-identity-item" type="button" role="menuitem">
         <svg class="toolbar-identity-item-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="2.2"/><path d="M6.2 9.2V6.8l2.3 1.35L10.8 6.8v2.4"/></svg>
-        Apps
+        Marketplace
       </button>
       <div class="toolbar-identity-divider" role="separator"></div>
       <button id="identity-menu-show-desktop" class="toolbar-identity-item" type="button" role="menuitem">
@@ -73,6 +73,10 @@
   <span id="toolbar-active-title" class="toolbar-active-title">Home</span>
   <nav id="toolbar-menubar" class="toolbar-menubar" aria-label="App menus"></nav>
   <div class="toolbar-spacer"></div>
+  <span id="toolbar-link-status" class="toolbar-link-status" role="status">
+    <span class="toolbar-link-status-dot" aria-hidden="true"></span>
+    <span id="toolbar-link-status-text" class="toolbar-link-status-text"></span>
+  </span>
   <button
     id="toolbar-wallet"
     class="toolbar-btn wallet-btn"
@@ -112,6 +116,17 @@
     <span class="mission-control-glyph" aria-hidden="true"></span>
   </button>
   <button
+    id="toolbar-fullscreen"
+    class="toolbar-btn toolbar-fullscreen-btn"
+    type="button"
+    aria-label="Enter full screen"
+    title="Enter full screen"
+    aria-pressed="false"
+    hidden
+  >
+    <span class="fullscreen-glyph" aria-hidden="true"></span>
+  </button>
+  <button
     id="toolbar-control-centre"
     class="toolbar-btn control-centre-btn"
     type="button"
@@ -145,6 +160,10 @@
   inert
   hidden
 >
+  <div class="notification-center-link">
+    <p class="notification-center-link-title">Reconnecting to your Home…</p>
+    <p class="notification-center-link-detail">What you see may be out of date until it answers.</p>
+  </div>
   <div class="nc-cal" aria-label="Date">
     <div class="nc-cal-primary">
       <div id="nc-cal-date" class="nc-cal-date">—</div>
@@ -167,6 +186,7 @@
   <p id="notification-center-empty" class="notification-center-empty" hidden>
     No recent notifications on this device
   </p>
+  <button id="notification-center-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <aside
@@ -240,11 +260,6 @@
   <div class="control-centre-divider" role="separator"></div>
   <div class="control-centre-section" aria-label="Nearby">
     <div class="control-centre-label">Nearby</div>
-    <button id="control-centre-discovery" class="control-centre-row" type="button" role="switch" aria-checked="false">
-      <span class="control-centre-row-label">Find People</span>
-      <span class="control-centre-switch" aria-hidden="true"></span>
-    </button>
-    <p id="control-centre-discovery-detail" class="control-centre-hint" hidden></p>
     <div id="control-centre-carrier" class="control-centre-row control-centre-row-static" aria-live="polite">
       <span class="control-centre-row-label">Carrier</span>
       <span id="control-centre-carrier-detail" class="control-centre-row-detail">—</span>
@@ -264,9 +279,6 @@
     <button id="control-centre-desktop-icons" class="control-centre-row" type="button" role="switch" aria-checked="true">
       <span class="control-centre-row-label">Desktop Icons</span>
       <span class="control-centre-switch" aria-hidden="true"></span>
-    </button>
-    <button id="control-centre-fullscreen" class="control-centre-row" type="button">
-      <span class="control-centre-row-label">Enter Fullscreen</span>
     </button>
     <button id="control-centre-show-windows" class="control-centre-row" type="button">
       <span class="control-centre-row-label">Overview</span>
@@ -293,6 +305,7 @@
       <span class="control-centre-row-detail">Open</span>
     </button>
   </div>
+  <button id="control-centre-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <!-- Assistant Space: the room the Shelf morph reveals. Home GUI owns the place
@@ -475,6 +488,7 @@
       aria-label="Search results"
       hidden
     ></div>
+    <button id="spotlight-handle" class="sheet-handle" type="button" aria-label="Close"></button>
   </div>
 </section>
 
@@ -513,6 +527,38 @@
           Open System
         </button>
       </li>
+      <li class="setup-sheet-step setup-sheet-goal" data-setup-goal="chat-room" hidden>
+        <span class="setup-sheet-step-index" aria-hidden="true">2</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Community</h3>
+          <p class="setup-sheet-step-body">Posts, contacts and messages with other Homes.</p>
+        </div>
+        <button class="el-button" type="button">Open Chat</button>
+      </li>
+      <li class="setup-sheet-step setup-sheet-goal" data-setup-goal="assistant" hidden>
+        <span class="setup-sheet-step-index" aria-hidden="true">3</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Assistant</h3>
+          <p class="setup-sheet-step-body">Get a model, then chat with it on this device.</p>
+        </div>
+        <button class="el-button" type="button">Open Assistant</button>
+      </li>
+      <li class="setup-sheet-step setup-sheet-goal" data-setup-goal="browser" hidden>
+        <span class="setup-sheet-step-index" aria-hidden="true">4</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Browser</h3>
+          <p class="setup-sheet-step-body">Open websites in a Home window.</p>
+        </div>
+        <button class="el-button" type="button">Open Browser</button>
+      </li>
+      <li class="setup-sheet-step setup-sheet-goal" data-setup-goal="system" data-setup-settings="about" hidden>
+        <span class="setup-sheet-step-index" aria-hidden="true">5</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Updates</h3>
+          <p class="setup-sheet-step-body">Check for new signed releases in System → About.</p>
+        </div>
+        <button class="el-button" type="button">Open Updates</button>
+      </li>
     </ol>
     <button id="setup-sheet-later" class="el-button" type="button">Later</button>
   </div>
@@ -529,6 +575,22 @@
       aria-multiselectable="false"
       tabindex="0"
     ></section>
+    <nav id="phone-home" class="phone-home" aria-label="Home screen">
+      <div id="phone-home-pages" class="phone-home-pages"></div>
+      <div
+        id="phone-home-dots"
+        class="phone-home-dots"
+        role="slider"
+        tabindex="0"
+        aria-label="Home screen page"
+        aria-valuemin="1"
+        aria-valuemax="1"
+        aria-valuenow="1"
+      ></div>
+      <div class="phone-home-editbar">
+        <button id="phone-home-done" class="phone-home-done" type="button">Done</button>
+      </div>
+    </nav>
   </section>
 </main>
 
@@ -582,7 +644,28 @@
         hidden
       >
         <span class="taskbar-icon">
-          <span class="taskbar-item-icon"></span>
+          <!-- Home's Assistant mark: orange chevron beneath the frosted glass one,
+               composited live. Motion lives in shell-assistant-mark.js. -->
+          <span class="taskbar-item-icon assistant-mark" data-tone="raster">
+            <img
+              class="assistant-mark-layer"
+              data-assistant-layer="orange"
+              src="./icons/assistant-mark/orange/icon-128.png?v=home-20261030a"
+              srcset="./icons/assistant-mark/orange/icon-128.png?v=home-20261030a 128w, ./icons/assistant-mark/orange/icon-256.png?v=home-20261030a 256w"
+              sizes="64px"
+              alt=""
+              draggable="false"
+            >
+            <img
+              class="assistant-mark-layer"
+              data-assistant-layer="glass"
+              src="./icons/assistant-mark/glass/icon-128.png?v=home-20261030a"
+              srcset="./icons/assistant-mark/glass/icon-128.png?v=home-20261030a 128w, ./icons/assistant-mark/glass/icon-256.png?v=home-20261030a 256w"
+              sizes="64px"
+              alt=""
+              draggable="false"
+            >
+          </span>
         </span>
       </button>
       <button
@@ -599,6 +682,13 @@
     </div>
   </div>
 </footer>
+
+<!-- Phone only: the Dock tucks under an open window; this handle brings it back
+     and the scrim dismisses the peek (shell-phone-dock.js). -->
+<button id="phone-dock-handle" class="phone-dock-handle" type="button" aria-label="Show Dock" hidden>
+  <span class="phone-dock-handle-bar" aria-hidden="true"></span>
+</button>
+<button id="phone-dock-scrim" class="phone-dock-scrim" type="button" aria-label="Hide Dock" tabindex="-1"></button>
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 
@@ -735,6 +825,23 @@
       <span class="launcher-card-title"></span>
     </span>
   </button>
+</template>
+
+<template id="phone-home-item-template">
+  <button class="phone-home-app" type="button">
+    <span class="app-glyph phone-home-icon" aria-hidden="true"></span>
+    <span class="phone-home-title"></span>
+  </button>
+</template>
+
+<template id="phone-home-assistant-page-template">
+  <section class="phone-home-page phone-home-assistant-page" aria-label="Assistant">
+    <button class="phone-home-assistant-open" type="button">
+      <span class="app-glyph phone-home-assistant-icon" aria-hidden="true"></span>
+      <span class="phone-home-assistant-title">Assistant</span>
+      <span class="phone-home-assistant-hint">Ask on this machine</span>
+    </button>
+  </section>
 </template>
 
 <template id="window-error-template">

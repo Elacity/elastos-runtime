@@ -285,9 +285,6 @@ async fn run_update(
                 if update.update_available { "yes" } else { "no" }
             );
             println!("Discovery:       {}", update.discovery);
-            if let Some(gateway) = update.working_gateway.as_deref() {
-                println!("Gateway:         {}", gateway);
-            }
             Ok(())
         }
         (false, true) => {

@@ -210,12 +210,12 @@ A conforming provider MAY:
 
 ## Current Implementation
 
-`peer-provider` v1.1 — Iroh 0.96 + distributed-topic-tracker (DHT discovery)
+The in-Runtime Carrier serves `elastos://peer/*` as the `carrier-gossip`
+provider (`CarrierGossipProvider` in `elastos-server/src/carrier.rs`). It
+replaced the separate `peer-provider` subprocess.
 
-- **Transport:** QUIC via iroh
-- **Discovery:** BitTorrent Mainline DHT + mDNS (LAN) + pkarr
-- **Gossip:** iroh-gossip (ALPN-based)
-- **Dependencies:** ~470 unique crates (heavy crypto stack)
-- **Binary size:** ~16MB release
-- **Status:** Frozen for stability in the current source contract. Release and
-  installed status are recorded in the repository's `state.md`.
+- **Transport:** direct QUIC via Iroh 1.0.2; no relay (see
+  [CARRIER.md](../../docs/CARRIER.md))
+- **Discovery:** mDNS on the local network, explicit tickets, and bootstrap
+  peers
+- **Gossip:** iroh-gossip 0.101.0 (ALPN-based)

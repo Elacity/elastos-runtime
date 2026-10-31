@@ -25,7 +25,7 @@ Wallet RPC, Chain RPC, or backend SDK.
 The canonical implementation is `protected-content-decrypt-provider`, called
 through the Runtime-owned protected-content coordinator. Its typed operations
 cover reconstruction, scoped media reads and terminal cleanup. Installation
-and activation evidence belongs in [state.md](../state.md).
+and activation evidence belongs in its GitHub issue.
 
 The provisional `decrypt-provider` capsule uses
 the old `elastos_common::protected_content` DTO, validates requests, and returns

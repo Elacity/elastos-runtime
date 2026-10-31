@@ -13,14 +13,16 @@ import {
   mountGlyph,
   targetById,
   desktopObjectByEntryId,
-} from "./shell-core.js?v=home-20260813a";
-import { openFileObject } from "./shell-surface.js?v=home-20260813a";
-import { openTarget } from "./shell-windows.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261030a";
+import { openFileObject } from "./shell-surface.js?v=home-20261030a";
+import { openTarget } from "./shell-windows.js?v=home-20261030a";
 import {
   closeOtherShellPopovers,
+  LAYER_STATE,
   registerShellPopover,
+  registerStageLayer,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260813a";
+} from "./shell-popovers.js?v=home-20261030a";
 
 /* Bound by bindQuickLook() once the lazy GUI template is in the DOM. */
 let panel = null;
@@ -141,6 +143,11 @@ export function bindQuickLook() {
     return;
   }
   registerShellPopover("quick-look", () => hideQuickLook());
+  registerStageLayer("quick-look", {
+    selector: "#quick-look",
+    state: () => (isQuickLookOpen() ? LAYER_STATE.open : LAYER_STATE.closed),
+    close: () => hideQuickLook(),
+  });
   closeButton?.addEventListener("click", () => hideQuickLook());
   openButton?.addEventListener("click", () => openEntry());
   panel.addEventListener("click", (event) => {

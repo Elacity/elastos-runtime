@@ -10,11 +10,11 @@
  * UI ≠ authority: Space switches never mint Capsule/Carrier grants.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260813a";
+import { shellState } from "./shell-core.js?v=home-20261030a";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20261030a";
 
 const DESKTOP_STAGE = "desktop";
 /* Singleton Agent Space — the Assistant's room, pinned far left of the ring.
@@ -105,6 +105,7 @@ export function isAgentSpace(spaceId) {
  * @param {{
  *   available: () => boolean,
  *   busy: () => boolean,
+ *   engaged: () => boolean,
  *   open: () => void,
  *   close: () => void,
  * }} hooks
@@ -115,6 +116,12 @@ export function bindAgentSpace(hooks) {
 
 function agentSpaceAvailable() {
   return agentSpaceHooks?.available?.() === true;
+}
+
+/* The person has the Agent room open or opening (face up or mid-morph, or the
+   ring already on the Agent Space). */
+export function agentSpaceEngaged() {
+  return isAgentSpace(getActiveStageId()) || agentSpaceHooks?.engaged?.() === true;
 }
 
 /* Agent ↔ other Space switches ride the Shelf morph, never a slide or cut. */

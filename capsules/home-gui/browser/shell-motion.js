@@ -83,3 +83,8 @@ export function dismissWithMotion(el, options = {}) {
   el.addEventListener("animationend", onEnd);
   token.timer = window.setTimeout(finish, ms + 40);
 }
+
+/** Whether `el` is playing a leave started by dismissWithMotion. */
+export function isDismissing(el) {
+  return Boolean(el && leaveTokens.has(el));
+}

@@ -1,18 +1,19 @@
 ---
 name: e2e-audit
-description: On-demand only — invoke with /e2e-audit. Journey-audit register reference for PR review, release gating, and stability/regression assessment in this repo.
+description: On-demand only — invoke with /e2e-audit. Reads the historical Home journey-audit workbook as test input for PR review and regression assessment in this repo.
 disable-model-invocation: true
 ---
 
-# Journey Audit Register
+# Journey Audit Workbook
 
 ## Overview
 
 [docs/audits/ElastOS-Home-Journey-Audit.xlsx](../../../docs/audits/ElastOS-Home-Journey-Audit.xlsx)
-is the canonical register of user journeys, static controls, and findings. It is
-the reference for stability and correctness for every PR and release. Treat it
-as a contract: product-behavior changes are measured against it, and the
-register is updated in the same PR that changes what it describes.
+is a historical snapshot of user journeys, static controls, and findings. It is
+test input, not a current record. Current acceptance lives in GitHub: each
+owning issue keeps its Acceptance record (see
+[AGENTS.md](../../../AGENTS.md#acceptance-record)), and #93 owns the release
+gates. The workbook is not updated.
 
 ## Reading the workbook
 
@@ -36,29 +37,22 @@ python3 .claude/skills/e2e-audit/read-workbook.py "Journey Matrix"  # TSV dump
 python3 .claude/skills/e2e-audit/read-workbook.py Findings --grep AUTH-01
 ```
 
-## The invariant
+## Using it
 
 1. Before changing behavior in an area, read that area's Journey Matrix rows
    and every Finding whose Journey IDs reference them.
-2. A journey recorded as Pass stays Pass. A change that intentionally alters a
-   journey's expected behavior updates the journey row in the same PR and names
-   the change in the PR description.
-3. A finding closes only with its "Proof to close" evidence. Dispositions are
-   updated in place, never deleted.
-4. New product surface ships with new journey rows (ID, Area, Expected
-   behavior, Steps, Prerequisites) in the same PR.
-5. Verdicts are evidence-bound. Live status and Live evidence come only from
-   installed, live checks; source reading updates Source state only. The
-   snapshot pins installed evidence to an exact source commit — later source
-   changes need their own installed checks before any live claim.
-6. Release gate: no open P1 finding against a touched area, and a refreshed
-   audit snapshot for the exact release revision. The register drives
-   pre-release testing.
+2. Transfer the relevant journeys and open findings to the owning GitHub issue
+   as acceptance checks. Record results there, not in the workbook.
+3. Keep journeys that passed working. A change that intentionally alters one
+   names the change in the PR description and the owning issue.
+4. Live status in the workbook is pinned to its snapshot source commit. Any
+   current live claim needs installed evidence from the exact candidate.
 
 ## Common mistakes
 
+- Treating the workbook as current status — its verdicts date from the
+  snapshot; the owning issue holds current status.
 - Claiming a journey passes because code compiles or unit tests pass — the
-  register separates Source state from Live evidence for exactly this reason.
-- Changing an area without searching the workbook for its journey IDs.
+  workbook separates Source state from Live evidence for exactly this reason.
 - Reading the evidence labels as repo paths — evidence files stay outside the
   repository (see [docs/audits/README.md](../../../docs/audits/README.md)).

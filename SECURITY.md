@@ -4,6 +4,52 @@
 
 If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
 
+Do not describe an unfixed issue in a public issue, pull request, commit message, or branch name.
+
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls. Components run
+inside the Runtime process: separate linear memories, but the same operating
+system process as Runtime keys. Installed Homes admit only release-path
+capsules matched by signed CID receipts and capsules signed by the release
+publisher, so third-party executable capsules need key-free, confined
+worker processes before they are admitted
+([World Computer plan](https://github.com/Elacity/elastos-runtime/issues/285)).
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The seed operator can read hosted data, wallet keys and recovery material.
+Passkeys control sign-in; stored data and keys remain accessible to the Runtime
+account and root while Home is locked. Protection against hosted operators and
+root, and against other software or OS users while a self-hosted Home is locked,
+is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+An unlocked self-hosted Home trusts its owner and their host software. Recovery
+from a stolen device or profile key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
+
+## Stored keys and recovery
+
+Keys are stored next to the data they protect. Full data-home backups include
+all keys. Protect those backups and your Recovery Kit as secrets. Encryption
+with keys stored on the same host leaves those secrets accessible to its
+operator. Use hosted accounts only for public demos; keep wallets, private data
+and recovery material on your own device until hosted protection passes its
+acceptance gate. Independent review and installed proof remain security gates.
+
 ## Open Findings
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
@@ -22,32 +68,92 @@ key and revocation state are committed atomically, operators must verify the
 persisted key and restart result instead of treating command completion as a
 durable rotation receipt.
 
-### Host-plane Carrier providers use Runtime admission
+### Runtime owns Carrier admission
 
 **Severity:** Medium
-**Files:** `elastos/crates/elastos-server/src/carrier_service.rs`
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-server/src/carrier_service.rs`
+**Status:** Open (host-plane envelope)
+
+Runtime identifies each Carrier peer by its endpoint key. A key alone gives no
+authority. A Home serves a peer's `content/fetch` only for a CID that an active
+publication on it lists, and a Library publication only to a peer whose
+authenticated device belongs to an accepted contact of the person who
+published it, as receiving Homes take files only from contacts. A protected
+listing's sealed payload is served to any peer; opening it needs the key
+release a purchase grants. A pin is only local storage: files received in
+Chat, models and withdrawn publications stay pinned, and pinned alone is never
+served to peers. Unpublish withdraws the record, which stops new transfers of
+that file at once, unless another file still shared on this Home (yours or
+another person's) has the same contents. The pin stays until a later cleanup.
+A Home answers a peer's read in one message and checks again just before
+sending it, so a read under way when the publication is withdrawn is refused
+on the same terms. Bytes already sent can't be recalled.
+Over HTTP, an ordinary Home's raw CID routes (`/content/<cid>`, `/ipfs/<cid>`,
+`/s/<cid>`) answer only its own Home and app sessions; a seed keeps its public
+CID gateway.
+Only a node that serves publisher content (a seed) answers the raw
+`content_fetch` byte operation or serves without these checks. In this
+release a seed accepts no new copies from other Homes; copies it already holds
+stay. A Home accepts a new copy from a peer only if the owner gave that peer
+the `content.replica` permission; copies it already holds stay. The owner
+trusts such a peer like an own device: it can ask the Home to pin content,
+import complete content and read storage status. An import pins only the CID
+it was asked for and never removes an existing pin. No peer can publish,
+remove or repair content on a Home or a seed. Peers cannot use the
+availability provider. A Home signs an availability announcement only from its
+own pin state. Peers cannot push or read gossip messages directly. Only topics
+that a Home joins keep messages, to a maximum of 100 topics. A granted peer's
+`ensure` (once the pin succeeds) announces the CID and joins its topic, so a
+granted peer shares that limit with the Home's own topics. A granted peer's
+`import_exact`, `admission` and `status`, and any peer's `fetch`, join no
+topic. No peer can push a whole object with `import_object`.
+
+Host-process provider capsules use a raw operation and path envelope without a
+capsule capability token. Runtime owns admission for this trusted provider
+class. Manifests and audit output must show this boundary. The envelope does
+not grant capsule authority.
+
+### I/O bridge line reads are not bounded while reading
+
+**Files:** `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
 **Status:** Open
 
-Host-plane Carrier service requests use a raw operation/path envelope without
-a capsule capability-token field. Runtime owns admission for this trusted
-provider class. Its trust boundary must remain explicit in manifests and audit
-output; the envelope is not an independent grant of capsule authority.
+The I/O bridge rejects complete lines above 1 MiB, but its line readers
+allocate before that check. Size checks after reading do not bound memory use
+or an incomplete frame's lifetime. Add bounds while reading, with oversized
+and slow-frame tests.
 
-### Request framing remains incompletely bounded
+### Whole-object Carrier fetch replies are held in memory
 
-**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
-**Status:** Open
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`
+**Status:** Open ([#341](https://github.com/Elacity/elastos-runtime/issues/341))
 
-The incoming Carrier request handler reads a line before parsing without a
-request-size cap or read deadline at that boundary. The I/O bridge rejects
-complete lines above 1 MiB, but its line readers allocate before that check.
-Size checks after reading do not bound memory use or an incomplete frame's
-lifetime. Add bounds while reading, with oversized and slow-frame tests;
-the Carrier integration task is tracked in [deferred work](docs/DEFERRED_WORK.md#retained-source-integration).
+A whole-object content fetch reply arrives as one line. It is refused while
+reading once it passes one 200 MiB file as base64 (about 268 MiB), the largest
+file Runtime downloads whole. Only two such fetches run at once, and one per
+peer.
+
+### Contact requests by DID
+
+**Severity:** Low
+**Files:** `elastos/crates/elastos-server/src/collaboration_discovery_runtime.rs`, `elastos/crates/elastos-server/src/collaboration_contact_store.rs`
+**Status:** Open ([#86](https://github.com/Elacity/elastos-runtime/issues/86))
+
+Anyone who has a Profile's DID can send it one contact request through the
+seed's Community node, whether or not that Profile is visible in Discovery.
+The node learns which Profile asked which and holds the requester's signed
+Profile; it learns nothing more about the recipient until the recipient
+answers in Inbox. Only the device that signed a request, answer or mailbox
+read may submit it, and the recipient's Home checks every request and answer
+itself. Profiles and devices are free to create, so the per-sender and
+per-device limits bound one identity only: many new identities can fill one
+person's 16 request slots on the node until those requests expire after
+24 hours, and that person's other requests wait meanwhile. Leave Community
+stops all requests.
 
 ## Resolved Findings
 
-These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
+These findings are resolved in source but remain listed as security history because they shaped the runtime contract.
 
 ### I/O bridge parse-size check
 
@@ -59,15 +165,29 @@ The I/O bridge rejects complete request lines above 1 MiB before parsing. The
 old `carrier_bridge.rs` has been removed. This resolved parse-size check does
 not close the read-time framing gap above.
 
+### Carrier and operator peer reads
+
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-server/src/operator_control.rs`
+**Status:** Fixed
+
+Lines from peers are read with a size cap and a deadline, and longer lines are
+refused before they are buffered. Incoming Carrier requests allow one provider
+request or one gossip message plus envelope, within 10 seconds. Operator
+requests, read before their signature is checked, allow 64 KiB within 10
+seconds. Replies are capped by what the request can return: a full gossip
+topic for a pull, one importable object for a provider call, update metadata
+for an operator answer. Provider replies share a 256 MiB in-flight budget.
+Whole-object content fetch replies allow one 200 MiB file as base64; the open
+item above tracks streaming them. Relays close after five minutes without bytes
+in either direction, and stream acknowledgements have deadlines.
+
 ## Architecture
 
-The runtime enforces a capability-based security model:
-
-- **Capsules** run sandboxed (WASM or microVM) with zero ambient authority
-- **Capability tokens** are Ed25519-signed by the runtime and validated on every resource access
-- **12-point token validation** covers version, signature, issuer, caller, action, resource, epoch, revocation, timing, use-count, and classification
-- **Audit events** are emitted at every security-critical operation
-- **Carrier** authenticates transport endpoints. Runtime verifies product
-  identity and signed message authority before exposing typed app projections.
+Runtime validates signed capability tokens against the caller, action,
+resource, epoch, revocation and token constraints. It checks principal and
+session authority separately. Carrier authenticates transport endpoints;
+Runtime verifies product identity and signed message authority before exposing
+typed app projections. These checks complement the current browser boundary
+and do not establish provider process confinement or a separate Home authority.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full trust model.

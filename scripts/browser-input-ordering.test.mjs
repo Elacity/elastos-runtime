@@ -6,7 +6,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import test from "node:test";
 import vm from "node:vm";
 import { runtimePageOwner, sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
-import { selkiesMessagesForInput } from "../capsules/browser/browser/browser-input.js";
+import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "../capsules/browser/browser/browser-input.js";
 import { createBrowserClipboardBridge } from "../capsules/browser/browser/browser-clipboard.js";
 
 // An explicit ref runs the unchanged behavioral gate as a negative control.
@@ -36,7 +36,7 @@ function assertCanceled(results) {
 }
 
 function harness() {
-  const requests = [], sends = [], mutations = [], failures = [], effects = [];
+  const requests = [], sends = [], mutations = [], failures = [], effects = [], channel = { open: true, buffered: 0, drainedAt: 0, generation: 1 };
   const state = vm.createContext({
     currentPage: { page_id: "page:original", title: "Original", actual_url: "https://fixture.invalid/nav?run=ordering",
       runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup:original" },
@@ -44,8 +44,12 @@ function harness() {
     currentPageGeneration: 1, currentDisplayMode: "webrtc_remote_display", currentView: { width: 1280, height: 720 },
     libraryPickerRequest: null, runtimePageOwner, sameRuntimePageOwner, selkiesMessagesForInput,
     PAGE_STATUS_AFTER_INPUT_DELAY_MS: 1, PAGE_STATUS_AFTER_SCROLL_DELAY_MS: 1,
+    DATACHANNEL_INPUT_SETTLE_MS, setTimeout, Date,
     remoteDisplay: {
-      inputChannelOpen: () => true,
+      inputChannelOpen: () => channel.open,
+      inputBufferedAmount: () => channel.buffered,
+      lastInputDrainAt: () => channel.drainedAt,
+      currentInputChannelGeneration: () => channel.generation,
       // This observes synchronous dispatch, not a guest-side data-channel ack.
       sendInputMessages: messages => sends.push(...plain(messages)),
     },
@@ -68,9 +72,15 @@ function harness() {
   // The old implementation remains executable so the same behavioral tests can
   // record a red baseline, rather than failing merely on a missing new symbol.
   if (source.includes("function dispatchBrowserInput(")) names.push("dispatchBrowserInput");
+  for (const name of ["noteDatachannelSend", "releaseDragButton", "awaitDatachannelInputSettled"]) {
+    if (source.includes(`function ${name}(`)) names.push(name);
+  }
   const queue = source.match(/^let browserInputQueue = [^\n]+;$/m)?.[0] || "";
   const cap = source.match(/^const MAX_PENDING_BROWSER_INPUTS = [0-9_]+;$/m)?.[0] || "";
-  vm.runInContext(queue + "\n" + cap + "\n" + names.map(declaration).join("\n"), state);
+  const barrier = [/^const DATACHANNEL_INPUT_BARRIER_TIMEOUT_MS = [0-9_]+;$/m, /^let lastDatachannelInputAt = [^\n]+;$/m,
+    /^let datachannelDrainedAt = [^\n]+;$/m]
+    .map(pattern => source.match(pattern)?.[0] || "").join("\n");
+  vm.runInContext(queue + "\n" + cap + "\n" + barrier + "\n" + names.map(declaration).join("\n"), state);
   const submit = (event, options) => Promise.resolve(state.sendBrowserInput(event, options))
     .then(value => ({ status: "fulfilled", value }), error => ({ status: "rejected", error }));
   const changeOwner = kind => {
@@ -80,7 +90,7 @@ function harness() {
     if (kind === "cleanup") state.currentPage.runtime_cleanup.id = "cleanup:replacement";
     return plain(state.currentPage);
   };
-  return { state, requests, sends, mutations, failures, effects, submit, changeOwner };
+  return { state, requests, sends, mutations, failures, effects, channel, submit, changeOwner };
 }
 
 test("rapid r/e/d waits for each Runtime ack and preserves the observed recovered suffix", async t => {
@@ -101,6 +111,9 @@ test("rapid r/e/d waits for each Runtime ack and preserves the observed recovere
 for (const [name, event, messages] of [
   ["Backspace", { type: "key", key: "Backspace" }, ["kd,65288", "ku,65288"]],
   ["Enter", { type: "key", key: "Enter" }, ["kd,65293", "ku,65293"]],
+  ["Drag press", { type: "mouse", x: 15, y: 20, buttons: 1 }, ["m,15,20,1,0"]],
+  ["Drag release", { type: "mouse", x: 30, y: 20, buttons: 0 }, ["m,30,20,0,0"]],
+  ["Select all", { type: "key_combo", keysyms: [65507, 97] }, ["kd,65507", "kd,97", "ku,97", "ku,65507"]],
 ]) test(`${name} dispatch waits behind unresolved Runtime text`, async () => {
   const h = harness(), first = h.submit(text("r")), second = h.submit(event);
   await nextTurn();
@@ -359,4 +372,130 @@ test("128 pending inputs are bounded; overflow preserves accepted order and capa
   assert.ok((await Promise.all([...results, replacement])).every(result => result.status === "fulfilled"));
   assert.deepEqual(h.effects, [...accepted, "replacement"]);
   assert.deepEqual(h.requests.map(request => request.event.text), [...accepted, "replacement"]);
+});
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const release = { type: "mouse", x: 30, y: 20, buttons: 0 };
+
+for (const [name, first, messages] of [
+  ["drag release", release, ["m,30,20,0,0"]],
+  ["Cmd+A select-all", { type: "key_combo", keysyms: [65507, 97] }, ["kd,65507", "kd,97", "ku,97", "ku,65507"]],
+]) test(`Runtime text after a ${name} waits for the datachannel settle barrier`, async t => {
+  // Advance the guest settle clock explicitly: a busy suite can delay a real
+  // sleep beyond the barrier before the assertion gets to observe it.
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const h = harness(), results = [h.submit(first), h.submit(text("x"))];
+  await nextTurn();
+  assert.deepEqual(h.sends, messages);
+  t.mock.timers.tick(DATACHANNEL_INPUT_SETTLE_MS - 1);
+  await nextTurn();
+  assert.equal(h.requests.length, 0, "replacement text must not overtake the selection");
+  t.mock.timers.tick(10);
+  await nextTurn();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].ack();
+  assert.ok((await Promise.all(results)).every(result => result.status === "fulfilled"));
+});
+
+test("Runtime text with no preceding datachannel input has no barrier delay", async () => {
+  const h = harness(), result = h.submit(text("x"));
+  await nextTurn();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].ack();
+  assert.equal((await result).status, "fulfilled");
+});
+
+test("a buffered datachannel holds Runtime text until it drains and settles", async () => {
+  const h = harness();
+  h.channel.buffered = 64;
+  const results = [h.submit(release), h.submit(text("x"))];
+  await sleep(DATACHANNEL_INPUT_SETTLE_MS + 50);
+  assert.equal(h.requests.length, 0);
+  h.channel.buffered = 0;
+  await sleep(DATACHANNEL_INPUT_SETTLE_MS - 50);
+  assert.equal(h.requests.length, 0, "settle restarts once the buffer drains");
+  await sleep(100);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].ack();
+  assert.ok((await Promise.all(results)).every(result => result.status === "fulfilled"));
+});
+
+test("a datachannel that never drains fails the barrier visibly instead of reordering", async () => {
+  const h = harness();
+  h.channel.buffered = 64;
+  const [, typed] = await Promise.all([h.submit(release), h.submit(text("x"))]);
+  assert.equal(typed.status, "rejected");
+  assert.equal(typed.error.message, "Browser input is still being delivered. Check the page before typing again.");
+  assert.equal(h.requests.length, 0);
+});
+
+test("a stalled Runtime request does not hold the drag release", async () => {
+  const h = harness(), typed = h.submit(text("r"));
+  const move = h.submit({ type: "mouse", x: 20, y: 20, buttons: 1 }, { isStale: () => true });
+  await nextTurn();
+  h.state.releaseDragButton(release, h.state.currentRuntimePageOwner());
+  assert.deepEqual(h.sends, ["m,30,20,0,0"], "the release must go at once, not behind the pending request");
+  h.requests[0].ack();
+  await Promise.all([typed, move]);
+  assert.deepEqual(h.sends, ["m,30,20,0,0"], "the ended drag's queued move must not press the button again");
+});
+
+test("Runtime text after a direct drag release waits for its drain and settle", async () => {
+  const h = harness();
+  h.state.releaseDragButton(release, h.state.currentRuntimePageOwner());
+  const typed = h.submit(text("x"));
+  await sleep(DATACHANNEL_INPUT_SETTLE_MS - 50);
+  assert.equal(h.requests.length, 0);
+  await sleep(100);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].ack();
+  assert.equal((await typed).status, "fulfilled");
+});
+
+test("a drag release for a replaced page is dropped, not sent to the replacement", () => {
+  const h = harness(), dragOwner = h.state.currentRuntimePageOwner();
+  h.changeOwner("page");
+  h.state.releaseDragButton(release, dragOwner);
+  assert.deepEqual(h.sends, []);
+});
+
+for (const [name, lose] of [
+  ["closes", channel => { channel.open = false; channel.buffered = 0; }],
+  ["reconnects on the same page", channel => { channel.generation += 1; channel.buffered = 0; }],
+]) test(`Runtime input is refused, not settled, when the channel ${name} with bytes pending`, async () => {
+  // #482 fixture: bufferedAmount=64, channel lost after 20 ms reporting 0.
+  const h = harness();
+  h.channel.buffered = 64;
+  await h.submit(release);
+  const typed = h.submit(text("x"));
+  await sleep(20);
+  lose(h.channel);
+  const result = await typed;
+  assert.equal(result.status, "rejected");
+  assert.equal(result.error.message, "Browser input is still being delivered. Check the page before typing again.");
+  assert.equal(h.requests.length, 0);
+  h.channel.open = true;
+  const fresh = h.submit(text("y"));
+  await nextTurn();
+  assert.equal(h.requests.length, 1, "fresh input after the refusal is not held by the lost channel");
+  h.requests[0].ack();
+  assert.equal((await fresh).status, "fulfilled");
+});
+
+test("settle starts at the observed drain, not at the first check", async () => {
+  // Send at 0, drain at ~190 (bufferedamountlow), text at ~200: not before ~340.
+  const h = harness();
+  h.channel.buffered = 64;
+  await h.submit(release);
+  await sleep(190);
+  h.channel.buffered = 0;
+  h.channel.drainedAt = Date.now();
+  await sleep(10);
+  const typed = h.submit(text("x"));
+  await sleep(DATACHANNEL_INPUT_SETTLE_MS - 40);
+  assert.equal(h.requests.length, 0, "text must wait the settle after the observed drain");
+  await sleep(80);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].ack();
+  assert.equal((await typed).status, "fulfilled");
 });

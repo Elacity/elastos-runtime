@@ -35,7 +35,7 @@ does not retroactively establish its cause.
 
 ## Source and evidence
 
-[Current source](../../state.md) records the pre-handover branch, commit, tree,
+[Current source](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md) records the pre-handover branch, commit, tree,
 divergence and publication status. The diagnostic code and separate execution-plan commit
 remain local. This handover changes documentation only.
 
@@ -51,14 +51,14 @@ The clean-source Runtime-only release build passed with Rust 1.91.0,
 `RUSTFLAGS='-D warnings'`, `CARGO_BUILD_JOBS=1` and
 `cargo build --release --locked -p elastos-server --bin elastos` from
 `$SOURCE_ROOT/elastos`, using `$SHARED_CARGO_TARGET`. The exact artifact hash and
-size are in the [dated build record](../../state.md#execution-evidence-history--2026-09-10).
+size are in the [dated build record](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md#execution-evidence-history--2026-09-10).
 This docs-only commit follows that build. Preserve its actual source provenance;
 verify unchanged relevant build inputs/configuration and the artifact hash before
 reuse rather than rebuilding for documentation alone.
 
 The owner Home retains its earlier verified installation. The diagnostic binary
 is built but was neither installed nor used for Retry.
-See [current source and installed evidence](../../state.md#installed-candidate-proof)
+See [current source and installed evidence](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md#installed-candidate-proof)
 for the full proof limits. `$OWNER_HOME`, `$DATA_DIR`, `$SOURCE_ROOT`,
 `$SHARED_CARGO_TARGET` and recovery paths resolve only from the private ledger.
 Keep accounts, Wallets, passkeys, profiles, content and browser tabs intact.
@@ -74,7 +74,7 @@ cold peer delivery and remote authority remain open in the canonical plan.
 ## Remaining ownership and scope
 
 At this handover, the plan had nine ordered steps. The current
-[TASKS Now](../../TASKS.md#now) is the single execution queue and gives the
+[TASKS Now](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/TASKS.md#now) is the single execution queue and gives the
 next proof for each open action. Model and distribution
 contracts remain in [Model Provider](../MODEL_PROVIDER.md) and
 [Content capsule distribution](../CONTENT_CAPSULE_DISTRIBUTION.md).

@@ -24,24 +24,58 @@ pub(super) async fn inbox_summary(
         };
     if let Err(err) = super::gateway_home_system::apply_contact_request_notification_projection(
         &state.data_dir,
-        contact_authority.as_ref().map(|authority| &authority.store),
+        contact_authority.as_ref(),
+        state.collaboration_chat_product_port.as_ref(),
         &mut notifications,
     ) {
         return inbox_error_response(err);
     }
-    append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
     let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
-    append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
-    if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
-        append_runtime_capability_notifications(&mut notifications, capability_requests);
-    }
-    if let Ok(inspect_requests) =
-        pending_inspect_action_requests(&state.data_dir, &context.principal_id)
-    {
-        append_inspect_action_notifications(&mut notifications, inspect_requests);
-    }
+    append_inbox_requests(
+        &state,
+        &context,
+        wallet_approvals.approval_requests,
+        &mut notifications,
+    )
+    .await;
+    // Inbox draws hosted decisions and their history from `hosted_routes`.
     #[cfg(unix)]
-    let hosted_routes = {
+    let hosted_routes = match owner_hosted_routes(&state.data_dir, &context) {
+        Ok(routes) => {
+            let pending = routes.iter().filter(|route| route.is_pending()).count();
+            notifications.attention_count += pending;
+            notifications.unread_count += pending;
+            routes
+        }
+        Err(err) => return inbox_error_response(err),
+    };
+    Json(InboxSummaryResponse {
+        app: HomeCapsuleIdentity {
+            id: INBOX_CAPSULE_ID.to_string(),
+            route: "/apps/inbox/".to_string(),
+        },
+        notifications,
+        #[cfg(unix)]
+        hosted_routes,
+    })
+    .into_response()
+}
+
+/// Adds the person's open Inbox requests kept outside the Home notification
+/// store. Inbox, Home's summary and Home events all read this one list, so a
+/// request Inbox shows also counts in Home's badge, raises its notification
+/// and changes the Inbox events cursor. Owner hosted decisions come from
+/// `owner_hosted_routes`.
+pub(super) async fn append_inbox_requests(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    wallet_approvals: Vec<SystemWalletApprovalSummary>,
+    notifications: &mut HomeNotificationsSummary,
+) {
+    // Legacy hosted-route prompts in the store are superseded by the owner's
+    // private decisions.
+    #[cfg(unix)]
+    {
         notifications.entries.retain(|entry| {
             !entry.action_ref.as_ref().is_some_and(|action| {
                 action
@@ -59,30 +93,82 @@ pub(super) async fn inbox_summary(
             .iter()
             .filter(|entry| entry.severity == "attention")
             .count();
-        if ensure_admin_context(&state.data_dir, &context).is_ok() {
-            match crate::api::model_provider_egress_decision::inbox_history(&state.data_dir) {
-                Ok(routes) => {
-                    let pending = routes.iter().filter(|route| route.is_pending()).count();
-                    notifications.attention_count += pending;
-                    notifications.unread_count += pending;
-                    routes
-                }
-                Err(err) => return inbox_error_response(err),
-            }
-        } else {
-            Vec::new()
+    }
+    append_home_service_access_notifications(&state.data_dir, context, notifications);
+    if let Some(card) =
+        super::gateway_collaboration_presence::community_presence_request_notification(
+            state, context,
+        )
+    {
+        notifications.unread_count += 1;
+        notifications.attention_count += 1;
+        notifications.entries.push(card);
+    }
+    append_wallet_approval_notifications(notifications, wallet_approvals);
+    // Runtime capability requests are the admin's to answer.
+    if ensure_admin_context(&state.data_dir, context).is_ok() {
+        if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await
+        {
+            append_runtime_capability_notifications(notifications, capability_requests);
         }
-    };
-    Json(InboxSummaryResponse {
-        app: HomeCapsuleIdentity {
-            id: INBOX_CAPSULE_ID.to_string(),
-            route: "/apps/inbox/".to_string(),
-        },
-        notifications,
-        #[cfg(unix)]
-        hosted_routes,
-    })
-    .into_response()
+    }
+    if let Ok(inspect_requests) =
+        pending_inspect_action_requests(&state.data_dir, &context.principal_id)
+    {
+        append_inspect_action_notifications(notifications, inspect_requests);
+    }
+}
+
+/// Hosted access decisions and their history. They are the owner's alone, so
+/// anyone else gets none.
+#[cfg(unix)]
+pub(super) fn owner_hosted_routes(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<Vec<crate::api::model_provider_egress_decision::HostedRouteSummary>> {
+    if ensure_admin_context(data_dir, context).is_err() {
+        return Ok(Vec::new());
+    }
+    crate::api::model_provider_egress_decision::inbox_history(data_dir)
+}
+
+/// Each pending hosted decision as the owner's Home notification; Inbox
+/// answers it with the same approve action.
+#[cfg(unix)]
+pub(super) fn append_hosted_route_notifications(
+    notifications: &mut HomeNotificationsSummary,
+    routes: &[crate::api::model_provider_egress_decision::HostedRouteSummary],
+) {
+    for route in routes.iter().filter(|route| route.is_pending()) {
+        let provider = if route.provider.trim().is_empty() {
+            "Hosted model"
+        } else {
+            route.provider.as_str()
+        };
+        notifications.unread_count += 1;
+        notifications.attention_count += 1;
+        notifications.entries.push(HomeNotificationEntrySummary {
+            id: format!("external-http-request:{}", route.id),
+            source_app: INBOX_CAPSULE_ID.to_string(),
+            kind: "hosted_route_decision".to_string(),
+            title: format!("{provider} access request"),
+            body: format!(
+                "This Home asks to reach {provider} at {}. Approve or deny it in Inbox.",
+                route.origin
+            ),
+            action_ref: Some(HomeNotificationActionSummary {
+                app: INBOX_CAPSULE_ID.to_string(),
+                action_id: format!(
+                    "{}{}",
+                    crate::api::model_provider_egress_decision::APPROVE_PREFIX,
+                    route.id
+                ),
+            }),
+            severity: "attention".to_string(),
+            read: false,
+            created_at: route.requested_at,
+        });
+    }
 }
 
 pub(super) fn append_wallet_approval_notifications(
@@ -221,6 +307,23 @@ pub(super) async fn inbox_action(
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
+    if action.action_id.starts_with("room-approve-request:")
+        || action.action_id.starts_with("room-deny-request:")
+    {
+        if state.collaboration_chat_product_port.is_some() {
+            return super::gateway_room::configured_legacy_room_control_unsupported_response();
+        }
+        if let Err(error) = ensure_admin_context(&state.data_dir, &context) {
+            return inbox_error_response(error);
+        }
+    }
+    if action.action_id.starts_with("capability-approve-request:")
+        || action.action_id.starts_with("capability-deny-request:")
+    {
+        if let Err(error) = ensure_admin_context(&state.data_dir, &context) {
+            return inbox_error_response(error);
+        }
+    }
     match dispatch_inbox_action(&state, &launch, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
@@ -274,9 +377,13 @@ async fn dispatch_inbox_action(
 ) -> anyhow::Result<String> {
     let action_id = action.action_id.as_str();
     let data_dir = &state.data_dir;
+    // Entries one account owns, such as its direct messages, change only for
+    // that account.
+    let viewer = super::gateway_home_system::load_profile_authority_for_context(data_dir, context)?
+        .map(|profile| profile.document().profile_did.clone());
     if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
         return Ok(
-            match crate::notifications::mark_read(data_dir, notification_id)? {
+            match crate::notifications::mark_read(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Marked inbox entry read.".to_string(),
                 false => "That inbox entry was already read or is no longer present.".to_string(),
             },
@@ -284,11 +391,18 @@ async fn dispatch_inbox_action(
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
         return Ok(
-            match crate::notifications::dismiss(data_dir, notification_id)? {
+            match crate::notifications::dismiss(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Dismissed inbox entry.".to_string(),
                 false => "That inbox entry is already gone.".to_string(),
             },
         );
+    }
+    if let Some(answer) = super::gateway_collaboration_presence::answer_community_presence_request(
+        state, context, action_id,
+    )
+    .await
+    {
+        return answer;
     }
     if let Some(request_hash) = action_id.strip_prefix("contact-accept-request:") {
         return decide_contact_request(
@@ -318,7 +432,7 @@ async fn dispatch_inbox_action(
         };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -332,7 +446,7 @@ async fn dispatch_inbox_action(
             };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
@@ -364,7 +478,7 @@ async fn dispatch_inbox_action(
             INBOX_CAPSULE_ID,
         )
         .await?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
@@ -439,7 +553,7 @@ async fn dispatch_inbox_action(
         ensure_admin_context(data_dir, context)?;
         let approved_at = now_ts();
         store_wallet_price_http_policy(data_dir, &context.principal_id, approved_at)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         append_wallet_price_policy_audit(
             data_dir,
             &context.principal_id,
@@ -472,7 +586,16 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
+            .await;
+        let _offer_id = crate::api::model_provider_egress_decision::endable_decision_offer_id(
+            data_dir, request_id, proof,
+        )?;
         crate::api::model_provider_egress_decision::end_decision(data_dir, request_id, proof)?;
+        #[cfg(unix)]
+        let _end =
+            crate::api::hosted_egress_admission::begin_hosted_end(data_dir, &_offer_id).await;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
         return Ok(
             "Ended this hosted access. A later request needs a new Inbox decision.".to_string(),
@@ -487,8 +610,11 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
+            .await;
         crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(
             "Approved this hosted access. End it in Inbox when it is no longer needed.".to_string(),
         );
@@ -502,6 +628,9 @@ async fn dispatch_inbox_action(
             .proof_binding_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
+        let _decision = crate::api::model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
+            .await;
         crate::api::model_provider_egress_decision::deny(data_dir, request_id, proof)?;
         let _ = crate::notifications::dismiss_external_http_request(data_dir, request_id);
         return Ok("Denied this hosted access.".to_string());
@@ -511,8 +640,11 @@ async fn dispatch_inbox_action(
     {
         ensure_admin_context(data_dir, context)?;
         crate::jev_approval_lens::record_human_decision(data_dir, request_id, "approve")?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
-        return Ok("Approved this hosted connection. Send again from Assistant.".to_string());
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
+        return Ok(
+            "Recorded your approval. Runtime still asks in Inbox before anything is sent."
+                .to_string(),
+        );
     }
     if let Some(request_id) =
         action_id.strip_prefix(crate::jev_approval_lens::HOSTED_HTTP_DENY_PREFIX)

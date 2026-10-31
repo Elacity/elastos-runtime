@@ -10,7 +10,7 @@ const shellWindowsSource = fs.readFileSync(
   "utf8",
 );
 const documentsSource = fs.readFileSync(
-  new URL("../capsules/documents/browser/index.html", import.meta.url),
+  new URL("../capsules/documents/browser/documents.js", import.meta.url),
   "utf8",
 );
 
@@ -70,6 +70,7 @@ const documentsHarnessSource = [
   "hasExactKeys",
   "clearAutosaveTimer",
   "scheduleAutosave",
+  "unsavedDocumentName",
   "chooseInCapsule",
   "confirmInCapsule",
   "closeConfirmModal",
@@ -77,6 +78,9 @@ const documentsHarnessSource = [
   "suspendAutosaveForHomeWindowClose",
   "resumeAutosaveForHomeWindowClose",
   "requestHomeWindowCloseDecision",
+  "hasUnsavedDocuments",
+  "unsavedDocumentNames",
+  "saveAllUnsaved",
   "postHomeWindowCloseResult",
   "handleHomeWindowCloseRequest",
 ]
@@ -97,9 +101,14 @@ const documentsSaveHarnessSource = [
   "suspendAutosaveForHomeWindowClose",
   "resumeAutosaveForHomeWindowClose",
   "applySavedDocumentState",
+  "reconcileKeptAfterSave",
   "requireSavedWorkingCopy",
   "saveCurrent",
   "requestHomeWindowCloseDecision",
+  "unsavedDocumentName",
+  "hasUnsavedDocuments",
+  "unsavedDocumentNames",
+  "saveAllUnsaved",
 ]
   .map((name) => extractFunction(documentsSource, name))
   .join("\n");
@@ -138,7 +147,9 @@ function createShellHarness() {
   };
   const shellState = {
     windows: new Map([[entry.id, entry]]),
+    shellLayoutState: { documentsAutosave: false },
   };
+  const savedLayouts = [];
   const context = vm.createContext({
     DOCUMENTS_WINDOW_CLOSE_TIMEOUT_MS: numericConstant(
       shellWindowsSource,
@@ -156,6 +167,12 @@ function createShellHarness() {
     URL,
     URLSearchParams,
     pendingDocumentsWindowCloses: new Map(),
+    DOCUMENTS_PREFERENCES_REQUEST_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"),
+    DOCUMENTS_PREFERENCES_SET_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"),
+    DOCUMENTS_PREFERENCES_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_TYPE"),
+    saveShellLayoutState() {
+      savedLayouts.push({ ...shellState.shellLayoutState });
+    },
     shellState,
     removeWindowEntries(entries) {
       removed.push(entries.map((candidate) => candidate.id));
@@ -183,7 +200,7 @@ function createShellHarness() {
     },
   });
   vm.runInContext(
-    `${shellHarnessSource}\nthis.api = { closeWindow, handleDocumentsWindowCloseResult };`,
+    `${shellHarnessSource}\n${extractFunction(shellWindowsSource, "documentsPreferenceMessage")}\n${extractFunction(shellWindowsSource, "handleDocumentsPreferenceMessage")}\nthis.api = { closeWindow, handleDocumentsWindowCloseResult, handleDocumentsPreferenceMessage };`,
     context,
   );
   return {
@@ -191,6 +208,14 @@ function createShellHarness() {
     posts,
     removed,
     shellState,
+    savedLayouts,
+    preference(message, options = {}) {
+      return context.api.handleDocumentsPreferenceMessage({
+        origin: options.origin || "null",
+        source: options.source || frameWindow,
+        data: message,
+      });
+    },
     frame,
     frameWindow,
     timerCount() {
@@ -228,6 +253,7 @@ function createDocumentsSaveHarness() {
     },
     currentSessionId: 1,
     mode: "shell",
+    autosave: true,
     dirty: true,
     pendingConfirmation: null,
   };
@@ -263,6 +289,7 @@ function createDocumentsSaveHarness() {
     saveRecovery: null,
     savedWorkingCopy: { ...state.current },
     pendingHomeWindowCloseTarget: null,
+    unsavedDocuments: new Map(),
     saveInFlight: null,
     window: {
       setTimeout(callback, delay) {
@@ -275,8 +302,7 @@ function createDocumentsSaveHarness() {
       },
     },
     reportSaveFailure() {},
-    setStatus() {},
-    scheduleStatusClear() {},
+    showError() {},
     clearStatus() {},
     upsertDocumentListItem() {},
     updateDocumentsNavigation() {},
@@ -359,6 +385,9 @@ function createDocumentsHarness({
   currentSessionId = 1,
   savePlan = "success",
   queuedAutosave = false,
+  autosave = true,
+  kept = [],
+  onSave = null,
 } = {}) {
   const posted = [];
   const focused = [];
@@ -372,10 +401,12 @@ function createDocumentsHarness({
     current: { doc_did: "doc-1" },
     currentSessionId,
     mode: "shell",
+    autosave,
     dirty,
     pendingConfirmation: null,
   };
   const elements = {
+    titleInput: { value: "Audit notes" },
     confirmModal: {
       classList: { add() {}, remove() {} },
       setAttribute() {},
@@ -417,11 +448,24 @@ function createDocumentsHarness({
     saveRecovery: null,
     pendingHomeWindowCloseTarget: null,
     saveInFlight: null,
+    // Documents kept unsaved in this window while another is open.
+    unsavedDocuments: new Map(kept.map((title) => [`document:${title}`, { document: { doc_did: title, title, file_name: "" } }])),
+    restoreUnsavedDocument(key) {
+      const kept = context.unsavedDocuments.get(key);
+      context.unsavedDocuments.delete(key);
+      state.current = kept.document;
+      elements.titleInput.value = kept.document.title;
+      state.dirty = true;
+      return true;
+    },
     reportSaveFailure() {
       reportedSaveFailure += 1;
     },
     saveCurrent: async () => {
       saveCalls += 1;
+      if (onSave?.({ state, elements, unsavedDocuments: context.unsavedDocuments, call: saveCalls }) === "handled") {
+        return;
+      }
       if (savePlan === "failure") {
         throw new Error("save failed");
       }
@@ -454,9 +498,11 @@ function createDocumentsHarness({
   return {
     focused,
     posted,
+    elements,
     timers,
     state,
     saveCalls: () => saveCalls,
+    kept: () => [...context.unsavedDocuments.keys()],
     reportedSaveFailure: () => reportedSaveFailure,
     async request(requestId = "documents-close-request-1") {
       const pending = context.api.handleHomeWindowCloseRequest({
@@ -780,4 +826,205 @@ test("real save requeue paths stay suspended while the close decision is open", 
   harness.respond("cancel");
   await decision;
   assert.equal(harness.hasTimer(900), true);
+});
+
+test("with Save automatically off, edits start no timer and closing asks to save by name", async () => {
+  const harness = createDocumentsHarness({ dirty: true, autosave: false });
+  harness.scheduleAutosave();
+  assert.equal([...harness.timers.values()].some((timer) => timer.delay === 900), false);
+  const cancelled = harness.request();
+  await Promise.resolve();
+  assert.equal(harness.elements.confirmTitle.textContent, "Save changes to Audit notes?");
+  assert.equal(harness.elements.confirmAction.textContent, "Save");
+  assert.equal(harness.elements.confirmSecondaryAction.textContent, "Don't save");
+  assert.equal(harness.elements.confirmSecondaryAction.hidden, false);
+  harness.respond("cancel");
+  await cancelled;
+  assert.equal(harness.posted.at(-1).message.reason, "cancelled");
+  assert.equal(harness.saveCalls(), 0);
+  assert.equal([...harness.timers.values()].some((timer) => timer.delay === 900), false);
+
+  const dropped = harness.request("documents-close-request-2");
+  harness.respond("secondary");
+  await dropped;
+  assert.equal(harness.posted.at(-1).message.ok, true);
+  assert.equal(harness.posted.at(-1).message.reason, "discarded");
+  assert.equal(harness.saveCalls(), 0);
+
+  const saving = createDocumentsHarness({ dirty: true, autosave: false });
+  const saved = saving.request();
+  saving.respond("confirm");
+  await saved;
+  assert.equal(saving.saveCalls(), 1);
+  assert.equal(saving.posted.at(-1).message.ok, true);
+});
+
+test("Home remembers the Documents Save automatically choice and tells every Documents window", () => {
+  const harness = createShellHarness();
+  const requestType = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE");
+  const setType = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_SET_TYPE");
+  const type = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_TYPE");
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), type);
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"), setType);
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"), requestType);
+  const token = "documents-close-token";
+
+  harness.preference({ type: requestType, homeToken: token });
+  assert.deepEqual({ ...harness.posts.at(-1).message }, { type, homeToken: token, autosave: false });
+
+  // Wrong token, wrong sender or wrong shape change nothing.
+  harness.preference({ type: setType, homeToken: "other", autosave: true });
+  harness.preference({ type: setType, homeToken: token, autosave: true }, { source: {} });
+  harness.preference({ type: setType, homeToken: token, autosave: "yes" });
+  harness.preference({ type: setType, homeToken: token, autosave: true }, { origin: "https://evil.example" });
+  assert.equal(harness.shellState.shellLayoutState.documentsAutosave, false);
+  assert.equal(harness.savedLayouts.length, 0);
+
+  harness.preference({ type: setType, homeToken: token, autosave: true });
+  assert.equal(harness.shellState.shellLayoutState.documentsAutosave, true);
+  assert.deepEqual(harness.savedLayouts, [{ documentsAutosave: true }]);
+  assert.deepEqual({ ...harness.posts.at(-1).message }, { type, homeToken: token, autosave: true });
+
+  harness.preference({ type: requestType, homeToken: token });
+  assert.equal(harness.posts.at(-1).message.autosave, true);
+});
+
+test("Documents applies Home's remembered choice and turning it on restores the 900 ms autosave", () => {
+  const timers = new Map();
+  let nextTimerId = 1;
+  const posted = [];
+  const toggle = { attributes: {}, title: "", setAttribute(name, value) { this.attributes[name] = value; } };
+  const state = { homeToken: "tok", autosave: false, current: { doc_did: "doc-1" }, mode: "shell", dirty: true, currentSessionId: 1 };
+  const context = vm.createContext({
+    state,
+    elements: { autosaveToggle: toggle },
+    autosaveTimerId: 0,
+    saveRecovery: null,
+    pendingHomeWindowCloseTarget: null,
+    DOCUMENTS_PREFERENCES_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"),
+    DOCUMENTS_PREFERENCES_SET_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"),
+    DOCUMENTS_PREFERENCES_REQUEST_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"),
+    window: {
+      parent: { postMessage(message) { posted.push(message); } },
+      setTimeout(callback, delay) { const id = nextTimerId++; timers.set(id, { callback, delay }); return id; },
+      clearTimeout(id) { timers.delete(id); },
+    },
+    saveCurrent: async () => {},
+    reportSaveFailure() {},
+  });
+  vm.runInContext(
+    ["hasExactKeys", "clearAutosaveTimer", "scheduleAutosave", "applyAutosavePreference", "toggleAutosavePreference",
+      "requestAutosavePreference", "handleAutosavePreferenceMessage"].map((name) => extractFunction(documentsSource, name)).join("\n") +
+      "\nthis.api = { scheduleAutosave, toggleAutosavePreference, requestAutosavePreference, handleAutosavePreferenceMessage };",
+    context,
+  );
+  const has900 = () => [...timers.values()].some((timer) => timer.delay === 900);
+  context.api.scheduleAutosave();
+  assert.equal(has900(), false);
+  context.api.requestAutosavePreference();
+  assert.deepEqual({ ...posted.at(-1) }, { type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"), homeToken: "tok" });
+
+  assert.equal(context.api.handleAutosavePreferenceMessage({ type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), homeToken: "other", autosave: true }), false);
+  assert.equal(state.autosave, false);
+  assert.equal(context.api.handleAutosavePreferenceMessage({ type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), homeToken: "tok", autosave: true }), true);
+  assert.equal(state.autosave, true);
+  assert.equal(toggle.attributes["aria-checked"], "true");
+  assert.equal(has900(), true);
+
+  context.api.toggleAutosavePreference();
+  assert.equal(state.autosave, false);
+  assert.equal(has900(), false);
+  assert.deepEqual({ ...posted.at(-1) }, { type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"), homeToken: "tok", autosave: false });
+});
+
+test("a Documents request that never answers fails at its deadline and keeps the edits", async () => {
+  const fetchCalls = [];
+  const context = vm.createContext({
+    state: { homeToken: "tok" },
+    DOCUMENTS_REQUEST_DEADLINE_MS: 20,
+    AbortController,
+    window: { setTimeout, clearTimeout },
+    fetch(path, init) {
+      fetchCalls.push(path);
+      // A server that never answers: only the deadline ends the request.
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    },
+  });
+  vm.runInContext(
+    ["documentsApi", "documentsProviderApi"].map((name) => extractFunction(documentsSource, name)).join("\n") +
+      "\nthis.api = { documentsProviderApi };",
+    context,
+  );
+  const guard = new Promise((_resolve, reject) => setTimeout(() => reject(new Error("no deadline")), 2000));
+  await assert.rejects(
+    Promise.race([context.api.documentsProviderApi("save", { doc_did: "doc-1" }), guard]),
+    /did not answer in time\. Your edits are kept\./,
+  );
+  assert.deepEqual(fetchCalls, ["/api/provider/documents/save"]);
+  assert.equal(numericConstant(documentsSource, "DOCUMENTS_REQUEST_DEADLINE_MS"), 20_000);
+});
+
+test("closing asks once for every unsaved document in the window and Save all saves each", async () => {
+  const harness = createDocumentsHarness({ dirty: true, autosave: false, kept: ["Plan", "Notes"] });
+  const pending = harness.request();
+  await Promise.resolve();
+  assert.equal(harness.elements.confirmTitle.textContent, "Save changes to 3 documents?");
+  assert.equal(harness.elements.confirmAction.textContent, "Save all");
+  assert.equal(harness.elements.confirmSecondaryAction.textContent, "Don't save");
+  harness.respond("confirm");
+  await pending;
+  assert.equal(harness.saveCalls(), 3);
+  assert.deepEqual(harness.kept(), []);
+  assert.equal(harness.posted.at(-1).message.ok, true);
+});
+
+test("a window whose open document is saved still asks for the documents it keeps", async () => {
+  const cancelled = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"] });
+  const pending = cancelled.request();
+  await Promise.resolve();
+  assert.equal(cancelled.elements.confirmTitle.textContent, "Save changes to Plan?");
+  assert.equal(cancelled.elements.confirmAction.textContent, "Save");
+  cancelled.respond("cancel");
+  await pending;
+  assert.equal(cancelled.posted.at(-1).message.reason, "cancelled");
+  assert.deepEqual(cancelled.kept(), ["document:Plan"]);
+  assert.equal(cancelled.saveCalls(), 0);
+
+  const dropped = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"] });
+  const discard = dropped.request();
+  dropped.respond("secondary");
+  await discard;
+  assert.equal(dropped.posted.at(-1).message.reason, "discarded");
+  assert.equal(dropped.saveCalls(), 0);
+
+  const failing = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"], savePlan: "failure" });
+  const failed = failing.request();
+  failing.respond("confirm");
+  await failed;
+  assert.equal(failing.posted.at(-1).message.ok, false);
+  assert.equal(failing.posted.at(-1).message.reason, "save_failed");
+});
+
+test("Save all keeps saving until nothing in the window is unsaved, edits made during a save included", async () => {
+  // Kept "Plan" saves; while it saves, the person edits Plan again and moves to
+  // a saved document, so Plan is kept unsaved once more.
+  const harness = createDocumentsHarness({
+    dirty: false, autosave: false, kept: ["Plan"],
+    onSave({ state, elements, unsavedDocuments, call }) {
+      if (call !== 1) return "";
+      unsavedDocuments.set("document:Plan", { document: { doc_did: "Plan", title: "Plan", file_name: "", body: "newer" } });
+      state.current = { doc_did: "clean" };
+      elements.titleInput.value = "Clean";
+      state.dirty = false;
+      return "handled";
+    },
+  });
+  const pending = harness.request();
+  harness.respond("confirm");
+  await pending;
+  assert.equal(harness.saveCalls(), 2, "the newer edit must be saved too");
+  assert.deepEqual(harness.kept(), []);
+  assert.equal(harness.posted.at(-1).message.ok, true);
 });

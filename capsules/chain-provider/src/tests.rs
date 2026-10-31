@@ -1539,6 +1539,47 @@ fn proxies_typed_evm_contract_call_without_raw_rpc_url() {
 }
 
 #[test]
+fn rpc_error_detail_with_multibyte_text_is_shortened_safely() {
+    // The 44-byte detail prefix plus "execution reverted: " and 959 ASCII
+    // bytes ends at offset 1022, so the 2-byte 'é' spans the 1024-byte limit.
+    let reverted = format!("execution reverted: {}\u{e9}", "a".repeat(959));
+    let rpc_url = spawn_rpc_sequence_asserting_server_with_replies(vec![(
+        "eth_call",
+        json!([
+            {"to": "0x0000000000000000000000000000000000000001", "data": "0x"},
+            "latest"
+        ]),
+        RpcReply::Error(json!({"code": 3, "message": reverted})),
+    )]);
+    let mut provider = provider_with_rpc(rpc_url);
+
+    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        provider.handle(Request::ContractCall {
+            network: "esc-local".to_string(),
+            to: "0x0000000000000000000000000000000000000001".to_string(),
+            data: "0x".to_string(),
+            block: None,
+        })
+    }))
+    .expect("multibyte upstream RPC error text must not panic the provider");
+
+    match response {
+        Response::Error { code, message } => {
+            assert_eq!(code, "upstream_rpc_error");
+            let expected_prefix = format!(
+                "EVM RPC request rejected: eth_call: code 3: execution reverted: {}",
+                "a".repeat(959)
+            );
+            assert!(
+                message.starts_with(&expected_prefix),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[test]
 fn proxies_typed_evm_gas_estimate_without_wallet_approval() {
     let rpc_url = spawn_rpc_server("eth_estimateGas", json!("0x5208"));
     let mut provider = provider_with_rpc(rpc_url);

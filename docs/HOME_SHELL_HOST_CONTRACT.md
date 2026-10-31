@@ -107,7 +107,11 @@ The Home host may:
   accepted active `home-gui` ready message;
 - mint target-scoped routes through Runtime using host-held authority;
 - route Runtime events and approved payloads to their registered child frame;
-- show a minimal reload, Desktop, or sign-out recovery surface.
+- show a minimal reload, Desktop, or sign-out recovery surface;
+- ask for a reload, never reload by itself, when a summary reports a Runtime
+  version other than the one that served the page: after an update the page,
+  the shell and open windows keep their old code until the page reloads, and
+  a reload would drop what open windows have not saved.
 
 The Home host must not:
 
@@ -181,7 +185,9 @@ Home token, random lifecycle generation, bounded random request id, operation,
 purpose, MIME type, and payload bound. Each frame may have at most one request
 in flight. Home keeps only bounded, expiring replay ids and text-free in-flight
 metadata. Concurrent, replayed, substituted, malformed, oversized, stale,
-retired, and timed-out requests fail closed.
+retired, and timed-out requests fail closed. A Home page whose code predates a
+purpose answers it as `malformed` with purpose `invalid`; the client reports
+that as `unknown_purpose`, so the app can ask for a Home reload.
 
 The purpose policy is closed. Browser may read or write bounded `text/plain`
 for `browser.text`. Wallet may write addresses and Wallet Recovery Keys.
@@ -299,9 +305,14 @@ active. CSS hiding is not an accepted lifecycle model for a live previous
 shell. Home's browser-local active-shell hint may suppress a flash during boot,
 but Runtime state remains authoritative.
 
-If the selected shell cannot launch, Home shows the host-owned recovery surface.
-Recovery can retry, return to `home-gui` through the Runtime shell route, or sign
-out. It does not mount a hidden desktop as a fallback.
+If the selected shell fails to launch, Home shows the host-owned recovery
+surface. Recovery can retry, return to `home-gui` through the Runtime shell
+route, or sign out. It does not mount a hidden desktop as a fallback.
+
+A saved shell that is no longer launchable (for example the Terminal view when
+host developer mode is off) is not a launch failure: Runtime drops it from the
+shell candidates and resets the saved choice, and Home switches to `home-gui`
+through the same Runtime shell route, so every later load opens the Desktop.
 
 ## Verification
 
@@ -315,9 +326,10 @@ node scripts/home-clipboard-headless-smoke.mjs
 node scripts/home-clipboard-source-gate.mjs
 node scripts/home-shell-system-switch-smoke.mjs
 node scripts/home-shell-switchback-recovery-smoke.mjs
+node scripts/home-shell-unavailable-shell-fallback-smoke.mjs
 node scripts/home-cli-browser-smoke.mjs
 node scripts/wallet-connector-transaction-smoke.mjs
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
 node scripts/home-shell-objective-audit.mjs
 (cd elastos && cargo test -p elastos-server test_home_launch -- --nocapture)
 ```

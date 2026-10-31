@@ -170,6 +170,285 @@ fn test_capsule_capability_requests_render_as_inbox_notifications() {
         .contains("elastos://content/publish"));
 }
 
+/// A local Runtime that keeps capability requests until the shell grants or
+/// denies them, as `/api/capability/*` does.
+#[derive(Clone, Default)]
+struct CapabilityRuntime {
+    pending: Arc<TokioMutex<Vec<String>>>,
+    granted: Arc<TokioMutex<Vec<String>>>,
+    denied: Arc<TokioMutex<Vec<String>>>,
+}
+
+impl CapabilityRuntime {
+    async fn start(data_dir: &std::path::Path) -> Self {
+        let runtime = Self::default();
+        let app = Router::new()
+            .route("/api/health", get(fake_runtime_health))
+            .route(
+                "/api/auth/attach",
+                post(|AxumJson(body): AxumJson<Value>| async move {
+                    assert_eq!(body["secret"], "capability-attach");
+                    AxumJson(json!({ "token": format!("{}-token", body["scope"].as_str().unwrap()) }))
+                }),
+            )
+            .route(
+                "/api/capability/request",
+                post(
+                    |AxumState(runtime): AxumState<CapabilityRuntime>,
+                     AxumJson(body): AxumJson<Value>| async move {
+                        let request_id = body["request_id"].as_str().unwrap().to_string();
+                        runtime.pending.lock().await.push(request_id.clone());
+                        AxumJson(json!({ "request_id": request_id, "status": "pending" }))
+                    },
+                ),
+            )
+            .route(
+                "/api/capability/pending",
+                get(
+                    |AxumState(runtime): AxumState<CapabilityRuntime>, headers: HeaderMap| async move {
+                        assert_eq!(headers["authorization"], "Bearer shell-token");
+                        let requests = runtime
+                            .pending
+                            .lock()
+                            .await
+                            .iter()
+                            .map(|request_id| {
+                                json!({
+                                    "request_id": request_id,
+                                    "resource": "elastos://content/publish",
+                                    "action": "execute",
+                                    "requested_at": 42,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        AxumJson(json!({ "requests": requests }))
+                    },
+                ),
+            )
+            .route(
+                "/api/capability/grant",
+                post(
+                    |AxumState(runtime): AxumState<CapabilityRuntime>,
+                     AxumJson(body): AxumJson<Value>| async move {
+                        let request_id = body["request_id"].as_str().unwrap().to_string();
+                        runtime.pending.lock().await.retain(|id| id != &request_id);
+                        runtime.granted.lock().await.push(request_id);
+                        AxumJson(json!({ "status": "granted" }))
+                    },
+                ),
+            )
+            .route(
+                "/api/capability/deny",
+                post(
+                    |AxumState(runtime): AxumState<CapabilityRuntime>,
+                     AxumJson(body): AxumJson<Value>| async move {
+                        let request_id = body["request_id"].as_str().unwrap().to_string();
+                        runtime.pending.lock().await.retain(|id| id != &request_id);
+                        runtime.denied.lock().await.push(request_id);
+                        AxumJson(json!({ "status": "denied" }))
+                    },
+                ),
+            )
+            .with_state(runtime.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let coords = json!({
+            "api_url": api_url,
+            "attach_secret": "capability-attach",
+            "pid": std::process::id(),
+            "runtime_kind": crate::runtime_control::RUNTIME_KIND_OPERATOR,
+            "binary_sha256": "",
+            "policy_sha256": "",
+        });
+        std::fs::write(
+            crate::runtime_control::home_runtime_coord_path(data_dir),
+            serde_json::to_vec_pretty(&coords).unwrap(),
+        )
+        .unwrap();
+        runtime
+    }
+
+    /// Files a request the way a running capsule asks the Runtime for access.
+    async fn file_request(&self, data_dir: &std::path::Path, request_id: &str) {
+        let coords = load_live_runtime_coords(data_dir).await.unwrap();
+        reqwest::Client::new()
+            .post(format!("{}/api/capability/request", coords.api_url))
+            .json(&json!({ "request_id": request_id }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+}
+
+async fn inbox_capability_action(app: &Router, token: &str, action_id: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"action_id":"{action_id}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn get_json(app: &Router, origin: &'static str, uri: &str, token: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", origin)
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn capability_entry_count(summary: &Value) -> usize {
+    summary["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "capability_request")
+        .count()
+}
+
+#[tokio::test]
+async fn test_inbox_capability_requests_answer_only_to_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let admin_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &admin);
+    let guest_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &guest);
+    let runtime = CapabilityRuntime::start(dir.path()).await;
+    runtime.file_request(dir.path(), "cap-1").await;
+
+    assert_eq!(
+        inbox_capability_action(&app, &guest_inbox, "capability-approve-request:cap-1").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        inbox_capability_action(&app, &guest_inbox, "capability-deny-request:cap-1").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(*runtime.pending.lock().await, vec!["cap-1".to_string()]);
+    assert!(runtime.granted.lock().await.is_empty());
+    assert!(runtime.denied.lock().await.is_empty());
+
+    let admin_summary = get_json(&app, "null", "/api/apps/inbox/summary", &admin_inbox).await;
+    assert_eq!(capability_entry_count(&admin_summary), 1);
+    assert_eq!(
+        inbox_capability_action(&app, &admin_inbox, "capability-approve-request:cap-1").await,
+        StatusCode::OK
+    );
+    assert_eq!(*runtime.granted.lock().await, vec!["cap-1".to_string()]);
+    assert!(runtime.pending.lock().await.is_empty());
+
+    runtime.file_request(dir.path(), "cap-2").await;
+    assert_eq!(
+        inbox_capability_action(&app, &admin_inbox, "capability-deny-request:cap-2").await,
+        StatusCode::OK
+    );
+    assert_eq!(*runtime.denied.lock().await, vec!["cap-2".to_string()]);
+}
+
+#[tokio::test]
+async fn test_inbox_and_home_list_capability_requests_only_for_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let admin_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &admin);
+    let guest_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &guest);
+    let home_origin = "http://localhost:61180";
+    let runtime = CapabilityRuntime::start(dir.path()).await;
+
+    let events_uri = "/api/apps/home/events?wait_ms=0";
+    let guest_before = get_json(&app, home_origin, events_uri, &guest.home_token).await;
+    let admin_before = get_json(&app, home_origin, events_uri, &admin.home_token).await;
+    runtime.file_request(dir.path(), "cap-1").await;
+
+    let guest_inbox_summary = get_json(&app, "null", "/api/apps/inbox/summary", &guest_inbox).await;
+    assert_eq!(capability_entry_count(&guest_inbox_summary), 0);
+    let guest_home = get_json(
+        &app,
+        home_origin,
+        "/api/apps/home/summary",
+        &guest.home_token,
+    )
+    .await;
+    assert_eq!(capability_entry_count(&guest_home), 0);
+    let guest_after = get_json(&app, home_origin, events_uri, &guest.home_token).await;
+    assert_eq!(guest_after["cursor"], guest_before["cursor"]);
+
+    let admin_inbox_summary = get_json(&app, "null", "/api/apps/inbox/summary", &admin_inbox).await;
+    assert_eq!(capability_entry_count(&admin_inbox_summary), 1);
+    let admin_home = get_json(
+        &app,
+        home_origin,
+        "/api/apps/home/summary",
+        &admin.home_token,
+    )
+    .await;
+    assert_eq!(capability_entry_count(&admin_home), 1);
+    let admin_after = get_json(&app, home_origin, events_uri, &admin.home_token).await;
+    assert_ne!(admin_after["cursor"], admin_before["cursor"]);
+}
+
+#[tokio::test]
+async fn test_capability_request_from_guest_launched_capsule_waits_for_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let admin_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &admin);
+    let guest_inbox = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &guest);
+    let runtime = CapabilityRuntime::start(dir.path()).await;
+    // The Runtime records no principal on a capability request, so the one a
+    // capsule from the Guest's own session files is still the admin's to answer.
+    runtime.file_request(dir.path(), "cap-guest").await;
+
+    assert_eq!(
+        inbox_capability_action(&app, &guest_inbox, "capability-approve-request:cap-guest").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(*runtime.pending.lock().await, vec!["cap-guest".to_string()]);
+    assert_eq!(
+        inbox_capability_action(&app, &admin_inbox, "capability-approve-request:cap-guest").await,
+        StatusCode::OK
+    );
+    assert_eq!(*runtime.granted.lock().await, vec!["cap-guest".to_string()]);
+}
+
 #[tokio::test]
 async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs() {
     let dir = tempfile::tempdir().unwrap();

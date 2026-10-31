@@ -4,18 +4,19 @@ import {
   pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261030a";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260813a";
+  registerStageLayer,
+} from "./shell-popovers.js?v=home-20261030a";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20260813a";
-import { playUiSound } from "./shell-sounds.js?v=home-20260813a";
+} from "./shell-windows.js?v=home-20261030a";
+import { playUiSound } from "./shell-sounds.js?v=home-20261030a";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
@@ -94,6 +95,7 @@ export function bindWalletRail() {
   }
   if (!registered) {
     registerShellPopover("wallet-rail", () => hideWalletRail({ restoreFocus: false }));
+    registerStageLayer("wallet-rail", { selector: "#wallet-rail", close: () => hideWalletRail({ restoreFocus: false }) });
     registered = true;
   }
   barButton?.addEventListener("click", () => {
@@ -169,11 +171,6 @@ export function bindWalletRail() {
 
 function finePointerHoverAvailable() {
   return !window.matchMedia?.("(hover: none), (pointer: coarse)")?.matches;
-}
-
-function connectorSheetOpen() {
-  const connectorSheet = document.querySelector("#connector-sheet");
-  return Boolean(connectorSheet && !connectorSheet.hidden);
 }
 
 function clearEdgeOpenTimer() {
@@ -262,7 +259,7 @@ function bindEdgeReveal() {
         return;
       }
       lastPointerClientX = event.clientX;
-      if (!walletRailAvailable() || connectorSheetOpen()) {
+      if (!walletRailAvailable()) {
         clearEdgeOpenTimer();
         return;
       }
@@ -273,7 +270,7 @@ function bindEdgeReveal() {
         if (!walletRailOpen() && !edgeOpenTimer) {
           edgeOpenTimer = window.setTimeout(() => {
             edgeOpenTimer = 0;
-            if (!walletRailAvailable() || connectorSheetOpen() || walletRailOpen()) {
+            if (!walletRailAvailable() || walletRailOpen()) {
               return;
             }
             openedByEdgeHover = true;
@@ -337,6 +334,10 @@ function markFrameReady() {
   frame?.classList.add("is-ready");
   pushUiPreferencesToFrameWindow(frame?.contentWindow);
   flushQueuedChromeCommand();
+  // The rail opened while the preloaded Wallet was still loading.
+  if (walletRailOpen() && new URL(frame.dataset.route).searchParams.get("preload") === "1") {
+    postWalletSoftRefresh();
+  }
 }
 
 function onWalletChromeMessage(event) {
@@ -415,7 +416,7 @@ export function preloadWalletRail() {
   if (!walletRailAvailable() || !frame || frame.dataset.route || launching) {
     return;
   }
-  void mountWalletFrame();
+  void mountWalletFrame({ preload: true });
 }
 
 function clearPreloadTimer() {
@@ -656,7 +657,7 @@ export function retireWalletRail() {
   }
 }
 
-async function mountWalletFrame() {
+async function mountWalletFrame({ preload = false } = {}) {
   if (launching) {
     return;
   }
@@ -698,6 +699,9 @@ async function mountWalletFrame() {
     // chrome (those live in this head). Window launches omit the flag.
     const route = new URL(String(launched.route || ""), window.location.origin);
     route.searchParams.set("presentation", "rail");
+    // A preloaded Wallet stays out of sight, so it must not ask for market
+    // prices until the rail opens (see postWalletSoftRefresh).
+    if (preload) route.searchParams.set("preload", "1");
     frame.src = route.href;
     frame.dataset.route = route.href;
   } catch (error) {
@@ -722,11 +726,6 @@ function bindOutsideDismiss() {
   outsideDismissBound = true;
   document.addEventListener("pointerdown", (event) => {
     if (!walletRailOpen() || rail.contains(event.target)) {
-      return;
-    }
-    // The connector ceremony sheet sits above the rail — ignore outside
-    // dismiss while it is open (and never treat sheet clicks as outside).
-    if (connectorSheetOpen()) {
       return;
     }
     openedByEdgeHover = false;

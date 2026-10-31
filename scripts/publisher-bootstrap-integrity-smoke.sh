@@ -18,7 +18,7 @@ required_install = [
 ]
 required_publish = [
     "discover-source-bootstrap.py",
-    "trusted-source Carrier bootstrap requires both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID",
+    "unsigned preparation requires the Carrier ticket and node from one publisher",
 ]
 required_discover = [
     "/.well-known/elastos/carrier-bootstrap.json?role=publisher",

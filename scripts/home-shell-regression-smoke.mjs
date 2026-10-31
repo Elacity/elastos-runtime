@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import vm from "node:vm";
 import { exerciseNavigationConsumers, navigationClientFixture } from "./home-navigation-consumers-smoke.mjs";
 
-const moduleVersion = "home-20260813a";
+const moduleVersion = "home-20261030a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();
@@ -237,6 +237,14 @@ class FakeElement {
 
   scrollIntoView() {}
 
+  setPointerCapture() {}
+
+  releasePointerCapture() {}
+
+  hasPointerCapture() {
+    return false;
+  }
+
   getBoundingClientRect() {
     if (this.selector === "#desktop") {
       return { left: 0, top: 0, width: 1024, height: 768, right: 1024, bottom: 768 };
@@ -404,8 +412,6 @@ const shellChrome = await import(`../capsules/home-gui/browser/shell-chrome.js?v
 const shellControlCentre = await import(`../capsules/home-gui/browser/shell-control-centre.js?v=${moduleVersion}`);
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
-const shellWalletRail = await import(`../capsules/home-gui/browser/shell-wallet-rail.js?v=${moduleVersion}`);
-const shellConnectorSheet = await import(`../capsules/home-gui/browser/shell-connector-sheet.js?v=${moduleVersion}`);
 const shellSpotlight = await import(`../capsules/home-gui/browser/shell-spotlight.js?v=${moduleVersion}`);
 const shellKeyboard = await import(`../capsules/home-gui/browser/shell-keyboard.js?v=${moduleVersion}`);
 
@@ -501,11 +507,11 @@ shellCore.shellState.currentSummary = firstRunSummary;
 shellSurface.renderDesktop(firstRunSummary);
 assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
+    "chat-room",
     "browser",
+    "system",
     "wallet",
     "documents",
-    "chat-room",
-    "system",
   ]),
   "fresh layout did not seed only the available core dock targets in canonical order",
   shellCore.shellState.shellLayoutState.taskbar,
@@ -670,16 +676,6 @@ const controlCentreScript = readFileSync(
   new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
   "utf8",
 );
-const openHomeGuiTargetBlock = sourceBlock(
-  homeGuiScript,
-  "export function openHomeGuiTarget(target, options = {}) {",
-  "Home GUI connector open path",
-);
-const attachAuthorizedHomeGuiTargetBlock = sourceBlock(
-  homeGuiScript,
-  "export function attachAuthorizedHomeGuiTarget(launched) {",
-  "Home GUI authorized connector attach path",
-);
 const homeSetupSheetScript = readFileSync(
   new URL("../capsules/home-gui/browser/shell-setup-sheet.js", import.meta.url),
   "utf8",
@@ -710,22 +706,6 @@ const taskbarCloseIndex = homeGuiTemplate.indexOf("</footer>", taskbarPrimaryInd
 const launcherMarkup = launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
   ? homeGuiTemplate.slice(launcherOpenIndex, launcherCloseIndex)
   : "";
-
-assert(
-  openHomeGuiTargetBlock.includes("void showConnectorSheet(target, {") &&
-    openHomeGuiTargetBlock.includes('query: { ...query, presentation: "sheet" },') &&
-    openHomeGuiTargetBlock.includes('console.error("connector sheet open failed", error);') &&
-    !openHomeGuiTargetBlock.includes("openTarget(target, options);\n      },"),
-  "Home GUI connector sheet open path still falls back to a generic connector launch",
-  openHomeGuiTargetBlock,
-);
-assert(
-  /if \(walletRailOpen\(\) && isConnectorSheetTarget\(launched\?\.target\)\) \{\s*return attachAuthorizedConnectorSheet\(launched\);\s*\}\s*return attachAuthorizedTarget\(launched\);/.test(
-    attachAuthorizedHomeGuiTargetBlock,
-  ),
-  "Home GUI authorized connector attach path no longer keeps wallet ceremony on the sheet",
-  attachAuthorizedHomeGuiTargetBlock,
-);
 
 assert(
   (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
@@ -943,6 +923,60 @@ assert(
   shellCore.shellState.currentSummary = summary;
 }
 
+{
+  // Every Inbox request that waits for an answer raises Home's notification
+  // once, when it first appears, not only wallet approvals. The toast shows
+  // fixed words for the kind, never the request's own text, which apps,
+  // pages and other people choose parts of; Inbox shows the details.
+  const toast = elementForSelector("#home-notification-toast");
+  const title = elementForSelector("#home-notification-title");
+  const body = elementForSelector("#home-notification-body");
+  const targets = [{ target: "inbox", title: "Inbox", route: "/apps/inbox/" }];
+  const request = (kind, id, action, extra = {}) => ({
+    id, kind, title: "Approve wallet payment", body: `Morgan asks you to approve a ${kind} payment now.`,
+    severity: "attention", read: false, action_ref: { app: "inbox", action_id: action }, ...extra,
+  });
+  const withEntries = (entries) => ({ notifications: { entries }, targets });
+  const fixedBody = "A request waits for your answer in Inbox.";
+  const kinds = [
+    ["hosted_route_decision", "external-http-request:model-egress-1", "model-egress-approve:model-egress-1", "Hosted model access request"],
+    ["capability_request", "capability-request:1", "capability-approve-request:1", "Capability request"],
+    ["inspect_action_request", "inspect-action-request:1", "inspect-approve-request:1", "Runtime action request"],
+    ["external_http_request", "external-http-request:price-1", "wallet-price-http-approve:price-1", "Internet access request"],
+    ["contact_request", "contact-request:1", "contact-accept-request:1", "Contact request"],
+    ["room_access_request", "room-access-request:1", "room-approve-request:1", "Room access request"],
+    ["service_access_request", "service-access-request:1", "service-approve-request:1", "Service access request"],
+    ["community_presence_request", "community-presence-request:1", "community-presence-always:1", "Community presence request"],
+    ["wallet_approval_request", "wallet-approval-request:1", "wallet-approve-request:1", "Wallet approval request"],
+  ];
+  const before = withEntries([]);
+  for (const [kind, id, action, fixedTitle] of kinds) {
+    toast.hidden = true;
+    title.textContent = "";
+    body.textContent = "";
+    const after = withEntries([request(kind, id, action)]);
+    shellSurface.maybeShowInboxRequestToast(before, after);
+    assert(toast.hidden === false && title.textContent === fixedTitle && body.textContent === fixedBody,
+      `Home did not raise its fixed notification for a new ${kind}`,
+      { kind, hidden: toast.hidden, title: title.textContent, body: body.textContent, fixedTitle });
+    toast.hidden = true;
+    shellSurface.maybeShowInboxRequestToast(after, after);
+    assert(toast.hidden === true, `Home raised its notification again for the same ${kind}`, { kind });
+  }
+  // Nothing new, an already read entry, a message or the first summary stay quiet.
+  const quiet = [
+    [null, withEntries([request("capability_request", "capability-request:2", "capability-approve-request:2")])],
+    [before, withEntries([request("contact_request", "contact-request:2", "contact-accept-request:2", { read: true })])],
+    [before, withEntries([request("direct_message", "direct-message:1", "open-conversation:1")])],
+  ];
+  for (const [previous, next] of quiet) {
+    toast.hidden = true;
+    shellSurface.maybeShowInboxRequestToast(previous, next);
+    assert(toast.hidden === true, "Home raised its notification for an entry that needs no answer",
+      { entries: next.notifications.entries });
+  }
+}
+
 assert(
   peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;"),
   "People unified-sidebar must reserve the Home safe-top inset in its sidebar column",
@@ -962,8 +996,10 @@ assert(
   "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
 );
 assert(
-  browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);"),
-  "Browser no longer applies the Home-owned toolbar content inset",
+  browserStyle.includes("padding: 8px 10px;") &&
+    !browserStyle.includes("--window-chrome-safe-leading") &&
+    !homeGuiStyle.includes("window-chrome-unified-toolbar"),
+  "Browser must sit under the standard draggable Home title bar, without a traffic-light inset",
 );
 assert(
   !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
@@ -996,17 +1032,13 @@ assert(
   "Control Centre must issue preference requests without treating local mutations as canonical state",
 );
 assert(
-  homeGuiScript.includes("const active = Boolean(fullscreenElement());") &&
-    homeGuiScript.includes("document.addEventListener(\"fullscreenchange\", syncFullscreenButton);") &&
-    homeGuiScript.includes("document.addEventListener(\"webkitfullscreenchange\", syncFullscreenButton);") &&
-    homeGuiScript.includes("await exit.call(document);") &&
-    homeGuiScript.includes("await request.call(root);"),
-  "Home Control Centre fullscreen action no longer follows the real browser Fullscreen API state",
+  homeGuiScript.includes("bindFullscreenToggle(toolbarFullscreenButton);"),
+  "Home top-bar full screen toggle no longer follows the real browser Fullscreen API state",
 );
 assert(
   !homeGuiScript.includes("toggleActiveFullscreenStage") &&
     !homeGuiScript.includes("Window fullscreen stage (dedicated Space)"),
-  "Home Control Centre fullscreen action still routes through the app-window fullscreen Space path",
+  "Home top-bar full screen toggle still routes through the app-window fullscreen Space path",
 );
 assert(
   homeGuiScript.includes("bindSetupSheet();") &&
@@ -1093,9 +1125,9 @@ assert(
     homeGuiTemplate.includes('id="toolbar-active-title"') &&
     homeGuiTemplate.includes('id="toolbar-menubar"') &&
     homeGuiTemplate.includes('id="toolbar-control-centre"') &&
-    homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
+    homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
+    !homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
     homeGuiTemplate.includes('id="identity-menu-sign-out"') &&
-    !homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
     !homeGuiTemplate.includes('id="toolbar-sign-out"'),
   "Home template still mixes the obsolete naked top bar with the canonical system bar structure",
 );
@@ -1283,8 +1315,9 @@ assert(
     shellSpotlight.spotlightOpen() === true &&
       spotlight.hidden === false &&
       spotlightInput === document.activeElement &&
-      spotlight.getAttribute("aria-hidden") === "false",
-    "Home Spotlight did not open and focus the search field",
+      spotlight.getAttribute("aria-hidden") === "false" &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not open and focus the search field, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1315,6 +1348,47 @@ assert(
     "Home Spotlight did not open the selected app and close",
     restoredBrowserLaunches.slice(launchesBefore),
   );
+  // System is open now, so activating its row focuses that window rather
+  // than launching again; Spotlight closing is the activation signal.
+  const launchesBeforePress = restoredBrowserLaunches.length;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  // Tablet and desktop: a touch opens on press, exactly as before the phone
+  // work (phones-r1 #4).
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight off the phone must open a touched result on press");
+  // Phone: a finger landing may be a scroll, so touch opens on the tap.
+  window.innerWidth = 390;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  const touchedRow = spotlightResults.children[1];
+  touchedRow.dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(
+    shellSpotlight.spotlightOpen() === true &&
+      spotlightInvoker.getAttribute("aria-haspopup") === "dialog" &&
+      spotlightInvoker.getAttribute("aria-controls") === "spotlight" &&
+      spotlightInvoker.getAttribute("aria-expanded") === "true",
+    "Home Spotlight on the phone must not open a result when a finger lands on it (the touch may be a scroll), and its bar button must be marked expanded",
+  );
+  touchedRow.dispatch("click");
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  window.innerWidth = 1280;
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight on the phone must open a touched result on tap");
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "mouse" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight must open a result on mouse press");
+  assert(
+    restoredBrowserLaunches.length === launchesBeforePress,
+    "Home Spotlight press tests must focus the open System window, not launch again",
+    restoredBrowserLaunches.slice(launchesBeforePress),
+  );
   spotlightInvoker.focus();
   shellSpotlight.showSpotlight();
   spotlightInput.value = "no-match-query";
@@ -1334,8 +1408,9 @@ assert(
   spotlightPanel.dispatch("animationend", { target: spotlightPanel });
   assert(
     shellSpotlight.spotlightOpen() === false &&
-      document.activeElement === spotlightInvoker,
-    "Home Spotlight did not close on Escape and restore focus",
+      document.activeElement === spotlightInvoker &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not close on Escape and restore focus, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1380,8 +1455,7 @@ const expectedWindowChrome = {
     className: "window-chrome-continuous",
   },
   browser: {
-    mode: "unified-toolbar",
-    className: "window-chrome-unified-toolbar",
+    mode: "standard",
   },
 };
 
@@ -1402,6 +1476,26 @@ for (const entry of shellCore.shellState.windows.values()) {
 }
 
 const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => entry.targetId === "browser");
+{
+  const browserHead = browserEntry.node.querySelector(".window-head");
+  browserEntry.node.offsetWidth = 800;
+  browserEntry.node.offsetHeight = 600;
+  browserEntry.node.style.left = "200px";
+  browserEntry.node.style.top = "100px";
+  const leftBefore = browserEntry.node.style.left;
+  const topBefore = browserEntry.node.style.top;
+  browserHead.dispatch("pointerdown", { pointerId: 41, clientX: 400, clientY: 120, target: browserHead });
+  browserHead.dispatch("pointermove", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  browserHead.dispatch("pointerup", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  assert(
+    browserEntry.node.dataset.windowChromeMode === "standard" &&
+      !browserEntry.node.classList.contains("window-chrome-unified-toolbar") &&
+      browserEntry.node.style.left === "260px" &&
+      browserEntry.node.style.top === "160px",
+    "Browser window title bar must be a standard Home title bar that drags the window",
+    { left: [leftBefore, browserEntry.node.style.left], top: [topBefore, browserEntry.node.style.top] },
+  );
+}
 const browserClose = browserEntry.node.querySelector("[data-action='close']");
 browserClose.focus();
 shellWindows.minimizeWindow(browserEntry.id);
@@ -1625,7 +1719,11 @@ assert(
       .disabled === true &&
     restoredBrowserEntry.node
       .querySelector("[data-action='close']")
-      .getAttribute("aria-label") === "Close",
+      .getAttribute("aria-label") === "Close" &&
+    restoredBrowserEntry.browserClosingStatus?.textContent === "Closing…" &&
+    restoredBrowserEntry.browserClosingStatus.getAttribute("role") === "status" &&
+    restoredBrowserEntry.browserClosingStatus.parentElement ===
+      restoredBrowserEntry.node.querySelector(".window-body"),
   "nonterminal Browser cleanup ended the close handshake before Runtime settled",
   {
     state: restoredBrowserEntry.node.dataset.browserCloseState,
@@ -1889,110 +1987,6 @@ shellWindows.closeWindow(backgroundConnector.id);
 shellWindows.closeWindow(continuityWallet.id);
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
-
-shellWalletRail.bindWalletRail();
-shellConnectorSheet.bindConnectorSheet();
-const walletRailNode = document.querySelector("#wallet-rail");
-walletRailNode.hidden = true;
-walletRailNode.inert = true;
-const boundWalletRailFrame = shellWalletRail.walletRailFrame();
-boundWalletRailFrame.hidden = true;
-boundWalletRailFrame.dataset.route =
-  "/apps/wallet/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=wallet-rail-token";
-shellWalletRail.syncWalletRailAvailability(summary);
-const connectorSheetNode = document.querySelector("#connector-sheet");
-connectorSheetNode.hidden = true;
-connectorSheetNode.inert = true;
-const windowsBeforeAuthorizedConnectorSheet = shellCore.shellState.windows.size;
-const requestsBeforeAuthorizedConnectorSheet = requests.length;
-const closedRailConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route:
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
-    "#home_token=authorized-metamask-token",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  closedRailConnectorSheet === false &&
-    connectorSheetNode.hidden === true &&
-    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "direct authorized connector sheet attachment with a closed Wallet rail did not fail closed",
-  {
-    closedRailConnectorSheet,
-    hidden: connectorSheetNode.hidden,
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
-shellWalletRail.showWalletRail();
-const attachedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route:
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
-    "#home_token=authorized-metamask-token",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  attachedConnectorSheet === true &&
-    shellConnectorSheet.connectorSheetOpen() &&
-    shellConnectorSheet.connectorSheetTarget() === "wallet-metamask" &&
-    connectorSheetNode.hidden === false,
-  "authorized connector descriptor did not open the wallet connector sheet",
-  {
-    attachedConnectorSheet,
-    activeTarget: shellConnectorSheet.connectorSheetTarget(),
-    hidden: connectorSheetNode.hidden,
-  },
-);
-const connectorSheetFrame = shellConnectorSheet.connectorSheetFrame();
-assert(
-  connectorSheetFrame.dataset.route ===
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token" &&
-    connectorSheetFrame.getAttribute("src") ===
-      "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token",
-  "authorized connector sheet did not mount the exact descriptor route byte-for-byte",
-  {
-    route: connectorSheetFrame.dataset.route,
-    src: connectorSheetFrame.getAttribute("src"),
-  },
-);
-assert(
-  shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "authorized connector descriptor created a generic connector surface or a second launch",
-  {
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
-shellConnectorSheet.hideConnectorSheet();
-const failedAuthorizedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route: "",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  failedAuthorizedConnectorSheet === false &&
-    connectorSheetNode.hidden === true &&
-    !connectorSheetFrame.dataset.route &&
-    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "failed authorized connector sheet attachment did not fail closed",
-  {
-    failedAuthorizedConnectorSheet,
-    hidden: connectorSheetNode.hidden,
-    route: connectorSheetFrame.dataset.route || null,
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
 
 function sessionWindow(id, targetId, {
   x,
@@ -2352,6 +2346,27 @@ for (const target of hybridTargets) {
     `${target.target}: restore changed a saved selector`);
   }
 }
+// People's Message names a conversation; an open Chat window shows it.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("chat-room");
+const chatWindow = [...shellCore.shellState.windows.values()][0];
+const chatFrame = chatWindow.node.querySelector(".window-frame");
+const chatPosted = [];
+chatFrame.contentWindow = { postMessage(message, origin) { chatPosted.push({ message, origin }); } };
+const chatLaunches = restoredBrowserLaunches.length;
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" } });
+assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === chatLaunches
+  && shellCore.shellState.activeWindowId === chatWindow.id,
+  "Chat conversation Open created a window instead of using the open one");
+const chatToken = new URLSearchParams(new URL(chatFrame.dataset.route, window.location.href).hash.slice(1)).get("home_token");
+assert(chatToken && JSON.stringify(chatPosted.map((post) => post.message)) === JSON.stringify([{
+  type: "elastos.chat.navigate/v1",
+  homeToken: chatToken,
+  query: { conversation_id: "direct:sha256:fixture" },
+}]), "Chat conversation Open did not ask the open window to show it");
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" }, newWindow: true });
+assert(shellCore.shellState.windows.size === 2, "Chat New Window was reused for a conversation");
 // A Library picker alone is never the destination for ordinary browse Open.
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
@@ -2410,6 +2425,50 @@ assert(restoredBrowserLaunches.at(-1).query.url === "https://example.invalid/vis
   "session restore launched a hidden leftover Browser");
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
+{
+  // A restore that finishes after the person opened the Assistant keeps the room.
+  const shellStages = await import(`../capsules/home-gui/browser/shell-stages.js?v=${moduleVersion}`);
+  let engaged = true;
+  let roomCloses = 0;
+  shellStages.bindAgentSpace({
+    available: () => true, busy: () => false, engaged: () => engaged,
+    open() {}, close() { roomCloses += 1; },
+  });
+  const restoreWithVisibleWindow = async () => {
+    shellCore.shellState.homeBrowserState.session = {
+      root_shell: "home-gui", browser_context_id: shellCore.shellState.browserContextId, active_stage: "desktop",
+      windows: [{ target: "browser", active: true, query: { url: "https://example.invalid/restored" } }],
+    };
+    await shellWindows.restoreShellSession();
+    shellCore.shellState.windows.clear();
+    shellCore.shellState.activeWindowId = null;
+  };
+  await restoreWithVisibleWindow();
+  assert(roomCloses === 0, "session restore closed an Assistant room opened while it ran");
+  // Opening -> restore -> close before the ring entered Agent: restored windows sit on their own Desktops.
+  shellCore.shellState.homeBrowserState.session = {
+    root_shell: "home-gui", browser_context_id: shellCore.shellState.browserContextId, active_stage: "desktop",
+    desktops: ["desk-restore-2"],
+    windows: [
+      { target: "browser", active: true, query: { url: "https://example.invalid/here" } },
+      { target: "browser", desktopSpaceId: "desk-restore-2", query: { url: "https://example.invalid/elsewhere" } },
+    ],
+  };
+  await shellWindows.restoreShellSession();
+  engaged = false;
+  const restoredBySpace = Object.fromEntries([...shellCore.shellState.windows.values()]
+    .map((entry) => [entry.desktopSpaceId === "desk-restore-2" ? "other" : "current", entry.node.dataset.spaceVisible]));
+  assert(shellStages.getActiveStageId() === shellStages.desktopStageId() && roomCloses === 0,
+    "restore during an opening room changed the Space or closed the room", shellStages.getActiveStageId());
+  assert(restoredBySpace.current === "true" && restoredBySpace.other === "false",
+    "restored windows were not placed on their Desktops while the room was opening", restoredBySpace);
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellStages.restoreExtraDesktops([]);
+  await restoreWithVisibleWindow();
+  assert(roomCloses === 1, "session restore must still apply the saved Space when no room is open");
+  shellStages.bindAgentSpace(undefined);
+}
 const shellMenubar = await import(`../capsules/home-gui/browser/shell-menubar.js?v=${moduleVersion}`);
 const menuLaunches = [];
 shellMenubar.bindMenubar({
@@ -2572,7 +2631,7 @@ await openHybrid("documents", { query: { doc: "did:document-c" } });
 const documentWindows = [...shellCore.shellState.windows.values()];
 const originalDocumentTokens = documentWindows.map((entry) =>
   new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash);
-const documentsSource = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const documentsSource = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const navigationFunction = (source, name) => {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert(start >= 0, `Documents function missing: ${name}`);
@@ -2628,9 +2687,9 @@ const documentApp = vm.createContext({
   state: { current: { doc_did: "did:document-a" }, currentSessionId: 1, dirty: false, homeToken: navigationToken },
   elements: { titleInput: { value: "A" }, editor: { value: "Body A" } },
   documentSelectionSequence: 0, autosaveQueued: false, queuedSaveTarget: null,
-  saveRecovery: null, savedWorkingCopy: null,
+  saveRecovery: null, savedWorkingCopy: null, saveInFlight: null, unsavedDocuments: new Map(),
   clearAutosaveTimer() {}, upsertDocumentListItem() {}, renderDocumentsList() {},
-  renderCurrentDocument() {}, setStatus() {}, scheduleStatusClear() {},
+  renderCurrentDocument() {}, showError() {},
   baseName: (uri) => uri.split("/").pop(), base64ToUtf8: () => "Library text",
   documentsProviderApi: async (op, payload) => {
     selectionReads.push({ op, ...payload });
@@ -2643,7 +2702,7 @@ const documentApp = vm.createContext({
     deliverNavigation(data);
   } } },
 });
-vm.runInContext(["hasExactKeys", "updateDocumentsNavigation",
+vm.runInContext(["hasExactKeys", "updateDocumentsNavigation", "prepareToLeaveCurrent", "keepUnsavedCurrent", "restoreUnsavedDocument",
   "resetPendingSaveIntent", "replaceCurrentDocument", "requireSavedWorkingCopy", "selectDocument", "loadLibraryObject"]
   .map(documentFunction).join("\n"), documentApp);
 let documentClient = navigationClientFixture({ homeToken: navigationToken, homeOrigin: hostWindow.location.origin,
@@ -2836,6 +2895,32 @@ for (const [target, entry] of consumerEntries) {
   assert(!shellWindows.acceptHomeNavigation(entry, { ...report, query: {} }), "Changed actor accepted an existing binding");
   entry.targetId = oldTarget;
   assert(JSON.stringify(entry.launchQuery) === before, "Wrong actor/effect altered selector");
+
+  const sessionSaves = () => savedStatePatches.filter((patch) => Object.hasOwn(patch, "session")).length;
+  const settledQuery = { ...entry.launchQuery };
+  const savesBeforeRefresh = sessionSaves();
+  for (let refresh = 0; refresh < 8; refresh += 1) {
+    const hint = { ...report, sequence: record.sequence + 1, query: settledQuery };
+    assert(shellWindows.acceptHomeNavigation(entry, hint), `${target} rejected a fresh unchanged selection`);
+    assert(record.sequence === hint.sequence, `${target} did not advance its navigation guard`);
+    assert(!shellWindows.acceptHomeNavigation(entry, hint), `${target} accepted a replay after an unchanged selection`);
+  }
+  assert(sessionSaves() === savesBeforeRefresh, `${target} saved Home state for an unchanged selection`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: null }),
+    `${target} rejected a loading document hint`);
+  assert(JSON.stringify(entry.launchQuery) === before && sessionSaves() === savesBeforeRefresh,
+    `${target} changed settled selection while loading`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected an explicit selection clear`);
+  assert(sessionSaves() === savesBeforeRefresh + 1 && Object.keys(entry.launchQuery).length === 0,
+    `${target} did not persist its selection clear exactly once`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected a fresh empty selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 1, `${target} saved the same empty selection twice`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: settledQuery }),
+    `${target} rejected its next settled selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 2 && JSON.stringify(entry.launchQuery) === before,
+    `${target} did not persist its changed selection exactly once`);
 }
 await openHybrid("library", { query: { mode: "attach", returnTarget: "chat-room" } });
 const pickerEntry = [...shellCore.shellState.windows.values()].at(-1);
@@ -2930,4 +3015,92 @@ assert(
   "revealed Wallet moved on reload",
 );
 console.log("[home-shell-regression] auto-arrange, manual move and reveal survive reload: PASS");
+
+// Documents windows: "Save automatically" reaches every window and survives a
+// reload; sign-out settles each window's unsaved changes first.
+shellCore.initializeShellLayout(arrangedSummary);
+shellCore.shellState.currentSummary = { ...summary, targets: hybridTargets };
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("documents", { query: { doc: "did:document-one" } });
+await openHybrid("documents", { query: { doc: "did:document-two" } });
+const preferenceWindows = [...shellCore.shellState.windows.values()].map((entry) => {
+  const frame = entry.node.querySelector(".window-frame");
+  frame.contentWindow = { posted: [], postMessage(message) { this.posted.push(message); } };
+  return { entry, frameWindow: frame.contentWindow,
+    token: new URLSearchParams(new URL(frame.dataset.route, window.location.href).hash.slice(1)).get("home_token") };
+});
+assert(preferenceWindows.length === 2 && preferenceWindows[0].token !== preferenceWindows[1].token,
+  "two Documents windows with their own launch tokens");
+const preferencesType = "elastos.documents.preferences/v1";
+sendWindowEvent("message", { origin: "null", source: preferenceWindows[0].frameWindow,
+  data: { type: "elastos.documents.preferences.set/v1", homeToken: preferenceWindows[0].token, autosave: true } });
+for (const { frameWindow, token } of preferenceWindows) {
+  assert(JSON.stringify(frameWindow.posted.at(-1)) === JSON.stringify({ type: preferencesType, homeToken: token, autosave: true }),
+    "every Documents window must hear Save automatically turn on", frameWindow.posted);
+}
+const preferencePatch = savedStatePatches.at(-1);
+assert(preferencePatch?.layout?.documentsAutosave === true, "Save automatically did not persist in the Home layout", preferencePatch);
+shellCore.initializeShellLayout({ ...arrangedSummary,
+  browser_state: { principal_id: "principal:arranged-layout", layout: preferencePatch.layout } });
+sendWindowEvent("message", { origin: "null", source: preferenceWindows[1].frameWindow,
+  data: { type: "elastos.documents.preferences.request/v1", homeToken: preferenceWindows[1].token } });
+assert(JSON.stringify(preferenceWindows[1].frameWindow.posted.at(-1)) ===
+  JSON.stringify({ type: preferencesType, homeToken: preferenceWindows[1].token, autosave: true }),
+  "Save automatically did not survive reload", preferenceWindows[1].frameWindow.posted);
+
+const closeRequestType = "elastos.documents.window-close.request/v1";
+const answerClose = (win, ok, reason) => {
+  const request = win.frameWindow.posted.at(-1);
+  assert(request?.type === closeRequestType && request.homeToken === win.token, "Lock and sign-out must ask the Documents window", win.frameWindow.posted);
+  for (const [state, settledOk, settledReason] of [["pending", false, "awaiting_decision"], ["terminal", ok, reason]]) {
+    sendWindowEvent("message", { origin: "null", source: win.frameWindow, data: {
+      type: "elastos.documents.window-close.result/v1", requestId: request.requestId, homeToken: win.token,
+      state, ok: settledOk, reason: settledReason, sessionId: 1 } });
+  }
+};
+// Lock and sign-out run through the same step in Home's desktop: Cancel in the
+// second window stops it and keeps that window; settled windows let it go on.
+const sessionEnd = vm.createContext({ sessionEndPending: false,
+  closeDocumentsWindowsBeforeSessionEnd: shellWindows.closeDocumentsWindowsBeforeSessionEnd });
+vm.runInContext(navigationFunction(guiSource, "endHomeSessionAfterDocuments"), sessionEnd);
+let lockRequests = 0;
+const lock = () => sessionEnd.endHomeSessionAfterDocuments(() => { lockRequests += 1; });
+const cancelledLock = lock();
+await settleOpen();
+assert(preferenceWindows[1].frameWindow.posted.at(-1)?.type !== closeRequestType,
+  "Lock must ask one Documents window at a time");
+assert(await lock() === false && lockRequests === 0, "a second Lock press must wait for the first");
+answerClose(preferenceWindows[0], true, "");
+await settleOpen();
+answerClose(preferenceWindows[1], false, "cancelled");
+assert(await cancelledLock === false && lockRequests === 0, "Cancel in a Documents window must stop the Lock");
+assert(!shellCore.shellState.windows.has(preferenceWindows[0].entry.id) &&
+  shellCore.shellState.windows.has(preferenceWindows[1].entry.id),
+  "the cancelled Documents window must stay open");
+const settledLock = lock();
+await settleOpen();
+answerClose(preferenceWindows[1], true, "");
+assert(await settledLock === true && lockRequests === 1, "settled Documents windows must let the Lock go on");
+// A Documents window opened while another is asking is asked too.
+const fakeDocumentsWindow = (entry) => {
+  const frame = entry.node.querySelector(".window-frame");
+  frame.contentWindow = { posted: [], postMessage(message) { this.posted.push(message); } };
+  return { entry, frameWindow: frame.contentWindow,
+    token: new URLSearchParams(new URL(frame.dataset.route, window.location.href).hash.slice(1)).get("home_token") };
+};
+await openHybrid("documents", { query: { doc: "did:document-three" } });
+const firstLate = fakeDocumentsWindow([...shellCore.shellState.windows.values()].at(-1));
+const lockWithLateWindow = lock();
+await settleOpen();
+await openHybrid("documents", { query: { doc: "did:document-four" } });
+const lateWindow = fakeDocumentsWindow([...shellCore.shellState.windows.values()].at(-1));
+assert(lateWindow.entry !== firstLate.entry, "a second Documents window opened during the Lock");
+answerClose(firstLate, true, "");
+await settleOpen();
+answerClose(lateWindow, false, "cancelled");
+assert(await lockWithLateWindow === false && lockRequests === 1,
+  "a Documents window opened during the Lock must be asked before the Lock goes on");
+assert(shellCore.shellState.windows.has(lateWindow.entry.id), "the late window keeps its edits");
+console.log("[home-shell-regression] Documents preference reaches every window, survives reload, and Lock and sign-out ask first: PASS");
 console.log("[home-shell-regression] PASS");

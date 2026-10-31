@@ -84,3 +84,51 @@ export function normalizeHomeAgentBrowserUrl(message) {
     return "";
   }
 }
+
+const ASSISTANT_DOC_ID = /^[0-9a-f]{32}$/;
+
+/* Each Assistant document announces itself: hello {docId} when its script
+   starts, ready {docId} once its workspace has loaded. Messages from one
+   source arrive in order, so a document's hello always precedes its ready.
+   A hello means a new document started (also an in-frame reload): hide until
+   that document's ready. A ready from any other document is ignored.
+   An Assistant from an earlier release (kept after Undo with the Home tab
+   open) sends only {type} ready; that shows the room as it always did.
+   receive() returns "hide", "show" or "" (no change). */
+export function createAssistantFrameReadiness() {
+  let current = null;
+  let shown = false;
+  return Object.freeze({
+    receive(message) {
+      if (hasExactKeys(message, ["type", "docId"]) &&
+        typeof message.docId === "string" && ASSISTANT_DOC_ID.test(message.docId)) {
+        if (message.type === "home-agent:hello") {
+          current = message.docId;
+          shown = false;
+          return "hide";
+        }
+        if (message.type === "home-agent:ready" && message.docId === current && !shown) {
+          shown = true;
+          return "show";
+        }
+        return "";
+      }
+      if (hasExactKeys(message, ["type"]) && message.type === "home-agent:ready") {
+        /* A legacy document is now active (e.g. Undo, then an in-frame reload
+           into the old Assistant). One source delivers in order, so an old
+           document's ready always arrives before the next document's hello and
+           cannot land late after a current hello; after Home changes src, a
+           stale legacy ready can at most show the room until the new hello. */
+        current = null;
+        shown = true;
+        return "show";
+      }
+      return "";
+    },
+    /* Home is about to set or change the frame src: no document is current. */
+    reset() {
+      current = null;
+      shown = false;
+    },
+  });
+}

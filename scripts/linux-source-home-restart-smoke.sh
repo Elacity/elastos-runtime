@@ -220,7 +220,7 @@ class Fixture:
             self.data / "bin",
             self.data / "receipts",
             self.data / "capsules/home/browser",
-            self.data / "capsules/services/browser",
+            self.data / "capsules/system/browser",
         ):
             owner_dir(path)
         shutil.copyfile(pathlib.Path(sys.executable).resolve(), self.runtime)
@@ -230,7 +230,7 @@ class Fixture:
             self.capsule_receipt,
             b'{"schema":"elastos.source-home.managed-capsules/v1","capsules":[]}\n',
         )
-        for name in ("home", "services"):
+        for name in ("home", "system"):
             shutil.copyfile(
                 ROOT / f"capsules/{name}/browser/index.html",
                 self.data / f"capsules/{name}/browser/index.html",
@@ -253,7 +253,7 @@ addr = sys.argv[sys.argv.index("--addr") + 1]
 host, port_text = addr.rsplit(":", 1)
 data = pathlib.Path(os.environ["XDG_DATA_HOME"]) / "elastos"
 home = (data / "capsules/home/browser/index.html").read_bytes()
-services = (data / "capsules/services/browser/index.html").read_bytes()
+system = (data / "capsules/system/browser/index.html").read_bytes()
 if os.environ.get("ELASTOS_SMOKE_BAD_HOME") == "1":
     home = b"wrong Home\\n"
 
@@ -267,7 +267,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         values = {
             "/home/": home,
-            "/apps/services/": services,
+            "/apps/system/": system,
         }
         body = values.get(self.path)
         if body is None:
@@ -296,6 +296,12 @@ import pathlib
 import sys
 
 if os.environ.get("ELASTOS_SMOKE_FAIL_UPGRADE") == "1":
+    print("migrating Documents")
+    print(
+        "Error: Documents/large.bin is not encrypted and is 17 MiB. Move it out of "
+        + sys.argv[sys.argv.index("--data-dir") + 1]
+        + "/Users/x/Documents and try again."
+    )
     raise SystemExit(41)
 empty_receipt = os.environ.get("ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT")
 if empty_receipt is not None:
@@ -517,7 +523,7 @@ def empty_upgrade_proof(base):
         )
         receipt = json.loads(result.stdout)
         if receipt.get("ok") is not True or any(
-            receipt.get(f"{name}_http_code") != 200 for name in ("home", "services")
+            receipt.get(f"{name}_http_code") != 200 for name in ("home", "system")
         ):
             raise AssertionError("empty installation did not reach readiness")
         if "principal_root_rollback" in receipt or list((empty.data / "backups").iterdir()):
@@ -655,7 +661,7 @@ def linux_active_proof(base):
         raise AssertionError("published PID identity mismatch")
     if stat.S_IMODE(main.pid_file.stat().st_mode) != 0o600 or main.pid_file.stat().st_nlink != 1:
         raise AssertionError("published PID file is unsafe")
-    for name in ("home", "services"):
+    for name in ("home", "system"):
         if not (
             receipt.get(f"{name}_served_index_sha256")
             == receipt.get(f"{name}_installed_index_sha256")
@@ -715,6 +721,18 @@ def linux_active_proof(base):
     if "home_readiness_parity_failed" not in failed_result.stderr:
         raise AssertionError("failed readiness did not reach Home parity")
 
+    refused = Fixture(base, "refused-upgrade")
+    refused_result = refused.run(env=refused.environment(ELASTOS_SMOKE_FAIL_UPGRADE="1"), ok=False)
+    expected_line = (
+        "linux-source-home-restart: Error: Documents/large.bin is not encrypted and is 17 MiB. "
+        "Move it out of <data-dir>/Users/x/Documents and try again."
+    )
+    if expected_line not in refused_result.stderr:
+        raise AssertionError(f"refused upgrade did not print its redacted Error: line: {refused_result.stderr!r}")
+    unredacted = refused_result.stderr.replace("<data-dir>/Users/x/Documents", "")
+    if "migrating Documents" in refused_result.stderr or "/Users/x/Documents" in unredacted:
+        raise AssertionError("refused upgrade printed more than its redacted Error: line")
+
     unsafe_fifo = Fixture(base, "unsafe-rollback-fifo")
     fifo = unsafe_fifo.run(
         env=unsafe_fifo.environment(ELASTOS_SMOKE_UNSAFE_ROLLBACK="fifo"),
@@ -767,7 +785,7 @@ def main():
                 "exact_process_owner": True if active else "skipped_non_linux",
                 "rollback_and_failure_cleanup": True if active else "skipped_non_linux",
                 "already_ready_without_rollback": True if active else "skipped_non_linux",
-                "home_services_parity": True if active else "skipped_non_linux",
+                "home_system_parity": True if active else "skipped_non_linux",
                 "empty_upgrade_without_rollback": True if active else "skipped_non_linux",
                 "fixture_residue": False,
             },

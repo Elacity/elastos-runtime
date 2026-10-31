@@ -418,6 +418,36 @@ code {
   line-height: 1.35;
 }
 
+.runtime-update-fields {
+  margin: 12px 0 0;
+}
+
+.runtime-update-fields > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  margin-top: 5px;
+}
+
+.runtime-update-fields dt {
+  color: var(--el-muted);
+  font-size: 11px;
+}
+
+.runtime-update-fields dd {
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.runtime-update-changes {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .shell-picker {
   display: flex;
   align-items: center;
@@ -481,34 +511,67 @@ code {
   flex-wrap: wrap;
 }
 
-.ai-provider-instances,
+.models-row,
 .ai-provider-form,
-.ai-provider-instance {
+.ai-provider-instances,
+.ai-provider-instance,
+.model-management,
+.model-row {
   display: grid;
-  gap: 12px;
+  gap: 8px;
 }
-.ai-provider-instances[hidden], .ai-provider-form[hidden], #local-models[hidden], #approval-lens[hidden] { display: none; }
-.models-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
-.models-heading h1 { margin-bottom: 8px; }
-.models-heading > .pc2-btn { flex-shrink: 0; }
-.ai-provider-instance { grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; padding: 16px 0; border-bottom: 1px solid var(--el-hairline); }
+.ai-provider-instances[hidden], .ai-provider-form[hidden], #local-models[hidden], .model-management[hidden] { display: none; }
+.models-row p,
+.ai-provider-form h3,
+.model-management p,
+.model-management h2 { margin: 0; }
+.models-row > p:empty { display: none; }
+.ai-provider-form h3 { font-weight: 600; }
+.ai-provider-form .pc2-card-row > .pc2-input { flex: 0 1 320px; min-width: 0; }
+.ai-provider-instances:empty { display: none; }
+.ai-provider-instance { grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid var(--el-hairline); }
+.ai-provider-instance:first-child { padding-top: 0; }
+.ai-provider-instance:last-child { border-bottom: 0; }
 .ai-provider-instance > p { margin: 0; }
 .ai-provider-instance > .pc2-card-sublabel { grid-column: 1; overflow-wrap: anywhere; }
 .ai-provider-instance > .system-inline-row { grid-column: 2; grid-row: 1 / 3; }
 .ai-provider-details { grid-column: 1 / -1; }
-.ai-provider-instance:last-child { border-bottom: 0; }
-.ai-provider-instance .pc2-card-label { font-size: 15px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
-.ai-provider-state { font-size: 12px; font-weight: 400; color: var(--el-muted); }
+.ai-provider-instance .pc2-card-label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.ai-provider-state { font-size: 11px; font-weight: 400; color: var(--el-soft); }
 .ai-provider-details { font-size: 12px; color: var(--el-muted); }
 .ai-provider-details summary { cursor: pointer; padding: 4px 0; }
-.ai-provider-details p { overflow-wrap: anywhere; margin: 12px 0; }
-.ai-provider-form { max-width: 520px; padding: 12px 0; }
-.ai-provider-form .pc2-input { width: 100%; min-width: 0; box-sizing: border-box; font-size: 14px; padding: 10px 12px; }
-.approval-lens-controls { display: grid; gap: 8px; font-size: 14px; line-height: 1.5; }
-.approval-lens-controls .pc2-input { width: 100%; min-width: 0; box-sizing: border-box; }
-.approval-lens-controls p { margin: 0; }
-#approval-lens-manage .system-inline-row { margin-top: 8px; }
-@media (max-width: 600px) { .models-heading { flex-direction: column; } .ai-provider-instance { grid-template-columns: minmax(0, 1fr); } .ai-provider-instance > .system-inline-row { grid-column: 1; grid-row: auto; } }
+.ai-provider-details p { overflow-wrap: anywhere; margin: 8px 0; }
+.model-management { justify-items: start; font-size: 12px; color: var(--el-muted); }
+.model-management > p:empty { display: none; }
+.model-row { justify-items: start; }
+.model-row h2 { font-size: 13px; font-weight: 500; color: var(--el-text); }
+.model-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.model-list li,
+.model-controls,
+.model-keep { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]) {
+  border-color: transparent;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
+  font-weight: 600;
+}
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]):is(:hover, :focus-visible):not(:disabled) {
+  background: var(--el-accent-strong);
+}
+.model-controls .pc2-btn:is([data-model-control="use"], [data-model-control="open-assistant"]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--el-accent) 50%, transparent);
+  outline-offset: 2px;
+}
+.model-details summary { cursor: pointer; }
+.model-identity { overflow-wrap: anywhere; }
+@media (max-width: 767.98px) {
+  .ai-provider-form .pc2-card-row > .pc2-input { flex: none; }
+  .ai-provider-instance { grid-template-columns: minmax(0, 1fr); }
+  .ai-provider-instance > .system-inline-row { grid-column: 1; grid-row: auto; }
+  .model-management,
+  .model-row { justify-items: stretch; }
+  .model-controls { flex-direction: column; align-items: stretch; }
+}
 
 .pc2-input,
 .system-input {
@@ -541,6 +604,15 @@ code {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* The picker's close refocuses the hidden file input; a focused element is
+   scrolled into view, which dragged the whole settings container up when
+   the input sat below the fold. Fixed to the viewport it cannot scroll. */
+input[type="file"].visually-hidden {
+  position: fixed;
+  top: 0;
+  left: 0;
 }
 
 .system-file-button {
@@ -592,6 +664,11 @@ code {
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
   background: var(--el-inset);
+}
+
+/* Three long choices: wrap on a phone instead of overflowing the row. */
+#community-presence {
+  flex-wrap: wrap;
 }
 
 .system-segment-option {
@@ -835,20 +912,13 @@ code {
 
 .account-list,
 .network-table-card,
-.inspect-grid,
-.capsule-catalog {
+.inspect-grid {
   margin-top: 10px;
-}
-
-.catalog-row .catalog-actions,
-.catalog-row button {
-  justify-self: start;
 }
 
 .account-empty,
 .network-row-empty,
-.inspect-empty,
-.catalog-empty {
+.inspect-empty {
   padding: 10px 12px;
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
@@ -967,6 +1037,10 @@ code {
 [data-field="recovery-note"]:not([hidden]),
 #recovery-profile-setup:not([hidden]) {
   margin-top: 10px;
+}
+
+[data-field="recovery-note"] {
+  overflow-wrap: anywhere;
 }
 
 .recovery-pending {
@@ -1390,124 +1464,6 @@ code {
   font-size: 12px;
 }
 
-.catalog-toolbar,
-.catalog-group-heading,
-.catalog-row {
-  display: flex;
-  align-items: center;
-}
-
-.catalog-toolbar {
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.catalog-toolbar h1 {
-  margin-bottom: 2px;
-}
-
-.catalog-status {
-  margin: 0;
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-status[data-tone="error"] {
-  color: var(--el-danger);
-}
-
-.capsule-catalog,
-.catalog-group,
-.catalog-list,
-.catalog-row-body,
-.catalog-facts {
-  display: grid;
-}
-
-.capsule-catalog {
-  gap: 18px;
-}
-
-.catalog-group,
-.catalog-list {
-  gap: 7px;
-}
-
-.catalog-group-heading {
-  justify-content: space-between;
-  border-bottom: 1px solid var(--el-hairline);
-  padding-bottom: 6px;
-}
-
-.catalog-group-title {
-  margin: 0;
-  color: var(--el-text);
-  font-size: 14px;
-}
-
-.catalog-group-count {
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-row {
-  justify-content: space-between;
-  min-width: 0;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--el-hairline);
-  border-radius: 8px;
-  background: var(--el-inset);
-}
-
-.catalog-row-body {
-  min-width: 0;
-  gap: 3px;
-}
-
-.catalog-row h3,
-.catalog-summary {
-  margin: 0;
-}
-
-.catalog-row h3 {
-  color: var(--el-text);
-  font-size: 13px;
-}
-
-.catalog-summary,
-.catalog-facts {
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-facts {
-  gap: 2px;
-  margin: 3px 0 0;
-}
-
-.catalog-facts > div {
-  display: flex;
-  min-width: 0;
-  gap: 6px;
-}
-
-.catalog-facts dt {
-  flex: 0 0 auto;
-  color: var(--el-text);
-  font-weight: 700;
-}
-
-.catalog-facts dd {
-  min-width: 0;
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.catalog-open {
-  flex: 0 0 auto;
-}
-
 .network-table {
   display: grid;
   gap: 6px;
@@ -1765,7 +1721,7 @@ code {
 
 /* ---- Freeze additions kept over the original sheet ----
    Post-split features (detail view / lock screen / sidebar icons)
-   that the original sheet predates. Pinned by home-entropy-check. ---- */
+   that the original sheet predates. ---- */
 
 .system-locked {
   display: grid;
@@ -1821,15 +1777,83 @@ code {
   border-radius: 4px 4px 6px 6px;
 }
 
-.settings-sidebar-icon-catalog::before {
-  border-radius: 50%;
-  box-shadow:
-    inset 0 0 0 3px #f9f9f9,
-    0 0 0 1px currentColor;
-}
-
 .settings-sidebar-icon-about::before {
   border-radius: 50%;
   outline: 1.5px dotted currentColor;
   outline-offset: 2px;
+}
+
+/* Phone stage: no traffic lights to clear, so the menu button takes the
+   leading edge as a 44 px target and shares the first line with the page
+   title. The sidebar is the shared push drawer (elastos-drawer.js) at every
+   phone width, a phone held sideways too, so the button shows at every width
+   and stays above the open drawer to close it. */
+:root[data-el-form-factor="phone"] {
+  --system-phone-menu: var(--el-touch-target);
+  --system-phone-title-line: 32px;
+}
+
+:root[data-el-form-factor="phone"] .settings-search {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .settings-sidebar-item {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .sidebar-toggle {
+  display: inline-grid !important;
+  left: max(4px, env(safe-area-inset-left, 0px));
+  top: 4px;
+}
+
+/* The shared drawer toggle draws the sidebar icon every other capsule uses. */
+:root[data-el-form-factor="phone"] .sidebar-toggle .sidebar-toggle-button {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .settings-sidebar {
+  display: flex;
+  padding: calc(var(--system-phone-menu) + 12px) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  box-shadow: none;
+}
+
+/* .settings shows at the pushed-aside view's rounded corners: the drawer's
+   fill, made opaque on both so the two read as one surface. */
+:root[data-el-form-factor="phone"] .settings,
+:root[data-el-form-factor="phone"] .settings-sidebar {
+  --system-drawer-fill: color-mix(in srgb, var(--color-settings-sidebar) 78%, transparent);
+  background: linear-gradient(var(--system-drawer-fill), var(--system-drawer-fill)) var(--color-settings-bg);
+}
+
+:root[data-el-form-factor="phone"][data-el-theme="light"] .settings,
+:root[data-el-form-factor="phone"][data-el-theme="light"] .settings-sidebar {
+  --system-drawer-fill: color-mix(in srgb, var(--color-settings-sidebar) 86%, transparent);
+}
+
+:root[data-el-form-factor="phone"] .settings-content-container {
+  padding: calc(4px + (var(--system-phone-menu) - var(--system-phone-title-line)) / 2) max(16px, env(safe-area-inset-right, 0px)) calc(24px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+
+:root[data-el-form-factor="phone"] .settings-content h1,
+:root[data-el-form-factor="phone"] .settings-content h1.pc2-section-title {
+  min-height: var(--system-phone-title-line);
+  margin-left: calc(var(--system-phone-menu) - 8px);
+  font-size: 28px;
+  line-height: var(--system-phone-title-line);
+}
+
+:root[data-el-form-factor="phone"] .settings-content .pc2-btn,
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  min-height: var(--el-touch-target);
+}
+
+/* Under 16px, iOS zooms the page when a field takes focus. */
+:root[data-el-form-factor="phone"] .settings-content .pc2-input {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] [data-settings="models"] summary {
+  line-height: var(--el-touch-target);
 }
