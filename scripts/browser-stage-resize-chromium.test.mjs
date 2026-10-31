@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import test from "node:test";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
-const { chromium } = require("playwright");
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
 const source = await readFile(new URL("../capsules/browser/browser/browser-resize.js", import.meta.url), "utf8");
 
 test("real ResizeObserver uses untransformed content-box CSS pixels at DPR 1, 2 and 3", async () => {

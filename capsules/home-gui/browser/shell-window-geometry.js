@@ -100,17 +100,14 @@ export function fitWindowBounds({ x, y, width, height }, { allowPartial = false 
   };
 }
 
-// Shell callers retain these export names; Browser dimensions are independent.
-export function fitWindowToBrowserAspect(node) {
+// Browser width and height follow the available workspace independently.
+export function fitBrowserWindow(node) {
   if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true") return;
   applyWindowBounds(node, node.dataset.browserMaximized === "true"
     ? snappedWindowBounds("maximize")
     : fitWindowBounds(normalWindowBounds(node), { allowPartial: true }));
 }
 
-export function fitWindowToLargestBrowserAspect(node) {
-  fitWindowToBrowserAspect(node);
-}
 
 export function rememberWindowRestoreBounds(node) {
   if (

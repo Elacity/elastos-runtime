@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import vm from "node:vm";
+import nodeAssert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { inputSurfaceFixture } from "./lib/browser-input-surface-fixture.mjs";
+import { createBrowserRemoteDisplay } from "../capsules/browser/browser/browser-remote-display.js";
 import {
   isBrowserErrorUrl,
   sameBrowserStreamTarget,
@@ -207,6 +211,7 @@ expectError("display=unsupported", "Unsupported Browser display mode");
     let currentDisplayMode = "webrtc_remote_display";
     const getCurrentDisplayMode = () => currentDisplayMode;
     const getCurrentView = () => currentView;
+    const inputBlocked = () => false;
     const remoteVideo = {
       hidden: false,
       videoWidth: 1920,
@@ -231,6 +236,7 @@ expectError("display=unsupported", "Unsupported Browser display mode");
     let currentDisplayMode = "webrtc_remote_display";
     const getCurrentDisplayMode = () => currentDisplayMode;
     const getCurrentView = () => currentView;
+    const inputBlocked = () => false;
     const remoteVideo = {
       hidden: false,
       videoWidth: 1920,
@@ -263,6 +269,76 @@ expectError("display=unsupported", "Unsupported Browser display mode");
     points.outside === null,
     `contained letterbox clicks must not map into remote coordinates, got ${JSON.stringify(points.outside)}`,
   );
+}
+
+// Exercise the shipped input bindings, including the guards independent of size.
+{
+  const f = inputSurfaceFixture();
+  const event = { pointerId: 1, pointerType: "touch", clientX: 100, clientY: 100 };
+  f.panel.emit("pointerdown", event);
+  f.panel.emit("pointermove", { ...event, clientY: 50 });
+  f.panel.emit("pointerup", { ...event, clientY: 50 });
+  f.video.emit("click", event);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  nodeAssert.equal(f.sent.length, 1, "touch pan suppresses the synthetic click");
+  nodeAssert.equal(f.sent[0].type, "wheel"); nodeAssert.equal(f.sent[0].delta_y, 50);
+  nodeAssert.ok(f.audio.length > 0, "pointer gesture unlocks audio");
+  f.panel.emit("paste", { clipboardData: { types: ["text/plain"], getData: () => "plain text" } });
+  f.panel.emit("copy");
+  await new Promise(resolve => setImmediate(resolve));
+  nodeAssert.deepEqual(f.pasted, ["plain text"]); nodeAssert.equal(f.copied.length, 1);
+}
+// Route ordering and the clipboard bridge run against the actual Browser
+// dispatch functions, including a click/text Runtime ACK and datachannel wheel.
+execFileSync(process.execPath, ["--test", "--test-name-pattern=resize uses|click completion|actual clipboard bridge", "scripts/browser-input-ordering.test.mjs"], { cwd: repoRoot, stdio: "pipe" });
+
+{
+  class Events {
+    handlers = new Map();
+    addEventListener(name, handler) { const list = this.handlers.get(name) || []; list.push(handler); this.handlers.set(name, list); }
+  }
+  const media = [], peers = [], timers = new Map(), requests = [], recoveries = [];
+  class Media extends Events {
+    muted = true; srcObject = null; videoWidth = 0; videoHeight = 0; hidden = true;
+    constructor() { super(); media.push(this); }
+    play() { return Promise.resolve(); } pause() {}
+  }
+  class Stream { getTracks() { return []; } getAudioTracks() { return []; } addTrack() {} }
+  class Peer extends Events {
+    iceGatheringState = "complete"; connectionState = "new"; signalingState = "stable";
+    constructor(config) { super(); this.config = config; peers.push(this); }
+    async setRemoteDescription() {} async setLocalDescription(value) { this.localDescription = value; }
+    async createAnswer() { return { type: "answer", sdp: "v=0\r\n" }; }
+    async addIceCandidate() {} async getStats() { return new Map(); }
+    close() { this.connectionState = "closed"; }
+  }
+  let timer = 0;
+  globalThis.Audio = Media; globalThis.MediaStream = Stream; globalThis.RTCPeerConnection = Peer;
+  globalThis.window = { setTimeout(fn, ms) { timers.set(++timer, { fn, ms }); return timer; }, clearTimeout(id) { timers.delete(id); } };
+  const video = new Media();
+  const display = createBrowserRemoteDisplay({ debugMetrics: false,
+    fetchJson: async (url, options) => { requests.push(url); return { schema: "elastos.browser.webrtc-signal-ack/v1", type: options.body.type, accepted: true, candidates: [] }; },
+    friendlyOpenError: String, getCurrentDisplayMode: () => "webrtc_remote_display", getLastPageStatus: () => ({}),
+    handleRemoteInputChannelMessage() {}, onRecoveryRequired: async (...args) => recoveries.push(args),
+    remoteVideo: video, renderEmpty: {}, renderPanel: { focus() {} }, resetPageStatus() {},
+    setActiveBrowserPage() {}, setDisplayInput() {}, showStatus() {}, updateMetrics() {},
+  });
+  const offer = { schema: "elastos.browser.webrtc-offer/v1", type: "offer", sdp: "v=0\r\n" };
+  const session = { schema: "elastos.browser.display-session/v1", mode: "webrtc_remote_display", offerer: "engine", audio: true,
+    signaling_url: "/api/apps/browser/pages/test/webrtc", initial_offer: offer, audio_offer: offer,
+    media_transport: "runtime_relay", ice_servers: [] };
+  await nodeAssert.rejects(display.connect({ ...session, mode: "runtime_frame" }, {}), /not ready/);
+  nodeAssert.equal(peers.length, 0);
+  await display.connect(session, {});
+  nodeAssert.ok(peers.every(peer => peer.config.iceTransportPolicy === "relay"));
+  nodeAssert.ok(video.muted); video.srcObject = new Stream();
+  display.unlockAudioFromGesture(); await new Promise(resolve => setImmediate(resolve));
+  nodeAssert.equal(video.muted, false); nodeAssert.equal(media[1].muted, false);
+  const timeout = [...timers.values()].find(value => value.ms === 30000);
+  nodeAssert.ok(timeout); timeout.fn(); await new Promise(resolve => setImmediate(resolve));
+  nodeAssert.equal(recoveries.length, 1, "missing video returns failure to Runtime cleanup");
+  nodeAssert.ok(requests.every(url => url === session.signaling_url), "failure uses only Runtime signaling, with no image-polling fallback");
+  display.close();
 }
 console.log(
   JSON.stringify({

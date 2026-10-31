@@ -1,4 +1,4 @@
-import { observeBrowserStage } from "./browser-resize.js?v=browser-20261031a";
+import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031a";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -643,6 +643,7 @@ function runtimeViewerOwnerActive(owner) {
 function finalizeRuntimePageClose(owner) {
   if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
     currentPage = null;
+    resetPageInputDelivery();
     currentPageGeneration = 0;
     restoredViewerOwner = null;
     currentBrowserEngineId = "";
@@ -1674,6 +1675,15 @@ function releaseDragButton(event, dragOwner) {
   noteDatachannelSend();
 }
 
+// Delivery receipts belong to one page and its display channel.
+function resetPageInputDelivery() {
+  lastDatachannelInputAt = 0;
+  datachannelDrainedAt = 0;
+  datachannelSendDisplay = null;
+  datachannelSendGeneration = 0;
+  resizeFrameFence.reset();
+}
+
 // The datachannel has no guest ack, so Runtime-route input that follows a
 // datachannel send waits until the drain is observed and the guest has had
 // the settle delay after it. It fails rather than reorder.
@@ -1780,6 +1790,7 @@ async function dispatchBrowserInput(
         (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
       throw new Error("The Browser file request changed. Check the page before trying again.");
     }
+    if (event?.type === "resize" && response?.resize_error) return response;
     handleFileChooserFromStatus(response);
     syncViewFromResponse(response);
     if (response.actual_url) {
@@ -1864,6 +1875,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   },
   setActiveBrowserPage: () => {
     document.body.dataset.browserPage = "active";
+    stageResize.opened();
   },
   setDisplayInput: (input, protocol) => {
     currentDisplayInput = input;
@@ -2355,6 +2367,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
     currentPage = openedPage;
+    resetPageInputDelivery();
     currentPageGeneration = nextPageGeneration++;
     openedOwner = currentRuntimePageOwner();
     if (unsettledRuntimeOpen === openSettlement) {
@@ -2383,7 +2396,6 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
     }
-    stageResize.opened();
     await connectRemoteDisplay(openedPage.display_session, openedPage);
     publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
@@ -2663,15 +2675,16 @@ profileResetCommit?.addEventListener("click", () => {
 });
 
 const resizeOwner = () => currentPage?.page_id && currentDisplayMode === PRODUCT_DISPLAY_MODE
-  && !unloadCleanupStarted && !homeWindowCloseInFlight
+  && remoteDisplay?.isTrackReady() && !unloadCleanupStarted && !homeWindowCloseInFlight
   ? `${currentPage.page_id}:${currentPageGeneration}` : null;
+const resizeFrameFence = createBrowserFrameFence(remoteVideo);
 const stageResize = observeBrowserStage({
   stage: renderPanel,
   getOwner: resizeOwner,
-  send: (event, owner) => sendBrowserInput(event, {
+  send: (event, owner) => resizeFrameFence.run(() => sendBrowserInput(event, {
     focus: false, isStale: () => owner !== resizeOwner(),
-  }),
-  onError: () => showStatus("Browser could not resize the page. Resize the window to try again.", { sticky: true }),
+  })),
+  onError: error => showStatus(error?.message || "Browser could not resize the page. Resize the window to try again."),
 });
 window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
 
@@ -2682,6 +2695,7 @@ bindBrowserInputSurface({
   getInputOwner: currentRuntimePageOwner,
   sameInputOwner: sameRuntimePageOwner,
   getCurrentView: () => currentView,
+  inputBlocked: () => resizeFrameFence.blocked(),
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText: homeClipboard.readText,
@@ -2791,6 +2805,7 @@ async function restoreRuntimePageViewer(summary) {
   const owner = runtimePageOwner(page, nextPageGeneration);
   if (!owner) throw new Error("Runtime could not restore Browser cleanup authority.");
   currentPage = page;
+  resetPageInputDelivery();
   currentPageGeneration = nextPageGeneration++;
   runtimeOwnershipTerminallyAbsent = false;
   if (page.recovery_state === "cleanup_pending") {
@@ -2840,7 +2855,6 @@ async function restoreRuntimePageViewer(summary) {
     currentPage = { ...currentPage, display_session: display };
     publishRuntimePageForHost(currentPage);
     await connecting;
-    stageResize.opened();
     return true;
   } catch (error) {
     if (statusPromise) await statusPromise.catch(() => null);

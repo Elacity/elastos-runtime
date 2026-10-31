@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { browserDisplayMetrics, resizeBrowserPage, applyBrowserDisplayMode, pruneBrowserDisplayModes,
-  validateBrowserGeometry } from "./browser-selkies-control-service.mjs";
+  validateBrowserGeometry, withBrowserResizeWriter, browserGeometryCommand, browserResizeInputResult, browserResizeAvailable } from "./browser-selkies-control-service.mjs";
 
 function fixture({ failMode = false, failMetrics = false, failGate = "", failVerify = false } = {}) {
   const log = [];
@@ -15,6 +15,8 @@ function fixture({ failMode = false, failMetrics = false, failGate = "", failVer
     browserPage: { target_id: "same-target", ...size, _cdp: { async request(method, params) {
       if (method === "Browser.getWindowForTarget") return { windowId: 123,
         bounds: { left: native.window.x, top: native.window.y, width: native.window.width, height: failVerify && native.window.width == 390 ? 1 : native.window.height, windowState: "fullscreen" } };
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 42 };
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { clientWidth: viewport.width, clientHeight: viewport.height } };
       if (method === "Runtime.evaluate") return { result: { value: { ...viewport, dpr: 1,
         screenWidth: viewport.width, screenHeight: viewport.height, outerWidth: Math.max(500, viewport.width), outerHeight: viewport.height } } };
@@ -27,6 +29,7 @@ function fixture({ failMode = false, failMetrics = false, failGate = "", failVer
       throw Error(`Unexpected CDP command ${method}`);
     } } } };
   const io = {
+    available: async () => {}, pageCount: () => 1,
     async gate(command) { log.push(command); if (command === failGate) throw Error(`gate ${command}`); },
     mode(width, height) { log.push(`mode:${width}x${height}`);
       // A failed RandR command can still have partially changed the framebuffer.
@@ -80,7 +83,7 @@ for (const failure of ["failMode", "failMetrics", "failVerify"]) {
 
 test("invalid sizes and sequences have no writer or display effects", async () => {
   const { page, io, log } = fixture();
-  for (const [width, height] of [[319, 240], [3842, 2160], [390, 2162], [391, 700], [NaN, 700], ["390", 700], [390, 0]]) {
+  for (const [width, height] of [[3840, 2160], [1920, 1082], [319, 240], [3842, 2160], [390, 2162], [391, 700], [NaN, 700], ["390", 700], [390, 0]]) {
     assert.throws(() => validateBrowserGeometry(width, height));
     await assert.rejects(resizeBrowserPage(page, { width, height, sequence: 1 }, io));
   }
@@ -100,12 +103,13 @@ for (const failGate of ["acquire", "begin", "settle", "release"]) {
   test(`gate ${failGate} failure reports failure and releases confirmed custody`, async () => {
     const { page, io, log } = fixture({ failGate });
     await assert.rejects(resizeBrowserPage(page, { width: 390, height: 1200, sequence: 1 }, io));
-    if (failGate !== "acquire") assert.equal(log.at(-1), "release");
+    assert.equal(log.at(-1), "release");
+    if (failGate === "begin") assert.deepEqual(log, ["acquire", "begin", "settle", "release"]);
     if (["acquire", "begin"].includes(failGate)) assert.ok(!log.some(value => value.startsWith("mode:")));
   });
 }
 
-test("RandR uses explicit exact timings, measures actual size, and bounds mode retention", () => {
+test("RandR uses explicit exact timings, measures actual size, and bounds mode retention", async () => {
   let size = [3840, 2160]; const modes = new Set(), calls = [];
   const run = (program, args) => {
     assert.equal(program, "xrandr"); calls.push(args);
@@ -116,27 +120,82 @@ test("RandR uses explicit exact timings, measures actual size, and bounds mode r
     return "";
   };
   for (const [width, height] of [[1000, 700], [390, 1200], [844, 338]]) {
-    const actual = applyBrowserDisplayMode(width, height, run);
+    const actual = await applyBrowserDisplayMode(width, height, run);
     assert.equal(actual.width, width); assert.equal(actual.height, height);
-    pruneBrowserDisplayModes([{ width, height }], run);
+    await pruneBrowserDisplayModes([{ width, height }], run);
   }
   assert.equal(modes.size, 1);
   const portrait = calls.find(args => args[0] === "--newmode" && args[1] === "elastos_390x1200");
   assert.equal(portrait[3], "390"); assert.equal(portrait[7], "1200");
-  assert.throws(() => applyBrowserDisplayMode(390, 1200, (program, args) => {
+  await assert.rejects(() => applyBrowserDisplayMode(390, 1200, (program, args) => {
     if (args[0] === "--current") return "current 1000 x 700\nscreen connected\n elastos_390x1200";
     return "";
   }), /differs/);
 });
 
 
-test("RandR retires an unattached mode when addmode fails", () => {
+test("RandR retires an unattached mode when addmode fails", async () => {
   const calls = [];
-  assert.throws(() => applyBrowserDisplayMode(390, 1200, (_program, args) => {
+  await assert.rejects(() => applyBrowserDisplayMode(390, 1200, (_program, args) => {
     calls.push(args);
     if (args[0] === "--current") return "current 1000 x 700\nscreen connected";
     if (args[0] === "--addmode") throw Error("mode refused");
     return "";
   }), /mode refused/);
   assert.deepEqual(calls.at(-1), ["--rmmode", "elastos_390x1200"]);
+});
+
+test("resize queues behind an operator lease while its release can use the writer", async () => {
+  const { page, io, log } = fixture();
+  const lease = page.operatorLease = { id: "operator", active: true };
+  let waited = 0;
+  const result = await withBrowserResizeWriter(page, () => true,
+    () => resizeBrowserPage(page, { width: 390, height: 1200, sequence: 1 }, io), async () => {
+      waited++;
+      assert.equal(page.operatorLease, lease); assert.equal(lease.active, true);
+      assert.deepEqual(log, []);
+      await page.inputWriter.tail;
+      page.operatorLease = null;
+    });
+  assert.equal(waited, 1); assert.equal(result.width, 390);
+});
+
+for (const code of ["resize_shared_display", "resize_unavailable"]) {
+  test(`${code} is typed, leaves geometry untouched and permits later input`, async () => {
+    const { page, io, log } = fixture();
+    const unavailable = code === "resize_shared_display" ? { pageCount: () => 2 } : {
+      available: async () => { throw Object.assign(Error("guest tools unavailable"), { code }); },
+    };
+    await assert.rejects(withBrowserResizeWriter(page, () => true,
+      () => resizeBrowserPage(page, { width: 390, height: 1200, sequence: 1 }, { ...io, ...unavailable })), { code });
+    assert.equal(page.inputWriter.failed, false); assert.deepEqual(log, []);
+    const result = await withBrowserResizeWriter(page, () => true,
+      () => resizeBrowserPage(page, { width: 390, height: 1200, sequence: 2 }, io));
+    assert.equal(result.width, 390);
+  });
+}
+
+test("geometry child commands keep the event loop free and enforce output and time bounds", async () => {
+  let ticked = false;
+  const result = browserGeometryCommand(process.execPath, ["-e", "setTimeout(() => process.stdout.write('done'), 80)"]);
+  setTimeout(() => { ticked = true; }, 10);
+  assert.equal(await result, "done"); assert.equal(ticked, true);
+  await assert.rejects(browserGeometryCommand(process.execPath, ["-e", "process.stdout.write('x'.repeat(40000))"]), /geometry command failed/);
+  const started = Date.now();
+  await assert.rejects(browserGeometryCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"]), /geometry command failed/);
+  assert.ok(Date.now() - started < 4000);
+});
+
+test("unsupported resize returns a typed input result that keeps Runtime page lifecycle active", async () => {
+  const { page, io } = fixture();
+  const result = await browserResizeInputResult(page, () => resizeBrowserPage(page,
+    { width: 390, height: 1200, sequence: 1 }, { ...io, pageCount: () => 2 }));
+  assert.equal(result.accepted, false); assert.equal(result.resize_error.code, "resize_shared_display");
+  assert.equal(result.error, undefined);
+});
+
+test("missing gate socket and missing XRandR both produce resize_unavailable", async () => {
+  await assert.rejects(browserResizeAvailable({ stat: async () => { throw Error("ENOENT"); } }), { code: "resize_unavailable" });
+  await assert.rejects(browserResizeAvailable({ stat: async () => ({ isSocket: () => true }),
+    run: async () => { throw Error("spawn xrandr ENOENT"); } }), { code: "resize_unavailable" });
 });

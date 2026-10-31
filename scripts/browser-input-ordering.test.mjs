@@ -44,7 +44,7 @@ function harness() {
     currentPageGeneration: 1, currentDisplayMode: "webrtc_remote_display", currentView: { width: 1280, height: 720 },
     libraryPickerRequest: null, runtimePageOwner, sameRuntimePageOwner, selkiesMessagesForInput,
     PAGE_STATUS_AFTER_INPUT_DELAY_MS: 1, PAGE_STATUS_AFTER_SCROLL_DELAY_MS: 1,
-    DATACHANNEL_INPUT_SETTLE_MS, setTimeout, Date,
+    DATACHANNEL_INPUT_SETTLE_MS, setTimeout, Date, resizeFrameFence: { reset() {} },
     remoteDisplay: {
       inputChannelOpen: () => channel.open,
       inputBufferedAmount: () => channel.buffered,
@@ -72,7 +72,7 @@ function harness() {
   // The old implementation remains executable so the same behavioral tests can
   // record a red baseline, rather than failing merely on a missing new symbol.
   if (source.includes("function dispatchBrowserInput(")) names.push("dispatchBrowserInput");
-  for (const name of ["noteDatachannelSend", "releaseDragButton", "awaitDatachannelInputSettled"]) {
+  for (const name of ["noteDatachannelSend", "releaseDragButton", "awaitDatachannelInputSettled", "resetPageInputDelivery"]) {
     if (source.includes(`function ${name}(`)) names.push(name);
   }
   const queue = source.match(/^let browserInputQueue = [^\n]+;$/m)?.[0] || "";
@@ -512,4 +512,23 @@ test("resize uses the Runtime page input route and holds later pointer input unt
   assert.deepEqual(h.requests[1].event, { type: "click", x: 0, y: 0 });
   h.requests[1].ack();
   assert.ok((await Promise.all([resize, click])).every(result => result.status === "fulfilled"));
+});
+
+test("reopened page resets the old datachannel delivery barrier before its first resize", async () => {
+  const h = harness();
+  await h.submit({ type: "wheel", x: 0, y: 0, delta_y: 10 });
+  h.changeOwner("page"); h.channel.generation++;
+  h.state.resetPageInputDelivery();
+  const result = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  await nextTurn(); assert.equal(h.requests.length, 1);
+  h.requests[0].ack(); assert.equal((await result).status, "fulfilled");
+});
+
+test("typed resize refusal keeps later owner input usable", async () => {
+  const h = harness();
+  const result = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  await nextTurn(); h.requests[0].ack({ accepted: false, resize_error: { code: "resize_unavailable", message: "Guest tools unavailable" } });
+  assert.equal((await result).status, "fulfilled");
+  const click = h.submit({ type: "click", x: 0, y: 0 });
+  await nextTurn(); h.requests[1].ack(); assert.equal((await click).status, "fulfilled");
 });

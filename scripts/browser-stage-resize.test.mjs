@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { browserStageSize, observeBrowserStage } from "../capsules/browser/browser/browser-resize.js";
+import { browserStageSize, observeBrowserStage, createBrowserFrameFence } from "../capsules/browser/browser/browser-resize.js";
 
 function fixture() {
   let callback, owner = "page:1", visible = true, timerId = 0;
@@ -23,10 +23,10 @@ function fixture() {
 
 test("CSS sizes round even and obey both dimension and pixel ceilings", () => {
   for (const [width, height, expected] of [[390, 1200, [390, 1200]], [1001, 701, [1002, 702]],
-    [1, 1, [320, 240]], [99999, 99999, [3840, 2160]], [844, 338, [844, 338]]]) {
+    [1, 1, [320, 240]], [99999, 99999, [1920, 1080]], [844, 338, [844, 338]]]) {
     const size = browserStageSize(width, height);
     assert.deepEqual([size.width, size.height], expected);
-    assert.ok(size.width * size.height <= 8_294_400);
+    assert.ok(size.width * size.height <= 2_073_600);
   }
   for (const size of [[0, 700], [390, 0], [-2, 700], [Infinity, 700], [NaN, 700]]) assert.equal(browserStageSize(...size), null);
 });
@@ -57,4 +57,24 @@ test("failed resize reports recovery and permits another request", async () => {
   const f = fixture(); f.observer.opened(); await f.settle(0, true);
   assert.equal(f.errors.length, 1); f.resize(1001, 701); f.tick();
   assert.equal(f.sent.length, 2); assert.equal(f.sent[1].event.sequence, 2); await f.settle(1);
+});
+
+test("frame fence waits for decoded ACK dimensions and resumes at its deadline", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  let now = 0, ticks = 0;
+  const fence = createBrowserFrameFence(video, { now: () => now, timeout: 100,
+    wait: async ms => { assert.equal(fence.blocked(), true); now += ms; ticks++;
+      if (ticks === 3) Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); } });
+  await fence.run(async () => ({ accepted: true, width: 390, height: 1200 }));
+  assert.equal(ticks, 3); assert.equal(fence.blocked(), false);
+  await fence.run(async () => ({ accepted: true, width: 844, height: 338 }));
+  assert.ok(now >= 148); assert.equal(fence.blocked(), false);
+  await assert.rejects(fence.run(async () => { throw Error("refused"); }));
+  assert.equal(fence.blocked(), false);
+});
+
+test("display setup has no resize owner; first ready frame sends the stage size", () => {
+  const f = fixture(); f.owner(null); f.observer.opened(); f.resize(1000, 700); f.tick();
+  assert.equal(f.sent.length, 0);
+  f.owner("ready-page"); f.observer.opened(); assert.equal(f.sent.length, 1);
 });

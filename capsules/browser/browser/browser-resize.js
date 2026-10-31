@@ -4,7 +4,9 @@ export function browserStageSize(width, height) {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
   width = Math.max(320, Math.min(3840, Math.round(width / 2) * 2));
   height = Math.max(240, Math.min(2160, Math.round(height / 2) * 2));
-  // The dimension ceilings also bound the raster to 8,294,400 pixels.
+  const scale = Math.min(1, Math.sqrt(2_073_600 / (width * height)));
+  width = Math.floor(width * scale / 2) * 2;
+  height = Math.floor(height * scale / 2) * 2;
   return { width, height };
 }
 
@@ -30,6 +32,7 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
       const result = await send({ type: "resize", width: next.width, height: next.height,
         sequence: ++sequence }, next.owner);
       if (result?.accepted === true && next.owner === getOwner()) applied = next;
+      else if (result?.resize_error && next.owner === getOwner()) onError(result.resize_error);
     } catch (error) {
       if (next.owner === getOwner()) onError(error);
     } finally {
@@ -64,6 +67,28 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
     stop() {
       stopped = true; pending = null; clearTimer(timer); observer.disconnect();
       stage.ownerDocument?.removeEventListener("visibilitychange", resumed);
+    },
+  };
+}
+
+// Hold pointer mapping from the request until a frame with the ACKed geometry
+// decodes. A stalled stream releases the fence after one second.
+export function createBrowserFrameFence(video, { wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now = Date.now, timeout = 1000 } = {}) {
+  let generation = 0, blocked = false;
+  return {
+    blocked: () => blocked,
+    reset() { generation++; blocked = false; },
+    async run(send) {
+      const current = ++generation;
+      blocked = true;
+      try {
+        const result = await send();
+        const deadline = now() + timeout;
+        while (current === generation && result?.accepted === true &&
+          (video.videoWidth !== result.width || video.videoHeight !== result.height) && now() < deadline) await wait(16);
+        return result;
+      } finally { if (current === generation) blocked = false; }
     },
   };
 }

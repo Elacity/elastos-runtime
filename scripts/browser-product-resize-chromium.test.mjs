@@ -15,7 +15,7 @@ const require = createRequire(
     import.meta.url,
   ),
 );
-const { chromium } = require("playwright");
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -76,6 +76,7 @@ test("Chromium keeps its target and form while DPR-1 layout follows portrait and
       </script>`);
   });
   proxy.on("connect", (_request, socket) => {
+    socket.on("error", error => { if (error.code !== "ECONNRESET") throw error; });
     socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
   });
 
@@ -156,5 +157,86 @@ test("Chromium keeps its target and form while DPR-1 layout follows portrait and
   } finally {
     await browser.close();
     await close(proxy);
+  }
+});
+
+// Real CDP and browser page zoom; only the guest's X server and writer socket
+// are substituted. The extension sets Chrome's page zoom, not CSS/pinch zoom.
+test("scrolling page resizes and restores at 90%, 100% and 110% page zoom in an isolated world", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { resizeBrowserPage } = await import("./browser-selkies-control-service.mjs");
+  const directory = await mkdtemp(join(tmpdir(), "browser-resize-cdp-"));
+  let context;
+  try {
+    await writeFile(join(directory, "manifest.json"), JSON.stringify({ manifest_version: 3, name: "Resize test zoom", version: "1.0", permissions: ["tabs"], background: { service_worker: "worker.js" } }));
+    await writeFile(join(directory, "worker.js"), "chrome.runtime.onInstalled.addListener(() => {});");
+    context = await chromium.launchPersistentContext(join(directory, "profile"), {
+      headless: true, executablePath: process.env.BRAVE_BIN,
+      ignoreDefaultArgs: ["--hide-scrollbars", "--disable-extensions"],
+      args: [`--disable-extensions-except=${directory}`, `--load-extension=${directory}`],
+      viewport: { width: 1000, height: 700 },
+    });
+    const worker = context.serviceWorkers()[0] || await context.waitForEvent("serviceworker");
+    const page = await context.newPage();
+    await page.route("http://resize.test/**", route => route.fulfill({ contentType: "text/html", body: '<style>body {height:10000px;width:2000px}</style><input id="draft" value="kept">' }));
+    await page.goto("http://resize.test/");
+    const session = await context.newCDPSession(page);
+    const targetId = (await session.send("Target.getTargetInfo")).targetInfo.targetId;
+    let native = { schema: "elastos.browser.x11-geometry/v1", ok: true,
+      root: { xid: "0x1", width: 1000, height: 700 },
+      window: { xid: "0x2", parent_xid: "0x1", pid: 123, wm_class: ["app", "Chromium"], x: 0, y: 0, width: 1000, height: 700, border_width: 0, override_redirect: false } };
+    let failMetrics = false;
+    const cdp = { request: async (method, params) => {
+      if (method === "Browser.getWindowForTarget") return { windowId: 1, bounds: { left: 0, top: 0, width: native.window.width, height: native.window.height, windowState: "fullscreen" } };
+      if (method === "Emulation.setDeviceMetricsOverride" && failMetrics) { failMetrics = false; throw Error("injected metrics failure"); }
+      return session.send(method, params);
+    } };
+    session.on("Page.javascriptDialogOpening", () => { cdp.javascriptDialogOpen = true; });
+    session.on("Page.javascriptDialogClosed", () => { cdp.javascriptDialogOpen = false; });
+    await session.send("Page.enable");
+    const fixture = { config: { displaySurface: { stream: { width: 1000, height: 700 } } }, browserPage: { target_id: targetId, _cdp: cdp } };
+    const io = { gate: async () => {}, available: async () => {}, pageCount: () => 1,
+      mode: async (width, height) => { Object.assign(native.root, { width, height }); },
+      native: payload => { if (payload) Object.assign(native.window, payload.window); return structuredClone(native); },
+      prune: async () => {} };
+    let sequence = 0;
+    for (const zoom of [1, .9, 1.1]) {
+      await worker.evaluate(async zoom => {
+        const tabs = await chrome.tabs.query({ url: "http://resize.test/*" });
+        await chrome.tabs.setZoom(tabs[0].id, zoom);
+        if (Math.abs(await chrome.tabs.getZoom(tabs[0].id) - zoom) > .001) throw Error("page zoom did not apply");
+      }, zoom);
+      await page.waitForFunction(zoom => Math.abs(devicePixelRatio - zoom) < .001, zoom);
+      for (const [width, height] of [[390, 1200], [844, 338], [1000, 700]]) {
+        const result = await resizeBrowserPage(fixture, { width, height, sequence: ++sequence }, io);
+        assert.ok(Math.abs(result.viewport.width - width / zoom) <= 1);
+        assert.ok(Math.abs(result.viewport.height - height / zoom) <= 1);
+        assert.equal((await session.send("Target.getTargetInfo")).targetInfo.targetId, targetId);
+      }
+      failMetrics = true;
+      await assert.rejects(resizeBrowserPage(fixture, { width: 390, height: 1200, sequence: ++sequence }, io), /injected metrics failure/);
+      assert.deepEqual(fixture.config.displaySurface.stream, { width: 1000, height: 700 });
+      assert.equal(await page.locator("#draft").inputValue(), "kept");
+    }
+    await page.evaluate(() => { Object.defineProperty(window, "innerWidth", { value: -1 }); Object.defineProperty(window, "devicePixelRatio", { value: -1 }); });
+    const result = await resizeBrowserPage(fixture, { width: 390, height: 1200, sequence: ++sequence }, io);
+    assert.ok(Math.abs(result.viewport.width - 390 / 1.1) <= 1);
+    page.on("dialog", () => {}); // Keep the dialog open for the resize refusal check.
+    const dialogOpened = new Promise(resolve => session.once("Page.javascriptDialogOpening", resolve));
+    await page.evaluate(() => { setTimeout(() => alert("Resize test"), 0); });
+    await dialogOpened;
+    const started = Date.now();
+    await assert.rejects(resizeBrowserPage(fixture, { width: 844, height: 338, sequence: ++sequence }, io), { code: "resize_dialog_open" });
+    assert.ok(Date.now() - started < 1000, "an open dialog refuses promptly");
+    const dialogClosed = new Promise(resolve => session.once("Page.javascriptDialogClosed", resolve));
+    await session.send("Page.handleJavaScriptDialog", { accept: false });
+    await dialogClosed;
+    await resizeBrowserPage(fixture, { width: 844, height: 338, sequence: ++sequence }, io);
+
+  } finally {
+    await context?.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });

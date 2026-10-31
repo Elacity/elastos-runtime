@@ -25,8 +25,7 @@ import {
 } from "./shell-core.js?v=home-20261030a";
 import {
   fitWindowBounds,
-  fitWindowToBrowserAspect,
-  fitWindowToLargestBrowserAspect,
+  fitBrowserWindow,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
@@ -1906,7 +1905,7 @@ async function createBrowserTargetWindow(targetId, options = {}) {
   } else if (launched.target === "browser" && node.dataset.maximized === "true") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
   }
   const activeSpace = getActiveStageId();
   const entry = {
@@ -2050,7 +2049,7 @@ function fitLaunchedWindow(entry) {
     return;
   }
   if (entry.targetId === "browser") {
-    fitWindowToBrowserAspect(entry.node);
+    fitBrowserWindow(entry.node);
     rememberWindowRestoreBounds(entry.node);
     return;
   }
@@ -2454,7 +2453,7 @@ function toggleWindowMaximize(id) {
   if (entry.targetId === "browser") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
     focusWindow(id);
     persistBrowserSession();
     return;

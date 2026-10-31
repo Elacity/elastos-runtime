@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { browserStageSize } from "../capsules/browser/browser/browser-resize.js";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import process from "node:process";
@@ -390,10 +391,11 @@ async function assertViewerResizeContinuity(page, width, height, resize) {
     "remote video before viewer resize",
   );
   await page.setViewportSize({ width, height });
-  const size = { width: Math.max(320, Math.min(3840, Math.round(width / 2) * 2)),
-    height: Math.max(240, Math.min(2160, Math.round(height / 2) * 2)) };
+  let size = browserStageSize(width, height);
   const applied = await resize(size);
-  if (applied.accepted !== true || applied.width !== size.width || applied.height !== size.height) {
+  const refused = applied.accepted === false && applied.resize_error?.code === "resize_unavailable";
+  if (refused) size = { width: before.video_width, height: before.video_height };
+  else if (applied.accepted !== true || applied.width !== size.width || applied.height !== size.height) {
     throw new Error("Guest did not accept viewer geometry");
   }
   let after = null;
@@ -431,6 +433,8 @@ async function assertViewerResizeContinuity(page, width, height, resize) {
     frame_progress: true,
     input_mapping: "decoded_video_coordinates",
     guest_resize_requests: 1,
+    resize_accepted: !refused,
+    resize_error: refused ? applied.resize_error.code : null,
   };
 }
 
@@ -813,7 +817,7 @@ async function main() {
           const result = expectOk(await adapter.request({ op: "input", page_id: pageId,
             principal_id: "person:local:hosted-product-webrtc-smoke",
             event: { type: "resize", ...size, sequence: Date.now() * 1000 } }), "resize");
-          Object.assign(displaySize, size);
+          if (result.accepted === true) Object.assign(displaySize, size);
           return result;
         })
       : null;

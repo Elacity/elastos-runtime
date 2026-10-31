@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -1027,22 +1027,37 @@ function numberOr(value, defaultValue) {
 export function validateBrowserGeometry(width, height) {
   if (!Number.isInteger(width) || !Number.isInteger(height) ||
       width < 320 || width > 3840 || height < 240 || height > 2160 ||
-      width % 2 || height % 2 || width * height > 8_294_400) {
+      width % 2 || height % 2 || width * height > 2_073_600) {
     throw Object.assign(new Error("Invalid Browser geometry"), { code: "invalid_request" });
   }
 }
 
-function browserGeometryCommand(program, args) {
-  const result = spawnSync(program, args, { encoding: "utf8", timeout: 2500, maxBuffer: 32768,
-    env: { ...process.env, DISPLAY: process.env.DISPLAY || ":40" } });
-  if (result.error || result.status !== 0) {
-    throw new Error(`${program} geometry command failed: ${String(result.stderr || result.error || result.status).slice(0, 240)}`);
-  }
-  return result.stdout;
+export function browserGeometryCommand(program, args) {
+  return new Promise((resolve, reject) => {
+    execFile(program, args, { encoding: "utf8", timeout: 2500, maxBuffer: 32768,
+      killSignal: "SIGKILL", env: { ...process.env, DISPLAY: process.env.DISPLAY || ":40" } },
+    (error, stdout, stderr) => error
+      ? reject(new Error(`${program} geometry command failed: ${String(stderr || error.message).slice(0, 240)}`))
+      : resolve(stdout));
+  });
 }
 
-function browserRandrGeometry(run) {
-  const raw = run("xrandr", ["--current"]);
+function browserResizeError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+export async function browserResizeAvailable({ stat = fs.promises.stat, run = browserGeometryCommand } = {}) {
+  try {
+    const socket = await stat("/run/elastos/browser-input-writer.sock");
+    if (!socket.isSocket()) throw new Error("missing writer socket");
+    await browserRandrGeometry(run);
+  } catch {
+    throw browserResizeError("resize_unavailable", "This Browser Engine requires a guest writer gate and XRandR for resize.");
+  }
+}
+
+async function browserRandrGeometry(run) {
+  const raw = await run("xrandr", ["--current"]);
   const size = raw.match(/current\s+(\d+)\s+x\s+(\d+)/);
   const output = raw.match(/^(\S+) connected/m)?.[1];
   if (!size || !output) throw new Error("RandR did not report the Browser display");
@@ -1051,47 +1066,47 @@ function browserRandrGeometry(run) {
 
 // Explicit timings preserve exact even dimensions, including 390px portrait.
 // Xvfb's startup allocation supplies the maximum; cvt is not required.
-export function applyBrowserDisplayMode(width, height, run = browserGeometryCommand) {
+export async function applyBrowserDisplayMode(width, height, run = browserGeometryCommand) {
   validateBrowserGeometry(width, height);
-  const before = browserRandrGeometry(run);
+  const before = await browserRandrGeometry(run);
   if (before.width === width && before.height === height) return before;
   const mode = `elastos_${width}x${height}`;
   if (!before.raw.split(/\s+/).includes(mode)) {
     const ht = width + 160, vt = height + 45;
-    run("xrandr", ["--newmode", mode, (ht * vt * 60 / 1e6).toFixed(6),
+    await run("xrandr", ["--newmode", mode, (ht * vt * 60 / 1e6).toFixed(6),
       String(width), String(width + 48), String(width + 80), String(ht),
       String(height), String(height + 3), String(height + 8), String(vt), "+hsync", "-vsync"]);
     try {
-      run("xrandr", ["--addmode", before.output, mode]);
+      await run("xrandr", ["--addmode", before.output, mode]);
     } catch (error) {
       // An unattached mode is absent from --current; retire it here so repeated
       // refused modes cannot accumulate outside the normal retention pass.
-      try { run("xrandr", ["--rmmode", mode]); } catch (cleanupError) {
+      try { await run("xrandr", ["--rmmode", mode]); } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "Browser mode creation and cleanup failed");
       }
       throw error;
     }
   }
-  run("xrandr", ["--fb", `${width}x${height}`, "--output", before.output, "--mode", mode]);
-  const actual = browserRandrGeometry(run);
+  await run("xrandr", ["--fb", `${width}x${height}`, "--output", before.output, "--mode", mode]);
+  const actual = await browserRandrGeometry(run);
   if (actual.width !== width || actual.height !== height) throw new Error("RandR geometry differs from the request");
   return actual;
 }
 
-export function pruneBrowserDisplayModes(keep, run = browserGeometryCommand) {
-  const current = browserRandrGeometry(run);
+export async function pruneBrowserDisplayModes(keep, run = browserGeometryCommand) {
+  const current = await browserRandrGeometry(run);
   const retained = new Set([...keep, current].map(size => `elastos_${size.width}x${size.height}`));
   for (const mode of new Set(current.raw.match(/\belastos_\d+x\d+\b/g) || [])) {
     if (retained.has(mode)) continue;
-    run("xrandr", ["--delmode", current.output, mode]);
-    run("xrandr", ["--rmmode", mode]);
+    await run("xrandr", ["--delmode", current.output, mode]);
+    await run("xrandr", ["--rmmode", mode]);
   }
 }
 
-function browserNativeGeometry(payload) {
+async function browserNativeGeometry(payload) {
   const args = ["-c", browserX11GeometrySource];
   if (payload) args.push("--configure", JSON.stringify(payload));
-  const value = JSON.parse(browserGeometryCommand("python3", args));
+  const value = JSON.parse(await browserGeometryCommand("python3", args));
   if (value?.schema !== "elastos.browser.x11-geometry/v1" || value.ok !== true) {
     throw new Error("Invalid Browser X11 geometry");
   }
@@ -1118,6 +1133,17 @@ export function resizeBrowserPage(page, event, overrides = {}) {
   return pending;
 }
 
+export async function browserResizeInputResult(page, action) {
+  const base = { schema: "elastos.browser.input-result/v1", page_id: page.pageId, direct_network: false };
+  try { return { ...base, accepted: true, ...await action() }; }
+  catch (error) {
+    if (!String(error?.code || "").startsWith("resize_")) throw error;
+    // A refused resize is a completed input result. Runtime retains its active
+    // page lifecycle; the viewer can retry after the stated condition changes.
+    return { ...base, accepted: false, resize_error: { code: error.code, message: error.message } };
+  }
+}
+
 async function transactBrowserGeometry(page, event, overrides) {
   const { width, height, sequence } = event;
   validateBrowserGeometry(width, height);
@@ -1129,19 +1155,29 @@ async function transactBrowserGeometry(page, event, overrides) {
   }
   page.resizeSequence = sequence;
   const io = { gate: browserInputWriterGate, mode: applyBrowserDisplayMode,
-    native: browserNativeGeometry, prune: pruneBrowserDisplayModes, wait: sleep, ...overrides };
+    native: browserNativeGeometry, prune: pruneBrowserDisplayModes, wait: sleep,
+    available: browserResizeAvailable, pageCount: () => 1, ...overrides };
+  if (io.pageCount() !== 1) throw browserResizeError("resize_shared_display", "Resize requires one Browser page on this display. Close the other pages and try again.");
+  await io.available();
   const cdp = page.browserPage?._cdp;
   if (!cdp || page.closed) throw new Error("Browser page is unavailable for resize");
   const targetId = page.browserPage.target_id;
   const snapshot = async () => {
-    const native = io.native();
+    if (cdp.javascriptDialogOpen) throw browserResizeError("resize_dialog_open", "Close the page dialog before resizing Browser.");
+    const native = await io.native();
     const window = await cdp.request("Browser.getWindowForTarget", { targetId });
-    const layout = await cdp.request("Page.getLayoutMetrics");
+    const { frameTree } = await cdp.request("Page.getFrameTree");
+    const { executionContextId } = await cdp.request("Page.createIsolatedWorld", {
+      frameId: frameTree.frame.id, worldName: "elastos-browser-geometry",
+    }, 1000);
     const dom = await cdp.request("Runtime.evaluate", { returnByValue: true,
-      expression: "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height,outerWidth,outerHeight})" });
-    return { native, window, layout: layout.cssVisualViewport, viewport: dom.result?.value };
+      contextId: executionContextId, timeout: 1000,
+      expression: "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height,outerWidth,outerHeight})" }, 1000);
+    return { native, window, viewport: dom.result?.value };
   };
-  const verify = async (saved, size, windowBounds, viewport = size) => {
+  const verify = async (saved, size, windowBounds, viewport = null) => {
+    const zoom = saved.viewport.dpr;
+    const expected = viewport || { width: Math.floor(size.width / zoom), height: Math.floor(size.height / zoom) };
     for (let attempt = 0; attempt < 20; attempt++) {
       const actual = await snapshot();
       const n = actual.native.window, old = saved.native.window;
@@ -1155,8 +1191,9 @@ async function transactBrowserGeometry(page, event, overrides) {
           sameBrowserGeometry(actual.window.bounds, windowBounds) &&
           actual.window.bounds.left === windowBounds.x && actual.window.bounds.top === windowBounds.y &&
           actual.window.bounds.windowState === saved.window.bounds.windowState &&
-          actual.layout?.clientWidth === viewport.width && actual.layout?.clientHeight === viewport.height &&
-          sameBrowserGeometry(actual.viewport, viewport) && actual.viewport.dpr === 1 &&
+          Math.abs(actual.viewport?.width - expected.width) <= (viewport ? 0 : 1) &&
+          Math.abs(actual.viewport?.height - expected.height) <= (viewport ? 0 : 1) &&
+          actual.viewport.dpr === zoom &&
           actual.viewport.screenWidth === size.width && actual.viewport.screenHeight === size.height) return actual;
       await io.wait(50);
     }
@@ -1171,23 +1208,23 @@ async function transactBrowserGeometry(page, event, overrides) {
   let held = false, begun = false, changed = false, before, actual, failure;
   const rememberFailure = error => { failure = failure ? new AggregateError([failure, error], "Browser resize or restore failed") : error; };
   try {
-    await io.gate("acquire", admission, 30000); held = true;
-    await io.gate("begin", admission, undefined, effect); begun = true;
+    held = true; await io.gate("acquire", admission, 30000);
+    begun = true; await io.gate("begin", admission, undefined, effect);
     before = await snapshot();
     validateBrowserGeometry(before.native.root.width, before.native.root.height);
-    if (before.window.bounds.windowState !== "fullscreen" || before.viewport?.dpr !== 1 ||
-        !Number.isInteger(before.viewport.width) || before.viewport.width < 1 || before.viewport.width > 3840 ||
-        !Number.isInteger(before.viewport.height) || before.viewport.height < 1 || before.viewport.height > 2160) {
-      throw new Error("Browser resize requires its fullscreen DPR-1 Chromium window");
+    if (before.window.bounds.windowState !== "fullscreen" || !Number.isFinite(before.viewport?.dpr) || before.viewport.dpr <= 0 ||
+        !Number.isInteger(before.viewport.width) || before.viewport.width < 1 || before.viewport.width > 38400 ||
+        !Number.isInteger(before.viewport.height) || before.viewport.height < 1 || before.viewport.height > 21600) {
+      throw new Error("Browser resize requires its fullscreen Chromium window");
     }
     const size = { width, height }, bounds = { x: 0, y: 0, ...size };
-    io.prune([before.native.root, size]);
+    await io.prune([before.native.root, size]);
     changed = true;
-    io.mode(width, height);
-    io.native({ identity: before.native, root: size, window: bounds, restore: false });
+    await io.mode(width, height);
+    await io.native({ identity: before.native, root: size, window: bounds, restore: false });
     await setBrowserPageGeometry(cdp, size);
     actual = await verify(before, size, bounds);
-    io.prune([before.native.root, size]);
+    await io.prune([before.native.root, size]);
     publish(size);
   } catch (error) {
     rememberFailure(error);
@@ -1200,7 +1237,7 @@ async function transactBrowserGeometry(page, event, overrides) {
         () => io.mode(size.width, size.height),
         () => io.native({ identity: before.native, root: size, window: bounds, restore: true }),
         () => cdp.request("Emulation.setDeviceMetricsOverride", {
-          width: before.viewport.width, height: before.viewport.height, deviceScaleFactor: 1,
+          width: size.width, height: size.height, deviceScaleFactor: 1,
           mobile: false, screenWidth: size.width, screenHeight: size.height,
         }),
         async () => { await verify(before, size, bounds, before.viewport); publish(size); },
@@ -3884,6 +3921,8 @@ class CdpClient {
     if (typeof message.method !== "string") {
       return;
     }
+    if (message.method === "Page.javascriptDialogOpening") this.javascriptDialogOpen = true;
+    if (message.method === "Page.javascriptDialogClosed") this.javascriptDialogOpen = false;
     const waiter = this.waiters.find((entry) => entry.method === message.method);
     if (waiter) {
       this.waiters = this.waiters.filter((entry) => entry !== waiter);
@@ -5760,11 +5799,25 @@ async function withBrowserInputWriter(page, isCurrent, action, cleanup = false) 
     if ((state.failed && !cleanup) || page.closed || !isCurrent()) throw browserOperatorError("operator_owner_changed");
     return action();
   });
-  state.tail = pending.catch(() => {
+  state.tail = pending.catch(error => {
+    if (String(error?.code || "").startsWith("resize_")) return;
     state.failed = true;
     if (page.inputWriter === state) page.inputWriter = null;
   });
   try { return await pending; } finally { state.pending--; }
+}
+
+export async function withBrowserResizeWriter(page, isCurrent, action, wait = sleep) {
+  const deadline = performance.now() + 32000;
+  for (;;) {
+    const result = await withBrowserInputWriter(page, isCurrent, async () => {
+      if (page.operatorLease) return null;
+      return { value: await action() };
+    });
+    if (result) return result.value;
+    if (performance.now() >= deadline) throw browserResizeError("resize_writer_busy", "Browser resize is waiting for the operator to finish. Try again after control returns.");
+    await wait(50);
+  }
 }
 
 function cancelBrowserOperatorLease(page, id) {
@@ -6809,6 +6862,14 @@ async function main() {
       }
       if (req.method === "POST" && op === "input") {
         if (body?.event?.type === "operator_lease" && body.event.command === "release") cancelBrowserOperatorLease(page, body.event.admission_id);
+        const isResize = body?.event?.type === "resize";
+        if (isResize) {
+          httpJson(res, 200, await browserResizeInputResult(page, () => withBrowserResizeWriter(
+            page, () => pages.get(pageId) === page && !res.destroyed,
+            () => resizeBrowserPage(page, body.event, { pageCount: () => [...pages.values()].filter(value => !value.closed).length }),
+          )));
+          return;
+        }
         const ownerHandoff = !String(body?.event?.type || "").startsWith("operator_") && page.operatorLease;
         if (ownerHandoff) cancelBrowserOperatorLease(page, ownerHandoff.id);
         const inputStarted = performance.now();
@@ -6844,14 +6905,6 @@ async function main() {
             can_go_forward: state.can_go_forward,
             file_chooser: state.file_chooser || summarizeBrowserFileChooser(page.browserPage),
             direct_network: false,
-          });
-          return;
-        }
-        if (body?.event?.type === "resize") {
-          const geometry = await resizeBrowserPage(page, body.event);
-          httpJson(res, 200, {
-            schema: "elastos.browser.input-result/v1", page_id: pageId,
-            accepted: true, ...geometry, direct_network: false,
           });
           return;
         }
@@ -6944,9 +6997,10 @@ async function main() {
       const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
         ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
       const inspectionStatus = Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? INSPECTION_HTTP_STATUS[error.code] : null;
-      httpJson(res, inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+      const resizeStatus = String(error?.code || "").startsWith("resize_") ? 409 : null;
+      httpJson(res, resizeStatus || inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
         error: error instanceof Error ? error.message : String(error),
-        ...(displayStatus || inspectionStatus ? { code: error.code } : {}),
+        ...(resizeStatus || displayStatus || inspectionStatus ? { code: error.code } : {}),
       });
     }
   });
