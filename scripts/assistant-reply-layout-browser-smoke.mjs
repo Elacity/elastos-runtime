@@ -173,15 +173,28 @@ try {
   const frame = page.frames().find(candidate => candidate.url().includes("/apps/assistant/"));
 
   const input = room.locator("#agent-composer-input");
+  // Polls until the newest block is at the end and fully above the composer,
+  // for up to 5 s; then asserts on the last measurement.
   const expectNewestAboveComposer = async (selector, label) => {
-    await page.waitForTimeout(400);
-    const seen = await frame.evaluate(newestClearance, selector);
+    const deadline = Date.now() + 5000;
+    let seen = await frame.evaluate(newestClearance, selector);
+    while (!(seen.newest && seen.atEnd && seen.abovePx >= 0) && Date.now() < deadline) {
+      await page.waitForTimeout(50);
+      seen = await frame.evaluate(newestClearance, selector);
+    }
     assert.ok(seen.newest && seen.atEnd, `${label} is the newest block, at the end: ${JSON.stringify(seen)}`);
     assert.ok(seen.abovePx >= 0, `${label} sits fully above the composer: ${JSON.stringify(seen)}`);
     return seen.abovePx;
   };
-  // A long follow-up being typed grows the composer upwards.
-  const typeLongFollowUp = () => input.fill(Array.from({ length: 6 }, (_, i) => `Follow-up line ${i + 1}`).join("\n"));
+  // A long follow-up being typed grows the composer upwards; wait for the
+  // growth so the next measurement cannot pass on the old composer.
+  const composerHeight = () => frame.evaluate(() => document.querySelector(".taskbar.is-agent-face").getBoundingClientRect().height);
+  const typeLongFollowUp = async () => {
+    const before = await composerHeight();
+    await input.fill(Array.from({ length: 6 }, (_, i) => `Follow-up line ${i + 1}`).join("\n"));
+    await frame.waitForFunction((height) =>
+      document.querySelector(".taskbar.is-agent-face").getBoundingClientRect().height > height, before, { timeout: 5000 });
+  };
   const seen = {};
 
   stage = "status line of a running turn";
