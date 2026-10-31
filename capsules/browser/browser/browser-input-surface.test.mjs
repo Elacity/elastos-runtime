@@ -90,6 +90,7 @@ function surface({ datachannel = true } = {}) {
   // sent, and a release for another page's drag is dropped.
   const pages = { current: { page_id: "page:old" } };
   const sent = [];
+  const fence = { blocked: false };
   const remoteVideo = fakeTarget({
     hidden: false,
     videoWidth: 1280,
@@ -111,6 +112,7 @@ function surface({ datachannel = true } = {}) {
     sameInputOwner: (left, right) => left === right,
     getCurrentView: () => ({ width: 1280, height: 720 }),
     keyboardCapture: null,
+    inputBlocked: () => fence.blocked,
     pasteHostClipboardIntoRemote: async () => {},
     readHostClipboardText: async () => "",
     remoteVideo,
@@ -134,7 +136,7 @@ function surface({ datachannel = true } = {}) {
   const flushFrames = () => frames.splice(0).forEach((callback) => callback());
   const mouse = (type, clientX, clientY, extra = {}) =>
     renderPanel.fire(type, { pointerType: "mouse", pointerId: 1, button: 0, clientX, clientY, ...extra });
-  return { inputs, sent, pages, staleChecks, renderPanel, remoteVideo, mouse, flushFrames, captured };
+  return { inputs, sent, pages, staleChecks, renderPanel, remoteVideo, mouse, flushFrames, captured, fence };
 }
 
 test("mouse event encodes as one Selkies held-button or release message", () => {
@@ -215,6 +217,43 @@ test("a press without movement keeps the Runtime click", () => {
   mouse("pointerup", 103, 100);
   renderPanel.fire("click", { clientX: 103, clientY: 100 });
   assert.deepEqual(inputs, [{ type: "click", x: 103, y: 100 }]);
+});
+
+test("a drag cannot start while the frame fence holds pointer input; its click is suppressed", () => {
+  const h = surface();
+  h.mouse("pointerdown", 100, 100);
+  h.fence.blocked = true;
+  h.mouse("pointermove", 120, 100);
+  h.fence.blocked = false;
+  h.mouse("pointermove", 140, 100);
+  h.flushFrames();
+  h.mouse("pointerup", 150, 100);
+  h.renderPanel.fire("click", { clientX: 150, clientY: 100 });
+  assert.deepEqual(h.inputs, [], "a press mapped before the fence must not reach the guest");
+  assert.equal(h.captured.size, 0);
+});
+
+test("drag moves held by the frame fence are dropped; the release is still sent", () => {
+  const h = surface();
+  h.mouse("pointerdown", 100, 100);
+  h.mouse("pointermove", 120, 100);
+  h.fence.blocked = true;
+  h.flushFrames();
+  h.mouse("pointermove", 140, 100);
+  h.flushFrames();
+  h.mouse("pointerup", 150, 100);
+  h.fence.blocked = false;
+  h.mouse("pointerdown", 200, 200);
+  h.mouse("pointermove", 220, 200);
+  h.flushFrames();
+  h.mouse("pointerup", 230, 200);
+  assert.deepEqual(h.inputs, [
+    { type: "mouse", x: 100, y: 100, buttons: 1 },
+    { type: "mouse", x: 100, y: 100, buttons: 0 },
+    { type: "mouse", x: 200, y: 200, buttons: 1 },
+    { type: "mouse", x: 220, y: 200, buttons: 1 },
+    { type: "mouse", x: 230, y: 200, buttons: 0 },
+  ]);
 });
 
 test("pointercancel during a drag sends the release", () => {

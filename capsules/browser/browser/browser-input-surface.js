@@ -366,7 +366,8 @@ export function bindBrowserInputSurface({
     }
     const point = mouseDragState.pendingPoint;
     mouseDragState.pendingPoint = null;
-    if (point) {
+    // A move held by the frame fence is dropped; the release still follows.
+    if (point && !inputBlocked()) {
       mouseDragState.lastPoint = point;
       sendMouseMove(mouseDragState, point);
     }
@@ -376,6 +377,8 @@ export function bindBrowserInputSurface({
     const state = mouseDragState;
     mouseDragState = null;
     if (!state?.dragging) {
+      // A drag refused by the frame fence pressed nothing; its click is not a press either.
+      if (state?.refused) suppressSyntheticClickUntil = Date.now() + 700;
       return false;
     }
     state.ended = true;
@@ -427,6 +430,7 @@ export function bindBrowserInputSurface({
       lastPoint: start,
       pendingPoint: null,
       dragging: false,
+      refused: false,
       ended: false,
       frame: 0,
     };
@@ -434,7 +438,7 @@ export function bindBrowserInputSurface({
 
   renderPanel.addEventListener("pointermove", (event) => {
     const state = mouseDragState;
-    if (!state || event.pointerId !== state.pointerId) {
+    if (!state || state.refused || event.pointerId !== state.pointerId) {
       return;
     }
     if (dragOwnerChanged(state)) {
@@ -445,6 +449,12 @@ export function bindBrowserInputSurface({
       const dx = event.clientX - state.clientX;
       const dy = event.clientY - state.clientY;
       if (Math.hypot(dx, dy) < MOUSE_DRAG_THRESHOLD_PX) {
+        return;
+      }
+      // The press was mapped before the frame fence closed: the guest
+      // geometry may have changed, so the drag never presses the button.
+      if (inputBlocked()) {
+        state.refused = true;
         return;
       }
       state.dragging = true;
