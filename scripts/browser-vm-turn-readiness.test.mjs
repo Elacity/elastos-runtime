@@ -109,7 +109,7 @@ function controller(t, { linux = false, delayed = false } = {}) {
     fs: { statSync(file, options) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
-    } },
+    }, accessSync: fs.accessSync, constants: fs.constants },
     execFileSync(command, args) {
       assert.equal(command, "python3");
       assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
@@ -193,6 +193,46 @@ for (const tool of ["debugfs", "python3"]) {
   });
 }
 
+test("mechanics (mock probe): an empty PATH entry resolves debugfs in the current directory", async t => {
+  const c = controller(t);
+  const cwd = process.cwd();
+  const here = path.join(c.root, "cwd");
+  fs.mkdirSync(here);
+  const write = () => {
+    fs.writeFileSync(path.join(here, "debugfs.new"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.renameSync(path.join(here, "debugfs.new"), path.join(here, "debugfs"));
+  };
+  write();
+  c.env.PATH = `:${process.env.PATH}`;
+  process.chdir(here);
+  try {
+    assert.deepEqual(await c.read(), ready);
+    write();
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 2, "the shell runs ./debugfs for an empty PATH entry");
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("mechanics (mock probe): a PATH file this user cannot execute is not the resolved debugfs", async t => {
+  const c = controller(t);
+  const tools = path.join(c.root, "tools");
+  fs.mkdirSync(tools);
+  const write = () => {
+    // Group/other execute bits only: the shell skips it for this user.
+    fs.writeFileSync(path.join(tools, "debugfs.new"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(path.join(tools, "debugfs.new"), 0o611);
+    fs.renameSync(path.join(tools, "debugfs.new"), path.join(tools, "debugfs"));
+  };
+  write();
+  c.env.PATH = `${tools}:${process.env.PATH}`;
+  assert.deepEqual(await c.read(), ready);
+  write();
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1, "replacing a file the preflight would not run is not a new input");
+});
+
 test("mechanics (mock probe): a configured but absent debugfs keeps a successful probe ready", async t => {
   const c = controller(t);
   c.env.ELASTOS_DEBUGFS_BIN = path.join(c.root, "absent-debugfs");
@@ -212,19 +252,25 @@ test("the control service probes readiness when it starts, before any request", 
       launcher_program: f.launcher, launcher_args: [] }) },
     stdio: ["ignore", "ignore", "pipe"],
   });
-  t.after(() => child.kill("SIGKILL"));
+  const closed = new Promise(resolve => child.once("close", resolve));
   let stderr = "";
-  const event = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`no startup probe: ${stderr}`)), 5000);
-    child.stderr.on("data", chunk => {
-      stderr += chunk;
-      const line = stderr.split("\n").find(entry => entry.includes('"host_readiness"'));
-      if (line) { clearTimeout(timer); resolve(JSON.parse(line)); }
+  try {
+    const event = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no startup probe: ${stderr}`)), 5000);
+      child.stderr.on("data", chunk => {
+        stderr += chunk;
+        const line = stderr.split("\n").find(entry => entry.includes('"host_readiness"'));
+        if (line) { clearTimeout(timer); resolve(JSON.parse(line)); }
+      });
     });
-  });
-  // The fixture preflight is not executable, so the eager probe reports it.
-  assert.equal(event.source, "probe");
-  assert.equal(event.reason, "preparation_required");
+    // The fixture preflight is not executable, so the eager probe reports it.
+    assert.equal(event.source, "probe");
+    assert.equal(event.reason, "preparation_required");
+  } finally {
+    // Stop the service before the fixture directory is removed.
+    child.kill("SIGKILL");
+    await closed;
+  }
 });
 
 for (const kind of ["unset", "different-path", "remove", "replace", "chmod", "retarget-symlink"]) {

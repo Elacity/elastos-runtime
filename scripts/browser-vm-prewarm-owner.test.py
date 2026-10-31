@@ -13,17 +13,34 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def started(pid):
-    """Process start time; with the pid it identifies one process."""
+GONE = "gone"
+
+
+def identity(pid):
+    """Start time of pid (with the pid it names one process); GONE if no such
+    process exists; None if it could not be observed."""
     result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
-    return result.stdout.strip() or None
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return GONE
+    except PermissionError:
+        return None
+    return None
 
 
 def wait_gone(pid, start, seconds):
+    """True once the process named by (pid, start) is observed to be gone."""
     deadline = time.monotonic() + seconds
-    while started(pid) == start and time.monotonic() < deadline:
+    while True:
+        current = identity(pid)
+        if current is not None and current != start:
+            return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.05)
-    return started(pid) != start
 
 
 class BrowserVmPrewarmOwner(unittest.TestCase):
@@ -45,9 +62,17 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
         # that is still the exact one this test started.
         for writer in list(self.writers):  # close_owner removes from the list
             self.close_owner(writer)
+        survivors = False
         for pid, start in self.services.items():
-            if not wait_gone(pid, start, 5) and started(pid) == start:
+            if wait_gone(pid, start, 5):
+                continue
+            if identity(pid) == start:  # still exactly our process; anything else is left alone
                 os.kill(pid, signal.SIGKILL)
+                if wait_gone(pid, start, 5):
+                    continue
+            survivors = True
+        if survivors:
+            self.fail(f"control service did not exit; fixture kept at {self.directory}")
         shutil.rmtree(self.directory, ignore_errors=True)
 
     def close_owner(self, writer):
@@ -79,7 +104,9 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
             os.close(reader)
         self.assertEqual(result.returncode, 0, result.stderr)
         pid = json.loads(result.stdout)["control_status"]["pid"]
-        self.services.setdefault(pid, started(pid))
+        observed = identity(pid)
+        self.assertTrue(observed and observed != GONE, f"could not observe control service {pid}")
+        self.services.setdefault(pid, observed)
         return pid, writer
 
     def status(self):
@@ -108,7 +135,7 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
         self.assertEqual(second, first)
         self.close_owner(second_owner)
         time.sleep(1.0)
-        self.assertEqual(started(first), self.services[first], "the kept service must outlive the other Runtime")
+        self.assertEqual(identity(first), self.services[first], "the kept service must outlive the other Runtime")
         self.assertEqual(self.status()["pid"], first)
 
     def test_real_owner_closing_stops_the_service(self):

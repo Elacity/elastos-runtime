@@ -154,16 +154,18 @@ function readinessInputStamps(dataDir, launcher) {
   }
 }
 
-// Mirrors the preflight's resolution: a command with a slash is used as is,
-// a bare name is the first executable file on PATH.
+// Mirrors the preflight's resolution: a command with a slash is used as is; a
+// bare name is the first PATH entry holding a file this process may execute.
+// An empty PATH entry is the current directory, as in the shell.
 function resolveReadinessTool(command) {
   const candidates = command.includes("/")
     ? [path.resolve(command)]
-    : (process.env.PATH || "").split(":").filter(Boolean).map((dir) => path.join(dir, command));
+    : (process.env.PATH ?? "").split(":").map((dir) => path.resolve(dir || ".", command));
   for (const candidate of candidates) {
     try {
-      const info = fs.statSync(candidate);
-      if (info.isFile() && (info.mode & 0o111) !== 0) return candidate;
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
     } catch {}
   }
   return null;
