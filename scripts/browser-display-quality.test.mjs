@@ -3,9 +3,10 @@ import test from "node:test";
 import { browserDisplayMetrics, resizeBrowserPage, applyBrowserDisplayMode, pruneBrowserDisplayModes,
   validateBrowserGeometry, withBrowserResizeWriter, browserGeometryCommand, browserResizeInputResult, browserResizeAvailable } from "./browser-selkies-control-service.mjs";
 
-function fixture({ failMode = false, failMetrics = false, failGate = "", failVerify = false } = {}) {
+function fixture({ failMode = false, failMetrics = false, failGate = "", failVerify = false, zoom = 1 } = {}) {
   const log = [];
-  let size = { width: 1000, height: 700 }, viewport = { ...size };
+  const cssSize = ({ width, height }) => ({ width: Math.floor(width / zoom), height: Math.floor(height / zoom) });
+  let size = { width: 1000, height: 700 }, viewport = cssSize(size);
   let native = { schema: "elastos.browser.x11-geometry/v1", ok: true,
     root: { xid: "0x1", ...size },
     window: { xid: "0x2", parent_xid: "0x1", pid: 123, wm_class: ["app", "Chromium"],
@@ -18,13 +19,13 @@ function fixture({ failMode = false, failMetrics = false, failGate = "", failVer
       if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame" } } };
       if (method === "Page.createIsolatedWorld") return { executionContextId: 42 };
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { clientWidth: viewport.width, clientHeight: viewport.height } };
-      if (method === "Runtime.evaluate") return { result: { value: { ...viewport, dpr: 1,
-        screenWidth: viewport.width, screenHeight: viewport.height, outerWidth: Math.max(500, viewport.width), outerHeight: viewport.height } } };
+      if (method === "Runtime.evaluate") return { result: { value: { ...viewport, dpr: zoom,
+        screenWidth: 1280, screenHeight: 720, outerWidth: Math.max(500, viewport.width), outerHeight: viewport.height } } };
       if (method === "Emulation.setDeviceMetricsOverride") {
         log.push(`metrics:${params.width}x${params.height}`);
         assert.equal(params.deviceScaleFactor, 1);
         if (failMetrics) { failMetrics = false; throw Error("CDP refused metrics"); }
-        viewport = { width: params.width, height: params.height }; return {};
+        viewport = cssSize(params); return {};
       }
       throw Error(`Unexpected CDP command ${method}`);
     } } } };
@@ -69,6 +70,21 @@ test("transaction orders writer, RandR, native window, CDP, verification and rel
     assert.equal(page.browserPage.target_id, "same-target");
   }
 });
+
+// Chrome page zoom changes CSS layout and DPR together. The pinned headless
+// shell exercises visual zoom separately in the real-CDP test.
+for (const zoom of [.9, 1.1]) {
+  test(`page zoom ${zoom} verifies CSS viewport and restores the exact saved size`, async () => {
+    const { page, io } = fixture({ zoom });
+    const result = await resizeBrowserPage(page, { width: 390, height: 1200, sequence: 1 }, io);
+    assert.equal(result.viewport.width, Math.floor(390 / zoom));
+    assert.equal(result.viewport.height, Math.floor(1200 / zoom));
+    assert.equal(result.viewport.dpr, zoom);
+    const failed = fixture({ zoom, failMetrics: true });
+    await assert.rejects(resizeBrowserPage(failed.page, { width: 390, height: 1200, sequence: 1 }, failed.io), /CDP refused metrics/);
+    assert.deepEqual(failed.page.config.displaySurface.stream, { width: 1000, height: 700 });
+  });
+}
 
 for (const failure of ["failMode", "failMetrics", "failVerify"]) {
   test(`${failure}: restore all geometry before writer settlement`, async () => {

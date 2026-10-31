@@ -266,8 +266,8 @@ test("a drag leaving the video clamps to its edge", () => {
   h.mouse("pointerup", 1500, 800);
   assert.deepEqual(h.inputs, [
     { type: "mouse", x: 100, y: 100, buttons: 1 },
-    { type: "mouse", x: 1280, y: 0, buttons: 1 },
-    { type: "mouse", x: 1280, y: 720, buttons: 0 },
+    { type: "mouse", x: 1279, y: 0, buttons: 1 },
+    { type: "mouse", x: 1279, y: 719, buttons: 0 },
   ]);
 });
 

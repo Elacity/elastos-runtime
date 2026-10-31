@@ -7,8 +7,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || "playwright");
 const source = await readFile(new URL("../capsules/browser/browser/browser-resize.js", import.meta.url), "utf8");
 
 test("real ResizeObserver uses untransformed content-box CSS pixels at DPR 1, 2 and 3", async () => {
-  const browser = await chromium.launch({ headless: true,
-    executablePath: process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" });
+  const browser = await chromium.launch({ headless: true });
   try {
     for (const deviceScaleFactor of [1, 2, 3]) {
       const context = await browser.newContext({ viewport: { width: 1280, height: 1400 }, deviceScaleFactor });

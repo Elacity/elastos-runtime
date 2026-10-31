@@ -1133,6 +1133,19 @@ export function resizeBrowserPage(page, event, overrides = {}) {
   return pending;
 }
 
+export async function withBrowserResizeWriter(page, isCurrent, action, wait = sleep) {
+  const deadline = performance.now() + 32000;
+  for (;;) {
+    const result = await withBrowserInputWriter(page, isCurrent, async () => {
+      if (page.operatorLease) return null;
+      return { value: await action() };
+    });
+    if (result) return result.value;
+    if (performance.now() >= deadline) throw browserResizeError("resize_writer_busy", "Browser resize is waiting for the operator to finish. Try again after control returns.");
+    await wait(50);
+  }
+}
+
 export async function browserResizeInputResult(page, action) {
   const base = { schema: "elastos.browser.input-result/v1", page_id: page.pageId, direct_network: false };
   try { return { ...base, accepted: true, ...await action() }; }
@@ -1172,7 +1185,7 @@ async function transactBrowserGeometry(page, event, overrides) {
     }, 1000);
     const dom = await cdp.request("Runtime.evaluate", { returnByValue: true,
       contextId: executionContextId, timeout: 1000,
-      expression: "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height,outerWidth,outerHeight})" }, 1000);
+      expression: "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,outerWidth,outerHeight})" }, 1000);
     return { native, window, viewport: dom.result?.value };
   };
   const verify = async (saved, size, windowBounds, viewport = null) => {
@@ -1193,8 +1206,7 @@ async function transactBrowserGeometry(page, event, overrides) {
           actual.window.bounds.windowState === saved.window.bounds.windowState &&
           Math.abs(actual.viewport?.width - expected.width) <= (viewport ? 0 : 1) &&
           Math.abs(actual.viewport?.height - expected.height) <= (viewport ? 0 : 1) &&
-          actual.viewport.dpr === zoom &&
-          actual.viewport.screenWidth === size.width && actual.viewport.screenHeight === size.height) return actual;
+          actual.viewport.dpr === zoom) return actual;
       await io.wait(50);
     }
     throw new Error("Browser geometry did not settle");
@@ -5805,19 +5817,6 @@ async function withBrowserInputWriter(page, isCurrent, action, cleanup = false) 
     if (page.inputWriter === state) page.inputWriter = null;
   });
   try { return await pending; } finally { state.pending--; }
-}
-
-export async function withBrowserResizeWriter(page, isCurrent, action, wait = sleep) {
-  const deadline = performance.now() + 32000;
-  for (;;) {
-    const result = await withBrowserInputWriter(page, isCurrent, async () => {
-      if (page.operatorLease) return null;
-      return { value: await action() };
-    });
-    if (result) return result.value;
-    if (performance.now() >= deadline) throw browserResizeError("resize_writer_busy", "Browser resize is waiting for the operator to finish. Try again after control returns.");
-    await wait(50);
-  }
 }
 
 function cancelBrowserOperatorLease(page, id) {

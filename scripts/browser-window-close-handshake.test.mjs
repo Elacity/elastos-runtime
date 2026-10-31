@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { createBrowserFrameFence } from "../capsules/browser/browser/browser-resize.js";
 import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
 import { friendlyOpenError, isAuthoritySessionError } from "../capsules/browser/browser/browser-status.js";
 import { sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
@@ -76,6 +77,7 @@ function numericArrayConstant(source, name) {
 }
 
 const handshakeSource = [
+  "resetPageInputDelivery",
   "currentRuntimePageOwner",
   "finalizeRuntimePageClose",
   "hasExactMessageKeys",
@@ -304,6 +306,8 @@ function createHarness({
     launchToken: "launch-token-exact",
     currentPage: recoverable || ownerless ? null : page,
     currentPageGeneration: 7, unloadCleanupStarted: false,
+    lastDatachannelInputAt: 0, datachannelDrainedAt: 0, datachannelSendDisplay: null, datachannelSendGeneration: 0,
+    resizeFrameFence: createBrowserFrameFence({}),
     currentBrowserEngineId: "engine-exact",
     currentRemoteExitId: "exit-exact",
     browserSummaryPromise: null,

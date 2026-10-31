@@ -1228,7 +1228,7 @@ done
 }
 /opt/elastos/bin/node --input-type=module - "$ELASTOS_BROWSER_VM_WIDTH" "$ELASTOS_BROWSER_VM_HEIGHT" <<'BROWSER_INITIAL_GEOMETRY'
 import { applyBrowserDisplayMode } from "/opt/elastos/bin/browser-selkies-control-service.mjs";
-applyBrowserDisplayMode(Number(process.argv[2]), Number(process.argv[3]));
+await applyBrowserDisplayMode(Number(process.argv[2]), Number(process.argv[3]));
 BROWSER_INITIAL_GEOMETRY
 selkies_checkpoint "xvfb ready"
 selkies_checkpoint "starting audio"
@@ -2095,7 +2095,7 @@ selkies_checkpoint "starting selkies service"
   --stun_host= \
   --stun_port= \
   --enable_clipboard=true \
-  --enable_resize=true \
+  --enable_resize=false \
   --enable_basic_auth=true \
   --basic_auth_user "$ELASTOS_BROWSER_VM_SELKIES_AUTH_USER" \
   --basic_auth_password "$ELASTOS_BROWSER_VM_SELKIES_AUTH_PASSWORD" \
