@@ -8,15 +8,15 @@
    owns the layout). Pointer events only, so a mouse drags in edit mode too.
    docs/HOME_MOBILE.md. */
 
-import { LONG_PRESS_DRIFT_PX, LONG_PRESS_MS } from "./shell-touch.js?v=home-20261030a";
-import { LAYER_STATE, registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261030a";
+import { LONG_PRESS_DRIFT_PX, LONG_PRESS_MS } from "./shell-touch.js?v=home-20261031a";
+import { LAYER_STATE, registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261031a";
 import {
   appendPhoneHomePage,
   currentPhoneHomePage,
   phoneHomePageCount,
   phoneHomePageNode,
   showPhoneHomePage,
-} from "./shell-phone-home-pager.js?v=home-20261030a";
+} from "./shell-phone-home-pager.js?v=home-20261031a";
 
 // Held against a screen edge this long, the drag turns the page.
 const EDGE_TURN_MS = 450;

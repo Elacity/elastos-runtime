@@ -345,7 +345,7 @@ async function runScenario(name) {
   if (name === "home_people_navigation") {
     const environment = setupEnvironment(name, []);
     window.location.href = "http://localhost:61180/";
-    const version = "home-20261030a";
+    const version = "home-20261031a";
     const { shellState } = await import(`../capsules/home-gui/browser/shell-core.js?v=${version}`);
     const { openTarget } = await import(`../capsules/home-gui/browser/shell-windows.js?v=${version}`);
     const sent = [];

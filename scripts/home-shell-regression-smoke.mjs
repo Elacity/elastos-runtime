@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import vm from "node:vm";
 import { exerciseNavigationConsumers, navigationClientFixture } from "./home-navigation-consumers-smoke.mjs";
 
-const moduleVersion = "home-20261030a";
+const moduleVersion = "home-20261031a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();

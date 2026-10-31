@@ -15,7 +15,7 @@
    Presentation only — no authority. Repeat clicks are ignored until the
    sequence settles; reduced motion opens immediately. */
 
-import { prefersReducedMotion } from "./shell-motion.js?v=home-20261030a";
+import { prefersReducedMotion } from "./shell-motion.js?v=home-20261031a";
 
 export const ASSISTANT_MARK_CONTACT_MS = 240;
 export const ASSISTANT_MARK_RETURN_MS = 170;

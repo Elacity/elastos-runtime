@@ -33,8 +33,8 @@ addEventListener('message', (event) => {
 </script>`;
 const shellHtml = `<link rel="stylesheet" href="/apps/home-gui/style.css">${template}
 <script type="module">
-import * as core from '/apps/home-gui/shell-core.js?v=home-20261030a';
-import * as windows from '/apps/home-gui/shell-windows.js?v=home-20261030a';
+import * as core from '/apps/home-gui/shell-core.js?v=home-20261031a';
+import * as windows from '/apps/home-gui/shell-windows.js?v=home-20261031a';
 document.querySelector('.desktop-workspace').hidden = false;
 document.querySelector('.desktop-workspace').inert = false;
 const target = {target:'system', title:'System', route:'/apps/system/', window_policy:'single'};

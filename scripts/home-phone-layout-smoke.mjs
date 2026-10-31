@@ -1225,7 +1225,7 @@ function historyBack(frame) {
 // An app window as Back sees it, and the stage around it.
 function stageWindowState(frame, target) {
   return frame.evaluate(async (target) => {
-    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261030a", location.href).href);
+    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261031a", location.href).href);
     const node = document.querySelector(`.window[data-target="${target}"]`);
     return {
       home: location.href.includes("/apps/home-gui/"),
@@ -1247,8 +1247,8 @@ function homeState(page, frame) {
 // Closes every window of an app through the shell, wherever it is.
 function discardWindows(frame, target) {
   return frame.evaluate(async (target) => {
-    const core = await import(new URL("./shell-core.js?v=home-20261030a", location.href).href);
-    const windows = await import(new URL("./shell-windows.js?v=home-20261030a", location.href).href);
+    const core = await import(new URL("./shell-core.js?v=home-20261031a", location.href).href);
+    const windows = await import(new URL("./shell-windows.js?v=home-20261031a", location.href).href);
     for (const entry of [...core.shellState.windows.values()]) {
       if (entry.targetId === target) {
         await windows.closeWindow(entry.id);
@@ -1320,7 +1320,7 @@ async function probeBackRaces(page, frame) {
       await LAYER_OPENERS[spec.id].open(frame);
       await sleep(SHEET_SETTLE_MS);
       const race = await frame.evaluate(async ({ spec, timeoutMs }) => {
-        const owner = await import(new URL(`./${spec.module}?v=home-20261030a`, location.href).href);
+        const owner = await import(new URL(`./${spec.module}?v=home-20261031a`, location.href).href);
         const leaving = document.querySelector(spec.leaving);
         return new Promise((resolve) => {
           // Added after the shell's own popstate listener, so the shell's Back
@@ -1596,8 +1596,8 @@ async function probeResetOwnerReports(page, frame) {
   const homeUrl = page.url();
   const stageHistory = await frame.evaluate(() => document.body.dataset.stageHistory || "");
   const limits = await frame.evaluate(async () => {
-    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261030a", location.href).href);
-    const popovers = await import(new URL("./shell-popovers.js?v=home-20261030a", location.href).href);
+    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261031a", location.href).href);
+    const popovers = await import(new URL("./shell-popovers.js?v=home-20261031a", location.href).href);
     return {
       timeoutMs: stage.RESET_HISTORY_TIMEOUT_MS,
       attempts: stage.RESET_HISTORY_ATTEMPTS,
@@ -2935,7 +2935,7 @@ async function probePhoneBack(frame) {
       return;
     }
     await frame.evaluate(async () => {
-      const stage = await import(new URL("./shell-phone-stage.js?v=home-20261030a", location.href).href);
+      const stage = await import(new URL("./shell-phone-stage.js?v=home-20261031a", location.href).href);
       stage.closeTopStageLayer(document);
     });
   };
@@ -2983,8 +2983,8 @@ async function probePhoneBack(frame) {
   // still here. Every Home host surface must be a registered layer, and every
   // registered layer needs an opener below, so Back cannot silently miss one.
   const registry = await frame.evaluate(async () => {
-    const popovers = await import(new URL("./shell-popovers.js?v=home-20261030a", location.href).href);
-    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261030a", location.href).href);
+    const popovers = await import(new URL("./shell-popovers.js?v=home-20261031a", location.href).href);
+    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261031a", location.href).href);
     const layers = popovers.registeredStageLayers().map(({ id, selector }) => ({ id, selector }));
     const registered = new Set(layers.map((layer) => document.querySelector(layer.selector)).filter(Boolean));
     const unregistered = stage.LAYER_HOST_SELECTORS
@@ -3042,8 +3042,8 @@ async function probePhoneBack(frame) {
   // A fullscreen Space with the bar's identity menu open: Back closes the
   // menu and nothing else; the Space stays fullscreen.
   const fullscreenSetup = await frame.evaluate(async () => {
-    const core = await import(new URL("./shell-core.js?v=home-20261030a", location.href).href);
-    const stages = await import(new URL("./shell-stages.js?v=home-20261030a", location.href).href);
+    const core = await import(new URL("./shell-core.js?v=home-20261031a", location.href).href);
+    const stages = await import(new URL("./shell-stages.js?v=home-20261031a", location.href).href);
     const id = core.shellState.activeWindowId;
     if (!id) {
       return null;
@@ -3053,7 +3053,7 @@ async function probePhoneBack(frame) {
   });
   await sleep(SHEET_SETTLE_MS);
   const readFullscreen = () => frame.evaluate(async (id) => {
-    const stages = await import(new URL("./shell-stages.js?v=home-20261030a", location.href).href);
+    const stages = await import(new URL("./shell-stages.js?v=home-20261031a", location.href).href);
     const active = stages.getActiveStageId();
     return { activeStage: active, fullscreen: Boolean(id) && !stages.isDesktopSpace(active) };
   }, fullscreenSetup?.id || null);
@@ -3066,7 +3066,7 @@ async function probePhoneBack(frame) {
   const fullscreenAfter = { ...(await readFullscreen()), menu: await readLayer(frame, "identity-menu") };
   if (fullscreenSetup) {
     await frame.evaluate(async (id) => {
-      const stages = await import(new URL("./shell-stages.js?v=home-20261030a", location.href).href);
+      const stages = await import(new URL("./shell-stages.js?v=home-20261031a", location.href).href);
       stages.exitFullscreenStage(id);
     }, fullscreenSetup.id);
     await sleep(SHEET_SETTLE_MS);
@@ -3111,8 +3111,8 @@ async function probePhoneBack(frame) {
 // is on screen at all, leaving included), and the layers Back would count.
 function readLayer(frame, id) {
   return frame.evaluate(async (id) => {
-    const popovers = await import(new URL("./shell-popovers.js?v=home-20261030a", location.href).href);
-    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261030a", location.href).href);
+    const popovers = await import(new URL("./shell-popovers.js?v=home-20261031a", location.href).href);
+    const stage = await import(new URL("./shell-phone-stage.js?v=home-20261031a", location.href).href);
     const layer = popovers.registeredStageLayers().find((entry) => entry.id === id);
     const state = layer ? stage.stageLayerState(layer, document) : "closed";
     return {
@@ -3150,7 +3150,7 @@ function setWelcome(frame, { open, yielded = false }) {
 
 async function callShellModule(frame, file, call) {
   await frame.evaluate(async ({ file, call }) => {
-    const module = await import(new URL(`./${file}?v=home-20261030a`, location.href).href);
+    const module = await import(new URL(`./${file}?v=home-20261031a`, location.href).href);
     module[call]();
   }, { file, call });
 }

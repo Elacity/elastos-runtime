@@ -5,7 +5,7 @@
    short. With `tapCloses` the handle is a button, so a tap, Enter or Space
    closes too. Hidden off phone. docs/HOME_MOBILE.md. */
 
-import { registerStageGesture } from "./shell-popovers.js?v=home-20261030a";
+import { registerStageGesture } from "./shell-popovers.js?v=home-20261031a";
 
 // A drag this far toward the sheet's origin dismisses it; shorter snaps back.
 export const SHEET_DISMISS_DRAG_PX = 48;

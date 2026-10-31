@@ -9,19 +9,19 @@
  * (wallet → Wallet rail; setup → setup sheet; everything else → Inbox rail).
  */
 
-import { clockNode } from "./shell-core.js?v=home-20261030a";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20261030a";
+import { clockNode } from "./shell-core.js?v=home-20261031a";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20261031a";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261030a";
+} from "./shell-popovers.js?v=home-20261031a";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261030a";
-import { showWalletRail } from "./shell-wallet-rail.js?v=home-20261030a";
-import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261030a";
+} from "./shell-motion.js?v=home-20261031a";
+import { showWalletRail } from "./shell-wallet-rail.js?v=home-20261031a";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261031a";
 
 const MAX_ENTRIES = 50;
 const WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];

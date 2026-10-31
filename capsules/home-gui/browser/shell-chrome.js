@@ -8,14 +8,14 @@ import {
   toolbarSystem,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
-} from "./shell-core.js?v=home-20261030a";
-import { renderNcTimeChrome } from "./shell-notifications.js?v=home-20261030a";
+} from "./shell-core.js?v=home-20261031a";
+import { renderNcTimeChrome } from "./shell-notifications.js?v=home-20261031a";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261030a";
-import { isPhone } from "./shell-form-factor.js?v=home-20261030a";
-import { registerStageLayer } from "./shell-popovers.js?v=home-20261030a";
+} from "./shell-motion.js?v=home-20261031a";
+import { isPhone } from "./shell-form-factor.js?v=home-20261031a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20261031a";
 
 /* System chrome: the ElastOS brand at the far left of the bar is the system
    menu (the macOS Apple-menu position) — show desktop, fullscreen, System,

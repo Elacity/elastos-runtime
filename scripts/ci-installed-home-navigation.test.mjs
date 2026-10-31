@@ -399,7 +399,7 @@ test("installed navigation waits for real Home GUI restoration and preserves app
               const waitForWindowControls = () => shellFrame.waitForFunction(() => performance.now() >= Number(
                 document.querySelector('section.window[data-target="marketplace"]').dataset.controlGuardUntil), null, { timeout: 1500 });
               const readTaskbarAction = () => shellFrame.evaluate(async () => {
-                const { shellState } = await import("/apps/home-gui/shell-core.js?v=home-20261030a");
+                const { shellState } = await import("/apps/home-gui/shell-core.js?v=home-20261031a");
                 const windowNode = document.querySelector('section.window[data-target="marketplace"]');
                 if (shellState.windows.get(windowNode.dataset.windowId)?.node !== windowNode) throw new Error("fixture requires the active Shell module");
                 return { ...shellState.recentUiAction, now: performance.now(),

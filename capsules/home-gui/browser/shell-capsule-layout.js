@@ -6,7 +6,7 @@
    misuse. The shared theme runtime (capsules/_shared/elastos-theme.js) applies
    it as html[data-el-form-factor] and html[data-el-pointer]. */
 
-import { FORM_FACTOR_EVENT, formFactor, isCoarsePointer } from "./shell-form-factor.js?v=home-20261030a";
+import { FORM_FACTOR_EVENT, formFactor, isCoarsePointer } from "./shell-form-factor.js?v=home-20261031a";
 
 export const SHELL_LAYOUT_MESSAGE = "elastos:shell-layout";
 
