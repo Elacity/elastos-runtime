@@ -136,13 +136,12 @@ export function createBrowserFrameFence(video, { wait = ms => new Promise(resolv
       if (current === generation) void late(current);
       return result;
     },
-    // Ends an unknown result. Returns the geometry the guest is expected to
-    // keep (null when none was known), or undefined when nothing was unknown.
+    // Ends an unknown result; returns whether there was one to end.
     recover() {
-      if (!blocked || targets || !uncertain) return undefined;
+      if (!blocked || targets || !uncertain) return false;
       targets = uncertain.prior ? [uncertain.prior, ...uncertain.sizes] : [];
       void late(generation);
-      return uncertain.prior;
+      return true;
     },
   };
 }
