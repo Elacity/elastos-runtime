@@ -1303,143 +1303,36 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn landing_page() -> Html<String> {
-    Html(format!(
-        r#"<!DOCTYPE html>
+const LANDING_PAGE_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ElastOS Gateway</title>
+  <meta name="color-scheme" content="light dark" />
+  <title>ElastOS Home</title>
   <style>
-    :root {{
-      --bg: #0c1217;
-      --panel: #111a21;
-      --text: #e9f0f4;
-      --muted: #9bb1bf;
-      --accent: #29b6f6;
-      --ok: #54d66d;
-      --border: #203241;
-    }}
-    body {{
-      margin: 0;
-      font-family: "Segoe UI", "SF Pro Text", system-ui, sans-serif;
-      background: radial-gradient(circle at 20% 0%, #122130 0%, var(--bg) 45%);
-      color: var(--text);
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 1.25rem;
-    }}
-    main {{
-      width: min(820px, 100%);
-      background: linear-gradient(180deg, #111a21 0%, #0f171f 100%);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 1.25rem;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
-    }}
-    h1 {{
-      margin: 0 0 0.25rem;
-      font-size: 1.5rem;
-    }}
-    .muted {{
-      color: var(--muted);
-      margin: 0.125rem 0 0.75rem;
-    }}
-    .version {{
-      font-size: 0.875rem;
-      color: var(--ok);
-      margin-bottom: 1rem;
-    }}
-    form {{
-      display: flex;
-      gap: 0.5rem;
-      margin: 1rem 0 0.75rem;
-      flex-wrap: wrap;
-    }}
-    input[type="text"] {{
-      flex: 1 1 420px;
-      min-width: 220px;
-      background: #0d141b;
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 0.7rem 0.8rem;
-      font-size: 0.95rem;
-    }}
-    button {{
-      background: var(--accent);
-      color: #05131d;
-      border: 0;
-      border-radius: 10px;
-      padding: 0.7rem 1rem;
-      font-weight: 700;
-      cursor: pointer;
-    }}
-    code {{
-      background: #0c141b;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.1rem 0.35rem;
-    }}
-    ul {{
-      margin-top: 0.5rem;
-      color: var(--muted);
-    }}
-    a {{
-      color: var(--accent);
-    }}
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; box-sizing: border-box; font-family: system-ui, sans-serif; line-height: 1.5; background: #ffffff; color: #1a1a1a; }
+    main { max-width: 32rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+    a { color: #0b57d0; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #121212; color: #ececec; }
+      a { color: #8ab4f8; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>ElastOS Gateway</h1>
-    <p class="muted">Public ElastOS edge for MyWebSite, publisher objects, and read-only CID content.</p>
-    <p class="version">Version {}</p>
-
-    <form id="cid-form">
-      <input id="cid-input" type="text" placeholder="Paste CID, elastos://CID, or gateway URL" autocomplete="off" />
-      <button type="submit">Open</button>
-    </form>
-
-    <p class="muted">URL format: <code>/s/&lt;cid&gt;/</code></p>
-    <ul>
-      <li>Health check: <a href="/healthz">/healthz</a></li>
-      <li>Site root: <code>/</code> from <code>localhost://MyWebSite</code> or a bound Edge target.</li>
-      <li>Publisher objects: <code>/release-head.json</code>, <code>/release.json</code>, <code>/install.sh</code>, <code>/artifacts/...</code></li>
-      <li>Content example: <code>/s/bafy.../</code></li>
-    </ul>
+    <h1>ElastOS Home</h1>
+    <p>This is an ElastOS Home. It has no public website.</p>
+    <p><a href="https://elastos.elacitylabs.com/">About ElastOS</a></p>
   </main>
-
-  <script>
-    (function () {{
-      function extractCid(input) {{
-        var s = (input || "").trim().replace(/\/+$/, "");
-        if (!s) return "";
-        if (s.startsWith("elastos://")) return s.slice("elastos://".length).split("/")[0];
-        var m1 = s.match(/\/ipfs\/([^\/?#]+)/);
-        if (m1 && m1[1]) return m1[1];
-        var m2 = s.match(/^https?:\/\/([^./]+)\.ipfs\./i);
-        if (m2 && m2[1]) return m2[1];
-        return s;
-      }}
-
-      var form = document.getElementById("cid-form");
-      var input = document.getElementById("cid-input");
-      if (!form || !input) return;
-      form.addEventListener("submit", function (e) {{
-        e.preventDefault();
-        var cid = extractCid(input.value);
-        if (!cid) return;
-        window.location.href = "/s/" + encodeURIComponent(cid) + "/";
-      }});
-    }})();
-  </script>
 </body>
-</html>"#,
-        GATEWAY_VERSION
-    ))
+</html>
+"#;
+
+async fn landing_page() -> Html<String> {
+    Html(LANDING_PAGE_HTML.to_string())
 }
 
 include!("gateway_models.rs");

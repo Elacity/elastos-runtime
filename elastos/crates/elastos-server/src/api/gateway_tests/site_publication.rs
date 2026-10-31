@@ -175,7 +175,7 @@ fn test_advertised_gateway_urls_for_wildcard_bind_starts_with_loopback() {
 }
 
 #[tokio::test]
-async fn test_landing_page_200() {
+async fn test_landing_page_is_plain_home_page() {
     let dir = tempfile::tempdir().unwrap();
     let state = test_state(dir.path());
     let app = gateway_router(state);
@@ -186,11 +186,23 @@ async fn test_landing_page_200() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(content_type.starts_with("text/html"), "{content_type}");
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("ElastOS Gateway"));
+    assert!(text.contains("This is an ElastOS Home. It has no public website."));
+    assert!(text.contains(r#"<a href="https://elastos.elacitylabs.com/">About ElastOS</a>"#));
+    assert!(!text.contains(GATEWAY_VERSION));
+    assert!(!text.contains("/s/"));
+    assert!(!text.contains("healthz"));
+    assert!(!text.contains("<script"));
 }
 
 #[tokio::test]
