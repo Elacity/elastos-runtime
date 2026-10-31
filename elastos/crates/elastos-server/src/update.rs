@@ -2328,7 +2328,8 @@ mod tests {
         // The 0.8 train is renamed 2.0.0: each step of the jump is an update.
         for (installed, offered) in [
             ("0.8.0-alpha.26", "2.0.0-rc.1"),
-            ("2.0.0-rc.1", "2.0.0"),
+            ("2.0.0-rc.1", "2.0.0-rc.2"),
+            ("2.0.0-rc.2", "2.0.0"),
             ("0.7.1", "2.0.0"),
         ] {
             assert_eq!(

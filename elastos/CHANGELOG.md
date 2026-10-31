@@ -223,6 +223,53 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   raises its soft open-file limit to the hard limit, at most 10240, when it
   starts, and the Browser local exit keeps accepting after an accept error.
 
+## [2.0.0-rc.2] - 2026-10-31
+
+Second release candidate for 2.0.0 on the test channel.
+
+### Added
+
+- Admins can add another passkey, such as a second device or a security key, in System > Accounts > Add passkey. When sign-in fails, the lock screen says why.
+- Screens 640 px wide or less get a touch layout with a Dock and one app at a time. A phone still needs an HTTPS address for Home, which 2.0.0 does not set up (#116).
+- People has three pages: People, Profile and Public. Add someone by their DID from People, a Chat profile card or a message, even if you are not in Public.
+- A contact request waits 24 hours for the other Home to open.
+- Library's Share with contacts lets your contacts get a file of up to 8 MiB while your Home runs, and Chat's Attach posts a file's link in Community. Others must add you first, and files you received are not passed on.
+- On a Mac, admins can add a Venice or OpenRouter key in System > Models. Nothing is sent until you approve it in Inbox.
+
+### Changed
+
+- Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
+- From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
+- If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
+- Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
+- Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
+- After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
+- Your Home joins the shared Community. To stay out, run elastos setup --isolated before it first joins, or an admin leaves in System > Security. Inbox asks once whether members see when you are online.
+- Posts between networks pass through the main Community node, which can read them until the relay arrives in a later release. Direct messages need a direct connection, which some networks block.
+- After a network change, Home reconnects to Community by itself, usually within minutes. If a direct message is still Sending, restart either Home (#451).
+- Hidden in 2.0.0: Services, so contacts cannot share AI models or Browser; WalletConnect until it is set up; Approval Lens and Apps & Services in System; and the Archive tile.
+- Files no longer use the public IPFS network. Copies to your own other devices are not available yet (#498).
+- Known issue: Browser runs only on Apple Silicon Macs and has no Chinese, Japanese or Korean fonts.
+- Known issue: on a Jetson, getting Qwen takes about 43 minutes and its first reply about 22 seconds.
+- Known issue: Library can lose a save if the file is saved from two places at once, or renamed, moved or deleted meanwhile (#480).
+- Known issue: unsaved Documents edits are lost when sign-in ends after 12 hours without Home running, such as while the computer sleeps (#497).
+
+### Fixed
+
+- Since 2.0.0-rc.1: Assistant follows a Light or Dark change at once, shows long numbered lists in full and keeps its newest reply above the message box. System shows these notes as a list.
+- Assistant can edit and delete a message you just sent, and Qwen2.5 1.5B answers ordinary requests.
+- Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
+- Web links in Chat and Documents open only after you see the address and choose Open link. Documents Autosave is off by default.
+- Home starts with any number of large Library files. Library is faster and checks an archive before Extract Here.
+
+### Security
+
+- Web pages open in a separate sandbox, and apps need permission to reach your private data. Releases are signed with a new key kept off the public server.
+- Browser gets security fixes (Chromium 155). On a Mac it downloads a new image of about 900 MB once after the update.
+- Not done yet: Home can still use every app's permissions, background services run with your account's rights, and approvals do not have a screen only ElastOS controls (#173).
+- Importing a Recovery Kit does not yet ask for your passkey again (#403). On Linux with KVM, the Browser network helper is installed with sudo without a file check (#406).
+- Guests cannot see the security log or use the web Terminal, which is off by default.
+
 ## [2.0.0-rc.1] - 2026-10-30
 
 Release candidate for 2.0.0 on the test channel, with the same notes.
