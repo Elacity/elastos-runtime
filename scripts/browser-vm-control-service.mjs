@@ -100,8 +100,6 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
-const HOST_READINESS_STAMPS_SCHEMA = "elastos.browser.vm-host-readiness-stamps/v1";
-const MAX_HOST_READINESS_STAMPS_BYTES = 64 * 1024;
 // Probe inputs that are not files: where the preflight resolves its tools and
 // which platform it admits for. The Darwin TURN program is a stamped file.
 const READINESS_INPUT_ENV = [
@@ -111,9 +109,9 @@ const READINESS_INPUT_ENV = [
   "ELASTOS_DEBUGFS_BIN", "PATH",
 ];
 
-// Stamps of every readiness input: host platform/architecture/OS release, the
-// probe's environment, and each file's dev/inode/mode/size/mtime/ctime. They
-// identify the inputs a ready probe saw; they are not a checksum of them.
+// Key of the in-memory ready result: host platform/architecture/OS release,
+// the probe's environment, and each input file's dev/inode/mode/size/mtime/
+// ctime. A changed input, platform or architecture probes again.
 function readinessInputStamps(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
@@ -150,79 +148,6 @@ function readinessInputStamps(dataDir, launcher) {
   }
 }
 
-// The probe hashes the whole rootfs. Its ready result is kept beside the image
-// with the input stamps it saw, so a Runtime restart with the same inputs does
-// not hash again; any replaced or touched input, or another host, misses.
-function hostReadinessStampsPath(dataDir) {
-  return path.join(dataDir, "browser-vm/host-readiness.json");
-}
-
-function ownedPrivateParent(file) {
-  try {
-    const parent = fs.lstatSync(path.dirname(file));
-    return parent.isDirectory() && parent.uid === process.getuid() && (parent.mode & 0o022) === 0;
-  } catch {
-    return false;
-  }
-}
-
-// Unsafe or foreign state is never trusted: it reads as absent and the probe runs.
-function persistedHostReadiness(dataDir, stamps) {
-  const file = hostReadinessStampsPath(dataDir);
-  if (!ownedPrivateParent(file)) return null;
-  let fd;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    const info = fs.fstatSync(fd);
-    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o777) !== 0o600 ||
-        info.nlink !== 1 || info.size > MAX_HOST_READINESS_STAMPS_BYTES) return null;
-    const bytes = Buffer.alloc(info.size);
-    if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length) return null;
-    const record = JSON.parse(bytes.toString("utf8"));
-    if (
-      record?.schema === HOST_READINESS_STAMPS_SCHEMA &&
-      record.input_stamps === stamps &&
-      record.probe_result?.schema === "elastos.browser.engine-readiness/v1" &&
-      record.probe_result.readiness?.state === "ready"
-    ) {
-      return record.probe_result;
-    }
-  } catch {
-    // Missing, unreadable or malformed state misses.
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-  return null;
-}
-
-function persistHostReadiness(dataDir, stamps, result) {
-  const file = hostReadinessStampsPath(dataDir);
-  if (!ownedPrivateParent(file)) return;
-  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-  let fd;
-  let created = false;
-  try {
-    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
-      fs.constants.O_NOFOLLOW, 0o600);
-    created = true;
-    fs.writeSync(fd, JSON.stringify({ schema: HOST_READINESS_STAMPS_SCHEMA, input_stamps: stamps, probe_result: result }));
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    // Rename replaces the entry atomically; an existing entry is never truncated.
-    fs.renameSync(temporary, file);
-    created = false;
-  } catch {
-    if (fd !== undefined) fs.closeSync(fd);
-    // Remove only the temporary file this call created.
-    if (created) {
-      try {
-        fs.unlinkSync(temporary);
-      } catch {}
-    }
-  }
-}
-
 async function engineReadiness(config) {
   const unavailable = (reason) => ({
     schema: "elastos.browser.engine-readiness/v1",
@@ -251,12 +176,6 @@ async function engineReadiness(config) {
   }
   const stamps = readinessInputStamps(dataDir, config.launcher_program);
   if (stamps && readyHostReadiness?.stamps === stamps) return readyHostReadiness.result;
-  const persisted = stamps && persistedHostReadiness(dataDir, stamps);
-  if (persisted) {
-    readyHostReadiness = { stamps, result: persisted };
-    logEvent("host_readiness", { source: "persisted_stamps", state: "ready" });
-    return persisted;
-  }
   // Service start and the first open share one probe.
   hostReadinessProbe ??= probeHostReadiness(config, dataDir, stamps)
     .finally(() => { hostReadinessProbe = null; });
@@ -297,7 +216,6 @@ function probeHostReadiness(config, dataDir, stamps) {
             return resolve(finish(unavailable("preparation_required")));
           }
           readyHostReadiness = { stamps, result };
-          persistHostReadiness(dataDir, stamps, result);
         }
         resolve(finish(result));
       } catch {
