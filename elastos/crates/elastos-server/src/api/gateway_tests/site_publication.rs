@@ -197,7 +197,7 @@ async fn test_landing_page_is_plain_home_page() {
         .await
         .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("This is an ElastOS Home. It has no public website."));
+    assert!(text.contains("This is an ElastOS Home. No public website is available here."));
     assert!(text.contains(r#"<a href="https://elastos.elacitylabs.com/">About ElastOS</a>"#));
     assert!(!text.contains(GATEWAY_VERSION));
     assert!(!text.contains("/s/"));

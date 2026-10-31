@@ -1324,7 +1324,7 @@ const LANDING_PAGE_HTML: &str = r#"<!DOCTYPE html>
 <body>
   <main>
     <h1>ElastOS Home</h1>
-    <p>This is an ElastOS Home. It has no public website.</p>
+    <p>This is an ElastOS Home. No public website is available here.</p>
     <p><a href="https://elastos.elacitylabs.com/">About ElastOS</a></p>
   </main>
 </body>
