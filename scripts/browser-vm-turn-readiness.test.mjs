@@ -171,6 +171,39 @@ test("mechanics (mock probe): a host architecture change re-probes", async t => 
   assert.equal(c.probes.length, 2);
 });
 
+for (const tool of ["debugfs", "python3"]) {
+  test(`mechanics (mock probe): replacing ${tool} found through PATH re-probes`, async t => {
+    const c = controller(t);
+    const tools = path.join(c.root, "tools");
+    fs.mkdirSync(tools);
+    const real = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    const write = () => {
+      const next = path.join(tools, `${tool}.new`);
+      fs.writeFileSync(next, tool === "python3" ? `#!/bin/sh\nexec "${real}" "$@"\n` : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      fs.renameSync(next, path.join(tools, tool)); // Same name on PATH, new inode.
+    };
+    write();
+    c.env.PATH = `${tools}:${process.env.PATH}`;
+    assert.deepEqual(await c.read(), ready);
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 1);
+    write();
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 2, `a new ${tool} on the same PATH must not reuse readiness`);
+  });
+}
+
+test("mechanics (mock probe): a configured but absent debugfs keeps a successful probe ready", async t => {
+  const c = controller(t);
+  c.env.ELASTOS_DEBUGFS_BIN = path.join(c.root, "absent-debugfs");
+  assert.deepEqual(await c.read(), ready, "optional debugfs absence must not turn ready into preparation_required");
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1);
+  fs.writeFileSync(c.env.ELASTOS_DEBUGFS_BIN, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 2, "a debugfs that appears is a new input");
+});
+
 test("the control service probes readiness when it starts, before any request", async t => {
   const f = fixture(t);
   const child = spawn(process.execPath, [new URL("./browser-vm-control-service.mjs", import.meta.url).pathname], {

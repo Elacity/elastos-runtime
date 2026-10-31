@@ -124,9 +124,6 @@ function readinessInputStamps(dataDir, launcher) {
       : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
     path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
   ];
-  for (const key of ["ELASTOS_BROWSER_VM_PYTHON", "ELASTOS_DEBUGFS_BIN"]) {
-    if (path.isAbsolute(process.env[key] || "")) files.push(process.env[key]);
-  }
   if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
   } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
@@ -134,18 +131,42 @@ function readinessInputStamps(dataDir, launcher) {
     if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
     files.push(turnProgram);
   }
+  const stamp = (file) => {
+    const info = fs.statSync(file, { bigint: true });
+    return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
+  };
   try {
     return JSON.stringify({
       host: [process.platform, process.arch, os.release()],
       env: READINESS_INPUT_ENV.map((key) => [key, process.env[key] ?? null]),
-      files: files.map((file) => {
-        const info = fs.statSync(file, { bigint: true });
-        return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
+      files: files.map(stamp),
+      // The preflight runs these through the same PATH; debugfs is optional.
+      tools: [
+        ["python", process.env.ELASTOS_BROWSER_VM_PYTHON || "python3"],
+        ["debugfs", process.env.ELASTOS_DEBUGFS_BIN || "debugfs"],
+      ].map(([name, command]) => {
+        const resolved = resolveReadinessTool(command);
+        return resolved ? [name, ...stamp(resolved)] : [name, command, "absent"];
       }),
     });
   } catch {
     return null;
   }
+}
+
+// Mirrors the preflight's resolution: a command with a slash is used as is,
+// a bare name is the first executable file on PATH.
+function resolveReadinessTool(command) {
+  const candidates = command.includes("/")
+    ? [path.resolve(command)]
+    : (process.env.PATH || "").split(":").filter(Boolean).map((dir) => path.join(dir, command));
+  for (const candidate of candidates) {
+    try {
+      const info = fs.statSync(candidate);
+      if (info.isFile() && (info.mode & 0o111) !== 0) return candidate;
+    } catch {}
+  }
+  return null;
 }
 
 async function engineReadiness(config) {

@@ -43,7 +43,7 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
     def tearDown(self):
         # Closing every owner pipe stops the services; force only a process
         # that is still the exact one this test started.
-        for writer in self.writers:
+        for writer in list(self.writers):  # close_owner removes from the list
             self.close_owner(writer)
         for pid, start in self.services.items():
             if not wait_gone(pid, start, 5) and started(pid) == start:
