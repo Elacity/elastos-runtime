@@ -717,6 +717,8 @@ jobs:
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           install -d -m 700 "$RUNNER_TEMP/upstream-home"
+          # Darwin: Cargo and its C dependencies target macOS 11.0, not the runner SDK.
+          [[ "${{ matrix.host }}" != darwin ]] || export MACOSX_DEPLOYMENT_TARGET=11.0
           bundle=()
           [[ "$UPSTREAM_PLATFORM" != linux-arm64 ]] \
             || bundle=(--llama-arm64-bundle "$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz")
@@ -1027,6 +1029,9 @@ jobs:
     # The two hop builds may take 30 minutes and the update journey step 75.
     timeout-minutes: 150
     needs: source-gate
+    env:
+      # Cargo and its C dependencies target macOS 11.0, not the runner SDK.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: set job build directories
         run: |
