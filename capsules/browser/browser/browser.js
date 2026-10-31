@@ -38,7 +38,9 @@ const PAGE_STATUS_AFTER_INPUT_DELAY_MS = 650;
 const PAGE_STATUS_AFTER_SCROLL_DELAY_MS = 1200;
 const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
-const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
+// The open job has no push channel; its status read is a local job lookup, so
+// a short interval costs little and shows the display as soon as it is ready.
+const BROWSER_OPEN_POLL_INTERVAL_MS = 250;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
 const BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS = 5;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;

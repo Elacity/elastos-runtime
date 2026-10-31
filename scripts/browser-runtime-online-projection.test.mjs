@@ -92,7 +92,7 @@ test("online projection brackets initial navigation and follows later navigation
     '"before_initial_navigation"',
   );
   const navigation = controlServiceSource.indexOf(
-    "const navigation = await navigateInitialBrowserPage(cdp, browserControl, url);",
+    'const navigation = await navigateInitialBrowserPage(cdp, browserControl, url, "initial", {',
     beforeProjection,
   );
   const afterProjection = controlServiceSource.indexOf(

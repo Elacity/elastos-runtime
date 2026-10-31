@@ -2308,7 +2308,7 @@ function summarizeNetworkFailure(params, source = "Network.loadingFailed") {
   };
 }
 
-async function waitForInitialNavigation(cdp, browserControl, navigation, label = "initial") {
+async function waitForInitialNavigation(cdp, browserControl, navigation, label = "initial", { awaitLoad = true } = {}) {
   const failures = [];
   if (navigation.errorText) {
     if (isRetryableRuntimeNavigationError(navigation.errorText)) {
@@ -2338,6 +2338,9 @@ async function waitForInitialNavigation(cdp, browserControl, navigation, label =
       warning: error instanceof Error ? error.message : String(error),
     }));
   }
+  if (!awaitLoad) {
+    return { failures, network_changed: false, retryable: false };
+  }
   try {
     await cdp.waitForEvent("Page.loadEventFired", Math.min(browserControl.timeoutMs, 5000), "load");
     console.error(JSON.stringify({
@@ -2358,7 +2361,7 @@ async function waitForInitialNavigation(cdp, browserControl, navigation, label =
   return { failures, network_changed: false, retryable: false };
 }
 
-async function observeInitialNavigation(cdp, browserControl, label, action) {
+async function observeInitialNavigation(cdp, browserControl, label, action, options = {}) {
   const failures = [];
   cdp.clearEvents(["Page.domContentEventFired", "Page.loadEventFired", "Network.loadingFailed"]);
   const removeFailureHandler = cdp.onEvent("Network.loadingFailed", (params) => {
@@ -2382,7 +2385,7 @@ async function observeInitialNavigation(cdp, browserControl, label, action) {
         timed_out: isPageNavigateTimeoutError(message),
       };
     }
-    const readiness = await waitForInitialNavigation(cdp, browserControl, navigation, label);
+    const readiness = await waitForInitialNavigation(cdp, browserControl, navigation, label, options);
     const allFailures = [...failures, ...(readiness.failures || [])];
     const networkChanged = readiness.network_changed === true ||
       allFailures.some((failure) => isNetworkChangedError(failure.error_text));
@@ -2400,12 +2403,13 @@ async function observeInitialNavigation(cdp, browserControl, label, action) {
   }
 }
 
-async function navigateInitialBrowserPage(cdp, browserControl, url, label = "initial") {
+async function navigateInitialBrowserPage(cdp, browserControl, url, label = "initial", options = {}) {
   const first = await observeInitialNavigation(
     cdp,
     browserControl,
     label,
     () => cdp.request("Page.navigate", { url }, browserControl.timeoutMs),
+    options,
   );
   if (first.retryable !== true) {
     return first.navigation;
@@ -2438,6 +2442,7 @@ async function navigateInitialBrowserPage(cdp, browserControl, url, label = "ini
     browserControl,
     `${label}-repair`,
     () => cdp.request("Page.navigate", { url }, browserControl.timeoutMs),
+    options,
   );
   if (second.retryable) {
     if (second.timed_out || second.failures.some((failure) => isNavigationAbortedError(failure.error_text))) {
@@ -2951,32 +2956,19 @@ export class SelkiesPage {
     const wallet = normalizeWalletBridge(this.launchRequest.wallet || {});
     this.wallet = wallet;
     const displaySize = browserDisplayMetrics(this.config);
+    // The display stream does not depend on the page. Negotiate it while the
+    // initial navigation runs, so the first frame does not wait for the page.
     logControlEvent("page_open_browser_page_start", { page_id: this.pageId });
-    const browserPage = await openBrowserPage(
-      this.config,
-      this.launchRequest.url,
-      wallet,
-      this.launchRequest,
-      { forceNewTarget: this.forceNewTarget },
-    );
-    browserPage.page_id = this.pageId;
-    logControlEvent("page_open_browser_page_done", {
-      page_id: this.pageId,
-      target_id: browserPage.target_id || null,
-      actual_url: browserPage.url || null,
-    });
-    browserPage._stopWalletBridgeWatch = startWalletBridgeWatch(
-      browserPage,
-      wallet,
-      this.config.browserControl.timeoutMs,
-    );
-    this.browserPage = browserPage;
+    const pageOpen = this.openLaunchBrowserPage(wallet).then((browserPage) => this.adoptLaunchBrowserPage(browserPage, wallet));
+    // Mark the rejection handled now; it is rethrown by the await below.
+    pageOpen.catch(() => {});
     logControlEvent("page_open_video_sdp_start", { page_id: this.pageId });
     const videoOffer = await this.openWebRtcSession(displaySize);
     logControlEvent("page_open_video_sdp_done", { page_id: this.pageId });
     logControlEvent("page_open_audio_sdp_start", { page_id: this.pageId });
     const audioOffer = await this.openAudioWebRtcSession(displaySize);
     logControlEvent("page_open_audio_sdp_done", { page_id: this.pageId });
+    const browserPage = await pageOpen;
     const result = this.supervisorResult(
       videoOffer.sdp.sdp,
       browserPage,
@@ -2988,6 +2980,41 @@ export class SelkiesPage {
     this.establishedVideoProtocol = this.signalingEnvelope;
     this.establishedAudioProtocol = this.audioSignalingEnvelope;
     return result;
+  }
+
+  openLaunchBrowserPage(wallet) {
+    return openBrowserPage(
+      this.config,
+      this.launchRequest.url,
+      wallet,
+      this.launchRequest,
+      { forceNewTarget: this.forceNewTarget, deferLoad: true },
+    );
+  }
+
+  releaseLaunchBrowserPage(browserPage) {
+    return closeBrowserPage(this.config.browserControl, browserPage);
+  }
+
+  adoptLaunchBrowserPage(browserPage, wallet) {
+    browserPage.page_id = this.pageId;
+    logControlEvent("page_open_browser_page_done", {
+      page_id: this.pageId,
+      target_id: browserPage.target_id || null,
+      actual_url: browserPage.url || null,
+    });
+    if (this.closed) {
+      // Signaling failed or the open timed out first; close the late page.
+      this.releaseLaunchBrowserPage(browserPage).catch(() => {});
+      throw new Error("Browser page open finished after its session closed");
+    }
+    browserPage._stopWalletBridgeWatch = startWalletBridgeWatch(
+      browserPage,
+      wallet,
+      this.config.browserControl.timeoutMs,
+    );
+    this.browserPage = browserPage;
+    return browserPage;
   }
 
   createWebSocket() {
@@ -4936,7 +4963,9 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
     initScriptId = await installWalletBridge(cdp, wallet);
     logControlEvent("browser_page_wallet_bridge_done", { target_id: body.id || null });
     logControlEvent("browser_page_initial_navigation_start", { target_id: body.id || null, url });
-    const navigation = await navigateInitialBrowserPage(cdp, browserControl, url);
+    const navigation = await navigateInitialBrowserPage(cdp, browserControl, url, "initial", {
+      awaitLoad: options.deferLoad !== true,
+    });
     logControlEvent("browser_page_initial_navigation_done", {
       target_id: body.id || null,
       error_text: navigation.errorText || null,
@@ -4965,12 +4994,53 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
     browserPage.init_script_id = initScriptId;
     browserPage.url = page.url;
     browserPage.title = page.title;
+    if (options.deferLoad === true) {
+      refreshBrowserPageStateAfterLoad(cdp, browserPage, browserControl);
+    }
     return browserPage;
   } finally {
     if (!keepCdp) {
       cdp.close();
     }
   }
+}
+
+// A launch returns after DOMContentLoaded. Page status reads this cache, so
+// the final URL and title reach Home when the load event (or its 5 s bound)
+// arrives instead of delaying the first frame.
+function refreshBrowserPageStateAfterLoad(cdp, browserPage, browserControl) {
+  const boundMs = Math.min(browserControl.timeoutMs, 5000);
+  let settled = false;
+  let removeHandler = () => {};
+  const current = () => !cdp.closed && browserPage._cdp === cdp && browserPage.navigationInProgress !== true;
+  const settle = (ok) => {
+    if (settled) return;
+    settled = true;
+    removeHandler();
+    clearTimeout(timer);
+    console.error(JSON.stringify({
+      schema: "elastos.browser.selkies-control.navigation-ready/v1",
+      label: "initial",
+      event: "load",
+      deferred: true,
+      ok,
+      ...(ok ? {} : { warning: "timed out waiting for browser CDP event load" }),
+    }));
+    if (!current()) return;
+    readBrowserPageState(cdp, browserPage.url, browserPage.title, boundMs)
+      .then((state) => {
+        if (!current() || isBrowserErrorUrl(state.url)) return;
+        browserPage.url = state.url;
+        browserPage.title = state.title;
+      })
+      .catch(() => {});
+  };
+  const timer = setTimeout(() => settle(false), boundMs);
+  timer.unref?.();
+  // A handler only sees events no waiter claimed, so a later navigation's own
+  // load wait keeps its event.
+  removeHandler = cdp.onEvent("Page.loadEventFired", () => settle(true));
+  if (cdp.events.some((event) => event.method === "Page.loadEventFired")) settle(true);
 }
 
 function validatePasteText(value) {
