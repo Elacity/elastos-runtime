@@ -10,6 +10,10 @@ export function browserStageSize(width, height) {
   return { width, height };
 }
 
+// A request that fails without a typed refusal is retried once after this
+// delay: the frame fence holds pointer input until a resize is accepted.
+export const RESIZE_RETRY_MS = 1000;
+
 export function observeBrowserStage({ stage, getOwner, send, onError,
   ResizeObserverClass = globalThis.ResizeObserver,
   setTimer = setTimeout, clearTimer = clearTimeout,
@@ -35,8 +39,16 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
       else if (result?.resize_error && next.owner === getOwner()) onError(result.resize_error);
     } catch (error) {
       // A failed request leaves the guest geometry unknown, so the same size
-      // must be sendable again to recover.
-      if (next.owner === getOwner()) { applied = null; onError(error); }
+      // must be sendable again to recover. It is retried once by itself; a
+      // second failure is reported and waits for the next size change.
+      if (next.owner === getOwner()) {
+        applied = null;
+        if (next.retried) onError(error);
+        else if (!pending) {
+          pending = { ...next, retried: true };
+          timer = setTimer(() => { void flush(); }, RESIZE_RETRY_MS);
+        }
+      }
     } finally {
       inFlight = false;
       // A size that is still settling keeps its own debounce deadline.

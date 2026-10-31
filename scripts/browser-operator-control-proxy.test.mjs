@@ -34,3 +34,32 @@ test("operator proxy timeout closes its own hanging Unix exchange",async t=>{
   const h=await harness(t);h.respond(()=>{});const started=performance.now();
   await assert.rejects(h.input());assert.ok(performance.now()-started<2500);
 });
+test("input route logs failed input and resize outcomes without input bodies",async t=>{
+  const h=await harness(t),events=[];
+  const routeStart=source.indexOf("      const pageInputMatch ="),routeEnd=source.indexOf("      const pageWebrtcMatch =",routeStart);
+  assert.ok(routeStart>0&&routeEnd>routeStart);
+  const context=vm.createContext({http,Buffer,Error,Date,AbortController,setTimeout,clearTimeout,config:{signal_timeout_ms:2000},
+    activePages:h.activePages,activeVms:new Map(),MAX_BROWSER_INPUT_BODY_BYTES:1<<20,logEvent:(event,fields)=>events.push({event,...JSON.parse(JSON.stringify(fields))})});
+  vm.runInContext(["safeId","validateAbsolutePath","vmOwnsExactPage","ownedVmRecord","activePageGuestControl","requestJsonOverUnix","browserDisplayControlError","browserInspectionControlError","postJsonOverUnix","proxyGuestPageInput","readJsonBody","boundedLogText","logPageInput"].map(declaration).join("\n"),context);
+  const handler=vm.runInContext(`(async function(req, url, sendJson) { ${source.slice(routeStart,routeEnd)}\n sendJson(405, {}); })`,context);
+  const proxy=http.createServer((req,res)=>{handler(req,new URL(req.url,"http://localhost"),(status,body)=>{res.writeHead(status,{"content-type":"application/json"});res.end(JSON.stringify(body));});});
+  t.after(async()=>{proxy.closeAllConnections();await new Promise(resolve=>proxy.close(resolve));});
+  await new Promise(resolve=>proxy.listen(0,"127.0.0.1",resolve));
+  const post=event=>fetch(`http://127.0.0.1:${proxy.address().port}/pages/page%3Aowned/input`,{method:"POST",body:JSON.stringify({event})});
+  const resize={type:"resize",width:390,height:1200,sequence:7};
+  h.respond((_req,res)=>{res.writeHead(500,{"content-type":"application/json"});res.end(JSON.stringify({error:`resize failed: ${"x".repeat(400)}`}));});
+  assert.equal((await post(resize)).status,404);
+  h.respond((_req,res)=>{res.writeHead(500,{"content-type":"application/json"});res.end(JSON.stringify({error:"navigate failed"}));});
+  assert.equal((await post({type:"browser_command",command:"navigate",url:"https://secret.invalid/?token=abc"})).status,404);
+  h.respond((_req,res)=>res.end(JSON.stringify({schema:"elastos.browser.input-result/v1",page_id:"page:owned",accepted:true,width:390,height:1200,sequence:7})));
+  assert.equal((await post(resize)).status,200);
+  assert.equal((await post({type:"paste_text",text:"private words"})).status,200);
+  assert.deepEqual(events.map(({event,event_type})=>[event,event_type]),[["page_input_failed","resize"],["page_input_failed","browser_command"],["page_input_resize","resize"]]);
+  const [failedResize,failedNavigate,resized]=events;
+  assert.equal(failedResize.page_id,"page:owned");assert.equal(failedResize.guest_status,500);
+  assert.deepEqual(failedResize.requested,{width:390,height:1200,sequence:7});
+  assert.ok(failedResize.error.startsWith("resize failed: x"));assert.equal(failedResize.error.length,241);
+  assert.equal(failedNavigate.error,"navigate failed");assert.ok(!JSON.stringify(events).includes("secret.invalid"));
+  assert.ok(!JSON.stringify(events).includes("private words"));
+  assert.deepEqual([resized.accepted,resized.page_id_match,resized.width,resized.height,resized.sequence],[true,true,390,1200,7]);
+});

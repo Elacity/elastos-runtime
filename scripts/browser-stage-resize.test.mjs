@@ -1,19 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { browserStageSize, observeBrowserStage, createBrowserFrameFence } from "../capsules/browser/browser/browser-resize.js";
+import { browserStageSize, observeBrowserStage, createBrowserFrameFence, RESIZE_RETRY_MS } from "../capsules/browser/browser/browser-resize.js";
 
 function fixture() {
   let callback, owner = "page:1", visible = true, timerId = 0;
-  const timers = new Map(), sent = [], errors = [];
+  const timers = new Map(), delays = [], sent = [], errors = [];
   const stage = { clientWidth: 1001, clientHeight: 701, getClientRects: () => visible ? [{}] : [] };
   const observer = observeBrowserStage({ stage, getOwner: () => owner, initialSequence: 0,
     send(event, owner) { return new Promise((resolve, reject) => sent.push({ event, owner, resolve, reject })); },
     onError: error => errors.push(error),
     ResizeObserverClass: class { constructor(cb) { callback = cb; } observe() {} disconnect() {} },
-    setTimer(fn, ms) { assert.equal(ms, 150); timers.set(++timerId, fn); return timerId; },
+    setTimer(fn, ms) { assert.ok(ms === 150 || ms === RESIZE_RETRY_MS); delays.push(ms); timers.set(++timerId, fn); return timerId; },
     clearTimer(id) { timers.delete(id); },
   });
-  return { observer, sent, errors, stage,
+  return { observer, sent, errors, stage, delays,
     resize(width, height) { callback([{ target: stage, contentRect: { width, height } }]); },
     tick() { const callbacks = [...timers.values()]; timers.clear(); callbacks.forEach(fn => fn()); },
     owner(value) { owner = value; }, visible(value) { visible = value; },
@@ -53,13 +53,32 @@ test("hidden, zero, closed and replaced stages cannot send pending geometry", as
   assert.equal(f.sent.length, 1);
 });
 
-test("failed resize reports recovery and lets the same size be sent again", async () => {
+test("failed resize retries once, then reports and lets the same size be sent again", async () => {
   const f = fixture(); f.observer.opened(); await f.settle(0);
   f.resize(390, 1200); f.tick(); await f.settle(1, true);
+  assert.equal(f.errors.length, 0, "the first failure is retried before it is reported");
+  assert.equal(f.delays.at(-1), RESIZE_RETRY_MS);
+  f.tick();
+  assert.deepEqual(f.sent[2].event, { type: "resize", width: 390, height: 1200, sequence: 3 });
+  await f.settle(2, true);
   assert.equal(f.errors.length, 1);
+  f.tick(); assert.equal(f.sent.length, 3, "a failed retry is not retried again");
   f.resize(1001, 701); f.tick();
-  assert.equal(f.sent.length, 3, "an unknown guest geometry cannot skip the earlier size");
-  assert.equal(f.sent[2].event.sequence, 3); await f.settle(2);
+  assert.equal(f.sent.length, 4, "an unknown guest geometry cannot skip the earlier size");
+  assert.equal(f.sent[3].event.sequence, 4); await f.settle(3);
+});
+
+test("a resize retry succeeds silently; a newer size or a replaced page supersedes it", async () => {
+  const f = fixture(); f.observer.opened(); await f.settle(0, true);
+  f.tick(); assert.equal(f.sent.length, 2); await f.settle(1);
+  assert.equal(f.errors.length, 0);
+  f.resize(1001, 701); f.tick(); assert.equal(f.sent.length, 2, "the retried size is now applied");
+  f.resize(390, 1200); f.tick(); await f.settle(2, true);
+  f.resize(844, 338); f.tick();
+  assert.deepEqual([f.sent[3].event.width, f.sent[3].event.height], [844, 338]);
+  await f.settle(3, true); f.owner("page:2"); f.tick();
+  assert.equal(f.sent.length, 4, "a retry for a replaced page is dropped");
+  assert.equal(f.errors.length, 0);
 });
 
 const turn = async (count = 4) => { for (let i = 0; i < count; i++) await new Promise(resolve => setImmediate(resolve)); };
