@@ -660,13 +660,14 @@ test("Home update requires a verified complete offer and a controller that can a
 test("update notes draw as text lists under headings without Markdown marks", () => {
   const f = updateFixture();
   const items = f.context.updateNoteItems([
-    "### Security", "- Run `elastos update` from **System**.", "See [the guide](https://example.com/guide).",
-    "", "  ", 7, "# ", "Plain line.", "### Fixed", "Another line.",
+    "### Security", "- Run `elastos update` from **System**.", "See [the guide](https://example.com/a_(b)).",
+    "*Also* _this_ keeps snake_case and 2 * 3.", "", "  ", 7, "# ", "Plain line.", "### Fixed", "Another line.",
   ]);
   assert.deepEqual(JSON.parse(JSON.stringify(items)), [
     { heading: true, text: "Security" },
     { heading: false, text: "Run elastos update from System." },
     { heading: false, text: "See the guide." },
+    { heading: false, text: "Also this keeps snake_case and 2 * 3." },
     { heading: false, text: "Plain line." },
     { heading: true, text: "Fixed" },
     { heading: false, text: "Another line." },
@@ -686,9 +687,9 @@ test("update notes draw as text lists under headings without Markdown marks", ()
   const shape = child => child.tag === "ul" ? { ul: child.children.map(entry => entry.textContent) }
     : { [child.tag]: child.textContent, className: child.className };
   assert.deepEqual(node.children.map(shape), [
-    { p: "Security", className: "runtime-update-changes-heading" },
-    { ul: ["Run elastos update from System.", "See the guide.", "Plain line."] },
-    { p: "Fixed", className: "runtime-update-changes-heading" },
+    { h4: "Security", className: "runtime-update-changes-heading" },
+    { ul: ["Run elastos update from System.", "See the guide.", "Also this keeps snake_case and 2 * 3.", "Plain line."] },
+    { h4: "Fixed", className: "runtime-update-changes-heading" },
     { ul: ["Another line."] },
   ]);
   draw.setUpdateNotes([]);

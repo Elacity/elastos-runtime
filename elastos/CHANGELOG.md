@@ -13,7 +13,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Admins can add another passkey, such as a second device or a security key, in System > Accounts > Add passkey. When sign-in fails, the lock screen says why.
 - Screens 640 px wide or less get a touch layout with a Dock and one app at a time. A phone still needs an HTTPS address for Home, which 2.0.0 does not set up (#116).
 - People has three pages: People, Profile and Public. Add someone by their DID from People, a Chat profile card or a message, even if you are not in Public.
-- A contact request waits 24 hours for the other Home to open. Until the main Community node runs 2.0.0, People says requests cannot be delivered yet.
+- A contact request waits 24 hours for the other Home to open.
 - Library's Share with contacts lets your contacts get a file of up to 8 MiB while your Home runs, and Chat's Attach posts a file's link in Community. Others must add you first, and files you received are not passed on.
 - On a Mac, admins can add a Venice or OpenRouter key in System > Models. Nothing is sent until you approve it in Inbox.
 

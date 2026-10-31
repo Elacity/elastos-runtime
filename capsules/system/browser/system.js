@@ -477,7 +477,7 @@ function setUpdateNotes(items) {
     let list = null;
     for (const item of items) {
       if (item.heading) {
-        const heading = document.createElement("p");
+        const heading = document.createElement("h4");
         heading.className = "runtime-update-changes-heading";
         heading.textContent = item.text;
         node.append(heading);
@@ -3690,7 +3690,7 @@ function setRuntimeState(runtime) {
 }
 
 const SOURCE_CHANNEL_NAMES = { canary: "Test", stable: "Stable" };
-const SOURCE_SIGNED_TEXT = "Home installs only updates signed by the publisher it was installed from.";
+const SOURCE_SIGNED_TEXT = "Home installs only updates signed by its configured publisher.";
 
 function setSourceState(source) {
   const configured = Boolean(source && source.configured);
@@ -3744,8 +3744,12 @@ function updateNoteItems(notes) {
     const line = readText(note);
     return {
       heading: /^#{1,6}(?:\s|$)/.test(line),
-      text: line.replace(/^(?:#{1,6}|[-*])(?:\s+|$)/, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-        .replace(/\*\*|__|`/g, "").trim(),
+      text: line.replace(/^(?:#{1,6}|[-*])(?:\s+|$)/, "")
+        .replace(/\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
+        .replace(/\*\*|__|`/g, "")
+        .replace(/(^|[^\w*])\*(?=\S)([^*]*?\S)\*(?![\w*])/g, "$1$2")
+        .replace(/(^|[^\w])_(?=\S)([^_]*?\S)_(?!\w)/g, "$1$2")
+        .trim(),
     };
   }).filter((item) => item.text);
 }
