@@ -34,7 +34,9 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
       if (result?.accepted === true && next.owner === getOwner()) applied = next;
       else if (result?.resize_error && next.owner === getOwner()) onError(result.resize_error);
     } catch (error) {
-      if (next.owner === getOwner()) onError(error);
+      // A failed request leaves the guest geometry unknown, so the same size
+      // must be sendable again to recover.
+      if (next.owner === getOwner()) { applied = null; onError(error); }
     } finally {
       inFlight = false;
       // A size that is still settling keeps its own debounce deadline.
@@ -71,24 +73,37 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
   };
 }
 
-// Hold pointer mapping from the request until a frame with the ACKed geometry
-// decodes. A stalled stream releases the fence after one second.
+// Pointer and wheel input map through the decoded frame. They stay blocked from
+// a resize request until a frame with the guest's geometry decodes; a late
+// frame still clears the fence. A request that fails without a refusal leaves
+// the geometry unknown, so input waits for reset() or a later accepted resize.
 export function createBrowserFrameFence(video, { wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now, timeout = 1000 } = {}) {
-  let generation = 0, blocked = false;
+  let generation = 0, blocked = false, target = null;
+  const shown = () => video.videoWidth === target.width && video.videoHeight === target.height;
+  async function late(current) {
+    while (current === generation && !shown()) await wait(250);
+    if (current === generation) blocked = false;
+  }
   return {
     blocked: () => blocked,
-    reset() { generation++; blocked = false; },
+    reset() { generation++; blocked = false; target = null; },
     async run(send) {
       const current = ++generation;
-      blocked = true;
-      try {
-        const result = await send();
-        const deadline = now() + timeout;
-        while (current === generation && result?.accepted === true &&
-          (video.videoWidth !== result.width || video.videoHeight !== result.height) && now() < deadline) await wait(16);
-        return result;
-      } finally { if (current === generation) blocked = false; }
+      const prior = blocked ? target : video.videoWidth > 0 && video.videoHeight > 0
+        ? { width: video.videoWidth, height: video.videoHeight } : null;
+      blocked = true; target = null;
+      const result = await send();
+      if (current !== generation) return result;
+      if (result?.accepted === true) {
+        if (Number.isInteger(result.width) && Number.isInteger(result.height)) target = { width: result.width, height: result.height };
+      } else if (result?.resize_error) target = prior; // A refusal keeps the earlier geometry.
+      if (!target) return result;
+      const deadline = now() + timeout;
+      while (current === generation && !shown() && now() < deadline) await wait(16);
+      // Past the deadline the fence keeps waiting for the frame, off the request path.
+      if (current === generation) void late(current);
+      return result;
     },
   };
 }

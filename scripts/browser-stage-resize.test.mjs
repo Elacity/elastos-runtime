@@ -53,23 +53,82 @@ test("hidden, zero, closed and replaced stages cannot send pending geometry", as
   assert.equal(f.sent.length, 1);
 });
 
-test("failed resize reports recovery and permits another request", async () => {
-  const f = fixture(); f.observer.opened(); await f.settle(0, true);
-  assert.equal(f.errors.length, 1); f.resize(1001, 701); f.tick();
-  assert.equal(f.sent.length, 2); assert.equal(f.sent[1].event.sequence, 2); await f.settle(1);
+test("failed resize reports recovery and lets the same size be sent again", async () => {
+  const f = fixture(); f.observer.opened(); await f.settle(0);
+  f.resize(390, 1200); f.tick(); await f.settle(1, true);
+  assert.equal(f.errors.length, 1);
+  f.resize(1001, 701); f.tick();
+  assert.equal(f.sent.length, 3, "an unknown guest geometry cannot skip the earlier size");
+  assert.equal(f.sent[2].event.sequence, 3); await f.settle(2);
 });
 
-test("frame fence waits for decoded ACK dimensions and resumes at its deadline", async () => {
+const turn = async (count = 4) => { for (let i = 0; i < count; i++) await new Promise(resolve => setImmediate(resolve)); };
+function fenceFixture(video, onWait = () => {}) {
+  const clock = { now: 0 };
+  const fence = createBrowserFrameFence(video, { now: () => clock.now, timeout: 100,
+    wait: async ms => { clock.now += ms; onWait(fence); await turn(1); } });
+  return { fence, clock };
+}
+const ack = (width, height) => async () => ({ accepted: true, width, height });
+
+test("frame fence clears when the decoded frame shows the ACKed geometry", async () => {
   const video = { videoWidth: 1000, videoHeight: 700 };
-  let now = 0, ticks = 0;
-  const fence = createBrowserFrameFence(video, { now: () => now, timeout: 100,
-    wait: async ms => { assert.equal(fence.blocked(), true); now += ms; ticks++;
-      if (ticks === 3) Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); } });
-  await fence.run(async () => ({ accepted: true, width: 390, height: 1200 }));
+  let ticks = 0;
+  const { fence } = fenceFixture(video, fence => { assert.equal(fence.blocked(), true);
+    if (++ticks === 3) Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); });
+  await fence.run(ack(390, 1200));
   assert.equal(ticks, 3); assert.equal(fence.blocked(), false);
-  await fence.run(async () => ({ accepted: true, width: 844, height: 338 }));
-  assert.ok(now >= 148); assert.equal(fence.blocked(), false);
-  await assert.rejects(fence.run(async () => { throw Error("refused"); }));
+});
+
+test("a frame later than the deadline clears the fence; input stays blocked until then", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence, clock } = fenceFixture(video);
+  await fence.run(ack(390, 1200));
+  assert.ok(clock.now >= 100); assert.equal(fence.blocked(), true);
+  Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); await turn();
+  assert.equal(fence.blocked(), false);
+});
+
+test("no frame at the ACKed size keeps input blocked until the page is reset", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  await fence.run(ack(844, 338)); await turn(8);
+  assert.equal(fence.blocked(), true);
+  fence.reset(); assert.equal(fence.blocked(), false);
+  Object.assign(video, { videoWidth: 844, videoHeight: 338 }); await turn();
+  assert.equal(fence.blocked(), false);
+});
+
+test("a replaced page ends the old wait; old geometry cannot clear the new page", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  await fence.run(ack(390, 1200));
+  assert.equal(fence.blocked(), true);
+  fence.reset(); assert.equal(fence.blocked(), false);
+  let release;
+  const replaced = fence.run(() => new Promise(resolve => { release = resolve; }));
+  fence.reset(); release({ accepted: true, width: 390, height: 1200 }); await replaced;
+  assert.equal(fence.blocked(), false, "an ACK for a replaced page has no effect");
+  const next = fence.run(ack(844, 338));
+  Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); await next; await turn();
+  assert.equal(fence.blocked(), true);
+  Object.assign(video, { videoWidth: 844, videoHeight: 338 }); await turn();
+  assert.equal(fence.blocked(), false);
+});
+
+test("an unknown result keeps input blocked; a refusal keeps the earlier geometry", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  const refusal = async () => ({ accepted: false, resize_error: { code: "resize_dialog_open" } });
+  await assert.rejects(fence.run(async () => { throw Error("network"); }));
+  assert.equal(fence.blocked(), true);
+  await fence.run(refusal); assert.equal(fence.blocked(), true, "a refusal after an unknown result proves nothing");
+  await fence.run(async () => undefined); assert.equal(fence.blocked(), true);
+  await fence.run(ack(1000, 700)); assert.equal(fence.blocked(), false);
+  await fence.run(refusal); assert.equal(fence.blocked(), false);
+  await fence.run(ack(844, 338)); await fence.run(refusal);
+  assert.equal(fence.blocked(), true, "a refusal keeps the ACKed size that has not decoded yet");
+  Object.assign(video, { videoWidth: 844, videoHeight: 338 }); await turn();
   assert.equal(fence.blocked(), false);
 });
 
