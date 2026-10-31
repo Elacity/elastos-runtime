@@ -1,4 +1,4 @@
-import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031c";
+import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031d";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -20,7 +20,7 @@ import {
   sameRuntimePageOwner,
 } from "./browser-page-cleanup.js?v=browser-20260727a";
 import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261031a";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261031a";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261031d";
 import {
   browserMetricsText,
   friendlyOpenError,
@@ -2688,8 +2688,14 @@ const stageResize = observeBrowserStage({
   getOwner: resizeOwner,
   send: (event, owner) => resizeFrameFence.run(() => sendBrowserInput(event, {
     focus: false, isStale: () => owner !== resizeOwner(),
-  })),
-  onError: error => showStatus(error?.message || "Browser could not resize the page. Resize the window to try again."),
+  }), event),
+  onError: error => {
+    // After the retry also fails, pointer input resumes on the geometry the guest still shows.
+    const kept = resizeFrameFence.recover();
+    if (kept) showStatus(`Browser could not resize the page; it stays at ${kept.width}×${kept.height}.`);
+    else if (kept === null) showStatus("Browser could not resize the page. Resize the window to try again.");
+    else showStatus(error?.message || "Browser could not resize the page. Resize the window to try again.");
+  },
 });
 window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
 

@@ -1473,42 +1473,57 @@ function logEvent(event, fields = {}) {
   })}\n`);
 }
 
-function boundedLogText(value, maxChars = 240) {
-  const text = String(value ?? "");
-  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+// Error text from the guest, the request parser or the socket can carry URLs,
+// tokens or typed text, so failures are logged only as these categories.
+function pageInputErrorCode(error) {
+  if (Number.isInteger(error?.guestStatus)) return "guest_rejected";
+  if (error?.name === "URIError") return "invalid_page";
+  if (["ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE"].includes(error?.code)) return "guest_socket";
+  const message = error instanceof Error ? error.message : "";
+  for (const [pattern, code] of [
+    [/^page_id must be a safe identifier$/, "invalid_page"],
+    [/^browser page not found$/, "page_not_found"],
+    [/^browser page cleanup is pending$/, "page_cleanup_pending"],
+    [/^browser page guest control socket is unavailable$/, "guest_unavailable"],
+    [/^Browser VM guest control [A-Z]+ \S+ timed out$/, "guest_timeout"],
+    [/^Browser VM guest control returned non-JSON/, "guest_non_json"],
+    [/^Browser control response exceeded its byte limit$/, "guest_response_too_large"],
+    [/^Browser operator ownership changed$/, "ownership_changed"],
+    [/^request body (?:too large|is not JSON)/, "invalid_request"],
+  ]) {
+    if (pattern.test(message)) return code;
+  }
+  return "other";
 }
 
-// Input bodies carry typed text, URLs and files, so only the event type and
-// resize geometry are logged, with the guest's bounded error message. Every
-// failed input and every resize outcome is logged: the gateway rejects a
-// resize receipt whose page, geometry or sequence does not match the request.
+// Input bodies carry typed text, URLs and files. Only allowlisted fields are
+// logged: event type, guest HTTP status, error category, integer geometry and
+// sequence. Every failed input and every resize outcome is logged, because the
+// gateway rejects a resize receipt whose page, geometry or sequence differs.
 function logPageInput(rawPageId, event, startedAt, result, error = null) {
-  let pageId = rawPageId;
-  try { pageId = decodeURIComponent(rawPageId); } catch { /* keep the raw segment */ }
+  let pageId = null;
+  try { pageId = decodeURIComponent(rawPageId); } catch { /* logged as invalid */ }
   const integer = value => (Number.isSafeInteger(value) ? value : null);
-  const type = typeof event?.type === "string" && /^[a-z_]{1,32}$/.test(event.type) ? event.type : "invalid";
-  const fields = { page_id: boundedLogText(pageId), event_type: type, duration_ms: Date.now() - startedAt };
+  const type = ["browser_command", "click", "clipboard_read", "clipboard_write", "file_upload", "key", "key_combo",
+    "mouse", "operator_lease", "operator_ref", "paste_text", "resize", "wheel"].includes(event?.type) ? event.type : "other";
+  const fields = { page_id: safeId(pageId) ? pageId : "invalid", event_type: type, duration_ms: Date.now() - startedAt };
   if (type === "resize") {
     fields.requested = { width: integer(event.width), height: integer(event.height), sequence: integer(event.sequence) };
   }
   if (error) {
-    logEvent("page_input_failed", {
-      ...fields,
-      guest_status: integer(error?.guestStatus),
-      code: typeof error?.code === "string" ? boundedLogText(error.code) : null,
-      error: boundedLogText(error instanceof Error ? error.message : error),
-    });
+    logEvent("page_input_failed", { ...fields, guest_status: integer(error?.guestStatus), code: pageInputErrorCode(error) });
     return;
   }
   logEvent("page_input_resize", {
     ...fields,
-    schema: typeof result?.schema === "string" ? boundedLogText(result.schema) : null,
+    schema_match: result?.schema === "elastos.browser.input-result/v1",
     page_id_match: result?.page_id === pageId,
     accepted: typeof result?.accepted === "boolean" ? result.accepted : null,
     width: integer(result?.width),
     height: integer(result?.height),
     sequence: integer(result?.sequence),
-    resize_error: typeof result?.resize_error?.code === "string" ? boundedLogText(result.resize_error.code) : null,
+    resize_error: ["resize_dialog_open", "resize_shared_display", "resize_unavailable", "resize_writer_busy"]
+      .includes(result?.resize_error?.code) ? result.resize_error.code : result?.resize_error ? "other" : null,
   });
 }
 

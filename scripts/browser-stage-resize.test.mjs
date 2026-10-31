@@ -151,6 +151,64 @@ test("an unknown result keeps input blocked; a refusal keeps the earlier geometr
   assert.equal(fence.blocked(), false);
 });
 
+test("a resize that fails twice returns pointer input to the geometry the guest still shows", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  const timers = new Map(), requests = [], errors = [];
+  let timerId = 0;
+  const observer = observeBrowserStage({ stage: { clientWidth: 390, clientHeight: 1200, getClientRects: () => [{}] },
+    getOwner: () => "page:1", initialSequence: 0,
+    send: event => fence.run(() => new Promise((resolve, reject) => requests.push({ event, resolve, reject })), event),
+    onError: error => errors.push({ error, kept: fence.recover() }),
+    ResizeObserverClass: class { observe() {} disconnect() {} },
+    setTimer(fn) { timers.set(++timerId, fn); return timerId; }, clearTimer(id) { timers.delete(id); } });
+  observer.opened();
+  requests[0].reject(Error("Browser Engine returned an invalid resize receipt")); await turn();
+  assert.equal(fence.blocked(), true, "pointer input waits for the pending retry");
+  assert.equal(errors.length, 0);
+  [...timers.values()].forEach(fn => fn()); timers.clear();
+  assert.deepEqual(requests[1].event, { type: "resize", width: 390, height: 1200, sequence: 2 });
+  requests[1].reject(Error("Browser Engine returned an invalid resize receipt")); await turn();
+  assert.deepEqual(errors.map(entry => entry.kept), [{ width: 1000, height: 700 }]);
+  assert.equal(fence.blocked(), false, "the decoded frame already shows the kept geometry");
+  assert.equal(timers.size, 0, "no further automatic retry");
+  observer.stop();
+});
+
+test("recover waits for a frame of the earlier or the requested geometry", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  const fail = async () => { throw Error("network"); };
+  await assert.rejects(fence.run(fail, { width: 390, height: 1200 }));
+  Object.assign(video, { videoWidth: 640, videoHeight: 480 });
+  await assert.rejects(fence.run(fail, { width: 390, height: 1200 }));
+  assert.deepEqual(fence.recover(), { width: 1000, height: 700 }, "the retry keeps the geometry from before the first failure");
+  await turn(); assert.equal(fence.blocked(), true);
+  Object.assign(video, { videoWidth: 390, videoHeight: 1200 }); await turn();
+  assert.equal(fence.blocked(), false, "a guest that applied the request also releases input");
+  assert.equal(fence.recover(), undefined);
+});
+
+test("recover with no decoded geometry releases input on the first decoded frame", async () => {
+  const video = { videoWidth: 0, videoHeight: 0 };
+  const { fence } = fenceFixture(video);
+  await assert.rejects(fence.run(async () => { throw Error("network"); }, { width: 390, height: 1200 }));
+  assert.equal(fence.recover(), null); await turn();
+  assert.equal(fence.blocked(), true);
+  Object.assign(video, { videoWidth: 1280, videoHeight: 720 }); await turn();
+  assert.equal(fence.blocked(), false);
+});
+
+test("recover does nothing after a refusal or an accepted resize", async () => {
+  const video = { videoWidth: 1000, videoHeight: 700 };
+  const { fence } = fenceFixture(video);
+  await fence.run(async () => ({ accepted: false, resize_error: { code: "resize_dialog_open" } }));
+  assert.equal(fence.recover(), undefined); assert.equal(fence.blocked(), false);
+  await assert.rejects(fence.run(async () => { throw Error("network"); }, { width: 390, height: 1200 }));
+  await fence.run(ack(1000, 700));
+  assert.equal(fence.recover(), undefined); assert.equal(fence.blocked(), false);
+});
+
 test("display setup has no resize owner; first ready frame sends the stage size", () => {
   const f = fixture(); f.owner(null); f.observer.opened(); f.resize(1000, 700); f.tick();
   assert.equal(f.sent.length, 0);

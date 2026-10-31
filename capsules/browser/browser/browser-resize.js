@@ -88,34 +88,61 @@ export function observeBrowserStage({ stage, getOwner, send, onError,
 // Pointer and wheel input map through the decoded frame. They stay blocked from
 // a resize request until a frame with the guest's geometry decodes; a late
 // frame still clears the fence. A request that fails without a refusal leaves
-// the geometry unknown, so input waits for reset() or a later accepted resize.
+// the geometry unknown: the guest shows its earlier geometry or a size it was
+// asked for. Input waits for a later accepted resize, reset(), or recover(),
+// which the caller uses once it stops retrying: input then resumes on a frame
+// of one of those geometries, or on any decoded frame when none was known.
 export function createBrowserFrameFence(video, { wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now, timeout = 1000 } = {}) {
-  let generation = 0, blocked = false, target = null;
-  const shown = () => video.videoWidth === target.width && video.videoHeight === target.height;
+  let generation = 0, blocked = false, targets = null, uncertain = null;
+  const decoded = () => video.videoWidth > 0 && video.videoHeight > 0;
+  const shown = () => decoded() && (targets.length === 0 ||
+    targets.some(size => video.videoWidth === size.width && video.videoHeight === size.height));
   async function late(current) {
     while (current === generation && !shown()) await wait(250);
     if (current === generation) blocked = false;
   }
   return {
     blocked: () => blocked,
-    reset() { generation++; blocked = false; target = null; },
-    async run(send) {
+    reset() { generation++; blocked = false; targets = null; uncertain = null; },
+    async run(send, requested = null) {
       const current = ++generation;
-      const prior = blocked ? target : video.videoWidth > 0 && video.videoHeight > 0
-        ? { width: video.videoWidth, height: video.videoHeight } : null;
-      blocked = true; target = null;
-      const result = await send();
+      const prior = uncertain ? uncertain.prior : blocked ? targets?.[0] ?? null
+        : decoded() ? { width: video.videoWidth, height: video.videoHeight } : null;
+      blocked = true; targets = null;
+      let result;
+      try {
+        result = await send();
+      } catch (error) {
+        if (current === generation) {
+          const sizes = uncertain?.sizes ?? [];
+          if (Number.isInteger(requested?.width) && Number.isInteger(requested?.height) &&
+              !sizes.some(size => size.width === requested.width && size.height === requested.height)) {
+            sizes.push({ width: requested.width, height: requested.height });
+          }
+          uncertain = { prior, sizes };
+        }
+        throw error;
+      }
       if (current !== generation) return result;
       if (result?.accepted === true) {
-        if (Number.isInteger(result.width) && Number.isInteger(result.height)) target = { width: result.width, height: result.height };
-      } else if (result?.resize_error) target = prior; // A refusal keeps the earlier geometry.
-      if (!target) return result;
+        uncertain = null;
+        if (Number.isInteger(result.width) && Number.isInteger(result.height)) targets = [{ width: result.width, height: result.height }];
+      } else if (result?.resize_error && !uncertain && prior) targets = [prior]; // A refusal keeps the earlier geometry.
+      if (!targets) return result;
       const deadline = now() + timeout;
       while (current === generation && !shown() && now() < deadline) await wait(16);
       // Past the deadline the fence keeps waiting for the frame, off the request path.
       if (current === generation) void late(current);
       return result;
+    },
+    // Ends an unknown result. Returns the geometry the guest is expected to
+    // keep (null when none was known), or undefined when nothing was unknown.
+    recover() {
+      if (!blocked || targets || !uncertain) return undefined;
+      targets = uncertain.prior ? [uncertain.prior, ...uncertain.sizes] : [];
+      void late(generation);
+      return uncertain.prior;
     },
   };
 }
