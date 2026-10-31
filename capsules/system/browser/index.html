@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-wallpaper-20261030a">
+<link rel="stylesheet" href="./style.css?v=system-update-notes-20261031">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -375,7 +375,7 @@
                 <div class="pc2-card-row device-identity-row">
                   <div>
                     <div class="pc2-card-label">Device identity</div>
-                    <div class="pc2-card-sublabel">Identifying string for this device — not a trust grant.</div>
+                    <div class="pc2-card-sublabel">This device's ID. Sharing it gives no one access to your Home.</div>
                   </div>
                   <div class="device-did-inline">
                     <code
@@ -417,7 +417,7 @@
                   <div><dt>New version</dt><dd data-field="update-new-version"></dd></div>
                   <div data-field="update-publisher-row"><dt>Publisher</dt><dd data-field="update-publisher"></dd></div>
                 </dl>
-                <p class="runtime-update-changes" data-field="update-changes"></p>
+                <div class="runtime-update-changes" data-field="update-changes"></div>
               </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
@@ -433,17 +433,14 @@
               <div class="pc2-group-row">
                 <div class="pc2-card-row pc2-card-row-stack">
                   <div>
-                    <div class="pc2-card-label">Trusted source</div>
+                    <div class="pc2-card-label">Update channel</div>
                     <div class="pc2-card-sublabel" data-field="source-policy"></div>
                   </div>
                   <span class="pc2-card-value" data-field="source-status" hidden></span>
                 </div>
                 <dl class="system-fields compact-proof">
-                  <div><dt>Source</dt><dd data-field="source-name"></dd></div>
                   <div><dt>Channel</dt><dd data-field="source-channel"></dd></div>
-                  <div><dt>Installed</dt><dd data-field="source-installed-version"></dd></div>
-                  <div><dt>Checks</dt><dd data-field="source-checks"></dd></div>
-                  <div><dt>Transport</dt><dd data-field="source-transport"></dd></div>
+                  <div><dt>Installed version</dt><dd data-field="source-installed-version"></dd></div>
                 </dl>
               </div>
               <div class="pc2-group-row">
@@ -469,6 +466,6 @@
     <p class="system-error" hidden></p>
   </main>
   <script src="./system-tabs.js"></script>
-  <script type="module" src="./system.js?v=system-wallpaper-20261030b"></script>
+  <script type="module" src="./system.js?v=system-update-notes-20261031"></script>
 </body>
 </html>

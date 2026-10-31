@@ -444,8 +444,25 @@ code {
   margin: 10px 0 0;
   font-size: 12px;
   line-height: 1.5;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.runtime-update-changes ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.runtime-update-changes li + li {
+  margin-top: 4px;
+}
+
+.runtime-update-changes-heading {
+  margin: 10px 0 0;
+  font-weight: 600;
+}
+
+.runtime-update-changes-heading:first-child {
+  margin-top: 0;
 }
 
 .shell-picker {

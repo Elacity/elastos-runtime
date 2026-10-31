@@ -170,7 +170,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
-  about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
+  about: ["about", "device", "version", "source", "channel", "network", "did", "update", "publisher", "changes"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
 const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
@@ -463,6 +463,35 @@ function setField(field, value, emptyText, titleValue) {
 function setTextFields(field, value) {
   for (const node of document.querySelectorAll(`[data-field="${field}"]`)) {
     node.textContent = value;
+  }
+}
+
+// Draws update notes as lists under any headings, as text only.
+function setUpdateNotes(items) {
+  for (const node of document.querySelectorAll('[data-field="update-changes"]')) {
+    if (!items.length) {
+      node.textContent = "Publisher has not supplied change notes.";
+      continue;
+    }
+    node.replaceChildren();
+    let list = null;
+    for (const item of items) {
+      if (item.heading) {
+        const heading = document.createElement("p");
+        heading.className = "runtime-update-changes-heading";
+        heading.textContent = item.text;
+        node.append(heading);
+        list = null;
+        continue;
+      }
+      if (!list) {
+        list = document.createElement("ul");
+        node.append(list);
+      }
+      const entry = document.createElement("li");
+      entry.textContent = item.text;
+      list.append(entry);
+    }
   }
 }
 
@@ -3660,27 +3689,27 @@ function setRuntimeState(runtime) {
   setHiddenFields("runtime-status", version.length === 0);
 }
 
+const SOURCE_CHANNEL_NAMES = { canary: "Test", stable: "Stable" };
+const SOURCE_SIGNED_TEXT = "Home installs only updates signed by the publisher it was installed from.";
+
 function setSourceState(source) {
   const configured = Boolean(source && source.configured);
-  const name = configured ? readText(source.name) || "default" : "Not configured";
-  const channel = readText(source && source.channel) || "not configured";
-  const installed = readText(source && source.installed_version) || "unknown";
-  const mode = readText(source && source.mode) || "development";
-  const policy = readText(source && source.update_policy);
-  const transport = readText(source && source.transport);
-  const sourcePeer = readText(source && source.source_peer);
+  const channelId = readText(source && source.channel);
+  const channel = SOURCE_CHANNEL_NAMES[channelId] || channelId;
   const checksAllowed = Boolean(source && source.update_checks_allowed);
-  setTextFields("source-status", configured ? mode : "Not configured");
+  setTextFields("source-status", configured ? channel || "Unknown" : "Off");
   setHiddenFields("source-status", false);
-  setTextFields("source-policy", policy);
-  setTextFields("source-name", name);
-  setTextFields("source-channel", channel);
-  setTextFields("source-installed-version", installed);
-  setTextFields("source-checks", checksAllowed ? "Allowed" : "Disabled");
-  setTextFields(
-    "source-transport",
-    sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
-  );
+  setTextFields("source-policy", !configured
+    ? "Home has no update source, so it does not check for updates."
+    : readText(source.mode) === "development"
+      ? "This is a development build, so System does not check for updates."
+      : !checksAllowed
+        ? "Home cannot check for updates because its update source names no publisher."
+        : channelId === "canary"
+          ? `Test versions arrive here before they become stable. ${SOURCE_SIGNED_TEXT}`
+          : SOURCE_SIGNED_TEXT);
+  setTextFields("source-channel", configured ? channel : "None");
+  setTextFields("source-installed-version", readText(source && source.installed_version) || "unknown");
 }
 
 function configureRuntimeUpdate() {
@@ -3706,6 +3735,19 @@ function homeRuntimeEventsFrom(event) {
     && message?.type === "elastos:runtime-events"
     && message?.schema === "elastos.home.runtime-events/v1"
     && Array.isArray(message.events) ? message.events : null;
+}
+
+// Signed release notes as plain items: a "#" line is a heading, and Markdown marks are dropped.
+function updateNoteItems(notes) {
+  if (!Array.isArray(notes)) return [];
+  return notes.filter((note) => typeof note === "string").slice(0, 32).map((note) => {
+    const line = readText(note);
+    return {
+      heading: /^#{1,6}(?:\s|$)/.test(line),
+      text: line.replace(/^(?:#{1,6}|[-*])(?:\s+|$)/, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/\*\*|__|`/g, "").trim(),
+    };
+  }).filter((item) => item.text);
 }
 
 function renderRuntimeUpdate(update) {
@@ -3746,11 +3788,9 @@ function renderRuntimeUpdate(update) {
   setHiddenFields("update-publisher-row", !publisher);
   const hideOffer = runtimeUpdate?.available !== true && !inProgress;
   setHiddenFields("update-offer", hideOffer);
-  const notes = runtimeUpdatePending?.changes || runtimeUpdate?.changes;
-  const changes = Array.isArray(notes) ? notes.filter((note) => typeof note === "string")
-    .slice(0, 32).map((note) => readText(note)).filter(Boolean).join("\n") : "";
-  setHiddenFields("update-changes", hideOffer || (inProgress && !changes && runtimeUpdate?.available !== true));
-  setTextFields("update-changes", changes || "Publisher has not supplied change notes.");
+  const changes = updateNoteItems(runtimeUpdatePending?.changes || runtimeUpdate?.changes);
+  setHiddenFields("update-changes", hideOffer || (inProgress && !changes.length && runtimeUpdate?.available !== true));
+  setUpdateNotes(changes);
   const actionable = runtimeUpdateCanApply();
   runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
   runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);

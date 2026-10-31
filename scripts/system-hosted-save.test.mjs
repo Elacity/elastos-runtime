@@ -591,6 +591,7 @@ function updateFixture(overrides = {}) {
     readText: value => typeof value === "string" ? value.trim() : "",
     setTextFields: (field, value) => fields.set(field, value),
     setHiddenFields: (field, value) => hiddenFields.set(field, value),
+    setUpdateNotes: items => fields.set("update-changes", items.map(item => item.text).join("\n")),
     shellHeaders: extra => ({ "x-elastos-home-token": "system-token", ...extra }),
     requestPasskeyStepUp: async (operation, intent) => { approvals.push({ operation, intent: JSON.parse(JSON.stringify(intent)) }); return "approved-exact-choice"; },
     fetchJson: async (url, init) => {
@@ -642,7 +643,7 @@ test("Home update requires a verified complete offer and a controller that can a
     assert.equal(f.button.hidden, false, phase);
   }
   f.context.renderRuntimeUpdate({ ...f.offer, changes: [] });
-  assert.equal(f.fields.get("update-changes"), "Publisher has not supplied change notes.");
+  assert.equal(f.fields.get("update-changes"), "");
   f.context.renderRuntimeUpdate({ ...f.offer, available: false, message: "Home is up to date." });
   assert.equal(f.hiddenFields.get("update-changes"), true);
   assert.equal(f.status.textContent, "Home is up to date.");
@@ -654,6 +655,45 @@ test("Home update requires a verified complete offer and a controller that can a
   assert.equal(f.hiddenFields.get("update-publisher-row"), true, "progress does not invent a publisher");
   f.context.renderRuntimeUpdate(null);
   assert.equal(f.timers.size, 0, "source Home without an installed controller has no update polling");
+});
+
+test("update notes draw as text lists under headings without Markdown marks", () => {
+  const f = updateFixture();
+  const items = f.context.updateNoteItems([
+    "### Security", "- Run `elastos update` from **System**.", "See [the guide](https://example.com/guide).",
+    "", "  ", 7, "# ", "Plain line.", "### Fixed", "Another line.",
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(items)), [
+    { heading: true, text: "Security" },
+    { heading: false, text: "Run elastos update from System." },
+    { heading: false, text: "See the guide." },
+    { heading: false, text: "Plain line." },
+    { heading: true, text: "Fixed" },
+    { heading: false, text: "Another line." },
+  ]);
+  assert.equal(f.context.updateNoteItems(Array(40).fill("Note.")).length, 32);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.context.updateNoteItems("Not a list."))), []);
+
+  const element = tag => ({ tag, className: "", children: [], text: "",
+    set textContent(value) { this.children = []; this.text = value; },
+    get textContent() { return this.text + this.children.map(child => child.textContent).join(""); },
+    append(child) { this.children.push(child); },
+    replaceChildren() { this.children = []; this.text = ""; } });
+  const node = element("div");
+  const draw = vm.createContext({ document: { querySelectorAll: () => [node], createElement: element } });
+  vm.runInContext(source.slice(source.indexOf("function setUpdateNotes("), source.indexOf("function setHiddenFields(")), draw);
+  draw.setUpdateNotes(items);
+  const shape = child => child.tag === "ul" ? { ul: child.children.map(entry => entry.textContent) }
+    : { [child.tag]: child.textContent, className: child.className };
+  assert.deepEqual(node.children.map(shape), [
+    { p: "Security", className: "runtime-update-changes-heading" },
+    { ul: ["Run elastos update from System.", "See the guide.", "Plain line."] },
+    { p: "Fixed", className: "runtime-update-changes-heading" },
+    { ul: ["Another line."] },
+  ]);
+  draw.setUpdateNotes([]);
+  assert.equal(node.textContent, "Publisher has not supplied change notes.");
+  assert.equal(node.children.length, 0);
 });
 
 test("guest System summary keeps update controls and discovery polling hidden", async () => {
