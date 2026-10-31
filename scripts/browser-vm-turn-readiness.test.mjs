@@ -10,7 +10,7 @@ const preflight = fs.readFileSync(new URL("./browser-vm-artifact-preflight.sh", 
 const hostReadiness = preflight.slice(preflight.indexOf('if mode == "--host-readiness":'),
   preflight.indexOf("\nif launch_ready:"));
 const control = fs.readFileSync(new URL("./browser-vm-control-service.mjs", import.meta.url), "utf8");
-const readiness = control.slice(control.indexOf("let verifiedHostReadiness ="),
+const readiness = control.slice(control.indexOf("let readyHostReadiness ="),
   control.indexOf("const OPEN_REQUEST_ENV ="));
 const ready = { schema: "elastos.browser.engine-readiness/v1", readiness: { state: "ready" } };
 const unavailable = (reason = "preparation_required") => ({ ...ready, readiness: { state: "unavailable", reason } });
@@ -93,19 +93,32 @@ test("TURN readiness does not replace image integrity or host compatibility chec
   assert.deepEqual(probe(f.env), unavailable("host_unsupported"));
 });
 
-function controller(t, { linux = false, delayed = false } = {}) {
-  const f = fixture(t);
+// The probe mock below always reports ready (unless the TURN or host checks
+// refuse), so the persisted-stamp tests prove cache mechanics, not image admission.
+function controller(t, { linux = false, delayed = false, from = null, arch = process.arch, foreignOwner = false,
+  now = null } = {}) {
+  // `from` restarts the service on an existing fixture: fresh memory, same disk.
+  const f = from ? { root: from.root, launcher: from.launcher, turn: from.turn, env: from.env } : fixture(t);
   if (linux) {
     f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
     delete f.env[turnKey];
   }
-  const probes = [], stats = [], networkChecks = [], messages = [];
-  const context = vm.createContext({ path, process: { env: f.env, platform: linux ? "linux" : "darwin",
-    stderr: { write: message => messages.push(message) } },
-    fs: { statSync(file, options) {
+  const probes = [], stats = [], networkChecks = [], messages = [], events = [];
+  const contextFs = Object.assign(Object.create(fs), {
+    statSync(file, options) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
-    } },
+    },
+    fstatSync(fd, options) {
+      const info = fs.fstatSync(fd, options);
+      return foreignOwner ? Object.assign(Object.create(Object.getPrototypeOf(info)), info, { uid: info.uid + 1 }) : info;
+    },
+  });
+  const context = vm.createContext({ path, os, Buffer, fs: contextFs,
+    ...(now === null ? {} : { Date: { now: () => now } }),
+    process: { env: f.env, platform: linux ? "linux" : "darwin", arch, pid: process.pid, getuid: process.getuid,
+      stderr: { write: message => messages.push(message) } },
+    logEvent: (event, fields) => events.push({ event, ...fields }),
     execFileSync(command, args) {
       assert.equal(command, "python3");
       assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
@@ -122,7 +135,7 @@ function controller(t, { linux = false, delayed = false } = {}) {
     },
   });
   const api = vm.runInContext(`${readiness}\n({engineReadiness})`, context);
-  return { ...f, probes, stats, networkChecks, messages,
+  return { ...f, probes, stats, networkChecks, messages, events, cache: path.join(f.root, "browser-vm/host-readiness.json"),
     read: async (launcher = f.launcher) => JSON.parse(JSON.stringify(await api.engineReadiness({ launcher_program: launcher }))),
   };
 }
@@ -135,6 +148,133 @@ test("unchanged TURN and image identities reuse successful readiness", async t =
   fs.writeFileSync(path.join(c.root, "bin/vmlinux"), "changed kernel identity");
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 2);
+});
+
+test("cache mechanics (mock probe): a restarted service reuses persisted stamps without probing", async t => {
+  const first = controller(t);
+  assert.deepEqual(await first.read(), ready);
+  assert.equal(first.probes.length, 1);
+  const restarted = controller(t, { from: first });
+  assert.deepEqual(await restarted.read(), ready);
+  assert.equal(restarted.probes.length, 0);
+  assert.deepEqual(restarted.events.map(e => e.source), ["persisted_stamps"]);
+  const info = fs.lstatSync(first.cache);
+  assert.equal(info.mode & 0o777, 0o600);
+  const record = JSON.parse(fs.readFileSync(first.cache, "utf8"));
+  assert.deepEqual(Object.keys(record).sort(), ["input_stamps", "probe_result", "schema"]);
+  assert.deepEqual(fs.readdirSync(path.dirname(first.cache)).filter(name => name.endsWith(".tmp")), []);
+});
+
+for (const change of ["rewrite-rootfs", "touch-manifest", "replace-preflight", "corrupt-cache", "unready-cache"]) {
+  test(`cache mechanics (mock probe): persisted stamps are not trusted after ${change}`, async t => {
+    const first = controller(t);
+    assert.deepEqual(await first.read(), ready);
+    if (change === "rewrite-rootfs") fs.writeFileSync(path.join(first.root, "browser-vm/rootfs.ext4"), "rewritten rootfs");
+    if (change === "touch-manifest") {
+      const later = new Date(Date.now() + 5000);
+      fs.utimesSync(path.join(first.root, "browser-vm/browser-vm-rootfs-manifest.json"), later, later);
+    }
+    if (change === "replace-preflight") {
+      const script = path.join(first.root, "scripts/browser-vm-artifact-preflight.sh");
+      fs.writeFileSync(`${script}.new`, fs.readFileSync(script));
+      fs.renameSync(`${script}.new`, script); // Same bytes, new inode.
+    }
+    if (change === "corrupt-cache") fs.writeFileSync(first.cache, "{not json");
+    if (change === "unready-cache") {
+      const record = JSON.parse(fs.readFileSync(first.cache, "utf8"));
+      record.probe_result = unavailable();
+      fs.writeFileSync(first.cache, JSON.stringify(record));
+    }
+    const restarted = controller(t, { from: first });
+    assert.deepEqual(await restarted.read(), ready);
+    assert.equal(restarted.probes.length, 1, "a changed input or cache must probe again");
+  });
+}
+
+test("a platform switch on the same Darwin host re-probes in memory and after restart", async t => {
+  const first = controller(t);
+  assert.deepEqual(await first.read(), ready);
+  first.env.ELASTOS_BROWSER_VM_PLATFORM = "darwin-amd64";
+  assert.deepEqual(await first.read(), unavailable("host_unsupported"));
+  assert.equal(first.probes.length, 2);
+  const restarted = controller(t, { from: first });
+  assert.deepEqual(await restarted.read(), unavailable("host_unsupported"));
+  assert.equal(restarted.probes.length, 1, "an arm64 ready record must not admit darwin-amd64");
+});
+
+test("cache mechanics (mock probe): another host architecture does not reuse persisted stamps", async t => {
+  const first = controller(t, { arch: "arm64" });
+  assert.deepEqual(await first.read(), ready);
+  const restarted = controller(t, { from: first, arch: "x64" });
+  assert.deepEqual(await restarted.read(), ready);
+  assert.equal(restarted.probes.length, 1);
+});
+
+for (const unsafe of ["symlink", "group-readable", "hard-link", "foreign-owner", "oversize", "directory"]) {
+  test(`cache mechanics (mock probe): unsafe persisted state (${unsafe}) is ignored and re-probed`, async t => {
+    const first = controller(t);
+    assert.deepEqual(await first.read(), ready);
+    const record = fs.readFileSync(first.cache, "utf8");
+    if (unsafe === "symlink") {
+      const elsewhere = path.join(first.root, "elsewhere.json");
+      fs.writeFileSync(elsewhere, record, { mode: 0o600 });
+      fs.unlinkSync(first.cache);
+      fs.symlinkSync(elsewhere, first.cache);
+    }
+    if (unsafe === "group-readable") fs.chmodSync(first.cache, 0o640);
+    if (unsafe === "hard-link") fs.linkSync(first.cache, path.join(first.root, "second-name.json"));
+    if (unsafe === "oversize") fs.writeFileSync(first.cache, record + " ".repeat(70 * 1024));
+    if (unsafe === "directory") {
+      fs.unlinkSync(first.cache);
+      fs.mkdirSync(first.cache, { mode: 0o700 });
+    }
+    const restarted = controller(t, { from: first, foreignOwner: unsafe === "foreign-owner" });
+    assert.deepEqual(await restarted.read(), ready);
+    assert.equal(restarted.probes.length, 1, "unsafe state must never be trusted");
+    if (unsafe === "symlink") assert.equal(fs.readFileSync(path.join(first.root, "elsewhere.json"), "utf8"), record,
+      "a write must replace the link, not follow it");
+  });
+}
+
+test("cache mechanics (mock probe): an unsafe parent directory is neither read nor written", async t => {
+  const first = controller(t);
+  assert.deepEqual(await first.read(), ready);
+  const parent = path.dirname(first.cache);
+  fs.chmodSync(parent, 0o777);
+  try {
+    const before = fs.readFileSync(first.cache, "utf8");
+    fs.writeFileSync(path.join(first.root, "bin/vmlinux"), "changed kernel identity");
+    const restarted = controller(t, { from: first });
+    assert.deepEqual(await restarted.read(), ready);
+    assert.equal(restarted.probes.length, 1);
+    assert.equal(fs.readFileSync(first.cache, "utf8"), before, "no write into a shared parent");
+  } finally {
+    fs.chmodSync(parent, 0o755);
+  }
+});
+
+test("cache mechanics (mock probe): a planted temporary name is neither followed nor removed", async t => {
+  const c = controller(t, { now: 4242 });
+  const victim = path.join(c.root, "victim");
+  fs.writeFileSync(victim, "victim bytes");
+  const planted = `${c.cache}.${process.pid}.4242.tmp`;
+  fs.symlinkSync(victim, planted);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(fs.readFileSync(victim, "utf8"), "victim bytes");
+  assert.ok(fs.lstatSync(planted).isSymbolicLink(), "a temporary name this call did not create stays");
+  assert.equal(fs.existsSync(c.cache), false, "no stamps are published without an owned temporary file");
+});
+
+test("service start and the first open share one readiness probe", async t => {
+  const c = controller(t, { delayed: true });
+  const prewarm = c.read();
+  const open = c.read();
+  assert.equal(c.probes.length, 1);
+  c.probes[0].finish();
+  assert.deepEqual(await prewarm, ready);
+  assert.deepEqual(await open, ready);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1);
 });
 
 for (const kind of ["unset", "different-path", "remove", "replace", "chmod", "retarget-symlink"]) {

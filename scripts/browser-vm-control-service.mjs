@@ -4,6 +4,7 @@ import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -97,9 +98,23 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 }
 
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
-let verifiedHostReadiness = null;
+let readyHostReadiness = null;
+let hostReadinessProbe = null;
+const HOST_READINESS_STAMPS_SCHEMA = "elastos.browser.vm-host-readiness-stamps/v1";
+const MAX_HOST_READINESS_STAMPS_BYTES = 64 * 1024;
+// Probe inputs that are not files: where the preflight resolves its tools and
+// which platform it admits for. The Darwin TURN program is a stamped file.
+const READINESS_INPUT_ENV = [
+  "ELASTOS_BROWSER_VM_PLATFORM", "ELASTOS_BROWSER_VM_DATA_DIR", "ELASTOS_BROWSER_VM_ROOTFS",
+  "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "ELASTOS_BROWSER_VM_KERNEL", "ELASTOS_BROWSER_VM_INITRD",
+  "ELASTOS_BROWSER_VM_INITRAMFS", "ELASTOS_BROWSER_VM_CROSVM_BIN", "ELASTOS_BROWSER_VM_PYTHON",
+  "ELASTOS_DEBUGFS_BIN", "PATH",
+];
 
-function readinessArtifactIdentity(dataDir, launcher) {
+// Stamps of every readiness input: host platform/architecture/OS release, the
+// probe's environment, and each file's dev/inode/mode/size/mtime/ctime. They
+// identify the inputs a ready probe saw; they are not a checksum of them.
+function readinessInputStamps(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
   const files = [
@@ -111,6 +126,9 @@ function readinessArtifactIdentity(dataDir, launcher) {
       : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
     path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
   ];
+  for (const key of ["ELASTOS_BROWSER_VM_PYTHON", "ELASTOS_DEBUGFS_BIN"]) {
+    if (path.isAbsolute(process.env[key] || "")) files.push(process.env[key]);
+  }
   if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
   } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
@@ -119,12 +137,89 @@ function readinessArtifactIdentity(dataDir, launcher) {
     files.push(turnProgram);
   }
   try {
-    return JSON.stringify(files.map((file) => {
-      const info = fs.statSync(file, { bigint: true });
-      return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
-    }));
+    return JSON.stringify({
+      host: [process.platform, process.arch, os.release()],
+      env: READINESS_INPUT_ENV.map((key) => [key, process.env[key] ?? null]),
+      files: files.map((file) => {
+        const info = fs.statSync(file, { bigint: true });
+        return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
+      }),
+    });
   } catch {
     return null;
+  }
+}
+
+// The probe hashes the whole rootfs. Its ready result is kept beside the image
+// with the input stamps it saw, so a Runtime restart with the same inputs does
+// not hash again; any replaced or touched input, or another host, misses.
+function hostReadinessStampsPath(dataDir) {
+  return path.join(dataDir, "browser-vm/host-readiness.json");
+}
+
+function ownedPrivateParent(file) {
+  try {
+    const parent = fs.lstatSync(path.dirname(file));
+    return parent.isDirectory() && parent.uid === process.getuid() && (parent.mode & 0o022) === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Unsafe or foreign state is never trusted: it reads as absent and the probe runs.
+function persistedHostReadiness(dataDir, stamps) {
+  const file = hostReadinessStampsPath(dataDir);
+  if (!ownedPrivateParent(file)) return null;
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const info = fs.fstatSync(fd);
+    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o777) !== 0o600 ||
+        info.nlink !== 1 || info.size > MAX_HOST_READINESS_STAMPS_BYTES) return null;
+    const bytes = Buffer.alloc(info.size);
+    if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length) return null;
+    const record = JSON.parse(bytes.toString("utf8"));
+    if (
+      record?.schema === HOST_READINESS_STAMPS_SCHEMA &&
+      record.input_stamps === stamps &&
+      record.probe_result?.schema === "elastos.browser.engine-readiness/v1" &&
+      record.probe_result.readiness?.state === "ready"
+    ) {
+      return record.probe_result;
+    }
+  } catch {
+    // Missing, unreadable or malformed state misses.
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  return null;
+}
+
+function persistHostReadiness(dataDir, stamps, result) {
+  const file = hostReadinessStampsPath(dataDir);
+  if (!ownedPrivateParent(file)) return;
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  let fd;
+  let created = false;
+  try {
+    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      fs.constants.O_NOFOLLOW, 0o600);
+    created = true;
+    fs.writeSync(fd, JSON.stringify({ schema: HOST_READINESS_STAMPS_SCHEMA, input_stamps: stamps, probe_result: result }));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    // Rename replaces the entry atomically; an existing entry is never truncated.
+    fs.renameSync(temporary, file);
+    created = false;
+  } catch {
+    if (fd !== undefined) fs.closeSync(fd);
+    // Remove only the temporary file this call created.
+    if (created) {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {}
+    }
   }
 }
 
@@ -154,9 +249,36 @@ async function engineReadiness(config) {
       return unavailable("preparation_required");
     }
   }
+  const stamps = readinessInputStamps(dataDir, config.launcher_program);
+  if (stamps && readyHostReadiness?.stamps === stamps) return readyHostReadiness.result;
+  const persisted = stamps && persistedHostReadiness(dataDir, stamps);
+  if (persisted) {
+    readyHostReadiness = { stamps, result: persisted };
+    logEvent("host_readiness", { source: "persisted_stamps", state: "ready" });
+    return persisted;
+  }
+  // Service start and the first open share one probe.
+  hostReadinessProbe ??= probeHostReadiness(config, dataDir, stamps)
+    .finally(() => { hostReadinessProbe = null; });
+  return hostReadinessProbe;
+}
+
+function probeHostReadiness(config, dataDir, stamps) {
+  const unavailable = (reason) => ({
+    schema: "elastos.browser.engine-readiness/v1",
+    readiness: { state: "unavailable", reason },
+  });
+  const startedAt = Date.now();
+  const finish = (result) => {
+    logEvent("host_readiness", {
+      source: "probe",
+      state: result.readiness?.state || null,
+      reason: result.readiness?.reason || null,
+      latency_ms: Date.now() - startedAt,
+    });
+    return result;
+  };
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
-  const identity = readinessArtifactIdentity(dataDir, config.launcher_program);
-  if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;
   return new Promise((resolve) => {
     execFile(script, ["--host-readiness"], {
       timeout: 30000, maxBuffer: 64 * 1024,
@@ -166,19 +288,20 @@ async function engineReadiness(config) {
           ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
       },
     }, (error, stdout) => {
-      if (error) return resolve(unavailable("preparation_required"));
+      if (error) return resolve(finish(unavailable("preparation_required")));
       try {
         const result = JSON.parse(stdout);
         if (result.schema !== "elastos.browser.engine-readiness/v1") throw new Error("schema");
         if (result.readiness?.state === "ready") {
-          if (!identity || readinessArtifactIdentity(dataDir, config.launcher_program) !== identity) {
-            return resolve(unavailable("preparation_required"));
+          if (!stamps || readinessInputStamps(dataDir, config.launcher_program) !== stamps) {
+            return resolve(finish(unavailable("preparation_required")));
           }
-          verifiedHostReadiness = { identity, result };
+          readyHostReadiness = { stamps, result };
+          persistHostReadiness(dataDir, stamps, result);
         }
-        resolve(result);
+        resolve(finish(result));
       } catch {
-        resolve(unavailable("readiness_unsupported"));
+        resolve(finish(unavailable("readiness_unsupported")));
       }
     });
   });
@@ -1291,12 +1414,13 @@ function validateConfig(config) {
   if (!Array.isArray(config.shutdown_args || [])) {
     throw new Error("shutdown_args must be an array");
   }
-  if (
-    config.config_fingerprint !== undefined &&
-    (typeof config.config_fingerprint !== "string" ||
-      !/^[0-9a-f]{64}$/.test(config.config_fingerprint))
-  ) {
-    throw new Error("config_fingerprint must be a sha256 hex string");
+  for (const field of ["config_fingerprint", "config_fingerprint_without_owner"]) {
+    if (
+      config[field] !== undefined &&
+      (typeof config[field] !== "string" || !/^[0-9a-f]{64}$/.test(config[field]))
+    ) {
+      throw new Error(`${field} must be a sha256 hex string`);
+    }
   }
   if (config.persistent_launcher !== undefined && typeof config.persistent_launcher !== "boolean") {
     throw new Error("persistent_launcher must be a boolean");
@@ -4695,6 +4819,7 @@ function main() {
           started_at: serviceStartedAt,
           uptime_ms: Math.max(0, Date.now() - serviceStartedAtMs),
           config_fingerprint: config.config_fingerprint || null,
+          config_fingerprint_without_owner: config.config_fingerprint_without_owner || null,
           control_service: controlServiceIdentity,
           active_pages: livePages,
           active_vms: activeVms.size,
@@ -5025,6 +5150,8 @@ function main() {
       network_mode: "runtime_net_only",
       direct_network: false,
     })}\n`);
+    // Verify the image now, off the first open's path.
+    engineReadiness(config).catch(() => {});
   });
 }
 
