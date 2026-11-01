@@ -165,6 +165,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+from types import SimpleNamespace
 
 
 def digest(path):
@@ -2382,17 +2383,18 @@ class CliProcesses:
     def __init__(self, output):
         self.output, self.processes, self.streams, self.roots = output, [], [], {}
 
-    def spawn(self, argv, env, cwd, label):
+    def spawn(self, argv, env, cwd, label, umask=-1):
+        """umask applies only in the child (Popen sets it after fork); the observer keeps its own."""
         stdout, stderr = ((self.output / (label + suffix)).open("wb") for suffix in (".stdout", ".stderr"))
         self.streams.extend((stdout, stderr))
         proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
-                                stdout=stdout, stderr=stderr, start_new_session=True)
+                                stdout=stdout, stderr=stderr, start_new_session=True, umask=umask)
         self.processes.append(proc)
         return proc
 
-    def command(self, argv, env, cwd, label, timeout=90):
+    def command(self, argv, env, cwd, label, timeout=90, umask=-1):
         started = time.monotonic()
-        proc = self.spawn(argv, env, cwd, label)
+        proc = self.spawn(argv, env, cwd, label, umask)
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -3335,6 +3337,64 @@ def cli_provider_warnings(home_path):
                    if "provider" in line and (match := re.search(r"\b(?:WARN|ERROR)\b(.*)", line))})
 
 
+# The person's commands on the default Ubuntu account; Popen applies it in the child only.
+CLI_UBUNTU_UMASK = 0o002
+
+
+def cli_ubuntu_layout(processes, manifest, home_path, evidence, steps):
+    """The default Ubuntu/Jetson account (#368): umask 002 leaves ~/.local and its bin and
+    share folders group-writable. This source's installer installs there and leaves those
+    folders as they were, Home starts and answers authenticated health, and a CLI update
+    applies the release after this one and keeps this Home's config and data. Only the
+    person's commands run with umask 002; the observer's own writes keep its 077."""
+    shared = [home_path / folder for folder in (".local", ".local/bin", ".local/share")]
+    for path in shared:
+        path.mkdir(mode=0o775)
+        path.chmod(0o775)
+    steps.phase("new")
+    reply = steps.install(home_path, "ubuntu-install", "new", umask=CLI_UBUNTU_UMASK)
+    need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
+         + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
+    steps.setup(home_path, "ubuntu-setup", "new", umask=CLI_UBUNTU_UMASK)
+    steps.verify(home_path, "new", "ubuntu-version", fresh=True)
+    steps.prepare(home_path, "ubuntu", "new")
+    env = cli_environment(home_path)
+    env["ELASTOS_CARRIER_MDNS"] = "0"
+    opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
+    env["PATH"] = str(opener.parent) + ":" + env["PATH"]
+    processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
+    process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home",
+                              umask=CLI_UBUNTU_UMASK)
+    try:
+        status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
+        while ready is None and process.poll() is None and time.monotonic() < deadline:
+            status = cli_private_json(status_path) if status_path.exists() else {}
+            if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
+                ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
+            else:
+                time.sleep(.2)
+        need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
+             + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
+        evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        evidence["home_exit"] = process.wait(timeout=35)
+    need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
+    # This Home's own state after prepare and Home close; the update must keep it.
+    before = cli_state(manifest, home_path)
+    steps.phase(CLI_SYSTEM_PHASE)
+    reply = steps.command(home_path, ["update"], "ubuntu-update", umask=CLI_UBUNTU_UMASK)
+    need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
+         + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
+    after = steps.verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
+    need(after["preserved"] == before["preserved"] and after["data"] == before["data"],
+         "update changed preserved data on the default Ubuntu account layout")
+    need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
+    evidence.update(status="passed", update={"from": manifest["new"]["version"], "to": manifest[CLI_SYSTEM_PHASE]["version"]})
+
+
+
 def cli_run(config, output, local_rehearsal=None):
     manifest = cli_admit(config, local_rehearsal)
     root = Path(config["root"])
@@ -3364,9 +3424,9 @@ def cli_run(config, output, local_rehearsal=None):
     holder_config = holder_data / "config.toml"
     holder_labels, holder_config_text = [], None
 
-    def command(home_path, args, label, evidence=None):
+    def command(home_path, args, label, evidence=None, umask=-1):
         reply = processes.command([str(home_path / ".local/bin/elastos"), *args],
-                                  cli_environment(home_path), home_path, label)
+                                  cli_environment(home_path), home_path, label, umask=umask)
         if evidence is not None:
             evidence.update(reply)
         if home_path != holder:
@@ -3422,24 +3482,25 @@ def cli_run(config, output, local_rehearsal=None):
         bootstrap = current
         installer_bootstrap.publication, published = publication, name
 
-    def install(home_path, label, release):
+    def install(home_path, label, release, umask=-1):
         env = cli_environment(home_path)
         env.update(ELASTOS_PUBLISHER_GATEWAY=installer_bootstrap.url,
                    ELASTOS_SOURCE_CONNECT_TICKET=bootstrap["ticket"], ELASTOS_PUBLISHER_NODE_ID=bootstrap["node_id"])
         installer_bootstrap.enabled = True
         try:
-            reply = processes.command(["/bin/bash", str(installers[release]), "--install-only"], env, home_path, label, timeout=180)
+            reply = processes.command(["/bin/bash", str(installers[release]), "--install-only"], env, home_path, label,
+                                      timeout=180, umask=umask)
             result["coordination"][label] = cli_coordination(home_path, required=reply["exit"] == 0)
             return reply
         finally:
             installer_bootstrap.enabled = False
 
-    def setup(home_path, label, release):
+    def setup(home_path, label, release, umask=-1):
         view = cli_support_view(manifest, release)
         track(home_path, {CLI_DATA + "/" + target: relative for target, relative in cli_setup_files(view).items()})
         evidence = {"status": "failed", "release": release}
         result["setup"][label] = evidence
-        reply = command(home_path, ["setup"], label, evidence)
+        reply = command(home_path, ["setup"], label, evidence, umask)
         need(cli_success(processes, label, reply), "installed setup failed; command exit " + str(reply["exit"])
              + cli_ci_stderr_detail(processes, manifest, label, label))
         for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
@@ -3489,10 +3550,7 @@ def cli_run(config, output, local_rehearsal=None):
         return observation
 
     def ubuntu_layout():
-        """The default Ubuntu/Jetson account (#368): umask 002 leaves ~/.local and its bin and
-        share folders group-writable. This source's installer installs there and leaves those
-        folders as they were, Home starts and answers authenticated health, and a CLI update
-        applies the release after this one."""
+        """The Ubuntu account case (cli_ubuntu_layout) on its own Home."""
         home_path = output / "homes/ubuntu-umask"
         home_path.mkdir(mode=0o750)
         shared = [home_path / folder for folder in (".local", ".local/bin", ".local/share")]
@@ -3500,54 +3558,8 @@ def cli_run(config, output, local_rehearsal=None):
         result["paths"]["m2-discovery"]["checks"][CLI_UBUNTU_CASE] = evidence
         processes.roots[str(home_path / ".local/bin/elastos")] = {
             manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("new", CLI_SYSTEM_PHASE)}
-
-        def as_user(run, *args):
-            # The person's commands run with umask 002; the harness's own fixture writes keep 077.
-            inherited = os.umask(0o002)
-            try:
-                return run(*args)
-            finally:
-                os.umask(inherited)
-
-        for path in shared:
-            path.mkdir(mode=0o775)
-            path.chmod(0o775)
-        phase("new")
-        reply = as_user(install, home_path, "ubuntu-install", "new")
-        need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
-             + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
-        as_user(setup, home_path, "ubuntu-setup", "new")
-        verify(home_path, "new", "ubuntu-version", fresh=True)
-        prepare(home_path, "ubuntu", "new")
-        env = cli_environment(home_path)
-        env["ELASTOS_CARRIER_MDNS"] = "0"
-        opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
-        env["PATH"] = str(opener.parent) + ":" + env["PATH"]
-        processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
-        process = as_user(processes.spawn, [str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home")
-        try:
-            status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
-            while ready is None and process.poll() is None and time.monotonic() < deadline:
-                status = cli_private_json(status_path) if status_path.exists() else {}
-                if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
-                    ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
-                else:
-                    time.sleep(.2)
-            need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
-                 + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
-            evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-            evidence["home_exit"] = process.wait(timeout=35)
-        need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
-        phase(CLI_SYSTEM_PHASE)
-        reply = as_user(command, home_path, ["update"], "ubuntu-update")
-        need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
-             + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
-        verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
-        need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
-        evidence.update(status="passed", update={"from": manifest["new"]["version"], "to": manifest[CLI_SYSTEM_PHASE]["version"]})
+        cli_ubuntu_layout(processes, manifest, home_path, evidence,
+                          SimpleNamespace(phase=phase, install=install, setup=setup, verify=verify, prepare=prepare, command=command))
 
     try:
         holder_mapping = manifest["holder"]["files"]
@@ -3629,7 +3641,7 @@ def cli_run(config, output, local_rehearsal=None):
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
             result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
-            if sys.platform.startswith("linux") and "initial_home" in manifest and CLI_SYSTEM_PHASE in manifest["publications"]:
+            if manifest["platform"].endswith("-linux") and "initial_home" in manifest and CLI_SYSTEM_PHASE in manifest["publications"]:
                 ubuntu_layout()
         refusals = manifest["selectors"]["m1-install"]["refusals"]
         for case in [*refusals, CLI_INSTALLER_CASE] if refusals else []:
@@ -3705,7 +3717,7 @@ def cli_run(config, output, local_rehearsal=None):
     return 0 if result["status"] == "passed" else 1
 
 
-def cli_check_result(result):
+def cli_check_result(result, platform):
     """The CI verdict on a run's result.json, which the job summary shows: the journey passed
     along the supported path from the pinned published release (its System installed the
     release with changed support), this source's System refused a tampered offer, showed the
@@ -3741,9 +3753,11 @@ def cli_check_result(result):
     need(all(path["checks"][case]["status"] == "passed" for path in result["paths"].values() for case in CLI_REFUSALS)
          and result["paths"]["m2-discovery"]["checks"].get(CLI_INSTALLER_CASE, {}).get("status") == "passed",
          "a CLI refusal did not hold")
-    # A Linux hop also proves the default Ubuntu account layout.
+    # A Linux hop also proves the default Ubuntu account layout. The result names this runner's
+    # release platform, so a missing or other platform cannot skip the Ubuntu case.
+    need(platform in CLI_PLATFORMS and result.get("platform") == platform, "the result is not for this host's release platform")
     ubuntu = result["paths"]["m2-discovery"]["checks"].get(CLI_UBUNTU_CASE, {})
-    need(not result.get("platform", "").endswith("-linux") or (ubuntu.get("status") == "passed"
+    need(not platform.endswith("-linux") or (ubuntu.get("status") == "passed"
          and ubuntu["home"]["authenticated_health"] and ubuntu["update"]["to"] == next_version),
          "the default Ubuntu account layout (umask 002, group-writable ~/.local) did not install, start and update")
     undo = home.get("undo", {})
@@ -3796,7 +3810,7 @@ def main():
             print(json.dumps(cli_install_previous_release(args.input, args.output)))
             return 0
         if args.operation == "check-result":
-            print(json.dumps(cli_check_result(cli_json(args.input))))
+            print(json.dumps(cli_check_result(cli_json(args.input), cli_host_platform())))
             return 0
         if args.operation == "build-ci-hop":
             need(args.runtime is not None and args.previous is not None and args.output is None and args.root is None,
