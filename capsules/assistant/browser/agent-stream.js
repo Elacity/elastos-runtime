@@ -55,8 +55,8 @@ const liveTurnCanonical = {
 const STREAM_BUDGET_MS = 8;
 const STREAM_TRACE_LIMIT = 48;
 const FOLLOW_RESUME_PX = 96;
-/** A scroll this soon after the reader's wheel, touch or drag is theirs. */
-const READER_GESTURE_MS = 1000;
+/** A scroll this soon after the reader's wheel, key, touch or pointer is theirs. */
+const READER_INPUT_MS = 1000;
 /** One-shot markdown+KaTeX above this freezes Brave. Stream freeze slices stay ~800. */
 const RICH_MARKDOWN_MAX_CHARS = 8_000;
 const LONG_TASK_TRACE_LIMIT = 24;
@@ -2065,6 +2065,14 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   let stickToBottom = true;
   /* scrollTop the stream left a following reader at; null if not following. */
   let endScrollTop = null;
+  /* Where the transcript was last seen (scroll event or the follow's own
+     scroll), to tell the reader moving up from layout; see onUserScroll. */
+  let lastScrollTop = 0;
+  let lastMaxTop = 0;
+  const noteScrollPosition = () => {
+    lastScrollTop = scroller.scrollTop;
+    lastMaxTop = scroller.scrollHeight - scroller.clientHeight;
+  };
   /* Land on the end now and once more after layout settles, unless the reader
      moved up in between or another turn took the transcript. */
   const pinToEnd = () => {
@@ -2085,7 +2093,6 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   let progressEl = null;
   let revealTimer = 0;
   let followRaf = 0;
-  let followScrollQuiet = false;
   let longTaskObserver = null;
   let frameWatch = 0;
   let streamingFlush = false;
@@ -2213,20 +2220,17 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       if (!stickToBottom || selectionInStream() || !scroller) {
         return;
       }
-      followScrollQuiet = true;
       const t0 = performance.now();
       /* True bottom: the stream's bottom padding keeps the end above the
          floating composer; scrollIntoView on an anchor left it underneath. */
       scroller.scrollTop = scroller.scrollHeight;
+      noteScrollPosition();
       const took = performance.now() - t0;
       perf.followMs += took;
       const last = perf.traces[perf.traces.length - 1];
       if (last) {
         last.followMs = Number(took.toFixed(2));
       }
-      window.requestAnimationFrame(() => {
-        followScrollQuiet = false;
-      });
     });
   };
 
@@ -2248,38 +2252,48 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
 
   const scroller = host.streamScrollEl?.();
   const streamRoot = host.streamEl?.();
-  /* A scroll event alone does not say the reader moved: a block above the
-     end shrinking (the status line giving way to the reply) clamps scrollTop,
-     and the reply growing in the same frame leaves the end far below. Only a
-     scroll that follows the reader's own wheel, touch or scrollbar drag stops
-     the follow; any other one is layout, and the follow lands on the end. */
+  /* The direction of a scroll says who moved. The reader going up (wheel,
+     keys such as Shift+Space, a scrollbar, a screen reader) lowers scrollTop
+     and stops the follow, whatever caused it. The reply growing never lowers
+     it: the follow and the reply row's own scroll to the end move it down.
+     One layout case lowers it too: a block above the end shrinking clamps
+     scrollTop, and the reply may grow again before the scroll event, so the
+     end looks far below. A scroll up is therefore the reader's unless the
+     room could have shrunk since the last scroll (its furthest scroll
+     position dropped) and the reader gave no input (wheel, key, touch,
+     pointer) in the last second; then the follow lands on the end. */
+  if (scroller) {
+    noteScrollPosition();
+  }
   let readerHolding = false;
-  let readerGestureAt = -Infinity;
-  const noteReaderGesture = () => {
-    readerGestureAt = performance.now();
+  let readerInputAt = -Infinity;
+  const noteReaderInput = () => {
+    readerInputAt = performance.now();
   };
   const onReaderHold = () => {
     readerHolding = true;
-    noteReaderGesture();
+    noteReaderInput();
   };
   const onReaderRelease = () => {
     if (readerHolding) {
       readerHolding = false;
-      noteReaderGesture();
+      noteReaderInput();
     }
   };
   const onUserScroll = () => {
-    if (followScrollQuiet || !scroller) {
+    if (!scroller) {
       return;
     }
-    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    if (distance > FOLLOW_RESUME_PX) {
-      if (!stickToBottom) {
-        return;
-      }
-      if (readerHolding || performance.now() - readerGestureAt < READER_GESTURE_MS) {
+    const top = scroller.scrollTop;
+    const maxTop = scroller.scrollHeight - scroller.clientHeight;
+    const movedUp = top < lastScrollTop - 1;
+    const roomShrank = maxTop < lastMaxTop - 1;
+    noteScrollPosition();
+    const readerInput = readerHolding || performance.now() - readerInputAt < READER_INPUT_MS;
+    if (maxTop - top > FOLLOW_RESUME_PX) {
+      if (stickToBottom && movedUp && (readerInput || !roomShrank)) {
         pauseFollow();
-      } else {
+      } else if (stickToBottom) {
         followAfterFlush();
       }
       return;
@@ -2289,7 +2303,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
   };
   const onUserScrollUp = (event) => {
-    noteReaderGesture();
+    noteReaderInput();
     if (event.deltaY < 0) {
       pauseFollow();
     }
@@ -2298,6 +2312,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     if (event.target?.closest?.("textarea, input, [contenteditable]")) {
       return;
     }
+    noteReaderInput();
     if (event.key === "PageUp" || event.key === "Home" || event.key === "ArrowUp") {
       pauseFollow();
     }
