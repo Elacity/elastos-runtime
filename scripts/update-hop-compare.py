@@ -2716,7 +2716,10 @@ def cli_coordination(home_path, required=True):
     if original is None:
         need(not required, "Runtime coordination file absent")
         return {"status": "absent"}
-    need(stat.S_IMODE(original[2]) == 0o600, "Runtime coordination file mode differs")
+    # The Runtime creates this lock with the person's umask (clamped to at least 022)
+    # inside its 0700 data directory: owned by them, never writable by anyone else.
+    need(original[3] == os.geteuid() and stat.S_IMODE(original[2]) & 0o7022 == 0,
+         "Runtime coordination file mode differs")
     with path.open("rb") as stream:
         info = os.fstat(stream.fileno())
         need((info.st_dev, info.st_ino, info.st_mode, info.st_uid) == original, "Runtime coordination file changed during inspection")
