@@ -6,7 +6,7 @@ const cid = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u';
 const uri = `elastos://${cid}`;
 const result = (state = 'available') => ({ schema: 'elastos.home.shared-content.result/v1',
   cid, uri, state, check_id: 'check-1', sender_display_name: 'Alma', size_bytes: 30 });
-function harness() {
+function harness({ browser = false } = {}) {
   let clock = 0;
   const document = {};
   function node() {
@@ -18,16 +18,17 @@ function harness() {
   }
   const nodes = Object.fromEntries(['root', 'appName', 'host', 'address', 'openButton', 'cancelButton',
     'eyebrow', 'title', 'asker', 'size', 'status'].map(key => [key, node()]));
-  const opened = [], gets = [];
-  let live = true, otherSheet = false;
+  const opened = [], gets = [], browserOpens = [];
+  let live = true, otherSheet = false, hasBrowser = browser;
   const windowRef = { ...node(), document, location: { origin: 'https://home.test' },
     performance: { now: () => clock }, open: (...args) => opened.push(args) };
   const prompt = createHomeExternalLinkPrompt({ ...nodes, windowRef, isLive: () => live,
-    otherSheetShown: () => otherSheet, openSharedFile: async value => opened.push(value) });
+    otherSheetShown: () => otherSheet, openSharedFile: async value => opened.push(value),
+    browserAvailable: () => hasBrowser, openInBrowser: url => browserOpens.push(url) });
   const begin = (extra = {}) => prompt.begin({ homeToken: 'launch', appId: 'chat-room', kind: 'shared', uri,
     check: async () => result(), get: async (id, signal) => { gets.push({ id, signal }); return { state: 'local' }; }, ...extra });
-  return { ...nodes, prompt, begin, opened, gets, windowRef, document, tick: (ms = 600) => { clock += ms; },
-    live: value => { live = value; }, other: value => { otherSheet = value; },
+  return { ...nodes, prompt, begin, opened, gets, browserOpens, windowRef, document, tick: (ms = 600) => { clock += ms; },
+    live: value => { live = value; }, other: value => { otherSheet = value; }, browser: value => { hasBrowser = value; },
     click: (trusted = true) => nodes.openButton.fire('click', { isTrusted: trusted }) };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
@@ -130,6 +131,91 @@ test('web links keep their existing guarded synchronous opening', () => {
   assert.ok(h.prompt.show(id, { schema: 'elastos.home.external-link.result/v1', app_id: 'chat-room', app_title: 'Chat', url: 'https://example.test/' }));
   h.click(); assert.equal(h.opened.length, 0); h.tick(); h.click();
   assert.deepEqual(h.opened, [['https://example.test/', '_blank', 'noopener,noreferrer']]);
+});
+
+const webResult = (url = 'https://example.test/page?q=1', app = ['chat-room', 'Chat']) => ({
+  schema: 'elastos.home.external-link.result/v1', app_id: app[0], app_title: app[1], url });
+const showWeb = (h, url, app = ['chat-room', 'Chat']) =>
+  h.prompt.show(h.prompt.begin({ homeToken: 'launch', appId: app[0] }), webResult(url, app));
+
+test('with the Browser app, Open in Browser hands the confirmed address to Browser, never a tab', () => {
+  const h = harness({ browser: true });
+  assert.ok(showWeb(h, 'https://example.test/page?q=1'));
+  assert.equal(h.openButton.textContent, 'Open in Browser');
+  assert.equal(h.asker.textContent, ' wants to open this address in the Browser app.');
+  assert.equal(h.address.textContent, 'https://example.test/page?q=1');
+  h.click(); h.click(false); assert.deepEqual(h.browserOpens, []);
+  h.tick(); h.click(false); assert.deepEqual(h.browserOpens, [], 'a synthetic click opens nothing');
+  h.click(); h.click();
+  assert.deepEqual(h.browserOpens, ['https://example.test/page?q=1']);
+  assert.deepEqual(h.opened, [], 'no window.open when Browser opens it');
+  assert.equal(h.root.hidden, true);
+});
+
+test('without the Browser app, Open link opens one tab with no opener and no referrer', () => {
+  const h = harness({ browser: false });
+  assert.ok(showWeb(h, 'https://example.test/page?q=1'));
+  assert.equal(h.openButton.textContent, 'Open link');
+  assert.equal(h.asker.textContent, ' wants to open this address in your browser.');
+  h.tick(); h.click();
+  assert.deepEqual(h.opened, [['https://example.test/page?q=1', '_blank', 'noopener,noreferrer']]);
+  assert.deepEqual(h.browserOpens, []);
+});
+
+test('the destination is fixed when the sheet appears, never switched in the click', () => {
+  const gone = harness({ browser: true }); showWeb(gone, 'https://example.test/a');
+  gone.browser(false); gone.tick(); gone.click();
+  assert.deepEqual(gone.browserOpens, ['https://example.test/a']); assert.deepEqual(gone.opened, []);
+  const added = harness({ browser: false }); showWeb(added, 'https://example.test/b');
+  added.browser(true); added.tick(); added.click();
+  assert.deepEqual(added.opened, [['https://example.test/b', '_blank', 'noopener,noreferrer']]);
+  assert.deepEqual(added.browserOpens, []);
+});
+
+for (const browser of [true, false]) test(`Cancel, Escape and a backdrop press open nothing (Browser app: ${browser})`, () => {
+  for (const close of ['cancel', 'escape', 'backdrop']) {
+    const h = harness({ browser }); showWeb(h, 'https://example.test/');
+    h.tick();
+    if (close === 'cancel') h.cancelButton.fire('click');
+    else if (close === 'escape') h.windowRef.fire('keydown', { key: 'Escape' });
+    else h.root.fire('click');
+    assert.equal(h.root.hidden, true, close);
+    h.click();
+    assert.deepEqual(h.browserOpens, [], close); assert.deepEqual(h.opened, [], close);
+  }
+});
+
+for (const browser of [true, false]) test(`a second request cannot swap the shown address (Browser app: ${browser})`, () => {
+  const h = harness({ browser }); showWeb(h, 'https://example.test/first');
+  assert.equal(h.prompt.begin({ homeToken: 'launch', appId: 'chat-room' }), '');
+  assert.equal(h.prompt.show('external-link-1', webResult('https://evil.test/')), false);
+  assert.equal(h.prompt.show('external-link-2', webResult('https://evil.test/')), false);
+  assert.equal(h.address.textContent, 'https://example.test/first');
+  h.tick(); h.click();
+  const target = browser ? h.browserOpens : h.opened.map(([url]) => url);
+  assert.deepEqual(target, ['https://example.test/first']);
+});
+
+test('a result for another app or a non-canonical address is never shown', () => {
+  for (const [url, app] of [['https://example.test/', ['assistant', 'Assistant']], ['HTTPS://Example.test', ['chat-room', 'Chat']],
+    ['javascript:alert(1)', ['chat-room', 'Chat']]]) {
+    const h = harness({ browser: true });
+    const id = h.prompt.begin({ homeToken: 'launch', appId: 'chat-room' });
+    assert.equal(h.prompt.show(id, webResult(url, app)), false, url);
+    h.tick(); h.click(); assert.deepEqual(h.browserOpens, []); assert.deepEqual(h.opened, []);
+  }
+});
+
+test('the Assistant without the Browser app gets the same prompt, naming it, and a tab only on Open link', () => {
+  const h = harness({ browser: false });
+  assert.ok(showWeb(h, 'https://docs.example/guide', ['assistant', 'Assistant']));
+  assert.equal(h.root.hidden, false);
+  assert.equal(h.appName.textContent, 'Assistant');
+  assert.equal(h.address.textContent, 'https://docs.example/guide');
+  assert.equal(h.openButton.textContent, 'Open link');
+  assert.deepEqual(h.opened, []);
+  h.tick(); h.click();
+  assert.deepEqual(h.opened, [['https://docs.example/guide', '_blank', 'noopener,noreferrer']]);
 });
 
 const { requestHomeSharedContent } = await import('./home-external-link.js');

@@ -38,7 +38,7 @@ globalThis.window = {
 
 // Same specifiers (including the cache-busting query) as home-gui.js, so the
 // test drives the module instances Home GUI uses.
-const version = "home-20261101c";
+const version = "home-20261101d";
 const core = await import(`../capsules/home-gui/browser/shell-core.js?v=${version}`);
 const face = await import(`../capsules/home-gui/browser/shell-assistant-face.js?v=${version}`);
 
@@ -80,11 +80,15 @@ function themesReceived() {
     .map(({ message, target }) => ({ theme: message.preferences.theme, target }));
 }
 
+// One deps object, bound once: the face keeps it by reference, so a later
+// test can change what this Home has.
+const faceDeps = {
+  targetById: () => null,
+  pushUiPreferencesToFrameWindow: core.pushUiPreferencesToFrameWindow,
+};
+
 test("a theme change reaches the Assistant frame without a reload", () => {
-  face.bindAssistantFace({
-    targetById: () => null,
-    pushUiPreferencesToFrameWindow: core.pushUiPreferencesToFrameWindow,
-  });
+  face.bindAssistantFace(faceDeps);
   const applyHomeGuiUiPreferences = homeGuiPreferences();
   applyHomeGuiUiPreferences({ theme: "light" });
 
@@ -101,4 +105,43 @@ test("a theme change reaches the Assistant frame without a reload", () => {
   // Every later change arrives at once, as it does for windows and rails.
   applyHomeGuiUiPreferences({ theme: "light" });
   assert.deepEqual(themesReceived(), [{ theme: "dark", target: "*" }, { theme: "light", target: "*" }]);
+});
+
+test("an Assistant link opens in Browser, or asks Home's link prompt when this Home has no Browser", () => {
+  const opens = [];
+  faceDeps.openTarget = (target, options) => opens.push({ target, options });
+  byId["#assistant-toggle"] = { hidden: true };
+  frameSays({ type: "home-agent:hello", docId: "b".repeat(32) });
+  frameSays({ type: "home-agent:ready", docId: "b".repeat(32) });
+  const linkReplies = () => assistantFrameWindow.received
+    .filter(({ message }) => message.type === "home-agent:open-link")
+    .map(({ message, target }) => ({ ...message, target }));
+  const url = "https://docs.example/guide?q=1";
+
+  faceDeps.targetById = (_summary, id) => (["assistant", "browser"].includes(id) ? { targetId: id } : null);
+  face.syncAssistantFaceAvailability({});
+  frameSays({ type: "home-agent:open-browser", url });
+  assert.deepEqual(opens, [{ target: "browser", options: { query: { url } } }]);
+  assert.deepEqual(linkReplies(), [], "with Browser the link never reaches the prompt");
+
+  faceDeps.targetById = (_summary, id) => (id === "assistant" ? { targetId: id } : null);
+  face.syncAssistantFaceAvailability({});
+  frameSays({ type: "home-agent:open-browser", url });
+  assert.equal(opens.length, 1, "no Browser app: nothing opens in Home GUI");
+  assert.deepEqual(linkReplies(), [{ type: "home-agent:open-link", url, target: "*" }]);
+  // The reply carries the capsule's own string, not Home GUI's normal form, so
+  // the capsule can match it: no trailing slash, a mixed-case host.
+  for (const raw of ["https://example.com", "https://Docs.Example/Guide"]) {
+    frameSays({ type: "home-agent:open-browser", url: raw });
+    assert.equal(linkReplies().at(-1).url, raw);
+  }
+  frameSays({ type: "home-agent:open-browser", url });
+  assert.equal(linkReplies().length, 4, "every click is answered");
+
+  // A link the face would not hand to Browser is not handed to the prompt either.
+  frameSays({ type: "home-agent:open-browser", url: "javascript:alert(1)" });
+  frameSays({ type: "home-agent:open-browser", url, extra: true });
+  frameSays({ type: "home-agent:open-browser", url: ` ${url}` });
+  assert.equal(linkReplies().length, 4);
+  delete byId["#assistant-toggle"];
 });

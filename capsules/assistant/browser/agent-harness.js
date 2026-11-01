@@ -15,7 +15,7 @@ import {
 import {
   shellState,
   desktopObjects,
-  postToHome,
+  openWebLink,
   openModelsFromAgent,
   openAiProviderSettingsFromAgent,
   copyFromButton,
@@ -1605,10 +1605,7 @@ export function bindAgentHarness() {
     const webLink = event.target.closest?.("[data-open-browser-url]");
     if (webLink) {
       event.preventDefault();
-      postToHome({
-        type: "home-agent:open-browser",
-        url: webLink.dataset.openBrowserUrl || "",
-      });
+      openWebLink(webLink.dataset.openBrowserUrl || "");
       return;
     }
     const copyCode = event.target.closest?.(".agent-md-copy");

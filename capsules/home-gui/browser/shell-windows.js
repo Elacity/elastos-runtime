@@ -22,7 +22,7 @@ import {
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20261101c";
+} from "./shell-core.js?v=home-20261101d";
 import {
   fitWindowBounds,
   fitBrowserWindow,
@@ -32,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20261101c";
+} from "./shell-window-geometry.js?v=home-20261101d";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -52,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20261101c";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101c";
+} from "./shell-stages.js?v=home-20261101d";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101d";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;

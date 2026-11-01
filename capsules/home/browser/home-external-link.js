@@ -3,9 +3,12 @@
 //
 // One request at a time. The Runtime names the requesting app from its signed
 // launch and returns the one validated address; this sheet shows and opens that
-// same string. Only a trusted click on Home's own Open link button opens it,
-// synchronously in that click, with no opener and no referrer. The app gets no
-// reply, so it cannot learn what the person chose.
+// same string. Only a trusted click on Home's own Open button opens it. When
+// this Home has the Browser app, the sheet says so when it appears and the click
+// opens the address there (in its one window); otherwise the click opens a new
+// tab synchronously, with no opener and no referrer. The destination is fixed
+// when the sheet appears, so the click never falls back to a tab later. The app
+// gets no reply, so it cannot learn what the person chose.
 
 // The file name a Chat post states for a shared file, fit to show and to
 // suggest when saving: no path separators, control characters or leading
@@ -180,6 +183,10 @@ export function createHomeExternalLinkPrompt({
   cancelButton,
   eyebrow, title, asker, size, status,
   openSharedFile = async () => {},
+  // When both are given and browserAvailable() is true as the sheet appears,
+  // Open hands the confirmed address to openInBrowser instead of a new tab.
+  browserAvailable = () => false,
+  openInBrowser = null,
   windowRef = globalThis.window,
   isLive = () => true,
   // True while another Home sheet (the Clipboard prompt) is on screen; the two
@@ -392,6 +399,10 @@ export function createHomeExternalLinkPrompt({
     if (!isLive(request.homeToken)) {
       return;
     }
+    if (request.destination === "browser") {
+      openInBrowser(request.href);
+      return;
+    }
     // Synchronous in the click: Safari keeps the user activation.
     windowRef.open(request.href, "_blank", "noopener,noreferrer");
   });
@@ -453,10 +464,12 @@ export function createHomeExternalLinkPrompt({
         renderShared(active);
       } else {
         active.href = checked.href;
+        active.destination = typeof openInBrowser === "function" && browserAvailable() === true ? "browser" : "tab";
+        const inBrowser = active.destination === "browser";
         if (eyebrow) { eyebrow.hidden = false; eyebrow.textContent = "Web link"; }
         if (title) title.textContent = "Open this link?";
         if (appName.parentElement) appName.parentElement.hidden = false;
-        if (asker) asker.textContent = " wants to open this address in your browser.";
+        if (asker) asker.textContent = inBrowser ? " wants to open this address in the Browser app." : " wants to open this address in your browser.";
         appName.textContent = checked.appTitle;
         host.hidden = false;
         host.textContent = checked.host;
@@ -464,7 +477,7 @@ export function createHomeExternalLinkPrompt({
         address.textContent = checked.href;
         if (size) size.hidden = true;
         if (status) status.hidden = true;
-        openButton.textContent = "Open link";
+        openButton.textContent = inBrowser ? "Open in Browser" : "Open link";
         cancelButton.textContent = "Cancel";
         openButton.hidden = false;
         openButton.disabled = false;

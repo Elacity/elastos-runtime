@@ -278,6 +278,25 @@ export function postToHome(message) {
   }
 }
 
+/* A web link goes to Home GUI, which opens it in the Browser app. A Home
+   without that app answers home-agent:open-link for the same address; only
+   then does the link go to Home's own link prompt (#430), as this app's
+   request, where the person sees the address and chooses Open link. */
+let pendingWebLink = "";
+export function openWebLink(url) {
+  pendingWebLink = url;
+  postToHome({ type: "home-agent:open-browser", url });
+}
+
+export function openWebLinkThroughHomePrompt(url) {
+  if (!url || url !== pendingWebLink) return false;
+  pendingWebLink = "";
+  const origin = homeOrigin();
+  if (!origin || !homeToken || window.top === window) return false;
+  window.top.postMessage({ type: "home:open-external", url, homeToken }, origin);
+  return true;
+}
+
 /* ---- copy ------------------------------------------------------------------ */
 
 /* Copy is Home's to perform: home-agent.js binds the one function that asks

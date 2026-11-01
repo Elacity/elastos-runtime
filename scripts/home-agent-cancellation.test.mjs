@@ -443,6 +443,34 @@ test("nested Agent Settings intent opens System models with exact origin", async
   window.location.href = prior.href; window.top = prior.top;
 });
 
+test("an Assistant link asks Home GUI for Browser first and Home's link prompt only for that same link", async () => {
+  const { openWebLink, openWebLinkThroughHomePrompt } = await import("../capsules/assistant/browser/harness-host.js");
+  const prior = { href: window.location.href, top: window.top, parent: window.parent };
+  const toParent = [], toTop = [];
+  window.parent = { postMessage: (message, origin) => toParent.push({ message, origin }) };
+  window.top = { postMessage: (message, origin) => toTop.push({ message, origin }) };
+  window.location.href = "https://home.example/apps/assistant/?home_origin=https%3A%2F%2Fhome.example";
+  const url = "https://docs.example/guide";
+  assert.equal(openWebLinkThroughHomePrompt(url), false, "nothing reaches the prompt unasked");
+  openWebLink(url);
+  assert.deepEqual(toParent, [{ origin: "*", message: { type: "home-agent:open-browser", url } }]);
+  assert.deepEqual(toTop, [], "with Browser, Home GUI opens it and Home's prompt is not asked");
+  assert.equal(openWebLinkThroughHomePrompt("https://evil.example/"), false, "Home GUI cannot swap the address");
+  assert.equal(openWebLinkThroughHomePrompt(url), true);
+  assert.deepEqual(toTop, [{ origin: "https://home.example", message: { type: "home:open-external", url, homeToken: "fixture" } }]);
+  assert.equal(openWebLinkThroughHomePrompt(url), false, "one prompt per click");
+  assert.equal(toTop.length, 1);
+  // Home GUI answers with the capsule's own string, so a link with no trailing
+  // slash or a mixed-case host still reaches the prompt, on every click.
+  for (const raw of ["https://example.com", "https://Docs.Example/Guide", "https://example.com"]) {
+    openWebLink(raw);
+    assert.equal(openWebLinkThroughHomePrompt(raw), true, raw);
+    assert.deepEqual(toTop.at(-1), { origin: "https://home.example", message: { type: "home:open-external", url: raw, homeToken: "fixture" } });
+  }
+  assert.equal(toTop.length, 4);
+  window.location.href = prior.href; window.top = prior.top; window.parent = prior.parent;
+});
+
 async function fixture(cancelReject = false, saved = null) {
   const events = defer();
   const accepted = defer();

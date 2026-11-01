@@ -10,9 +10,9 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20261101c";
-import { isPhone } from "./shell-form-factor.js?v=home-20261101c";
-import { registerStageGesture } from "./shell-popovers.js?v=home-20261101c";
+} from "./shell-core.js?v=home-20261101d";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101d";
+import { registerStageGesture } from "./shell-popovers.js?v=home-20261101d";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
