@@ -569,8 +569,10 @@ fn validate_component_owner_and_mode(
         if uid != geteuid().as_raw() && uid != 0 {
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
         }
+        // Group write is the default on per-user-group systems (Ubuntu umask
+        // 002 makes ~/.local group-writable); only world write is refused.
         let mode = metadata.mode() & 0o7777;
-        let writable_by_others = mode & 0o022 != 0;
+        let writable_by_others = mode & 0o002 != 0;
         let sticky = mode & 0o1000 != 0;
         if writable_by_others && !sticky {
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
@@ -667,6 +669,24 @@ mod tests {
     fn owner_only_dir(path: &Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_components_accept_owned_group_writable_and_refuse_world_writable() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
+        let shared = temp_root.join("local");
+        let root = shared.join("custody");
+        owner_only_dir(&root);
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+        validate_existing_path_components(&root).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            validate_existing_path_components(&root),
+            Err(CustodyProviderStateRootError::MissingOrUnsafe)
+        ));
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(target_os = "linux")]

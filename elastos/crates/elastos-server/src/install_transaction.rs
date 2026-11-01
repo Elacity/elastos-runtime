@@ -1418,13 +1418,14 @@ fn check_directory_mode(path: &Path, refused_mode: u32) -> anyhow::Result<()> {
             path.display()
         );
     }
-    let quoted = shell_quote_path(path);
     if metadata.uid() != unsafe { libc::geteuid() } {
+        // Never advise changing a folder that belongs to the system or another person.
         bail!(
-            "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
+            "installation directory is unsafe: {} is not owned by you. Choose a location you own",
             path.display()
         );
     }
+    let quoted = shell_quote_path(path);
     if metadata.mode() & refused_mode != 0 {
         let (description, fix) = if refused_mode == 0o002 {
             ("world-writable", "chmod o-w")
@@ -2750,6 +2751,24 @@ pub(crate) mod tests {
         assert!(status.success(), "{command}");
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
         assert!(InstallationGuard::acquire(&dir).is_ok());
+    }
+
+    #[test]
+    fn folder_owned_by_someone_else_is_refused_without_change_advice() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let error = check_installation_root(Path::new("/usr/bin"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is not owned by you. Choose a location you own"),
+            "{error}"
+        );
+        for advice in ["sudo", "chown", "chmod"] {
+            assert!(!error.contains(advice), "{error}");
+        }
+        assert!(InstallationGuard::acquire(Path::new("/usr/bin")).is_err());
     }
 
     #[test]

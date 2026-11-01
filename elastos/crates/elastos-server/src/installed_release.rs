@@ -48,7 +48,7 @@ pub(crate) fn load_or_migrate_for_update(
 ) -> Result<InstalledRelease> {
     guard.require_binary(binary)?;
     require_no_pending(binary)?;
-    check_directory(data, false)?;
+    check_data_root(data)?;
     require_current_source(data, source)?;
     let root = data.join("installation");
     let stage = data.join(MIGRATION);
@@ -539,11 +539,21 @@ fn consumed_present(data: &Path) -> Result<bool> {
 }
 
 fn check_directory(path: &Path, private: bool) -> Result<()> {
+    check_directory_mode(path, 0o7022, private)
+}
+
+/// The data root keeps its owner's group permissions (Ubuntu umask 002), as
+/// the installation writer admits it; descendants stay strict.
+fn check_data_root(path: &Path) -> Result<()> {
+    check_directory_mode(path, 0o7002, false)
+}
+
+fn check_directory_mode(path: &Path, refused: u32, private: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     anyhow::ensure!(
         metadata.is_dir()
             && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o7022 == 0
+            && metadata.mode() & refused == 0
             && (!private || metadata.mode() & 0o7777 == 0o700),
         "{REPAIR}"
     );
@@ -551,7 +561,7 @@ fn check_directory(path: &Path, private: bool) -> Result<()> {
 }
 
 fn check_parents(data: &Path, parent: &Path, private: bool) -> Result<()> {
-    check_directory(data, false)?;
+    check_data_root(data)?;
     let relative = parent.strip_prefix(data).context(REPAIR)?;
     let mut path = data.to_path_buf();
     for part in relative.components() {

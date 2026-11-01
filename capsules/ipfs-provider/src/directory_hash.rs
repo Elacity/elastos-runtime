@@ -155,9 +155,11 @@ fn open_root_with_mode(path: &Path, mode: RootMode) -> io::Result<File> {
         } else {
             // Canonical OS temp ancestors can be root-owned sticky directories.
             // Every component is opened without following links, including /tmp aliases.
+            // Group write is the default on per-user-group systems (Ubuntu umask
+            // 002 makes ~/.local group-writable); only world write is refused.
             let owner = meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() };
             let protected =
-                meta.mode() & 0o022 == 0 || (meta.uid() == 0 && meta.mode() & 0o1000 != 0);
+                meta.mode() & 0o002 == 0 || (meta.uid() == 0 && meta.mode() & 0o1000 != 0);
             if !owner || !protected {
                 return Err(invalid("unsafe staged ancestor"));
             }
@@ -1721,6 +1723,20 @@ mod tests {
         let file = root.path().join("not-a-repo");
         fs::write(&file, b"x").unwrap();
         assert!(seal_backend_repository(&file).is_err());
+    }
+
+    #[test]
+    fn staged_root_ancestors_accept_owned_group_writable_and_refuse_world_writable() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().canonicalize().unwrap().join("local");
+        let root = shared.join("staged");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+        open_root(&root).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_root(&root).is_err());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

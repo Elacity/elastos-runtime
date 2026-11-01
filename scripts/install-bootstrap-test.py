@@ -1153,6 +1153,36 @@ class InstallationTests(unittest.TestCase):
             result, _ = sandbox.run("--install-only")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_root_owned_group_writable_data_ancestor_is_accepted_unchanged(self):
+        # Debian and Ubuntu ship /var/local as root:staff 2775; nothing here can create one.
+        shared = next((path for path in (Path("/var/local"), Path("/var/mail")) if path.is_dir() and not path.is_symlink()
+                       and path.stat().st_uid == 0 and path.stat().st_mode & 0o020 and not path.stat().st_mode & 0o002), None)
+        if shared is None or os.geteuid() == 0:
+            self.skipTest("no root-owned group-writable folder on this host")
+        did, head, release = installable_fixture()
+        before = (shared.stat().st_mode, sorted(child.name for child in shared.iterdir()))
+        with InstallerSandbox(head, release, did) as sandbox:
+            (sandbox.home / "xdg-data").symlink_to(shared)
+            # No binary response: the installer stops at the download, before any write.
+            result, requests = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Unsafe", result.stderr)
+            self.assertNotEqual(requests, [])
+        self.assertEqual((shared.stat().st_mode, sorted(child.name for child in shared.iterdir())), before)
+
+    def test_install_dir_owned_by_someone_else_is_refused_without_changing_it(self):
+        if os.geteuid() == 0:
+            self.skipTest("root owns every folder")
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only", "--install-dir", "/usr/bin")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(requests, [])
+            self.assertIn("is not owned by you. Choose a location you own", result.stderr)
+            for advice in ("sudo", "chown", "chmod"):
+                self.assertNotIn(advice, result.stderr)
+
     def test_world_writable_data_ancestor_is_refused_before_download(self):
         did, head, release = installable_fixture()
         for mode in (0o777, 0o1777):

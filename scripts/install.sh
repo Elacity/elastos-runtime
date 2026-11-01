@@ -1224,7 +1224,7 @@ require_safe_existing_dir() {
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you. Choose a location you own"
     if [[ -n "$(find "$real" -maxdepth 0 -perm -o+w)" ]]; then
         die_exact "Unsafe installation directory: $(printf '%q' "$real") is world-writable; fix with: chmod o-w $(printf '%q' "$real")"
     fi

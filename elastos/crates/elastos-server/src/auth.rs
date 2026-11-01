@@ -1504,21 +1504,23 @@ fn require_secure_owner_persistence(data_dir: &Path) -> anyhow::Result<()> {
         let auth = auth_state_path(data_dir)?;
         ensure_regular_auth_parent(data_dir, auth.parent().ok_or(OwnerEnrollmentDenied)?)?;
         let mut path = data_dir.to_path_buf();
-        let validate = |path: &Path| -> anyhow::Result<()> {
+        // The data root keeps its owner's group permissions (Ubuntu umask
+        // 002), as the installation writer admits it; auth paths stay strict.
+        let validate = |path: &Path, refused: u32| -> anyhow::Result<()> {
             let metadata = std::fs::symlink_metadata(path)?;
             if metadata.file_type().is_symlink()
                 || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o022 != 0
+                || metadata.mode() & refused != 0
             {
                 return enrollment_denied();
             }
             Ok(())
         };
-        validate(&path)?;
+        validate(&path, 0o002)?;
         for component in auth.strip_prefix(data_dir)?.components() {
             path.push(component);
             if path.exists() {
-                validate(&path)?;
+                validate(&path, 0o022)?;
             }
         }
         Ok(())
@@ -10821,6 +10823,32 @@ mod tests {
             assert_eq!(probe.unwrap_err().kind(), ErrorKind::WouldBlock);
         } else {
             probe.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_persistence_accepts_group_writable_data_root_only() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let auth = auth_state_path(&data).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(auth.parent().unwrap())
+            .unwrap();
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(&data, 0o770);
+        require_secure_owner_persistence(&data).unwrap();
+        set(&data, 0o777);
+        assert!(require_secure_owner_persistence(&data).is_err());
+        set(&data, 0o700);
+        if auth.parent().unwrap() != data {
+            set(auth.parent().unwrap(), 0o770);
+            assert!(require_secure_owner_persistence(&data).is_err());
         }
     }
 
