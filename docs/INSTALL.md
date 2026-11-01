@@ -59,8 +59,17 @@ macOS Apple silicon), verifies the signed release, installs Runtime, and
 fetches the Home profile from the trusted publisher. It
 starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
 terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
-setup completes and prints the full command for opening Home later. The installer
-uses the installed binary's full path, so editing PATH is optional.
+setup completes and prints the full command for opening Home later. On a Linux
+computer with no desktop, such as a Jetson used over SSH, it prints the SSH
+tunnel command for opening Home from another computer.
+
+So that `elastos` is found in new terminals and after a restart, the installer
+adds one line ending in `# Added by the ElastOS installer` to your login profile
+(`~/.zprofile` for zsh, the default on macOS; `~/.profile` for bash, the default
+on Ubuntu, or `~/.bash_profile` if you have one). It does this only when the
+install folder is not already on PATH and the line is not there yet, and it
+prints the file it changed. Set `ELASTOS_NO_MODIFY_PATH=1` to skip it. To undo,
+delete that line; `--uninstall` removes it too.
 
 For automated provisioning, use `--install-only`:
 
@@ -270,8 +279,11 @@ keep the files in place and follow Runtime's operator repair step.
 
 Running `install.sh` again uses the same installation lock and journal. Before it
 stops Runtime, it restores an interrupted install and refuses an older release,
-another channel, a pending Home update, a second writer and an installed Runtime
-without a readable `sources.json`. Until an interrupted install is restored,
+a channel a stable or canary Home does not follow (for example canary on a
+stable Home), a pending Home update, a second writer and an installed Runtime
+without a readable `sources.json`. A Home on another channel, such as the
+retired `jetson-test`, can install a stable or canary release and then follows
+that channel. Until an interrupted install is restored,
 Home does not start and asks you to run `install.sh` again.
 
 How releases get to the seed is in
@@ -464,7 +476,8 @@ The installer stops this installation's Runtime the same way an install does:
 it stops only processes whose ownership records and command match this
 installation, and removes nothing if another process holds them. It then
 removes the binary, the components (including the release scripts and the
-Browser image), the trusted sources and the verified release. Your data
+Browser image), the trusted sources, the verified release and the PATH line the
+installer added to your login profile. Your data
 directory stays, including Browser profiles, so installing again continues with
 the same identity. Pass the same `--install-dir` you installed with. An install
 or update that is running or was interrupted stops the removal; finish it first.
