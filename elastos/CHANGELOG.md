@@ -12,8 +12,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - Admins can add another passkey, such as a second device or a security key, in System > Accounts > Add passkey. When sign-in fails, the lock screen says why.
 - Screens 640 px wide or less get a touch layout with a Dock and one app at a time. A phone still needs an HTTPS address for Home, which 2.0.0 does not set up (#116).
-- People has three pages: People, Profile and Public. Add someone by their DID from People, a Chat profile card or a message, even if you are not in Public.
-- A contact request waits 24 hours for the other Home to open.
+- People has three pages: People, Profile and Public. Add someone by their DID from People, a Chat profile card or a message, even if you are not in Public. A contact request waits 24 hours for the other Home to open.
 - Library's Share with contacts lets your contacts get a file of up to 8 MiB while your Home runs, and Chat's Attach posts a file's link in Community. Others must add you first, and files you received are not passed on.
 - On a Mac, admins can add a Venice or OpenRouter key in System > Models. Nothing is sent until you approve it in Inbox.
 
@@ -22,6 +21,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
+- The installer adds one line to your login profile (such as .zprofile or .profile) so the elastos command works after a restart; uninstall removes it, and ELASTOS_NO_MODIFY_PATH=1 skips it. On a Mac without Apple's Command Line Tools it opens Apple's installer and continues.
+- Known issue: after elastos update or Undo in a terminal, Home stays stopped. Start it with elastos home --browser (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
@@ -41,13 +42,14 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
 - Web links in Chat and Documents open only after you see the address and choose Open link. Documents Autosave is off by default.
 - Home starts with any number of large Library files. Library is faster and checks an archive before Extract Here.
+- Setup shows the size of the Browser download on a Mac, and stops before it when the disk is too small while Home still installs. It says while Home is starting, Ctrl+C stops it, and if it fails it says to run elastos setup again. Without a desktop, it says how to open Home from another computer.
 
 ### Security
 
 - Web pages open in a separate sandbox, and apps need permission to reach your private data. Releases are signed with a new key kept off the public server.
 - Browser gets security fixes (Chromium 155). On a Mac it downloads a new image of about 900 MB once after the update.
 - Not done yet: Home can still use every app's permissions, background services run with your account's rights, and approvals do not have a screen only ElastOS controls (#173).
-- Importing a Recovery Kit does not yet ask for your passkey again (#403). On Linux with KVM, the Browser network helper is installed with sudo without a file check (#406).
+- Importing a Recovery Kit does not yet ask for your passkey again (#403).
 - Guests cannot see the security log or use the web Terminal, which is off by default.
 
 ### Developer detail
@@ -241,6 +243,7 @@ Second release candidate for 2.0.0 on the test channel.
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
+- Known issue: after elastos update or Undo in a terminal, Home stays stopped. Start it with elastos home --browser (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
@@ -267,7 +270,7 @@ Second release candidate for 2.0.0 on the test channel.
 - Web pages open in a separate sandbox, and apps need permission to reach your private data. Releases are signed with a new key kept off the public server.
 - Browser gets security fixes (Chromium 155). On a Mac it downloads a new image of about 900 MB once after the update.
 - Not done yet: Home can still use every app's permissions, background services run with your account's rights, and approvals do not have a screen only ElastOS controls (#173).
-- Importing a Recovery Kit does not yet ask for your passkey again (#403). On Linux with KVM, the Browser network helper is installed with sudo without a file check (#406).
+- Importing a Recovery Kit does not yet ask for your passkey again (#403).
 - Guests cannot see the security log or use the web Terminal, which is off by default.
 
 ## [2.0.0-rc.1] - 2026-10-30

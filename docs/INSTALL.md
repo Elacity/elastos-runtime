@@ -37,8 +37,12 @@ curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 Developers can use the [Mac source guide](MAC.md) for source-home staging and
 Browser VM work.
 
-The installer needs `curl` and a working `python3`; on a Mac without the
-Command Line Tools it stops first and asks you to run `xcode-select --install`.
+The installer needs `curl` and a working `python3`. On a Mac without Apple's
+Command Line Tools, the installer opens Apple's installer for them. Click
+Install in Apple's window; the ElastOS installer continues by itself when the
+tools are installed. It waits up to 20 minutes, and Ctrl+C stops it. If it
+stops, or there is no terminal, run `xcode-select --install`, wait for it to
+finish, then run the install command again.
 Setup and updates need outgoing UDP to port 4433 for Carrier.
 
 Carrier uses mDNS by default to find other Homes on the same local network.
@@ -264,6 +268,10 @@ elastos update --check
 elastos update
 ```
 
+A terminal update or Undo leaves Home stopped, even if it was running before.
+Start it again with `elastos home --browser`. An update from System restarts
+Home by itself.
+
 After install, the web is used only to look up the publisher's current Carrier
 address from the `gateways` in `sources.json`; that answer is accepted only when
 it matches the trusted source. Releases and components come over Carrier and are
@@ -457,7 +465,16 @@ of that key exists.
 
 `--install-dir` moves only the binary. Everything else in the data directory is
 yours: identity keys, wallets, recovery material and user files. ElastOS adds
-no login items, launch agents, desktop entries or shell profile changes.
+no login items, launch agents or desktop entries.
+
+The installer adds one line to your login profile so new terminals find
+`elastos`: `~/.zprofile` for zsh; for bash, the first of `~/.bash_profile`,
+`~/.bash_login` or `~/.profile` that exists, else `~/.profile`; for other
+shells, `~/.zprofile` on macOS and `~/.profile` on Linux. The line ends with
+`# Added by the ElastOS installer`, and the installer prints which file it
+changed. It adds nothing when the install folder is already on PATH or the line
+is already there. To skip it, set `ELASTOS_NO_MODIFY_PATH=1` when you run the
+install command. Uninstall removes the line and keeps the rest of the file.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
