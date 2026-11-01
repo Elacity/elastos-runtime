@@ -587,6 +587,8 @@ CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", 
 # A signed release whose components name a kind this Runtime does not know needs the
 # publisher's install command (#89); it is offered only to an installed Home.
 CLI_INSTALLER_CASE = "unknown-kind"
+# The default Ubuntu/Jetson account: umask 002 and group-writable ~/.local, bin and share (#368).
+CLI_UBUNTU_CASE = "ubuntu-umask-002"
 CLI_FUTURE_COMPONENT, CLI_FUTURE_KIND = "update-hop-future", "update-hop-future-kind"
 # install_command() names only an https gateway; .invalid never resolves, so it adds no request.
 CLI_INSTALL_GATEWAY = "https://publisher.invalid"
@@ -3342,7 +3344,7 @@ def cli_run(config, output, local_rehearsal=None):
     result = {"schema": "elastos.update-hop.result/v1", "mode": CLI_MODE,
               "proof_kind": manifest["proof_kind"], "approval": manifest["approval"],
               "proof_scope": manifest.get("proof_scope", "production-positive"),
-              "signer_did": manifest["signer_did"], "channel": manifest["channel"],
+              "signer_did": manifest["signer_did"], "channel": manifest["channel"], "platform": manifest["platform"],
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
@@ -3486,6 +3488,62 @@ def cli_run(config, output, local_rehearsal=None):
                  "installed consumed head CID differs")
         return observation
 
+    def ubuntu_layout():
+        """The default Ubuntu/Jetson account (#368): umask 002 leaves ~/.local and its bin and
+        share folders group-writable. This source's installer installs there and leaves those
+        folders as they were, Home starts and answers authenticated health, and a CLI update
+        applies the release after this one."""
+        home_path = output / "homes/ubuntu-umask"
+        home_path.mkdir(mode=0o750)
+        shared = [home_path / folder for folder in (".local", ".local/bin", ".local/share")]
+        evidence = {"status": "failed", "umask": "002", "group_writable": [str(path.relative_to(home_path)) for path in shared]}
+        result["paths"]["m2-discovery"]["checks"][CLI_UBUNTU_CASE] = evidence
+        processes.roots[str(home_path / ".local/bin/elastos")] = {
+            manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("new", CLI_SYSTEM_PHASE)}
+        inherited = os.umask(0o002)
+        try:
+            for path in shared:
+                path.mkdir(mode=0o775)
+                need(path.stat().st_mode & 0o777 == 0o775, "Ubuntu layout fixture is not group-writable")
+            phase("new")
+            reply = install(home_path, "ubuntu-install", "new")
+            need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
+                 + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
+            setup(home_path, "ubuntu-setup", "new")
+            verify(home_path, "new", "ubuntu-version", fresh=True)
+            prepare(home_path, "ubuntu", "new")
+            env = cli_environment(home_path)
+            env["ELASTOS_CARRIER_MDNS"] = "0"
+            opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
+            env["PATH"] = str(opener.parent) + ":" + env["PATH"]
+            processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
+            process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home")
+            try:
+                status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
+                while ready is None and process.poll() is None and time.monotonic() < deadline:
+                    status = cli_private_json(status_path) if status_path.exists() else {}
+                    if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
+                        ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
+                    else:
+                        time.sleep(.2)
+                need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
+                     + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
+                evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                evidence["home_exit"] = process.wait(timeout=35)
+            need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
+            phase(CLI_SYSTEM_PHASE)
+            reply = command(home_path, ["update"], "ubuntu-update")
+            need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
+                 + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
+            verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
+            need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
+        finally:
+            os.umask(inherited)
+        evidence.update(status="passed", update={"from": manifest["new"]["version"], "to": manifest[CLI_SYSTEM_PHASE]["version"]})
+
     try:
         holder_mapping = manifest["holder"]["files"]
         binaries = {target: relative for target, relative in holder_mapping.items() if "/ipfs-repo/" not in target}
@@ -3566,6 +3624,8 @@ def cli_run(config, output, local_rehearsal=None):
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
             result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
+            if sys.platform.startswith("linux") and "initial_home" in manifest and CLI_SYSTEM_PHASE in manifest["publications"]:
+                ubuntu_layout()
         refusals = manifest["selectors"]["m1-install"]["refusals"]
         for case in [*refusals, CLI_INSTALLER_CASE] if refusals else []:
             # A fresh install of a newer component kind is the installer's job, not a refusal.
@@ -3676,6 +3736,11 @@ def cli_check_result(result):
     need(all(path["checks"][case]["status"] == "passed" for path in result["paths"].values() for case in CLI_REFUSALS)
          and result["paths"]["m2-discovery"]["checks"].get(CLI_INSTALLER_CASE, {}).get("status") == "passed",
          "a CLI refusal did not hold")
+    # A Linux hop also proves the default Ubuntu account layout.
+    ubuntu = result["paths"]["m2-discovery"]["checks"].get(CLI_UBUNTU_CASE, {})
+    need(not result.get("platform", "").endswith("-linux") or (ubuntu.get("status") == "passed"
+         and ubuntu["home"]["authenticated_health"] and ubuntu["update"]["to"] == next_version),
+         "the default Ubuntu account layout (umask 002, group-writable ~/.local) did not install, start and update")
     undo = home.get("undo", {})
     need(undo.get("status") == "passed" and undo["version"] == previous["version"]
          and undo["refused_plain_update"]["exit"] != 0 and undo["rollback"]["exit"] == 0,
