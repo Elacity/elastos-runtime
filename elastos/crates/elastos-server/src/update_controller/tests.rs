@@ -5522,3 +5522,22 @@ fn refused_releases_live_outside_status_and_keep_the_latest_eight() {
     assert!(!release_refused(&fixture.data, "head-5", "release-5").unwrap());
     assert!(release_refused(&fixture.data, "head-6", "release-6").unwrap());
 }
+
+#[tokio::test(start_paused = true)]
+async fn first_home_start_notes_progress_while_it_waits() {
+    let mut notes = Vec::new();
+    let ready = note_while_starting(
+        async {
+            tokio::time::sleep(Duration::from_secs(65)).await;
+            7
+        },
+        |seconds| notes.push(seconds),
+    )
+    .await;
+    assert_eq!(ready, 7);
+    assert_eq!(notes, [20, 40, 60]);
+    // A quick start prints nothing more.
+    let mut quick = Vec::new();
+    note_while_starting(async {}, |seconds| quick.push(seconds)).await;
+    assert!(quick.is_empty());
+}

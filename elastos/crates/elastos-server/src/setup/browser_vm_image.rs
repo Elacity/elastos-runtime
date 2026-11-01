@@ -23,6 +23,12 @@ const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
 const STAGING_PREFIX: &str = ".browser-image-stage-";
 const VERIFIED_SET_CACHE_LIMIT: usize = 8;
+// The unpacked set: the 4096 MiB root disk that
+// scripts/build/build-browser-vm-rootfs.sh builds, plus kernel, initrd and
+// receipts (about 120 MB). A test keeps it above the builder's root disk size.
+const UNPACKED_SET_BYTES: u64 = 4352 * 1024 * 1024;
+// Unit tests unpack small fixtures, so they do not ask for the full set's room.
+const UNPACK_ESTIMATE: u64 = if cfg!(test) { 0 } else { UNPACKED_SET_BYTES };
 
 // Like AuthState's verified-file cache, use inode plus nanosecond change time:
 // a same-size rewrite with restored mtime still requires verification.
@@ -484,9 +490,8 @@ pub(super) async fn install_via_carrier(
         .cloned()
         .ok_or_else(super::missing_trusted_source_error)?;
     let parent = dest.parent().unwrap();
-    fs::create_dir_all(parent)?;
+    require_space(dest, info)?;
     let size = info.size.unwrap();
-    check_disk_space(parent, size)?;
     let cancellation = PreparationCancellation::default();
     // tempfile creates an unlinked/private file on supported Unix Engine hosts.
     // Process exit or cancellation cannot leave a partial archive pathname.
@@ -508,6 +513,7 @@ pub(super) async fn install_via_carrier(
             );
             if received == total {
                 eprintln!();
+                eprintln!("Checking and unpacking the Browser image...");
             }
             displayed = std::time::Instant::now();
         }
@@ -515,9 +521,16 @@ pub(super) async fn install_via_carrier(
             || received == total
             || received.saturating_sub(checkpoint) >= 16 * 1024 * 1024
         {
-            check_disk_space(parent, total.saturating_sub(received))?;
+            // The rest of the download and the unpacked set still need room.
+            check_disk_space(
+                parent,
+                total
+                    .saturating_sub(received)
+                    .saturating_add(UNPACK_ESTIMATE),
+            )?;
             checkpoint = received;
-            tracing::info!(
+            // Debug: an INFO line here would cut through the progress line above.
+            tracing::debug!(
                 component = NAME,
                 phase = "downloading",
                 bytes_received = received,
@@ -584,7 +597,7 @@ fn install_archive_reader(
         "Browser image archive is incomplete: size mismatch"
     );
     reader.rewind()?;
-    tracing::info!(
+    tracing::debug!(
         component = NAME,
         phase = "verifying",
         "Browser image preparation"
@@ -623,7 +636,7 @@ fn install_archive_reader(
     fs::create_dir(&bundle)?;
     let reader = CancellableReader { reader, cancelled };
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
-    tracing::info!(
+    tracing::debug!(
         component = NAME,
         phase = "installing",
         "Browser image preparation"
@@ -723,7 +736,54 @@ fn lock_installation(parent: &Path) -> anyhow::Result<crate::host_lock::FileLock
     bail!("Browser image installation requires a supported Unix host")
 }
 
+/// Before the first byte is fetched, the download and the unpacked set must
+/// both fit with the shared reserve kept free. Otherwise one sentence names the
+/// space needed, instead of a refusal after the whole download.
+pub(super) fn require_space(dest: &Path, info: &PlatformInfo) -> anyhow::Result<()> {
+    let parent = dest
+        .parent()
+        .context("Browser image install path has no parent")?;
+    fs::create_dir_all(parent)?;
+    image_space(
+        available_space(parent)?,
+        info.size.unwrap_or_default(),
+        UNPACK_ESTIMATE,
+    )
+}
+
+fn image_space(available: u64, archive: u64, unpacked: u64) -> anyhow::Result<()> {
+    let needed = archive.saturating_add(unpacked);
+    if elastos_common::require_free_space(u128::from(available), u128::from(needed)).is_err() {
+        bail!(
+            "the Browser Engine image needs {} of free disk space to download and unpack, and {} is free",
+            super::progress::format_size(
+                needed.saturating_add(elastos_common::FREE_SPACE_RESERVE_BYTES)
+            ),
+            super::progress::format_size(available)
+        );
+    }
+    Ok(())
+}
+
+/// Cheap check for setup's download summary: the installed set's receipts name
+/// this release row. `verify_installed` still hashes the files before use.
+pub(super) fn receipts_match(data: &Path, info: &PlatformInfo) -> bool {
+    let dest = data.join(INSTALL_PATH);
+    super::extracted_bundle_cache_stale_reason(&dest, info).is_none()
+        && fs::read_to_string(dest.join(RECEIPT_HASH))
+            .ok()
+            .zip(super::compute_sha256_checksum(&dest.join(RECEIPT)).ok())
+            .is_some_and(|(recorded, current)| recorded.trim() == current)
+}
+
 fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
+    Ok(elastos_common::require_free_space(
+        u128::from(available_space(path)?),
+        u128::from(needed),
+    )?)
+}
+
+fn available_space(path: &Path) -> anyhow::Result<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -741,11 +801,7 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
         let block_size = stats.f_frsize;
         #[cfg(target_pointer_width = "32")]
         let block_size = u64::from(stats.f_frsize);
-        let available = disk_block_count(stats.f_bavail).saturating_mul(block_size);
-        Ok(elastos_common::require_free_space(
-            u128::from(available),
-            u128::from(needed),
-        )?)
+        Ok(disk_block_count(stats.f_bavail).saturating_mul(block_size))
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
@@ -1644,5 +1700,43 @@ mod tests {
             called.get(),
             "the oldest verified set should have been evicted"
         );
+    }
+
+    #[test]
+    fn browser_image_refuses_before_download_unless_download_and_unpack_fit() {
+        // The unpacked estimate covers the root disk the release image builder makes.
+        let builder = include_str!("../../../../../scripts/build/build-browser-vm-rootfs.sh");
+        let root_disk_mib: u64 = builder
+            .split("rootfs_size=\"${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-")
+            .nth(1)
+            .and_then(|rest| rest.split("M}\"").next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(UNPACKED_SET_BYTES >= (root_disk_mib + 128) * 1024 * 1024);
+        // The 2.0.0 Mac image: 868 MiB to download, about 4.2 GB unpacked.
+        let archive = 868 * 1024 * 1024;
+        let fits = archive + UNPACKED_SET_BYTES + elastos_common::FREE_SPACE_RESERVE_BYTES;
+        assert!(image_space(fits, archive, UNPACKED_SET_BYTES).is_ok());
+        assert!(image_space(fits - 1, archive, UNPACKED_SET_BYTES).is_err());
+        // A 3-7 GB disk once downloaded the whole archive and then failed to unpack.
+        assert_eq!(
+            image_space(5 * 1024 * 1024 * 1024, archive, UNPACKED_SET_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "the Browser Engine image needs 7.1 GB of free disk space to download and unpack, and 5.0 GB is free"
+        );
+    }
+
+    #[test]
+    fn browser_image_receipts_match_only_the_installed_release_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bytes, info) = archive(&fixture(b"rootfs"));
+        assert!(!receipts_match(temp.path(), &info));
+        install_archive(temp.path(), &bytes, &info, "darwin-arm64").unwrap();
+        assert!(receipts_match(temp.path(), &info));
+        let mut other = info.clone();
+        other.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+        assert!(!receipts_match(temp.path(), &other));
     }
 }

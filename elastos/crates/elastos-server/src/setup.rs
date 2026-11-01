@@ -286,6 +286,13 @@ async fn run_with_data_dir(
             &fs::canonicalize(&data_dir)?,
         )?)
     };
+    let platform = detect_platform();
+    // First, so a slow or blocked connection below never starts in silence.
+    eprintln!(
+        "ElastOS v{} — setup for {}",
+        env!("ELASTOS_VERSION"),
+        platform
+    );
     let signed_setup = if list {
         None
     } else {
@@ -298,13 +305,6 @@ async fn run_with_data_dir(
             (path, manifest, None)
         }
     };
-    let platform = detect_platform();
-
-    eprintln!(
-        "ElastOS v{} — setup for {}",
-        env!("ELASTOS_VERSION"),
-        platform
-    );
 
     if list {
         list_components(&manifest, &data_dir, &platform);
@@ -400,16 +400,20 @@ async fn run_with_data_dir(
             );
         }
     }
-    let size = if pending_bytes > 0 {
-        format!(" ({})", progress::format_size(pending_bytes))
-    } else {
-        String::new()
-    };
+    let browser_bytes = browser_config::pending_download_bytes(
+        &data_dir,
+        &manifest,
+        &platform,
+        components.iter().any(|name| name == "browser"),
+    );
     println!(
-        "Components: {} selected, {} to install{}",
-        components.len(),
-        pending_count,
-        size
+        "{}",
+        components_summary(
+            components.len(),
+            pending_count,
+            pending_bytes,
+            browser_bytes
+        )
     );
     println!();
 
@@ -615,6 +619,27 @@ async fn run_with_data_dir(
     Ok(())
 }
 
+/// The setup summary line names every byte setup downloads, Browser's included.
+fn components_summary(
+    selected: usize,
+    to_install: usize,
+    component_bytes: u64,
+    browser_bytes: u64,
+) -> String {
+    let size = match (component_bytes, browser_bytes) {
+        (0, 0) => String::new(),
+        (bytes, 0) => format!(" ({})", progress::format_size(bytes)),
+        (0, browser) => format!(" ({} for Browser)", progress::format_size(browser)),
+        (bytes, browser) => format!(
+            " ({} to download: {} for Home, {} for Browser)",
+            progress::format_size(bytes.saturating_add(browser)),
+            progress::format_size(bytes),
+            progress::format_size(browser)
+        ),
+    };
+    format!("Components: {selected} selected, {to_install} to install{size}")
+}
+
 /// True when the component loop in `run` skips this component before any
 /// effect. Keep in step with that loop's skip branches.
 fn skipped_before_install(
@@ -730,6 +755,7 @@ async fn admit_installed_setup_metadata(
     let cid = descriptor["cid"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("signed components CID is missing"))?;
+    println!("Connecting to the release source...");
     // The live source names only its newest release; a signed CID names this one.
     let client = crate::carrier::CarrierClient::connect_trusted_source(source, 15).await?;
     let result = async {
@@ -4334,6 +4360,8 @@ async fn download_component(
     require_component_not_model(name, dest)?;
     if name == browser_vm_image::NAME {
         browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
+        // Refused here, the sentence is not wrapped as a failed fetch.
+        browser_vm_image::require_space(dest, platform_info)?;
     }
 
     // Every component comes from the trusted source over Carrier.
@@ -5047,6 +5075,27 @@ pub(crate) mod tests {
             &component(Some("bin/a"), serde_json::json!({})),
             InstallState::Installed
         ));
+    }
+
+    #[test]
+    fn components_summary_names_every_download_including_browser() {
+        let mb = 1024 * 1024;
+        assert_eq!(
+            components_summary(30, 30, 110 * mb, 1040 * mb),
+            "Components: 30 selected, 30 to install (1.1 GB to download: 110.0 MB for Home, 1.0 GB for Browser)"
+        );
+        assert_eq!(
+            components_summary(30, 30, 110 * mb, 0),
+            "Components: 30 selected, 30 to install (110.0 MB)"
+        );
+        assert_eq!(
+            components_summary(30, 0, 0, 900 * mb),
+            "Components: 30 selected, 0 to install (900.0 MB for Browser)"
+        );
+        assert_eq!(
+            components_summary(30, 0, 0, 0),
+            "Components: 30 selected, 0 to install"
+        );
     }
 
     #[test]

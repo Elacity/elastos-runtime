@@ -57,6 +57,13 @@ const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 
 #[cfg(unix)]
 fn is_interactive_frontdoor_command(argv: &[String]) -> bool {
+    // The installer runs setup with stdin from /dev/null. Output on a terminal
+    // still means someone watches it, and Ctrl+C must stop it. Setup's writes
+    // already survive a killed process: locks are released and staging is
+    // removed by the next run.
+    if argv.first().is_some_and(|arg| arg == "setup") {
+        return std::io::stdout().is_terminal();
+    }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return false;
     }
@@ -2629,6 +2636,12 @@ mod tests {
             assert_eq!(super::should_isolate_process_group(&args), !interactive);
         }
         assert!(super::should_isolate_process_group(&["serve".to_string()]));
+        // Installer setup has stdin from /dev/null; a watched terminal still
+        // keeps it in the foreground group so Ctrl+C stops it.
+        assert_eq!(
+            super::should_isolate_process_group(&["setup".to_string()]),
+            !std::io::stdout().is_terminal()
+        );
     }
 
     #[test]

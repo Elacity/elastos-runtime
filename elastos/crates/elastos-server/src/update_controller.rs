@@ -1023,18 +1023,25 @@ impl Controller {
         let expected = installed.binary_sha256;
         drop(writer);
         let generation = hex::encode(rand::random::<[u8; 16]>());
+        println!(
+            "Starting Home. This can take up to {} minutes on a slow computer.",
+            READY_TIMEOUT.as_secs() / 60
+        );
         async {
             self.spawn(
                 &generation,
                 false,
                 &format!("Home {} start", source.installed_version),
             )?;
-            self.wait_ready(
+            let ready = self.wait_ready(
                 &generation,
                 &source.installed_version,
                 &expected,
                 READY_TIMEOUT,
-            )
+            );
+            note_while_starting(ready, |seconds| {
+                println!("Still starting Home ({seconds} s)...")
+            })
             .await
         }
         .await
@@ -1458,6 +1465,26 @@ impl Controller {
             }
             eprintln!("The previous Home did not start ({error:#}). Trying again.");
             attempt += 1;
+        }
+    }
+}
+
+/// The first start can take most of [`READY_TIMEOUT`] on a slow device (a
+/// Jetson is ready after 49-79 s), so the terminal hears from it on this interval.
+const START_NOTE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Runs `start`, calling `note` with the seconds waited every [`START_NOTE_INTERVAL`].
+async fn note_while_starting<T>(
+    start: impl std::future::Future<Output = T>,
+    mut note: impl FnMut(u64),
+) -> T {
+    let started = tokio::time::Instant::now();
+    let mut notes = tokio::time::interval_at(started + START_NOTE_INTERVAL, START_NOTE_INTERVAL);
+    tokio::pin!(start);
+    loop {
+        tokio::select! {
+            result = &mut start => return result,
+            _ = notes.tick() => note(started.elapsed().as_secs()),
         }
     }
 }
