@@ -1202,47 +1202,19 @@ echo /Library/Developer/CommandLineTools
                 self.assertEqual(profile.is_symlink(), kind == "symlink")
                 self.assertTrue(profile.samefile(target))
 
-    def test_profile_swapped_for_a_link_during_an_edit_leaves_the_link_target_unchanged(self):
+    def test_profile_swapped_for_a_link_before_the_edit_leaves_the_link_target_unchanged(self):
         line = 'export PATH="$HOME/.local/bin:$PATH"'
         marked = line + " # Added by the ElastOS installer\n"
         # The link target holds the marked line too, so a write through the link changes it.
         sentinel = '{"sentinel": true}\n' + marked
-        swap = 'mv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null; ln -s -- "$SENTINEL" "$PROFILE"\n'
-        # A regular file of someone else's put at the profile's name.
-        substitute = ('mv -- "$PROFILE" "$PROFILE.moved"; printf "substitute\\n" > "$SENTINEL.substitute"\n'
-                      'ln -- "$SENTINEL.substitute" "$PROFILE"\n')
-        after_read = lambda change: ''.join(f'eval "original_$(declare -f {edit})"\n'
-                                            f'{edit}() {{\noriginal_{edit} "$@" || return 1\n{change}}}\n'
-                                            for edit in ("profile_with_line", "profile_without_line"))
-        # The change runs right after the profile is admitted, right after the
-        # first new-file name is chosen (a link to the sentinel takes that name),
-        # or after the old content is read and before the new content takes its name.
-        hooks = {
-            "admission": 'eval "admitted_$(declare -f profile_admit)"\n'
-                         'profile_admit() {\nadmitted_profile_admit "$@" || return 1\n' + swap + '}\n',
-            "temp name": 'eval "chosen_$(declare -f profile_temp_name)"\n'
-                         'profile_temp_name() {\nlocal name\nname="$(chosen_profile_temp_name "$@")"\n'
-                         'if [[ ! -e "$SENTINEL.planted" ]]; then\n: > "$SENTINEL.planted"\n'
-                         'ln -s -- "$SENTINEL" "$name"\nfi\nprintf "%s\\n" "$name"\n}\n',
-            "read": after_read(swap),
-            "substitute": after_read(substitute),
-        }
+        # Right before the edit opens the profile, a symlink to the sentinel takes its name.
+        hook = ('python3() {\nmv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null\n'
+                'ln -s -- "$SENTINEL" "$PROFILE"\ncommand python3 "$@"\n}\n')
         actions = {"add": 'add_install_dir_to_login_profile\n',
                    "remove": 'remove_login_profile_lines "$HOME/.local/bin"\n'}
-        added, removed = "export EDITOR=vi\n" + marked, "export EDITOR=vi\n"
-        # (action, profile before, hook, profile after or None when left unchanged)
-        cases = [("add", "export EDITOR=vi\n", "admission", None),
-                 ("add", None, "admission", None),
-                 ("add", "export EDITOR=vi\n", "read", added),
-                 ("add", "export EDITOR=vi\n", "temp name", added),
-                 ("add", None, "temp name", marked),
-                 ("add", "export EDITOR=vi\n", "substitute", added),
-                 ("remove", added, "admission", None),
-                 ("remove", added, "read", removed),
-                 ("remove", added, "temp name", removed),
-                 ("remove", added, "substitute", removed)]
-        for action, before, hook, after in cases:
-            with self.subTest(action=action, before=before, hook=hook), \
+        for action, before in [("add", "export EDITOR=vi\n"), ("add", None),
+                               ("remove", "export EDITOR=vi\n" + marked)]:
+            with self.subTest(action=action, before=before), \
                     tempfile.TemporaryDirectory(prefix="installer-profile-swap-") as directory:
                 home, target = Path(directory, "home"), Path(directory, "runtime-data.json")
                 home.mkdir()
@@ -1251,28 +1223,32 @@ echo /Library/Developer/CommandLineTools
                 profile = home / ".profile"
                 if before is not None:
                     profile.write_text(before)
-                    profile.chmod(0o640)
                 result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
-                               'PROFILE="$1/.profile" SENTINEL="$2"\n' + hooks[hook] + actions[action],
+                               'PROFILE="$1/.profile" SENTINEL="$2"\n' + hook + actions[action],
                                home, target)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual((target.read_text(), target.stat().st_mode & 0o777), (sentinel, 0o604))
-                # No new file is left behind; a planted link is the test's own.
-                self.assertEqual([p.name for p in home.iterdir()
-                                  if p.name.startswith(".elastos-profile.") and not p.is_symlink()], [])
-                if hook == "substitute":
-                    self.assertEqual(Path(f"{target}.substitute").read_text(), "substitute\n")
-                if hook != "temp name" and before is not None:
+                self.assertTrue(profile.is_symlink())
+                self.assertIn("yourself: export PATH=", result.stdout)
+                if before is not None:
                     self.assertEqual(Path(f"{profile}.moved").read_text(), before)
-                if after is None:
-                    self.assertTrue(profile.is_symlink())
-                    self.assertIn("yourself: export PATH=", result.stdout)
-                else:
-                    # The new content replaced whatever held the name; the profile keeps its mode.
-                    self.assertFalse(profile.is_symlink())
-                    self.assertEqual(profile.read_text(), after)
-                    if before is not None:
-                        self.assertEqual(profile.stat().st_mode & 0o777, 0o640)
+
+    def test_profile_is_changed_in_place_keeping_its_inode_and_mode(self):
+        line = 'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+        with tempfile.TemporaryDirectory(prefix="installer-profile-inode-") as directory:
+            profile = Path(directory, ".profile")
+            # No trailing newline: the added line must start on its own line.
+            profile.write_text("export EDITOR=vi")
+            profile.chmod(0o600)
+            inode = profile.stat().st_ino
+            for script, expected in [('add_install_dir_to_login_profile\n', "export EDITOR=vi\n" + line),
+                                     ('remove_login_profile_lines "$HOME/.local/bin"\n', "export EDITOR=vi\n")]:
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               + script, directory)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((profile.read_text(), profile.stat().st_ino, profile.stat().st_mode & 0o777),
+                                 (expected, inode, 0o600))
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), [".profile"])
 
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()

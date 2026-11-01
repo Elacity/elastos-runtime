@@ -955,101 +955,46 @@ login_profile() {
     esac
 }
 
-# "device inode owner links mode" of the path $1 itself, or of the open file on
-# standard input when no path is given (GNU stat "-" and BSD stat without a
-# file use fstat). GNU stat -f reports the filesystem, so pick the syntax by what works.
-file_identity() {
-    if stat -c '%d' / >/dev/null 2>&1; then
-        stat -c '%d %i %u %h %a' -- "${1:--}"
-    else
-        stat -f '%d %i %u %l %Lp' ${1:+-- "$1"}
-    fi
-}
+# `edit_login_profile add|remove PROFILE LINE` adds LINE to a login profile or
+# removes the lines equal to it, through one opened file. The profile is opened
+# without following a link (a missing one is created exclusively) and must be
+# this user's regular file with a single name, so the edit cannot land in
+# another file such as Runtime data. It is changed in place: its inode, mode,
+# owner, ACL and other attributes stay. Otherwise it is left unchanged and the
+# function returns 1.
+edit_login_profile() {
+    python3 -I - "$@" <<'PY_LOGIN_PROFILE'
+import os
+import stat
+import sys
 
-# The installer edits a profile only when it is missing (then created new) or is
-# this user's own regular file with a single name. A symlink or a second hard
-# link could make the edit land in another file, such as Runtime data. Prints
-# "missing" or the admitted file's identity.
-profile_admit() {
-    local profile="$1" identity uid links
-    [[ ! -L "$profile" ]] || return 1
-    if [[ ! -e "$profile" ]]; then
-        echo missing
-        return 0
-    fi
-    [[ -f "$profile" ]] || return 1
-    identity="$(file_identity "$profile")" || return 1
-    read -r _ _ uid links _ <<< "$identity"
-    [[ "$uid" == "$(id -u)" && "$links" == 1 ]] || return 1
-    printf '%s\n' "$identity"
-}
-
-# Profile edits: the old content on stdin, the new content on stdout. awk ends
-# a last line that lacks a newline, so the added line never joins it.
-profile_with_line() {
-    PROFILE_LINE="$1" awk '{ print } END { print ENVIRON["PROFILE_LINE"] }'
-}
-profile_without_line() {
-    grep -vxF -- "$1" || [[ $? == 1 ]]
-}
-
-# A name for the new profile in the profile's folder; nothing is created here.
-profile_temp_name() {
-    printf '%s/.elastos-profile.%s.%s%s\n' "${1%/*}" "$$" "$RANDOM" "$RANDOM"
-}
-
-# Applies EDIT with LINE to an admitted profile. The installer never opens an
-# existing file for writing and never changes a file by name here: the old
-# content is read only from the opened admitted file; the new file is created
-# exclusively and written only through its descriptor; then it takes the
-# profile's name by rename (or by an exclusive link for a missing profile), so
-# a link swapped in at either name is refused or replaced, never followed.
-# Returns 1 with the profile unchanged otherwise.
-replace_login_profile() {
-    local profile="$1" edit="$2" line="$3" admitted mask saved_mask tmp="" attempt created=false status=1
-    admitted="$(profile_admit "$profile")" || return 1
-    if [[ "$admitted" == missing ]]; then
-        exec 3</dev/null
-        mask="$(umask)"
-    elif ! { exec 3<"$profile"; } 2>/dev/null; then
-        return 1
-    elif [[ "$(file_identity <&3 2>/dev/null)" != "$admitted" ]]; then
-        exec 3<&-
-        return 1
-    else
-        # The new file gets the profile's mode through the umask at creation;
-        # mode bits beyond 0666, such as execute, are dropped.
-        mask="$(printf '%04o' $((0777 & ~0${admitted##* })))"
-    fi
-    # Noclobber creates an absent name with O_EXCL and refuses an existing
-    # regular file or a link to one, so another random name is tried.
-    saved_mask="$(umask)"
-    umask "$mask"
-    set -C
-    for attempt in 1 2 3 4 5; do
-        tmp="$(profile_temp_name "$profile")"
-        { exec 4>"$tmp"; } 2>/dev/null && break
-        tmp=""
-    done
-    set +C
-    umask "$saved_mask"
-    # Noclobber opens an existing non-regular file (such as a FIFO) without
-    # creating it: only a regular file the name itself holds counts as created.
-    if [[ -n "$tmp" && -f "$tmp" && ! -L "$tmp" &&
-          "$(file_identity "$tmp" 2>/dev/null)" == "$(file_identity <&4 2>/dev/null)" ]]; then
-        created=true
-        if "$edit" "$line" <&3 >&4; then
-            if [[ "$admitted" == missing ]]; then
-                ln -n -- "$tmp" "$profile" 2>/dev/null && status=0
-            else
-                mv -f -- "$tmp" "$profile" 2>/dev/null && status=0 && created=false
-            fi
-        fi
-    fi
-    exec 3<&- 4>&-
-    # rm unlinks the name the installer created; it never writes a file.
-    [[ "$created" != true ]] || rm -f -- "$tmp"
-    return "$status"
+action, path, line = sys.argv[1], sys.argv[2], os.fsencode(sys.argv[3])
+flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+try:
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if action != "add":
+            raise
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o666)
+    with os.fdopen(fd, "r+b") as profile:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.geteuid() or found.st_nlink != 1:
+            sys.exit(1)
+        data = profile.read()
+        if action == "add":
+            # A last line without a newline would otherwise join this one.
+            new = data + (b"\n" if data and not data.endswith(b"\n") else b"") + line + b"\n"
+        else:
+            *lines, tail = data.split(b"\n")
+            new = b"".join(kept + b"\n" for kept in lines if kept != line) + (b"" if tail == line else tail)
+        if new != data:
+            profile.seek(0)
+            profile.write(new)
+            profile.truncate()
+except OSError:
+    sys.exit(1)
+PY_LOGIN_PROFILE
 }
 
 # One marked line in the login profile, so `elastos` is found after a restart
@@ -1065,8 +1010,8 @@ add_install_dir_to_login_profile() {
     if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
         return 0
     fi
-    if ! replace_login_profile "$profile" profile_with_line "$line"; then
-        warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be replaced; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
+    if ! edit_login_profile add "$profile" "$line"; then
+        warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be changed; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
         return 0
     fi
     PATH_PROFILE_UPDATED=true
@@ -1083,10 +1028,10 @@ remove_login_profile_lines() {
         [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile" || continue
         # The file stays even when empty: it may have existed before the install,
         # and removing a bash login file changes which one bash reads.
-        if replace_login_profile "$profile" profile_without_line "$line"; then
+        if edit_login_profile remove "$profile" "$line"; then
             ok "Removed the ElastOS PATH line from $(display_path "$profile")"
         else
-            warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be replaced; delete this line from it yourself: $line"
+            warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be changed; delete this line from it yourself: $line"
         fi
     done
 }
