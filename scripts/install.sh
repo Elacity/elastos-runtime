@@ -89,6 +89,11 @@ BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
 # 1 KiB/s for 60 s (the closest rule); there is no total cap.
 BINARY_DOWNLOAD_SPEED_LIMIT="${ELASTOS_BINARY_DOWNLOAD_SPEED_LIMIT:-1024}"
 BINARY_DOWNLOAD_SPEED_TIME="${ELASTOS_BINARY_DOWNLOAD_SPEED_TIME:-60}"
+# A Mac without Command Line Tools waits this long for Apple's installer.
+COMMAND_LINE_TOOLS_WAIT_SECONDS="${ELASTOS_COMMAND_LINE_TOOLS_WAIT_SECONDS:-1200}"
+COMMAND_LINE_TOOLS_POLL_SECONDS="${ELASTOS_COMMAND_LINE_TOOLS_POLL_SECONDS:-5}"
+# Ends the one PATH line the installer adds to a login profile; uninstall removes it.
+PATH_PROFILE_MARKER="# Added by the ElastOS installer"
 
 # ── Colors ────────────────────────────────────────────────────────────
 
@@ -882,6 +887,115 @@ runtime_command() {
     fi
 }
 
+# The command that runs this installer again with the same options.
+rerun_command() {
+    printf 'curl -fsSL %q | bash' "${PG}/install.sh"
+    if (( ${#INSTALLER_ARGS[@]} > 0 )); then
+        printf ' -s --'
+        printf ' %q' "${INSTALLER_ARGS[@]}"
+    fi
+}
+
+# Apple's python3 is a stub until the Command Line Tools are installed. Start
+# Apple's installer and wait for a python3 that runs. `xcode-select -p` is the
+# probe because running the stub can open Apple's window again.
+wait_for_command_line_tools() {
+    xcode-select --install >/dev/null 2>&1 || true
+    info "This Mac needs Apple's Command Line Tools once, for python3."
+    info "Click Install in Apple's window. This installer continues by itself when they are installed. Press Ctrl+C to stop."
+    local waited=0 next_note=60
+    while (( waited < COMMAND_LINE_TOOLS_WAIT_SECONDS )); do
+        sleep "$COMMAND_LINE_TOOLS_POLL_SECONDS"
+        waited=$((waited + COMMAND_LINE_TOOLS_POLL_SECONDS))
+        if xcode-select -p >/dev/null 2>&1 && python3 -c '' </dev/null >/dev/null 2>&1; then
+            ok "Apple's Command Line Tools are installed"
+            return 0
+        fi
+        if (( waited >= next_note )); then
+            info "Still waiting for Apple's Command Line Tools ($(format_elapsed "$waited"))..."
+            next_note=$((next_note + 60))
+        fi
+    done
+    return 1
+}
+
+# INSTALL_DIR as a PATH line for a shell profile: "$HOME/..." under HOME, quoted elsewhere.
+path_export_line() {
+    local quoted
+    quoted="$(printf '%q' "$INSTALL_DIR")"
+    if [[ "$quoted" == "$INSTALL_DIR" && -n "${HOME:-}" && "$INSTALL_DIR" == "${HOME%/}"/* ]]; then
+        printf 'export PATH="$HOME/%s:$PATH"' "${INSTALL_DIR#"${HOME%/}"/}"
+    else
+        printf 'export PATH=%s:"$PATH"' "$quoted"
+    fi
+}
+
+# The file the login shell reads at sign-in: zsh reads ~/.zprofile; bash reads the
+# first of ~/.bash_profile, ~/.bash_login and ~/.profile, so a new file must not
+# hide an existing one. Other shells: ~/.zprofile on macOS, ~/.profile on Linux.
+login_profile() {
+    local name
+    case "${SHELL##*/}" in
+        zsh) printf '%s/.zprofile' "$HOME" ;;
+        bash)
+            for name in .bash_profile .bash_login .profile; do
+                if [[ -f "$HOME/$name" ]]; then
+                    printf '%s/%s' "$HOME" "$name"
+                    return 0
+                fi
+            done
+            printf '%s/.profile' "$HOME" ;;
+        *)
+            if [[ "${PLATFORM:-}" == *-darwin ]]; then
+                printf '%s/.zprofile' "$HOME"
+            else
+                printf '%s/.profile' "$HOME"
+            fi ;;
+    esac
+}
+
+# One marked line in the login profile, so `elastos` is found after a restart
+# (as rustup, uv and bun do). Skipped when INSTALL_DIR is already on PATH, when
+# the line is present, and with ELASTOS_NO_MODIFY_PATH=1.
+PATH_PROFILE_UPDATED=false
+add_install_dir_to_login_profile() {
+    [[ "${ELASTOS_NO_MODIFY_PATH:-}" != 1 ]] || return 0
+    case ":${PATH}:" in *":${INSTALL_DIR}:"*) return 0 ;; esac
+    local profile line
+    profile="$(login_profile)"
+    line="$(path_export_line) ${PATH_PROFILE_MARKER}"
+    if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
+        return 0
+    fi
+    # A last line without a newline would otherwise join this one.
+    if ! { if [[ -s "$profile" && -n "$(tail -c 1 -- "$profile")" ]]; then printf '\n'; fi
+           printf '%s\n' "$line"; } 2>/dev/null >> "$profile"; then
+        warn "Could not add ElastOS to PATH in $(display_path "$profile"); use the full path below."
+        return 0
+    fi
+    PATH_PROFILE_UPDATED=true
+    ok "Added $(display_path "$INSTALL_DIR") to PATH in $(display_path "$profile"), so new terminals find elastos"
+    info "To undo, delete the line ending in '${PATH_PROFILE_MARKER}' from that file."
+}
+
+# Uninstall removes every line the installer added, from every profile it may use.
+remove_login_profile_lines() {
+    local profile kept
+    for profile in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+        [[ -f "$profile" ]] && grep -q -e "${PATH_PROFILE_MARKER}\$" -- "$profile" || continue
+        kept="$(mktemp)"
+        # Rewrite in place, so a linked profile stays a link and keeps its mode.
+        if { grep -v -e "${PATH_PROFILE_MARKER}\$" -- "$profile" > "$kept" || [[ $? == 1 ]]; } &&
+           cat -- "$kept" > "$profile"; then
+            [[ -s "$profile" || -L "$profile" ]] || rm -f -- "$profile"
+            ok "Removed the ElastOS PATH line from $(display_path "$profile")"
+        else
+            warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete the line ending in '${PATH_PROFILE_MARKER}' by hand."
+        fi
+        rm -f -- "$kept"
+    done
+}
+
 show_ready() {
     local runtime_bin="$1" command elapsed
     command="$(runtime_command "$runtime_bin")"
@@ -891,16 +1005,26 @@ show_ready() {
     printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
     printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
     if [[ "$command" != elastos ]]; then
-        local quoted path_entry
-        quoted="$(printf '%q' "$INSTALL_DIR")"
-        if [[ "$quoted" == "$INSTALL_DIR" && -n "${HOME:-}" && "$INSTALL_DIR" == "${HOME%/}"/* ]]; then
-            path_entry="\"\$HOME/${INSTALL_DIR#"${HOME%/}"/}:\$PATH\""
-        else
-            path_entry="${quoted}:\"\$PATH\""
-        fi
-        printf '    %b%-12s%b %s\n' "$DIM" "Add to PATH" "$NC" "export PATH=${path_entry}"
+        local label="Add to PATH"
+        # New terminals already read the profile line; only this one needs it.
+        [[ "$PATH_PROFILE_UPDATED" != true ]] || label="This terminal"
+        printf '    %b%-12s%b %s\n' "$DIM" "$label" "$NC" "$(path_export_line)"
     fi
     echo ""
+}
+
+# Home listens only on this computer (the Runtime's BROWSER_HOME_PORT, 8090). A
+# Linux computer with no desktop session, such as a Jetson used over SSH, has
+# no browser to open, so say how to reach Home from another computer.
+show_remote_open_hint() {
+    [[ "$(uname -s)" == Linux && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]] || return 0
+    local host
+    # SSH_CONNECTION is "client port server port": the address this session reached.
+    host="$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{ print $3 }')"
+    [[ -n "$host" ]] || host="$(uname -n)"
+    info "No desktop is running on this computer, so no browser opens here."
+    info "To use Home from another computer, run this there, then open http://localhost:8090/home/ in its browser:"
+    printf '  ssh -L 8090:localhost:8090 %s@%s\n' "$(id -un)" "$host"
 }
 
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
@@ -944,11 +1068,18 @@ finish_install() {
     fi
     step 5 "Set up Home"
     info "Setting up Home..."
-    local setup_args=(setup)
+    local setup_args=(setup) status=0
     if [[ "${ISOLATED:-false}" == true ]]; then
         setup_args+=(--isolated)
     fi
-    "$runtime_bin" "${setup_args[@]}" </dev/null || return $?
+    "$runtime_bin" "${setup_args[@]}" </dev/null || status=$?
+    if (( status != 0 )); then
+        # The Runtime is installed; only setup needs to run again.
+        warn "Home setup did not finish. ElastOS is installed, so you do not need to run the whole install again."
+        warn "If the reason above is a network that blocks UDP port 4433 (some office, school and hotel networks do), connect to another network, such as a phone hotspot."
+        warn "Then run: $(runtime_command "$runtime_bin") ${setup_args[*]}"
+        return "$status"
+    fi
     if ! prepare_browser_linux_host; then
         warn "Browser host preparation is incomplete. Home is ready. Run the installer from a terminal to complete Browser host access, then run elastos setup."
     elif [[ "${BROWSER_LINUX_HOST_READY:-false}" == true ]]; then
@@ -957,6 +1088,7 @@ finish_install() {
     fi
     show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
+        show_remote_open_hint
         info "Opening Home..."
         "$runtime_bin" home --browser </dev/tty || return $?
     else
@@ -1083,6 +1215,7 @@ uninstall_installation() {
     binary="${install_dir}/elastos"
     if [[ ! -e "$binary" && ! -L "$binary" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
         ok "No ElastOS installation found"
+        remove_login_profile_lines
         return 0
     fi
     command -v python3 &>/dev/null || die "Required tool not found: python3"
@@ -1098,6 +1231,7 @@ uninstall_installation() {
     uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
         || die "Uninstall did not finish; run it again after fixing the reason above"
     ok "Removed the Runtime and its components"
+    remove_login_profile_lines
     if [[ "$remove_data" == true ]]; then
         ok "Deleted the data directory"
     else
@@ -1118,6 +1252,7 @@ INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 UNINSTALL=false
 REMOVE_DATA=false
 INSTALL_STARTED_AT=$SECONDS
+INSTALLER_ARGS=("$@")
 installer_select_output
 
 while [[ $# -gt 0 ]]; do
@@ -1179,10 +1314,15 @@ for cmd in curl python3; do
 done
 # A Mac without Command Line Tools has only a python3 stub that cannot run.
 if ! python3 -c '' </dev/null &>/dev/null; then
-    if [[ "$PLATFORM" == *-darwin ]]; then
-        die "This Mac needs Apple's Command Line Tools for python3. Run: xcode-select --install, then run the installer again."
+    if [[ "$PLATFORM" != *-darwin ]]; then
+        die "python3 is installed but does not run. Repair python3, then run the installer again."
     fi
-    die "python3 is installed but does not run. Repair python3, then run the installer again."
+    # Only a person at a terminal can click Install in Apple's window.
+    if [[ ! -t 1 ]]; then
+        die_exact "This Mac needs Apple's Command Line Tools for python3. Run: xcode-select --install, and when it finishes run: $(rerun_command)"
+    fi
+    wait_for_command_line_tools \
+        || die_exact "Apple's Command Line Tools are not installed yet. When Apple's installer finishes, run: $(rerun_command)"
 fi
 
 if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
@@ -1440,8 +1580,9 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
     f.write("\n")
 PY
 
-# The writer refuses an older release, another channel, a pending Home
-# update and a concurrent writer before this installer stops Runtime.
+# The writer refuses an older release, a channel a stable or canary Home does
+# not follow, a pending Home update and a concurrent writer before this
+# installer stops Runtime.
 INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
     --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
     "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json")
@@ -1470,6 +1611,7 @@ info "Verifying and upgrading configured protected roots while Runtime is stoppe
 ok "Protected roots are ready"
 ok "Saved trusted source config to $(display_path "${DATA_DIR}/sources.json")"
 ok "Saved verified release inputs for Runtime setup and updates"
+add_install_dir_to_login_profile
 
 # ── Complete installation ─────────────────────────────────────────────
 
