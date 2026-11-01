@@ -462,7 +462,8 @@ fn validate_existing_path_components(path: &Path) -> Result<(), CustodyProviderS
                     return Err(CustodyProviderStateRootError::MissingOrUnsafe);
                 }
                 let shared = data_root.is_some_and(|data| data.starts_with(&current));
-                validate_component_owner_and_mode(&metadata, shared)?;
+                let below_data = data_root.is_some_and(|data| current.starts_with(data) && !shared);
+                validate_component_owner_and_mode(&metadata, shared, below_data)?;
             }
             Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
                 return Err(CustodyProviderStateRootError::MissingOrUnsafe)
@@ -572,11 +573,13 @@ fn validate_owner_mode_and_links(
 
 /// `shared` marks the data directory and its ancestors: they keep their
 /// owner's group permissions (Ubuntu umask 002 makes ~/.local group-writable).
-/// Directories below the data directory are ElastOS's own and stay closed to
-/// group writes.
+/// Directories below the data directory (`below_data`) are ElastOS's own and
+/// stay closed to group writes, sticky or not. Outside the custody layout no
+/// data directory is known and the original rule applies to every folder.
 fn validate_component_owner_and_mode(
     metadata: &fs::Metadata,
     shared: bool,
+    below_data: bool,
 ) -> Result<(), CustodyProviderStateRootError> {
     #[cfg(unix)]
     {
@@ -591,9 +594,9 @@ fn validate_component_owner_and_mode(
         let refused = if shared { 0o002 } else { 0o022 };
         let writable_by_others = mode & refused != 0;
         // The sticky exception (root-owned /tmp, a user's sticky folder) is for
-        // OS ancestors only: below DATA a sticky folder is still refused.
+        // OS folders only: below DATA a sticky folder is still refused.
         let sticky = mode & 0o1000 != 0;
-        if writable_by_others && !(shared && sticky) {
+        if writable_by_others && (below_data || !sticky) {
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
         }
     }
@@ -739,6 +742,16 @@ mod tests {
             Err(CustodyProviderStateRootError::MissingOrUnsafe)
         ));
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        // Outside the custody layout a /tmp-like sticky folder is accepted as
+        // before; without the sticky bit the same folder is refused.
+        let sticky_tmp = temp_root.join("tmp");
+        let state = sticky_tmp.join("state");
+        owner_only_dir(&state);
+        fs::set_permissions(&sticky_tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+        validate_existing_path_components(&state).unwrap();
+        fs::set_permissions(&sticky_tmp, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_existing_path_components(&state).is_err());
+        fs::set_permissions(&sticky_tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
