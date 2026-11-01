@@ -3403,9 +3403,7 @@ struct RestartScenario {
     old: Vec<(PathBuf, Vec<u8>)>,
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
+use crate::install_transaction::shell_quote;
 
 /// Shell lines that export `settings` and exec the real fixture Home below.
 fn fixture_home_exec(settings: &str) -> String {

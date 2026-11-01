@@ -919,12 +919,13 @@ wait_for_command_line_tools() {
     return 1
 }
 
-# INSTALL_DIR as a PATH line for a shell profile: "$HOME/..." under HOME, quoted elsewhere.
+# An install directory (default INSTALL_DIR) as a PATH line for a shell profile:
+# "$HOME/..." under HOME, quoted elsewhere.
 path_export_line() {
-    local quoted
-    quoted="$(printf '%q' "$INSTALL_DIR")"
-    if [[ "$quoted" == "$INSTALL_DIR" && -n "${HOME:-}" && "$INSTALL_DIR" == "${HOME%/}"/* ]]; then
-        printf 'export PATH="$HOME/%s:$PATH"' "${INSTALL_DIR#"${HOME%/}"/}"
+    local dir="${1:-$INSTALL_DIR}" quoted
+    quoted="$(printf '%q' "$dir")"
+    if [[ "$quoted" == "$dir" && -n "${HOME:-}" && "$dir" == "${HOME%/}"/* ]]; then
+        printf 'export PATH="$HOME/%s:$PATH"' "${dir#"${HOME%/}"/}"
     else
         printf 'export PATH=%s:"$PATH"' "$quoted"
     fi
@@ -954,6 +955,16 @@ login_profile() {
     esac
 }
 
+# The installer edits a profile only when it is missing (then created new) or is
+# this user's own regular file with a single name. A symlink or a second hard
+# link could make the edit land in another file, such as Runtime data.
+profile_is_editable() {
+    local profile="$1"
+    [[ ! -L "$profile" ]] || return 1
+    [[ -e "$profile" ]] || return 0
+    [[ -f "$profile" && -O "$profile" && -n "$(find "$profile" -maxdepth 0 -links 1 2>/dev/null)" ]]
+}
+
 # One marked line in the login profile, so `elastos` is found after a restart
 # (as rustup, uv and bun do). Skipped when INSTALL_DIR is already on PATH, when
 # the line is present, and with ELASTOS_NO_MODIFY_PATH=1.
@@ -967,6 +978,10 @@ add_install_dir_to_login_profile() {
     if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
         return 0
     fi
+    if ! profile_is_editable "$profile"; then
+        warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
+        return 0
+    fi
     # A last line without a newline would otherwise join this one.
     if ! { if [[ -s "$profile" && -n "$(tail -c 1 -- "$profile")" ]]; then printf '\n'; fi
            printf '%s\n' "$line"; } 2>/dev/null >> "$profile"; then
@@ -978,20 +993,26 @@ add_install_dir_to_login_profile() {
     info "To undo, delete the line ending in '${PATH_PROFILE_MARKER}' from that file."
 }
 
-# Uninstall removes every line the installer added, from every profile it may use.
+# Uninstall removes the exact line the installer added for this install
+# directory, from every profile it may use; other installs' lines stay.
 remove_login_profile_lines() {
-    local profile kept
+    local line profile kept
+    line="$(path_export_line "$1") ${PATH_PROFILE_MARKER}"
     for profile in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
-        [[ -f "$profile" ]] && grep -q -e "${PATH_PROFILE_MARKER}\$" -- "$profile" || continue
+        [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile" || continue
+        if ! profile_is_editable "$profile"; then
+            warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; delete this line from it yourself: $line"
+            continue
+        fi
         kept="$(mktemp)"
-        # Rewrite in place, so a linked profile stays a link and keeps its mode.
+        # Rewrite in place, so the profile keeps its mode.
         # The file stays even when empty: it may have existed before the install,
         # and removing a bash login file changes which one bash reads.
-        if { grep -v -e "${PATH_PROFILE_MARKER}\$" -- "$profile" > "$kept" || [[ $? == 1 ]]; } &&
+        if { grep -vxF -- "$line" "$profile" > "$kept" || [[ $? == 1 ]]; } &&
            cat -- "$kept" > "$profile"; then
             ok "Removed the ElastOS PATH line from $(display_path "$profile")"
         else
-            warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete the line ending in '${PATH_PROFILE_MARKER}' by hand."
+            warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete this line from it yourself: $line"
         fi
         rm -f -- "$kept"
     done
@@ -1216,7 +1237,7 @@ uninstall_installation() {
     binary="${install_dir}/elastos"
     if [[ ! -e "$binary" && ! -L "$binary" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
         ok "No ElastOS installation found"
-        remove_login_profile_lines
+        remove_login_profile_lines "$install_dir"
         return 0
     fi
     command -v python3 &>/dev/null || die "Required tool not found: python3"
@@ -1232,7 +1253,7 @@ uninstall_installation() {
     uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
         || die "Uninstall did not finish; run it again after fixing the reason above"
     ok "Removed the Runtime and its components"
-    remove_login_profile_lines
+    remove_login_profile_lines "$install_dir"
     if [[ "$remove_data" == true ]]; then
         ok "Deleted the data directory"
     else

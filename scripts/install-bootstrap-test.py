@@ -221,16 +221,28 @@ def shell_on_terminal(script, *args, timeout=30):
 
     reader = threading.Thread(target=drain)
     reader.start()
+    proc = None
     try:
+        # Its own process group, so a timeout or error stops the script and all it started.
         proc = subprocess.Popen([OPTIONS.bash, "--noprofile", "--norc", "-s", "--", *map(str, args)],
-                                stdin=subprocess.PIPE, stdout=slave, stderr=subprocess.PIPE, text=True)
+                                stdin=subprocess.PIPE, stdout=slave, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=os.setpgrp)
         os.close(slave)
         slave = None
         _, stderr = proc.communicate(HELPERS + "\n" + script, timeout=timeout)
+    except BaseException:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        raise
     finally:
         if slave is not None:
             os.close(slave)
-        reader.join(timeout=5)
+        # Every writer has exited, so the reader sees the end of the terminal.
+        reader.join()
         os.close(master)
     stdout = b"".join(chunks).decode(errors="replace").replace("\r\n", "\n")
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
@@ -420,6 +432,33 @@ class ShellTests(unittest.TestCase):
         self.assertIn("[1/5]", rich.stdout)
         self.assertIn("✓", rich.stdout)
         self.assertNotIn("[OK]", rich.stdout)
+
+    def test_terminal_run_that_times_out_stops_and_reaps_its_processes(self):
+        started, real_popen = [], subprocess.Popen
+
+        def record(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        threads = set(threading.enumerate())
+        with tempfile.TemporaryDirectory(prefix="installer-terminal-") as directory:
+            pid_file = Path(directory, "sleeper")
+            with mock.patch.object(subprocess, "Popen", record), \
+                    self.assertRaises(subprocess.TimeoutExpired):
+                shell_on_terminal('sleep 30 &\nprintf %s "$!" > "$1"\nwait\n', pid_file, timeout=3)
+            sleeper = int(pid_file.read_text())
+        # The script is killed and reaped, its reader thread is joined, and the
+        # process it started in the background is stopped too.
+        self.assertEqual(started[0].returncode, -signal.SIGKILL)
+        self.assertEqual(set(threading.enumerate()), threads)
+        for _ in range(50):
+            try:
+                os.kill(sleeper, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"background process {sleeper} still runs")
 
     def test_installed_version_reads_sources_and_rejects_control_text(self):
         with tempfile.TemporaryDirectory(prefix="installer-version-") as directory:
@@ -1114,6 +1153,54 @@ echo /Library/Developer/CommandLineTools
                 self.assertIn(f"Removed the ElastOS PATH line from ~/{profile}", result.stdout)
                 self.assertTrue(path.is_file())
                 self.assertEqual(path.read_text(), kept)
+
+    def test_uninstall_removes_only_the_selected_install_dirs_path_line(self):
+        did, head, release = installable_fixture()
+        marker = " # Added by the ElastOS installer\n"
+        with InstallerSandbox(head, release, did) as sandbox:
+            other = sandbox.root / "other bin"
+            default_line = 'export PATH="$HOME/.local/bin:$PATH"' + marker
+            other_line = shell('path_export_line "$1"\n', other).stdout + marker
+            hand = "echo mine" + marker
+            profile = sandbox.home / ".profile"
+            profile.write_text("export EDITOR=vi\n" + default_line + other_line + hand)
+            # Nothing is installed in either directory: only the selected line goes.
+            result, _ = sandbox.run("--uninstall", "--install-dir", str(other))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("No ElastOS installation found", result.stdout)
+            self.assertEqual(profile.read_text(), "export EDITOR=vi\n" + default_line + hand)
+            result, _ = sandbox.run("--uninstall")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(profile.read_text(), "export EDITOR=vi\n" + hand)
+
+    def test_linked_or_shared_profile_is_left_unchanged_with_the_line_to_add(self):
+        did, head, release = installable_fixture()
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        sentinel = '{"sentinel": true}\n'
+        for kind in ("symlink", "hard link"):
+            with self.subTest(kind=kind), InstallerSandbox(head, release, did) as sandbox:
+                # The profile name aliases another file, such as Runtime data.
+                target = sandbox.root / "runtime-data.json"
+                target.write_text(sentinel)
+                profile = sandbox.home / ".profile"
+                if kind == "symlink":
+                    profile.symlink_to(target)
+                else:
+                    os.link(target, profile)
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               'add_install_dir_to_login_profile\n', sandbox.home)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_text(), sentinel)
+                self.assertIn(f"add this line to it yourself: {line}\n", result.stdout)
+                # A marked line already in the aliased file stays on uninstall too.
+                shared = sentinel + line + " # Added by the ElastOS installer\n"
+                target.write_text(shared)
+                result, _ = sandbox.run("--uninstall")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_text(), shared)
+                self.assertIn("delete this line from it yourself", result.stdout)
+                self.assertEqual(profile.is_symlink(), kind == "symlink")
+                self.assertTrue(profile.samefile(target))
 
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()
