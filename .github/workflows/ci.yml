@@ -686,7 +686,7 @@ jobs:
             platform: linux-arm64
             host: linux
             target: aarch64-unknown-linux-musl
-          - os: macos-14
+          - os: macos-15
             platform: darwin-arm64
             host: darwin
             target: aarch64-apple-darwin
@@ -717,6 +717,8 @@ jobs:
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           install -d -m 700 "$RUNNER_TEMP/upstream-home"
+          # Darwin: Cargo and its C dependencies target macOS 11.0, not the runner SDK.
+          [[ "${{ matrix.host }}" != darwin ]] || export MACOSX_DEPLOYMENT_TARGET=11.0
           bundle=()
           [[ "$UPSTREAM_PLATFORM" != linux-arm64 ]] \
             || bundle=(--llama-arm64-bundle "$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz")
@@ -1023,10 +1025,13 @@ jobs:
 
   source-home-macos:
     name: source-home-macos
-    runs-on: macos-14
+    runs-on: macos-15
     # The two hop builds may take 30 minutes and the update journey step 75.
     timeout-minutes: 150
     needs: source-gate
+    env:
+      # Cargo and its C dependencies target macOS 11.0, not the runner SDK.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: set job build directories
         run: |
@@ -1179,7 +1184,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: source-home-journeys-macos-14
+          name: source-home-journeys-macos-15
           path: |
             ${{ runner.temp }}/source-home-journeys/**/*.json
             ${{ runner.temp }}/source-home-journeys/**/*.png

@@ -605,7 +605,7 @@ CLI_PLATFORM_ALIASES = {"x86_64-linux": ("linux-amd64",), "aarch64-linux": ("lin
                         "aarch64-darwin": ("darwin-arm64",), "darwin-arm64": ("aarch64-darwin",)}
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
 CLI_INSTALLED_METADATA = ("installation/release-head.json", "installation/release.json")
-CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("15.0.1", "15.1", "15.2", "15.3", "15.4", "16.1", "16.2"))
+CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("16", "16.1", "16.2", "16.3", "16.4", "26.0.1", "26.1.1", "26.2", "26.3"))
 
 
 def cli_host_platform():
@@ -1149,7 +1149,7 @@ def cli_prepare_ci_disk():
     growth = 20 * 1024**3 + CLI_PUBLISHED_RESERVE
     receipt = cli_reclaim_xcode(applications, protected, growth,
                                 lambda: shutil.disk_usage(checkout), remove)
-    receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
+    receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md"
     try:
         receipt = cli_reclaim_android(runner_home, os.geteuid(), receipt,
                                        lambda: shutil.disk_usage(checkout), remove)

@@ -253,6 +253,27 @@ def check_binary(path, platform):
     check_native_header(header, path.stat().st_mode, platform, path.name)
 
 
+def macos_minos(otool_load_commands):
+    """Minimum macOS from `otool -l` text: LC_BUILD_VERSION minos or LC_VERSION_MIN_MACOSX version."""
+    found, command = [], None
+    for line in otool_load_commands.splitlines():
+        words = line.split()
+        if words[:1] == ["cmd"] and len(words) == 2:
+            command = words[1]
+        elif ((command == "LC_BUILD_VERSION" and words[:1] == ["minos"])
+              or (command == "LC_VERSION_MIN_MACOSX" and words[:1] == ["version"])) and len(words) == 2:
+            found.append(tuple(int(part) for part in words[1].split(".")))
+    if not found:
+        raise ValueError("Mach-O has no macOS minimum version")
+    return max(found)
+
+
+def check_macos_floor(otool_load_commands, floor, label):
+    minos = macos_minos(otool_load_commands)
+    if minos > tuple(int(part) for part in floor.split(".")):
+        raise ValueError(f"{label}: requires macOS {'.'.join(map(str, minos))}, above its {floor} floor")
+
+
 def check_native_header(header, mode, platform, label):
     machine = PLATFORMS[platform][2]
     if platform.endswith("-linux"):
@@ -1397,6 +1418,9 @@ def main():
     create.add_argument("--platform", choices=PLATFORMS, required=True)
     check = commands.add_parser("verify")
     check.add_argument("root", type=Path)
+    floor = commands.add_parser("macos-floor", help="refuse Mach-O files whose minimum macOS exceeds the floor")
+    floor.add_argument("--floor", required=True)
+    floor.add_argument("files", nargs="+", type=Path)
     reuse = commands.add_parser("copy-support", help="copy verified native support without the original Runtime")
     for name in ("input", "root"):
         reuse.add_argument("--" + name, type=Path, required=True)
@@ -1435,6 +1459,9 @@ def main():
             copy_support(args)
         elif args.command == "verify":
             print(json.dumps(verify(args.root), sort_keys=True))
+        elif args.command == "macos-floor":
+            for path in args.files:
+                check_macos_floor(run("otool", "-l", str(path)), args.floor, path.name)
         elif args.command == "stage-inputs":
             stage_inputs(args.input, args.version, args.output, args.preview_platform)
         elif args.command == "verify-staged":

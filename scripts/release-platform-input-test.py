@@ -162,6 +162,21 @@ class PlatformInputTest(unittest.TestCase):
                                           for name, data in payloads.items()]))
         return package
 
+    def test_macos_floor_refuses_a_binary_above_its_floor(self):
+        def load_commands(*commands):
+            return "binary:\n" + "".join(f"Load command {n}\n      cmd {c}\n  cmdsize 32\n {k} {v}\n"
+                                          for n, (c, k, v) in enumerate(commands))
+        rust = load_commands(("LC_SEGMENT_64", "segname", "__TEXT"), ("LC_BUILD_VERSION", "minos", "11.0"),
+                             ("LC_BUILD_VERSION", "sdk", "15.5"))
+        self.assertEqual(inputs.macos_minos(rust), (11, 0))
+        inputs.check_macos_floor(rust, "11.0", "elastos-aarch64-darwin")
+        helper = load_commands(("LC_BUILD_VERSION", "minos", "15.0"))
+        with self.assertRaisesRegex(ValueError, "turnserver: requires macOS 15.0, above its 14.0 floor"):
+            inputs.check_macos_floor(helper, "14.0", "turnserver")
+        inputs.check_macos_floor(load_commands(("LC_VERSION_MIN_MACOSX", "version", "12.0")), "12.0", "ffmpeg")
+        with self.assertRaisesRegex(ValueError, "no macOS minimum"):
+            inputs.macos_minos(load_commands(("LC_SEGMENT_64", "segname", "__TEXT")))
+
     def test_browser_scripts_require_reviewed_bytes_and_executable_mode(self):
         source = inputs.SOURCE_ROOT / "scripts/browser-vm-control-service.mjs"
         source.parent.mkdir()

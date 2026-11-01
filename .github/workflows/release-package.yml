@@ -101,7 +101,7 @@ jobs:
   mac:
     name: Apple silicon N and N+1
     needs: admit
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 300
     permissions:
       contents: read
@@ -112,6 +112,8 @@ jobs:
     env:
       SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
       RELEASE_PLATFORM: aarch64-darwin
+      # Cargo and its C dependencies target macOS 11.0, not the runner SDK.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -182,6 +184,7 @@ jobs:
             [[ "$(jq -r '[.source.commit, .source.tree, .platform, .version] | join(" ")' "$inputs/$name/platform-input.json")" \
               == "$SOURCE_COMMIT $SOURCE_TREE aarch64-darwin $version" ]]
             [[ "$(HOME="$RELEASE_ROOT/home" "$inputs/$name/artifacts/elastos-aarch64-darwin" --version 2>&1)" == "elastos $version" ]]
+            python3 -I -S scripts/release-platform-input.py macos-floor --floor 11.0 "$inputs/$name/artifacts/elastos-aarch64-darwin"
           done
           [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]

@@ -144,6 +144,9 @@ def build(recipe, payload, cache, upstream):
                'TURN_NO_SCTP': '1', 'TURN_NO_MYSQL': '1', 'TURN_NO_PQ': '1', 'TURN_NO_MONGO': '1',
                'TURN_NO_HIREDIS': '1', 'TURN_NO_SQLITE': '1', 'TURN_NO_PROMETHEUS': '1',
                'TURN_NO_SYSTEMD': '1'}
+        if native.startswith('darwin'):
+            # Browser helpers keep macOS 14.0, not the runner SDK or the job's Cargo target.
+            env['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
         uapi = None
         if native.startswith('linux'):
             env['CC'] = 'musl-gcc'
@@ -333,6 +336,8 @@ def build_browser_native(recipe, payload, cache, upstream):
                'CFLAGS': '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/usr/src/elastos-browser'}
         for key in ('CPATH', 'LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD'):
             env.pop(key, None)
+        if native.startswith('darwin'):
+            env['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
         jobs = str(min(os.cpu_count() or 2, 4))
         uapi = None
         if native.startswith('linux'):
