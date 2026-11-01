@@ -1115,10 +1115,10 @@ echo /Library/Developer/CommandLineTools
             self.assertIn("Apple's Command Line Tools are not installed yet. When Apple's installer finishes, "
                           "run: curl -fsSL https://test.invalid/install.sh | bash -s --", result.stderr)
 
-    def test_install_adds_one_marked_path_line_to_the_login_profile_and_uninstall_removes_it(self):
+    def test_install_adds_one_marked_path_line_to_the_login_profile_and_uninstall_names_it(self):
         did, head, release = installable_fixture()
         line = 'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
-        # An existing empty ~/.bash_profile is the file bash reads, and must survive uninstall.
+        # An existing empty ~/.bash_profile is the file bash reads.
         for system, machine, shell_path, profile, text in [
                 ("Linux", "x86_64", "/bin/bash", ".profile", "export EDITOR=vi"),
                 ("Linux", "x86_64", "/bin/bash", ".bash_profile", ""),
@@ -1148,13 +1148,13 @@ echo /Library/Developer/CommandLineTools
                 # Added once, on its own line, after the existing text.
                 self.assertEqual(path.read_text(), kept + line)
 
+                # Uninstall never edits a profile; it names the line to delete.
                 result, _ = sandbox.run("--uninstall", env=[f"SHELL={shell_path}"])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(f"Removed the ElastOS PATH line from ~/{profile}", result.stdout)
-                self.assertTrue(path.is_file())
-                self.assertEqual(path.read_text(), kept)
+                self.assertIn(f"To finish, delete this line from ~/{profile}: {line}", result.stdout)
+                self.assertEqual(path.read_text(), kept + line)
 
-    def test_uninstall_removes_only_the_selected_install_dirs_path_line(self):
+    def test_uninstall_names_only_the_selected_install_dirs_path_line(self):
         did, head, release = installable_fixture()
         marker = " # Added by the ElastOS installer\n"
         with InstallerSandbox(head, release, did) as sandbox:
@@ -1164,14 +1164,19 @@ echo /Library/Developer/CommandLineTools
             hand = "echo mine" + marker
             profile = sandbox.home / ".profile"
             profile.write_text("export EDITOR=vi\n" + default_line + other_line + hand)
-            # Nothing is installed in either directory: only the selected line goes.
+            text = profile.read_bytes()
+            # Nothing is installed in either directory: only the selected line is named.
             result, _ = sandbox.run("--uninstall", "--install-dir", str(other))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("No ElastOS installation found", result.stdout)
-            self.assertEqual(profile.read_text(), "export EDITOR=vi\n" + default_line + hand)
+            self.assertIn(f"delete this line from ~/.profile: {other_line}", result.stdout)
+            self.assertNotIn(default_line, result.stdout)
             result, _ = sandbox.run("--uninstall")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(profile.read_text(), "export EDITOR=vi\n" + hand)
+            self.assertIn(f"delete this line from ~/.profile: {default_line}", result.stdout)
+            self.assertNotIn(other_line, result.stdout)
+            self.assertNotIn(hand, result.stdout)
+            self.assertEqual(profile.read_bytes(), text)
 
     def test_linked_or_shared_profile_is_left_unchanged_with_the_line_to_add(self):
         did, head, release = installable_fixture()
@@ -1192,15 +1197,75 @@ echo /Library/Developer/CommandLineTools
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(target.read_text(), sentinel)
                 self.assertIn(f"add this line to it yourself: {line}\n", result.stdout)
-                # A marked line already in the aliased file stays on uninstall too.
+                # Uninstall leaves the aliased file unchanged and names the line.
                 shared = sentinel + line + " # Added by the ElastOS installer\n"
                 target.write_text(shared)
                 result, _ = sandbox.run("--uninstall")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(target.read_text(), shared)
-                self.assertIn("delete this line from it yourself", result.stdout)
+                self.assertIn(f"To finish, delete this line from ~/.profile: {line}", result.stdout)
                 self.assertEqual(profile.is_symlink(), kind == "symlink")
                 self.assertTrue(profile.samefile(target))
+
+    def test_profile_swapped_for_a_link_before_the_append_leaves_the_link_target_unchanged(self):
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        sentinel = '{"sentinel": true}\n'
+        # Right before the append opens the profile, a symlink to the sentinel takes its name.
+        hook = ('python3() {\nmv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null\n'
+                'ln -s -- "$SENTINEL" "$PROFILE"\ncommand python3 "$@"\n}\n')
+        for before in ("export EDITOR=vi\n", None):
+            with self.subTest(before=before), \
+                    tempfile.TemporaryDirectory(prefix="installer-profile-swap-") as directory:
+                home, target = Path(directory, "home"), Path(directory, "runtime-data.json")
+                home.mkdir()
+                target.write_text(sentinel)
+                target.chmod(0o604)
+                profile = home / ".profile"
+                if before is not None:
+                    profile.write_text(before)
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               'PROFILE="$1/.profile" SENTINEL="$2"\n' + hook + 'add_install_dir_to_login_profile\n',
+                               home, target)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((target.read_text(), target.stat().st_mode & 0o777), (sentinel, 0o604))
+                self.assertTrue(profile.is_symlink())
+                self.assertIn(f"add this line to it yourself: {line}\n", result.stdout)
+                if before is not None:
+                    self.assertEqual(Path(f"{profile}.moved").read_text(), before)
+
+    def test_append_keeps_the_profile_inode_mode_and_bytes_and_uninstall_leaves_it(self):
+        line = b'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+        with tempfile.TemporaryDirectory(prefix="installer-profile-inode-") as directory:
+            profile = Path(directory, ".profile")
+            # No trailing newline: the added line must start on its own line.
+            profile.write_bytes(b"export EDITOR=vi")
+            profile.chmod(0o600)
+            inode = profile.stat().st_ino
+            prefix = 'HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+            for script in ('add_install_dir_to_login_profile\n', 'show_login_profile_lines "$HOME/.local/bin"\n'):
+                result = shell(prefix + script, directory)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((profile.read_bytes(), profile.stat().st_ino, profile.stat().st_mode & 0o777),
+                                 (b"export EDITOR=vi\n" + line, inode, 0o600))
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), [".profile"])
+
+    def test_short_append_restores_the_profile_and_prints_the_line_to_add(self):
+        original = b"export EDITOR=vi\n"
+        with tempfile.TemporaryDirectory(prefix="installer-profile-short-") as directory:
+            profile = Path(directory, ".profile")
+            profile.write_bytes(original)
+            inode = profile.stat().st_ino
+            # Only the append's python3 runs with a file size limit 3 bytes past
+            # the profile, so its one write fails or comes up short.
+            limit = len(original) + 3
+            hook = ('python3() {\ncommand python3 -c "import os, resource, sys\n'
+                    f'resource.setrlimit(resource.RLIMIT_FSIZE, ({limit}, {limit}))\n'
+                    'os.execvp(sys.argv[1], sys.argv[1:])" python3 "$@"\n}\n')
+            result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                           + hook + 'add_install_dir_to_login_profile\n', directory)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((profile.read_bytes(), profile.stat().st_ino), (original, inode))
+            self.assertIn('add this line to it yourself: export PATH="$HOME/.local/bin:$PATH"\n', result.stdout)
 
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()
@@ -1602,8 +1667,10 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(requests, [])
             self.assertIn("Only your Recovery Kit can restore this identity", result.stdout + result.stderr)
-            # The install's PATH line is gone; the profile file itself is never deleted.
-            self.assertEqual(self.files(sandbox), {".profile": b""})
+            # Uninstall never edits the profile; it names the install's PATH line to delete.
+            line = b'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+            self.assertEqual(self.files(sandbox), {".profile": line})
+            self.assertIn("To finish, delete this line from ~/.profile", result.stdout)
             self.assertFalse(sandbox.data.exists())
             self.assertFalse(sandbox.binary.exists())
 

@@ -955,14 +955,49 @@ login_profile() {
     esac
 }
 
-# The installer edits a profile only when it is missing (then created new) or is
-# this user's own regular file with a single name. A symlink or a second hard
-# link could make the edit land in another file, such as Runtime data.
-profile_is_editable() {
-    local profile="$1"
-    [[ ! -L "$profile" ]] || return 1
-    [[ -e "$profile" ]] || return 0
-    [[ -f "$profile" && -O "$profile" && -n "$(find "$profile" -maxdepth 0 -links 1 2>/dev/null)" ]]
+# `append_login_profile_line PROFILE LINE` appends LINE to a login profile
+# through one opened file. The profile is opened without following a link (a
+# missing one is created exclusively) and must be this user's regular file with
+# a single name, so the line cannot land in another file such as Runtime data.
+# Only new bytes are written, at the end, in one write; its inode, mode, owner,
+# ACL and existing content stay. A failed or short write is cut back to the
+# original size and this returns 1 (profile unchanged); if even that cut fails,
+# it returns 2 and the profile may end in part of the line.
+append_login_profile_line() {
+    python3 -I - "$@" <<'PY_LOGIN_PROFILE'
+import os
+import stat
+import sys
+
+path, line = sys.argv[1], os.fsencode(sys.argv[2])
+flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+try:
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.geteuid() or found.st_nlink != 1:
+            sys.exit(1)
+        size = os.lseek(fd, 0, os.SEEK_END)
+        # A last line without a newline would otherwise join this one.
+        new = (b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b"") + line + b"\n"
+        try:
+            written = os.write(fd, new)
+        except OSError:
+            written = -1
+        if written != len(new):
+            try:
+                os.ftruncate(fd, size)
+            except OSError:
+                sys.exit(2)
+            sys.exit(1)
+    finally:
+        os.close(fd)
+except OSError:
+    sys.exit(1)
+PY_LOGIN_PROFILE
 }
 
 # One marked line in the login profile, so `elastos` is found after a restart
@@ -978,14 +1013,13 @@ add_install_dir_to_login_profile() {
     if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
         return 0
     fi
-    if ! profile_is_editable "$profile"; then
-        warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
+    local status=0
+    append_login_profile_line "$profile" "$line" || status=$?
+    if [[ "$status" -eq 2 ]]; then
+        warn "Could not finish adding a line to $(display_path "$profile"); open it, delete its last line if it is cut short, then add this line yourself: $(path_export_line)"
         return 0
-    fi
-    # A last line without a newline would otherwise join this one.
-    if ! { if [[ -s "$profile" && -n "$(tail -c 1 -- "$profile")" ]]; then printf '\n'; fi
-           printf '%s\n' "$line"; } 2>/dev/null >> "$profile"; then
-        warn "Could not add ElastOS to PATH in $(display_path "$profile"); use the full path below."
+    elif [[ "$status" -ne 0 ]]; then
+        warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be changed; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
         return 0
     fi
     PATH_PROFILE_UPDATED=true
@@ -993,28 +1027,14 @@ add_install_dir_to_login_profile() {
     info "To undo, delete the line ending in '${PATH_PROFILE_MARKER}' from that file."
 }
 
-# Uninstall removes the exact line the installer added for this install
-# directory, from every profile it may use; other installs' lines stay.
-remove_login_profile_lines() {
-    local line profile kept
+# Uninstall never edits a profile: it names each profile that still holds the
+# exact line the installer added for this install directory.
+show_login_profile_lines() {
+    local line profile
     line="$(path_export_line "$1") ${PATH_PROFILE_MARKER}"
     for profile in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
         [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile" || continue
-        if ! profile_is_editable "$profile"; then
-            warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; delete this line from it yourself: $line"
-            continue
-        fi
-        kept="$(mktemp)"
-        # Rewrite in place, so the profile keeps its mode.
-        # The file stays even when empty: it may have existed before the install,
-        # and removing a bash login file changes which one bash reads.
-        if { grep -vxF -- "$line" "$profile" > "$kept" || [[ $? == 1 ]]; } &&
-           cat -- "$kept" > "$profile"; then
-            ok "Removed the ElastOS PATH line from $(display_path "$profile")"
-        else
-            warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete this line from it yourself: $line"
-        fi
-        rm -f -- "$kept"
+        warn "To finish, delete this line from $(display_path "$profile"): $line"
     done
 }
 
@@ -1237,7 +1257,7 @@ uninstall_installation() {
     binary="${install_dir}/elastos"
     if [[ ! -e "$binary" && ! -L "$binary" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
         ok "No ElastOS installation found"
-        remove_login_profile_lines "$install_dir"
+        show_login_profile_lines "$install_dir"
         return 0
     fi
     command -v python3 &>/dev/null || die "Required tool not found: python3"
@@ -1253,7 +1273,7 @@ uninstall_installation() {
     uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
         || die "Uninstall did not finish; run it again after fixing the reason above"
     ok "Removed the Runtime and its components"
-    remove_login_profile_lines "$install_dir"
+    show_login_profile_lines "$install_dir"
     if [[ "$remove_data" == true ]]; then
         ok "Deleted the data directory"
     else
