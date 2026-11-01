@@ -293,6 +293,41 @@ pub(super) async fn prepare_home(
     }
 }
 
+/// Signed bytes [`prepare_home`] downloads for Browser in this state: missing
+/// host helpers and the Engine image. Keep in step with `prepare_home`. This
+/// is for the setup summary only; a selection or row it cannot read counts as
+/// nothing, and `prepare_home` reports that problem itself.
+pub(super) fn pending_download_bytes(
+    data: &Path,
+    manifest: &super::ComponentsManifest,
+    platform: &str,
+    browser_selected: bool,
+) -> u64 {
+    if !browser_available(platform) || !browser_selected {
+        return 0;
+    }
+    let Ok(Some(rows)) = host_rows(manifest, platform) else {
+        return 0;
+    };
+    if !local_vm_selected(data, platform).unwrap_or(false) {
+        return 0;
+    }
+    let helpers = rows
+        .iter()
+        .filter(|row| row.missing(data))
+        .map(|row| row.info.size.unwrap_or_default())
+        .fold(0u64, u64::saturating_add);
+    let image = manifest
+        .external
+        .contains_key(super::browser_vm_image::NAME)
+        .then(|| super::browser_vm_image::component_info(manifest, platform).ok())
+        .flatten()
+        .filter(|info| !super::browser_vm_image::receipts_match(data, info))
+        .and_then(|info| info.size)
+        .unwrap_or_default();
+    helpers.saturating_add(image)
+}
+
 /// A host without Browser keeps no Engine selection and none of the
 /// release-owned Browser host files an earlier release installed, so neither
 /// Runtime nor the installer's Linux host step acts on them. Browser profiles
@@ -615,6 +650,53 @@ mod tests {
             fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
             b"invalid selection"
         );
+    }
+
+    #[test]
+    fn setup_summary_counts_the_browser_helpers_and_image_setup_downloads() {
+        let mut manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        let platform = "darwin-arm64";
+        let mut helpers = 0;
+        for name in manifest.profiles["browser-host"].components.clone() {
+            let component = manifest.external.get_mut(&name).unwrap();
+            let Some(info) = component.platforms.get_mut(platform) else {
+                continue;
+            };
+            info.strategy = None;
+            info.checksum = Some(format!("sha256:{}", "a".repeat(64)));
+            info.size = Some(1000);
+            helpers += 1000;
+        }
+        assert!(helpers > 0);
+        let image = manifest
+            .external
+            .get_mut(super::super::browser_vm_image::NAME)
+            .unwrap()
+            .platforms
+            .get_mut(platform)
+            .unwrap();
+        image.checksum = Some(format!("sha256:{}", "b".repeat(64)));
+        image.size = Some(911_000_000);
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        assert_eq!(
+            pending_download_bytes(data, &manifest, platform, true),
+            helpers + 911_000_000
+        );
+        // No Browser selected, a host without Browser, or a remote Engine: nothing.
+        assert_eq!(pending_download_bytes(data, &manifest, platform, false), 0);
+        assert_eq!(
+            pending_download_bytes(data, &manifest, "linux-arm64", true),
+            0
+        );
+        fs::create_dir_all(data.join("config")).unwrap();
+        fs::write(
+            data.join("config/browser-engine-adapter.json"),
+            br#"{"adapters": []}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_download_bytes(data, &manifest, platform, true), 0);
     }
 
     #[tokio::test]
