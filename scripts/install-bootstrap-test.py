@@ -1208,29 +1208,46 @@ echo /Library/Developer/CommandLineTools
         # The link target holds the marked line too, so a write through the link changes it.
         sentinel = '{"sentinel": true}\n' + marked
         swap = 'mv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null; ln -s -- "$SENTINEL" "$PROFILE"\n'
-        # The swap runs right after the profile is admitted, or after its old
-        # content is read and just before the new content takes its name.
+        # A regular file of someone else's put at the profile's name.
+        substitute = ('mv -- "$PROFILE" "$PROFILE.moved"; printf "substitute\\n" > "$SENTINEL.substitute"\n'
+                      'ln -- "$SENTINEL.substitute" "$PROFILE"\n')
+        after_read = lambda change: ''.join(f'eval "original_$(declare -f {edit})"\n'
+                                            f'{edit}() {{\noriginal_{edit} "$@" || return 1\n{change}}}\n'
+                                            for edit in ("profile_with_line", "profile_without_line"))
+        # The change runs right after the profile is admitted, right after the
+        # first new-file name is chosen (a link to the sentinel takes that name),
+        # or after the old content is read and before the new content takes its name.
         hooks = {
             "admission": 'eval "admitted_$(declare -f profile_admit)"\n'
                          'profile_admit() {\nadmitted_profile_admit "$@" || return 1\n' + swap + '}\n',
-            "read": ''.join(f'eval "original_$(declare -f {edit})"\n'
-                            f'{edit}() {{\noriginal_{edit} "$@" || return 1\n{swap}}}\n'
-                            for edit in ("profile_with_line", "profile_without_line")),
+            "temp name": 'eval "chosen_$(declare -f profile_temp_name)"\n'
+                         'profile_temp_name() {\nlocal name\nname="$(chosen_profile_temp_name "$@")"\n'
+                         'if [[ ! -e "$SENTINEL.planted" ]]; then\n: > "$SENTINEL.planted"\n'
+                         'ln -s -- "$SENTINEL" "$name"\nfi\nprintf "%s\\n" "$name"\n}\n',
+            "read": after_read(swap),
+            "substitute": after_read(substitute),
         }
         actions = {"add": 'add_install_dir_to_login_profile\n',
                    "remove": 'remove_login_profile_lines "$HOME/.local/bin"\n'}
+        added, removed = "export EDITOR=vi\n" + marked, "export EDITOR=vi\n"
         # (action, profile before, hook, profile after or None when left unchanged)
         cases = [("add", "export EDITOR=vi\n", "admission", None),
                  ("add", None, "admission", None),
-                 ("add", "export EDITOR=vi\n", "read", "export EDITOR=vi\n" + marked),
-                 ("remove", "export EDITOR=vi\n" + marked, "admission", None),
-                 ("remove", "export EDITOR=vi\n" + marked, "read", "export EDITOR=vi\n")]
+                 ("add", "export EDITOR=vi\n", "read", added),
+                 ("add", "export EDITOR=vi\n", "temp name", added),
+                 ("add", None, "temp name", marked),
+                 ("add", "export EDITOR=vi\n", "substitute", added),
+                 ("remove", added, "admission", None),
+                 ("remove", added, "read", removed),
+                 ("remove", added, "temp name", removed),
+                 ("remove", added, "substitute", removed)]
         for action, before, hook, after in cases:
             with self.subTest(action=action, before=before, hook=hook), \
                     tempfile.TemporaryDirectory(prefix="installer-profile-swap-") as directory:
                 home, target = Path(directory, "home"), Path(directory, "runtime-data.json")
                 home.mkdir()
                 target.write_text(sentinel)
+                target.chmod(0o604)
                 profile = home / ".profile"
                 if before is not None:
                     profile.write_text(before)
@@ -1239,18 +1256,23 @@ echo /Library/Developer/CommandLineTools
                                'PROFILE="$1/.profile" SENTINEL="$2"\n' + hooks[hook] + actions[action],
                                home, target)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(target.read_text(), sentinel)
-                self.assertEqual([p.name for p in home.iterdir() if p.name.startswith(".elastos-profile.")], [])
+                self.assertEqual((target.read_text(), target.stat().st_mode & 0o777), (sentinel, 0o604))
+                # No new file is left behind; a planted link is the test's own.
+                self.assertEqual([p.name for p in home.iterdir()
+                                  if p.name.startswith(".elastos-profile.") and not p.is_symlink()], [])
+                if hook == "substitute":
+                    self.assertEqual(Path(f"{target}.substitute").read_text(), "substitute\n")
+                if hook != "temp name" and before is not None:
+                    self.assertEqual(Path(f"{profile}.moved").read_text(), before)
                 if after is None:
                     self.assertTrue(profile.is_symlink())
                     self.assertIn("yourself: export PATH=", result.stdout)
-                    if before is not None:
-                        self.assertEqual(Path(f"{profile}.moved").read_text(), before)
                 else:
-                    # The new content replaced the link; the profile keeps its mode.
+                    # The new content replaced whatever held the name; the profile keeps its mode.
                     self.assertFalse(profile.is_symlink())
                     self.assertEqual(profile.read_text(), after)
-                    self.assertEqual(profile.stat().st_mode & 0o777, 0o640)
+                    if before is not None:
+                        self.assertEqual(profile.stat().st_mode & 0o777, 0o640)
 
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()

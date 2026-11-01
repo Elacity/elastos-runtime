@@ -984,44 +984,72 @@ profile_admit() {
     printf '%s\n' "$identity"
 }
 
-# Profile edits: the old content on stdin, the new content into the file $1.
+# Profile edits: the old content on stdin, the new content on stdout. awk ends
+# a last line that lacks a newline, so the added line never joins it.
 profile_with_line() {
-    cat > "$1" || return 1
-    # A last line without a newline would otherwise join this one.
-    if [[ -s "$1" && -n "$(tail -c 1 -- "$1")" ]]; then printf '\n' >> "$1" || return 1; fi
-    printf '%s\n' "$2" >> "$1"
+    PROFILE_LINE="$1" awk '{ print } END { print ENVIRON["PROFILE_LINE"] }'
 }
 profile_without_line() {
-    grep -vxF -- "$2" > "$1" || [[ $? == 1 ]]
+    grep -vxF -- "$1" || [[ $? == 1 ]]
 }
 
-# Applies EDIT with LINE to an admitted profile without ever writing through its
-# path: the old content is read only from the opened admitted file, and the new
-# content is a file in the same folder that then takes the profile's name
-# (exclusively for a missing profile), so a link swapped in after admission is
-# replaced, never followed. Returns 1 with the profile unchanged otherwise.
+# A name for the new profile in the profile's folder; nothing is created here.
+profile_temp_name() {
+    printf '%s/.elastos-profile.%s.%s%s\n' "${1%/*}" "$$" "$RANDOM" "$RANDOM"
+}
+
+# Applies EDIT with LINE to an admitted profile. The installer never opens an
+# existing file for writing and never changes a file by name here: the old
+# content is read only from the opened admitted file; the new file is created
+# exclusively and written only through its descriptor; then it takes the
+# profile's name by rename (or by an exclusive link for a missing profile), so
+# a link swapped in at either name is refused or replaced, never followed.
+# Returns 1 with the profile unchanged otherwise.
 replace_login_profile() {
-    local profile="$1" edit="$2" line="$3" admitted tmp
+    local profile="$1" edit="$2" line="$3" admitted mask saved_mask tmp="" attempt created=false status=1
     admitted="$(profile_admit "$profile")" || return 1
-    tmp="$(mktemp "${profile%/*}/.elastos-profile.XXXXXX" 2>/dev/null)" || return 1
     if [[ "$admitted" == missing ]]; then
-        if "$edit" "$tmp" "$line" < /dev/null &&
-           chmod "$(printf '%o' $((0666 & ~$(umask))))" "$tmp" &&
-           ln -n -- "$tmp" "$profile" 2>/dev/null; then
-            rm -f -- "$tmp"
-            return 0
-        fi
-    elif { exec 3<"$profile"; } 2>/dev/null; then
-        if [[ "$(file_identity <&3 2>/dev/null)" == "$admitted" ]] &&
-           "$edit" "$tmp" "$line" <&3 && chmod "${admitted##* }" "$tmp" &&
-           mv -f -- "$tmp" "$profile" 2>/dev/null; then
-            exec 3<&-
-            return 0
-        fi
+        exec 3</dev/null
+        mask="$(umask)"
+    elif ! { exec 3<"$profile"; } 2>/dev/null; then
+        return 1
+    elif [[ "$(file_identity <&3 2>/dev/null)" != "$admitted" ]]; then
         exec 3<&-
+        return 1
+    else
+        # The new file gets the profile's mode through the umask at creation;
+        # mode bits beyond 0666, such as execute, are dropped.
+        mask="$(printf '%04o' $((0777 & ~0${admitted##* })))"
     fi
-    rm -f -- "$tmp"
-    return 1
+    # Noclobber creates an absent name with O_EXCL and refuses an existing
+    # regular file or a link to one, so another random name is tried.
+    saved_mask="$(umask)"
+    umask "$mask"
+    set -C
+    for attempt in 1 2 3 4 5; do
+        tmp="$(profile_temp_name "$profile")"
+        { exec 4>"$tmp"; } 2>/dev/null && break
+        tmp=""
+    done
+    set +C
+    umask "$saved_mask"
+    # Noclobber opens an existing non-regular file (such as a FIFO) without
+    # creating it: only a regular file the name itself holds counts as created.
+    if [[ -n "$tmp" && -f "$tmp" && ! -L "$tmp" &&
+          "$(file_identity "$tmp" 2>/dev/null)" == "$(file_identity <&4 2>/dev/null)" ]]; then
+        created=true
+        if "$edit" "$line" <&3 >&4; then
+            if [[ "$admitted" == missing ]]; then
+                ln -n -- "$tmp" "$profile" 2>/dev/null && status=0
+            else
+                mv -f -- "$tmp" "$profile" 2>/dev/null && status=0 && created=false
+            fi
+        fi
+    fi
+    exec 3<&- 4>&-
+    # rm unlinks the name the installer created; it never writes a file.
+    [[ "$created" != true ]] || rm -f -- "$tmp"
+    return "$status"
 }
 
 # One marked line in the login profile, so `elastos` is found after a restart
