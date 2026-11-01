@@ -154,7 +154,7 @@ impl InstallationGuard {
         if !binary_parent.is_absolute() {
             bail!("installation binary parent must be an absolute existing path");
         }
-        check_directory(binary_parent)?;
+        check_installation_root(binary_parent)?;
         let lock_path = binary_parent.join(INSTALL_LOCK);
         let lock = OpenOptions::new()
             .read(true)
@@ -180,7 +180,7 @@ impl InstallationGuard {
         {
             bail!("installed release writer owns a different binary parent");
         }
-        check_directory(&self.binary_parent)?;
+        check_installation_root(&self.binary_parent)?;
         let path = self.binary_parent.join(INSTALL_LOCK);
         check_file(&self._lock, &path, true)?;
         let held = self._lock.metadata()?;
@@ -383,9 +383,9 @@ impl InstallTransaction {
             bail!("update paths must be absolute installed paths");
         }
         let data_dir = fs::canonicalize(data_dir).context("resolve update data directory")?;
-        check_directory(&data_dir)?;
+        check_installation_root(&data_dir)?;
         let bin_parent = fs::canonicalize(binary.parent().context("binary parent missing")?)?;
-        check_directory(&bin_parent)?;
+        check_installation_root(&bin_parent)?;
         let basename = binary
             .file_name()
             .and_then(|name| name.to_str())
@@ -549,8 +549,9 @@ impl InstallTransaction {
 
     fn check_parent(&self, parent: &Path, create: bool) -> anyhow::Result<()> {
         if parent == self.binary.parent().unwrap() {
-            return check_directory(parent);
+            return check_installation_root(parent);
         }
+        check_installation_root(&self.data_dir)?;
         let relative = parent
             .strip_prefix(&self.data_dir)
             .context("release parent escapes data root")?;
@@ -561,6 +562,9 @@ impl InstallTransaction {
             }
             path.push(part);
             match fs::symlink_metadata(&path) {
+                Ok(_) if path == self.binary.parent().unwrap() => {
+                    check_installation_root(&path)?;
+                }
                 Ok(_) => check_directory(&path)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
                     fs::DirBuilder::new().mode(0o700).create(&path)?;
@@ -1399,6 +1403,14 @@ pub(crate) fn shell_quote_path(path: &Path) -> String {
 }
 
 fn check_directory(path: &Path) -> anyhow::Result<()> {
+    check_directory_mode(path, 0o022)
+}
+
+fn check_installation_root(path: &Path) -> anyhow::Result<()> {
+    check_directory_mode(path, 0o002)
+}
+
+fn check_directory_mode(path: &Path, refused_mode: u32) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
         bail!(
@@ -1413,9 +1425,14 @@ fn check_directory(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    if metadata.mode() & 0o022 != 0 {
+    if metadata.mode() & refused_mode != 0 {
+        let (description, fix) = if refused_mode == 0o002 {
+            ("world-writable", "chmod o-w")
+        } else {
+            ("group- or world-writable", "chmod go-w")
+        };
         bail!(
-            "installation directory is unsafe: {} is group- or world-writable; fix with: chmod go-w {quoted}",
+            "installation directory is unsafe: {} is {description}; fix with: {fix} {quoted}",
             path.display()
         );
     }
@@ -2708,11 +2725,11 @@ pub(crate) mod tests {
         assert!(InstallationGuard::acquire(Path::new(".")).is_err());
         let file = fixture.data.join("owner-data");
         assert!(InstallationGuard::acquire(&file).is_err());
-        for mode in [0o770, 0o707] {
+        for mode in [0o707, 0o1777] {
             fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
             assert!(InstallationGuard::acquire(parent).is_err());
             assert!(!parent.join(INSTALL_LOCK).exists());
-            assert_eq!(fs::metadata(parent).unwrap().mode() & 0o777, mode);
+            assert_eq!(fs::metadata(parent).unwrap().mode() & 0o1777, mode);
         }
         assert_eq!(fs::read(file).unwrap(), b"data written by owner");
     }
@@ -2722,17 +2739,64 @@ pub(crate) mod tests {
         let fixture = Fixture::new();
         let dir = fixture._root.path().join("it's a \"bin\" $dir");
         fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
         let error = InstallationGuard::acquire(&dir).err().unwrap().to_string();
-        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o777);
         let command = error.split_once("fix with: ").expect(&error).1;
         let status = std::process::Command::new("sh")
             .args(["-c", command])
             .status()
             .unwrap();
         assert!(status.success(), "{command}");
-        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
         assert!(InstallationGuard::acquire(&dir).is_ok());
+    }
+
+    #[test]
+    fn transaction_accepts_owned_group_writable_data_and_bin_without_changing_modes() {
+        let fixture = Fixture::new();
+        let bin = fixture.binary.parent().unwrap();
+        fs::set_permissions(&fixture.data, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(bin, fs::Permissions::from_mode(0o770)).unwrap();
+        let writer = InstallTransaction::acquire(&fixture.data, &fixture.binary).unwrap();
+        fixture.old_files(&writer, false);
+        writer.prepare(&candidate()).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(fs::metadata(&fixture.data).unwrap().mode() & 0o777, 0o770);
+        assert_eq!(fs::metadata(bin).unwrap().mode() & 0o777, 0o770);
+        assert_eq!(
+            fs::read(fixture.data.join("owner-data")).unwrap(),
+            b"data written by owner"
+        );
+        for (id, path) in &writer.destinations {
+            assert_eq!(fs::read(path).unwrap(), candidate_bytes(*id));
+        }
+        assert!(InstallationGuard::acquire(bin).is_err());
+        drop(writer);
+        assert!(InstallationGuard::acquire(bin).is_ok());
+    }
+
+    #[test]
+    fn group_writable_roots_keep_descendant_and_private_stage_checks_strict() {
+        let fixture = Fixture::new();
+        fs::set_permissions(&fixture.data, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(
+            fixture.binary.parent().unwrap(),
+            fs::Permissions::from_mode(0o770),
+        )
+        .unwrap();
+        let writer = InstallTransaction::acquire(&fixture.data, &fixture.binary).unwrap();
+        let child = fixture.data.join("nonroot-child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(writer.check_parent(&child, false).is_err());
+        assert!(check_private_directory(&child).is_err());
+        assert_eq!(fs::metadata(&child).unwrap().mode() & 0o777, 0o770);
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_directory(&child).is_ok());
+        assert!(check_private_directory(&child).is_err());
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_private_directory(&child).is_ok());
     }
 
     #[test]
