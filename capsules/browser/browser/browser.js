@@ -28,7 +28,7 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260907c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261022e";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261101b";
 import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261015a";
 
 const STATUS_TTL_MS = 4200;
@@ -1961,8 +1961,8 @@ function closeRemoteDisplay() {
   remoteDisplay?.close();
 }
 
-async function connectRemoteDisplay(displaySession, enginePage = currentPage) {
-  await remoteDisplay.connect(displaySession, enginePage);
+async function connectRemoteDisplay(displaySession, enginePage = currentPage, signal = null) {
+  await remoteDisplay.connect(displaySession, enginePage, { signal });
 }
 
 function unlockRemoteAudioFromGesture() {
@@ -2438,7 +2438,6 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       throw new Error("Browser did not open the page.");
     }
     openSettlement.page = openedPage;
-    windowCloseAbortControllers.delete(networkAbort);
     if (remoteExitId && response?.stream_session?.backend !== remoteExitId) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
@@ -2476,7 +2475,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
     }
-    await connectRemoteDisplay(openedPage.display_session, openedPage);
+    // Signaling stays cancellable by Close until the display is connected.
+    await connectRemoteDisplay(openedPage.display_session, openedPage, networkAbort.signal);
+    windowCloseAbortControllers.delete(networkAbort);
     publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
     startPageHeartbeat();
@@ -2489,8 +2490,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     if (!runtimePostStarted) {
       proveRuntimeOwnershipAbsentBeforeDispatch();
     }
-    if (networkAbort.signal.aborted && !openedOwner) {
-      // The window is closing; its Close settles whatever this open started.
+    if (networkAbort.signal.aborted) {
+      // The window is closing. Its Close settles whatever this open started and
+      // closes the exact page the open retained (finalize closes the display).
       throw error;
     }
     if (

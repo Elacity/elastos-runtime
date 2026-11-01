@@ -1474,6 +1474,53 @@ test("a hung open POST is aborted by Close; the close then owns its settlement",
   assert.ok(Number.isFinite(context.unsettledRuntimeOpen.startedAt));
 });
 
+test("Close during hung display signaling closes exactly the page the open retained", async () => {
+  const harness = createHarness({
+    ownerless: true,
+    outcome: { state: "terminal", page_id: "page-exact", generation: 0, terminal_kind: "closed" },
+    fetchResponses: [{ schema: "elastos.browser.open-accepted/v1", status_url: "/api/apps/browser/open/open-exact" }],
+  });
+  let connectSignal = null;
+  Object.assign(harness.context, {
+    nextPageGeneration: 0, lastRequestedUrl: "", selectedBrowserEngineId: "engine-exact", selectedRemoteExitId: "",
+    currentDisplayMode: "", currentView: null, canGoBack: false, canGoForward: false,
+    visibleAddressForUrl: (value) => value, browserEngineLabel: (value) => value, browserExitLabel: (value) => value,
+    setLoading() {}, clearAddressDraft() {}, setCurrentUrl() {}, requireViewer() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display", guaranteeLevel: "isolated" }),
+    requireTerminalRuntimePageCloseOutcome: (outcome) => outcome,
+    cleanupPendingError: (outcome) => Object.assign(new Error("cleanup pending"), { cleanupOutcome: outcome }),
+    waitForRuntimeOpen: async () => ({
+      schema: "elastos.browser.open-result/v1",
+      engine_page: { schema: "elastos.browser.engine.page/v1", page_id: "page-exact", display_session: { mode: "webrtc_remote_display" } },
+      runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-exact" },
+    }),
+    syncDisplayInputFromSession() {}, viewFromDisplaySession: () => null, syncViewFromResponse() {}, syncBrowserLocation() {},
+    connectRemoteDisplay: (_session, _page, signal) => new Promise((_, reject) => {
+      connectSignal = signal;
+      signal.addEventListener("abort", () => reject(new Error("Browser connection interrupted.")), { once: true });
+    }),
+    startPageStatusPolling: () => assert.fail("a closing window must not start page polling"),
+    startPageHeartbeat() {},
+    remoteDisplay: { isTrackReady: () => false },
+    failRuntimeOwnedPage: () => assert.fail("Close, not the failed open, cleans up the retained page"),
+  });
+  vm.runInContext(`${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`, harness.context);
+  const opening = harness.context.requestRuntimeOpen("https://example.com/");
+  for (let turn = 0; turn < 8 && !connectSignal; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(connectSignal, "the display connect received Close's signal");
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  await assert.rejects(opening, /interrupted/);
+  for (let turn = 0; turn < 8; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.closeCalls.filter((call) => call.candidate).map((call) => call.candidate), [harness.owner]);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind,
+      harness.posted.at(-1).message.pageId, harness.posted.at(-1).message.cleanupId],
+    ["terminal", "closed", "page-exact", "cleanup-exact"],
+  );
+  assert.equal(harness.statuses.some(({ message }) => /interrupted/.test(message)), false);
+  assert.equal(harness.context.windowCloseAbortControllers.size, 0);
+});
+
 test("a hung ownership probe ends at its deadline instead of holding the close", async () => {
   const timers = [];
   const harness = createHarness({
