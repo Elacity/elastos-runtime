@@ -155,9 +155,13 @@ impl SourceCarrier {
         match elastos_server::carrier::CarrierClient::connect_trusted_source(&self.source, 10).await
         {
             Ok(client) => Ok(Arc::new(client)),
-            // Marked unavailable so discovery dials once more before giving up.
-            Err(error) => Err(anyhow::Error::new(update::UpdateSourceUnavailable)
-                .context(format!("Carrier connection failed: {error:#}"))),
+            // Only an unreachable source is marked unavailable, so discovery dials
+            // once more; a refused source configuration or identity is final.
+            Err(error) if elastos_server::carrier::is_trusted_source_unreachable(&error) => {
+                Err(anyhow::Error::new(update::UpdateSourceUnavailable)
+                    .context(format!("Carrier connection failed: {error:#}")))
+            }
+            Err(error) => Err(anyhow::anyhow!("Carrier connection failed: {error:#}")),
         }
     }
 
@@ -260,6 +264,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn update_command_does_not_retry_a_refused_carrier_identity() {
+        let configured = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let other = iroh::EndpointAddr::from(iroh::SecretKey::from_bytes(&[2; 32]).public())
+            .with_addrs([iroh::TransportAddr::Ip(([127, 0, 0, 1], 9).into())]);
+        let mut ticket = data_encoding::BASE32_NOPAD.encode(
+            &serde_json::to_vec(&serde_json::json!({"topic": null, "endpoints": [other]})).unwrap(),
+        );
+        ticket.make_ascii_lowercase();
+        let fixture = tempfile::tempdir().unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": ["did:key:fixture"], "channel": "stable",
+            "installed_version": "0.7.1", "publisher_node_id": configured.to_string(),
+            "connect_ticket": ticket
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(fixture.path(), &sources).unwrap();
+        let error =
+            run_update_command_for_data_dir(fixture.path(), true, None, true, None, false, "0.7.1")
+                .await
+                .unwrap_err();
+        // Not marked as an unanswered source, so discovery returns it without a retry.
+        assert!(!error.is::<update::UpdateSourceUnavailable>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(
+                "Carrier connection failed: trusted source ticket routes do not match the configured Carrier identity"
+            ),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
