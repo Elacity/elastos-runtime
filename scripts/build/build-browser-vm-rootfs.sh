@@ -268,6 +268,9 @@ set -- \
   dbus \
   fontconfig \
   fonts-dejavu-core \
+  fonts-liberation \
+  fonts-noto-core \
+  fonts-noto-color-emoji \
   gcc \
   gir1.2-gst-plugins-bad-1.0 \
   gir1.2-gst-plugins-base-1.0 \
