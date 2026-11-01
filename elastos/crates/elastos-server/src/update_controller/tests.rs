@@ -1185,6 +1185,41 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
     }
 }
 
+#[test]
+fn browser_home_refuses_a_port_another_program_holds_on_either_loopback() {
+    let data = tempfile::tempdir().unwrap();
+    let expected = |port: u16| {
+        format!(
+            "Home cannot start because another program is using port {port}; run `lsof -i :{port}` to see which one."
+        )
+    };
+
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let error = refuse_browser_home_port_in_use(data.path(), port).unwrap_err();
+    assert_eq!(error.to_string(), expected(port));
+    drop(v4);
+    refuse_browser_home_port_in_use(data.path(), port).unwrap();
+
+    // `localhost` would still bind 127.0.0.1 here while browsers reach the other program.
+    if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
+        let port = v6.local_addr().unwrap().port();
+        let error = refuse_browser_home_port_in_use(data.path(), port).unwrap_err();
+        assert_eq!(error.to_string(), expected(port));
+    }
+}
+
+#[test]
+fn browser_home_port_check_leaves_a_runtime_that_owns_this_home_to_the_host_lock() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _owner =
+        crate::host_lock::acquire_host_process_lock(data.path(), "gateway", "localhost:8090")
+            .unwrap();
+    refuse_browser_home_port_in_use(data.path(), port).unwrap();
+}
+
 #[tokio::test]
 async fn desktop_and_wallet_bindings_reach_captured_and_retained_child_commands() {
     let fixture = PrivateFixture::new();

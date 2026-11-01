@@ -16,11 +16,15 @@ pub async fn run_gateway(
 
 pub async fn run_browser_home() -> anyhow::Result<()> {
     elastos_server::update_controller::enter_browser_home().await?;
+    let port = elastos_server::update_controller::BROWSER_HOME_PORT;
+    // The controller checks before it starts Home; a source Home and an update
+    // restart are checked here, after the earlier Home has stopped.
+    elastos_server::update_controller::refuse_browser_home_port_in_use(
+        &elastos_server::sources::default_data_dir(),
+        port,
+    )?;
     elastos_server::gateway_cmd::run_gateway_direct_with_ready(
-        format!(
-            "localhost:{}",
-            elastos_server::update_controller::BROWSER_HOME_PORT
-        ),
+        format!("localhost:{port}"),
         false,
         None,
         None,

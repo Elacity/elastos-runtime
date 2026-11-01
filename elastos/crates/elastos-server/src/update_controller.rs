@@ -1022,6 +1022,10 @@ impl Controller {
         )?;
         let expected = installed.binary_sha256;
         drop(writer);
+        // Every earlier Home this controller owned has stopped by now. Fixture Homes
+        // bind an ephemeral port instead.
+        #[cfg(not(test))]
+        refuse_browser_home_port_in_use(&self.receipt.data_dir, BROWSER_HOME_PORT)?;
         let generation = hex::encode(rand::random::<[u8; 16]>());
         println!(
             "Starting Home. This can take up to {} minutes on a slow computer.",
@@ -2316,6 +2320,36 @@ async fn response_bytes(response: reqwest::Response, limit: usize) -> Result<Vec
 
 /// The browser Home always listens here; `home --browser` binds this port.
 pub const BROWSER_HOME_PORT: u16 = 8090;
+
+/// Home binds `localhost`, which names both loopback addresses. A program holding
+/// either one would take Home's browser traffic or leave Home half-bound, so Home
+/// refuses to start. A Runtime that still owns this Home's data is left to the host
+/// lock, which names it.
+pub fn refuse_browser_home_port_in_use(data_dir: &Path, port: u16) -> Result<()> {
+    if crate::host_lock::active_host_process(data_dir)?.is_some() {
+        return Ok(());
+    }
+    let in_use = [
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+    ]
+    .into_iter()
+    .any(|ip| {
+        // Same address reuse as Home's own bind, so a closed earlier Home never counts.
+        matches!(
+            std::net::TcpListener::bind((ip, port)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse
+        )
+    });
+    anyhow::ensure!(!in_use, port_in_use_message(port));
+    Ok(())
+}
+
+fn port_in_use_message(port: u16) -> String {
+    format!(
+        "Home cannot start because another program is using port {port}; run `lsof -i :{port}` to see which one."
+    )
+}
 
 fn approved_home_url(value: &str, port: u16) -> Result<url::Url> {
     anyhow::ensure!(

@@ -43,6 +43,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Web links in Chat and Documents open only after you see the address and choose Open link. Documents Autosave is off by default.
 - Home starts with any number of large Library files. Library is faster and checks an archive before Extract Here.
 - Setup shows the size of the Browser download on a Mac, and stops before it when the disk is too small while Home still installs. It says while Home is starting, Ctrl+C stops it, and if it fails it says to run elastos setup again. Without a desktop, it says how to open Home from another computer.
+- If another program uses port 8090, Home does not start and says how to find that program.
 
 ### Security
 
