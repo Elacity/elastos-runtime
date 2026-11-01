@@ -51,7 +51,7 @@ import {
   focusModeEnabled,
   pushUiPreferencesToFrameWindow,
   escapeHtml,
-} from "./shell-core.js?v=home-20261101a";
+} from "./shell-core.js?v=home-20261101b";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -69,26 +69,26 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20261101a";
-import { playUiSound } from "./shell-sounds.js?v=home-20261101a";
+} from "./shell-windows.js?v=home-20261101b";
+import { playUiSound } from "./shell-sounds.js?v=home-20261101b";
 import {
   bindAssistantFace,
   syncAssistantFaceAvailability,
-} from "./shell-assistant-face.js?v=home-20261101a";
+} from "./shell-assistant-face.js?v=home-20261101b";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   registerStageLayer,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20261101a";
+} from "./shell-popovers.js?v=home-20261101b";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261101a";
-import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20261101a";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20261101a";
-import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20261101a";
-import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261101a";
+} from "./shell-motion.js?v=home-20261101b";
+import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20261101b";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20261101b";
+import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20261101b";
+import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261101b";
 import {
   PHONE_ASSISTANT_TARGET,
   PHONE_DOCK_SLOTS,
@@ -98,19 +98,19 @@ import {
   phoneDockTargetIds,
   phoneHomePages,
   removePhoneHomeTarget,
-} from "./shell-phone-home.js?v=home-20261101a";
+} from "./shell-phone-home.js?v=home-20261101b";
 import {
   bindPhoneHomePager,
   phoneHomePerPage,
   renderPhoneHomePages,
-} from "./shell-phone-home-pager.js?v=home-20261101a";
+} from "./shell-phone-home-pager.js?v=home-20261101b";
 import {
   bindPhoneHomeEdit,
   enterPhoneHomeEdit,
   isPhoneHomeDragging,
   isPhoneHomeEditing,
-} from "./shell-phone-home-edit.js?v=home-20261101a";
-import { agentStageId, announceStage, setActiveStage } from "./shell-stages.js?v=home-20261101a";
+} from "./shell-phone-home-edit.js?v=home-20261101b";
+import { agentStageId, announceStage, setActiveStage } from "./shell-stages.js?v=home-20261101b";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

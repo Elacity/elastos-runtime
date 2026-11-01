@@ -3728,7 +3728,15 @@ async function openPage(
   const maxActivePages = Number(config.max_active_pages ?? 1);
   const livePages = liveCapacityPageCount(activePages, activeVms);
   if (livePages >= maxActivePages) {
-    throw new Error(`Browser VM active page capacity reached (${livePages}/${maxActivePages}); close a page before launching another page`);
+    logEvent("launch_refused", {
+      code: "browser_capacity_unavailable",
+      live_pages: livePages,
+      max_active_pages: maxActivePages,
+    });
+    throw codedError(
+      "browser_capacity_unavailable",
+      `Browser VM active page capacity reached (${livePages}/${maxActivePages}); close a page before launching another page`,
+    );
   }
   await retireConflictingIdleVmsForProfile(config, activeVms, vmKey, profileLeaseKey);
   await retireNonReusableIdleVmsForSinglePageRuntime(config, activeVms, vmKey);

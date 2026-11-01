@@ -22,7 +22,7 @@ import {
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20261101a";
+} from "./shell-core.js?v=home-20261101b";
 import {
   fitWindowBounds,
   fitBrowserWindow,
@@ -32,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20261101a";
+} from "./shell-window-geometry.js?v=home-20261101b";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -52,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20261101a";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101a";
+} from "./shell-stages.js?v=home-20261101b";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101b";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -1425,6 +1425,44 @@ function postPeopleNavigate(entry, query) {
   frame.contentWindow.postMessage({ type: "elastos.people.navigate/v1", homeToken, query }, "*");
 }
 
+const BROWSER_ONE_WINDOW_MESSAGE =
+  "Only one Browser window can be open at a time. Close the other one first.";
+let pendingBrowserWindowCreate = null;
+
+function postBrowserNavigate(entry, url) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) return false;
+  frame.contentWindow.postMessage({ type: "elastos.browser.navigate/v1", homeToken, url }, "*");
+  return true;
+}
+
+/** Mac Browser runs one live page per user, so every new Browser open (Dock,
+ * launcher, New Window, Spotlight, assistant or app links) focuses the
+ * existing Browser window and navigates it to the requested URL. */
+async function openBrowserWindowOnce(options) {
+  let entry = sortWindowEntriesByZOrder(browserWindowEntriesForTarget("browser"))[0] || null;
+  if (!entry && pendingBrowserWindowCreate) {
+    entry = await pendingBrowserWindowCreate.catch(() => null);
+    if (entry && shellState.windows.get(entry.id) !== entry) entry = null;
+  }
+  if (!entry) {
+    const pending = createBrowserTargetWindow("browser", options);
+    pendingBrowserWindowCreate = pending;
+    try {
+      return await pending;
+    } finally {
+      if (pendingBrowserWindowCreate === pending) pendingBrowserWindowCreate = null;
+    }
+  }
+  focusWindow(entry.id);
+  const url = typeof options.query?.url === "string" ? options.query.url : "";
+  if (url && !postBrowserNavigate(entry, url)) {
+    throw Object.assign(new Error(BROWSER_ONE_WINDOW_MESSAGE), { userMessage: BROWSER_ONE_WINDOW_MESSAGE });
+  }
+  return entry;
+}
+
 function browserLaunchAuthority(route) {
   try {
     const url = new URL(route, window.location.href);
@@ -1599,7 +1637,7 @@ function renderTargetLaunchError(targetId, error) {
     id: "shell-launch-error",
     title,
     headline: `Could not open ${title}`,
-    copy: "The app did not start. Close this window and try again.",
+    copy: error?.userMessage || "The app did not start. Close this window and try again.",
     subjectLabel: "App",
     subjectValue: title,
     detail: "",
@@ -1824,6 +1862,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const defaultHybrid = !single && targetById(shellState.currentSummary, targetId)?.window_policy === "hybrid"
     && options.newWindow !== true && !options.authorizedLaunch && !options.restoredPlacement
     && Object.keys(options.query || {}).length === 0;
+  if (targetId === "browser" && !options.authorizedLaunch && !options.restoredPlacement) {
+    return openBrowserWindowOnce(options);
+  }
   // A conversation request (People's Message) goes to the open Chat window.
   if (targetId === "chat-room" && options.newWindow !== true && !options.authorizedLaunch
     && !options.restoredPlacement && isChatConversationQuery(options.query)) {

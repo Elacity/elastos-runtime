@@ -1,11 +1,11 @@
-import { shellState, targetById, saveShellLayoutState } from "./shell-core.js?v=home-20261101a";
+import { shellState, targetById, saveShellLayoutState } from "./shell-core.js?v=home-20261101b";
 import {
   forgetChromeNotification,
   rememberChromeNotification,
   setHomeSetupNotificationHandler,
-} from "./shell-notifications.js?v=home-20261101a";
-import { registerStageLayer } from "./shell-popovers.js?v=home-20261101a";
-import { openTarget, openSystemRecoverySave } from "./shell-windows.js?v=home-20261101a";
+} from "./shell-notifications.js?v=home-20261101b";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20261101b";
+import { openTarget, openSystemRecoverySave } from "./shell-windows.js?v=home-20261101b";
 
 const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";
 const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";

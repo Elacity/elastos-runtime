@@ -423,7 +423,11 @@ async function request(method, path, body) {
     throw new Error(`same lifecycle identity was accepted twice: ${JSON.stringify(replay)}`);
   }
   const conflict = await requestRaw("POST", "/pages", openRequest("https://example.net/", "stream:other-vm-control-smoke"));
-  if (conflict.statusCode !== 400 || !String(conflict.body.error || "").includes("active page capacity reached")) {
+  if (
+    conflict.statusCode !== 400 ||
+    conflict.body.code !== "browser_capacity_unavailable" ||
+    !String(conflict.body.message || "").includes("active page capacity reached")
+  ) {
     throw new Error(`conflicting stream did not fail closed at capacity: ${JSON.stringify(conflict)}`);
   }
   const statusAfterConflict = await request("GET", "/status");

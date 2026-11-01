@@ -45,7 +45,7 @@ globalThis.window = {
 
 // Same specifier (including the cache-busting query) as shell-phone-dock.js,
 // otherwise Node instantiates a second shell-core with its own shellState.
-const { shellState } = await import("../capsules/home-gui/browser/shell-core.js?v=home-20261101a");
+const { shellState } = await import("../capsules/home-gui/browser/shell-core.js?v=home-20261101b");
 const {
   DOCK_EDGE_FADE_PX,
   PHONE_DOCK_PEEK_CLASS,

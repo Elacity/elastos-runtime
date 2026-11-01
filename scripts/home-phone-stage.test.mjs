@@ -5,7 +5,7 @@ import {
   STAGE_HISTORY_STATE,
   createStageHistory,
   isStageHistoryState,
-} from "../capsules/home-gui/browser/shell-phone-stage-history.js?v=home-20261101a";
+} from "../capsules/home-gui/browser/shell-phone-stage-history.js?v=home-20261101b";
 
 const HOST = "host";
 const CAPSULE = "capsule";

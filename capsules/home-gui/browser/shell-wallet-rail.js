@@ -4,19 +4,19 @@ import {
   pushUiPreferencesToFrameWindow,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20261101a";
+} from "./shell-core.js?v=home-20261101b";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261101a";
+} from "./shell-popovers.js?v=home-20261101b";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
   openTarget,
-} from "./shell-windows.js?v=home-20261101a";
-import { playUiSound } from "./shell-sounds.js?v=home-20261101a";
+} from "./shell-windows.js?v=home-20261101b";
+import { playUiSound } from "./shell-sounds.js?v=home-20261101b";
 
 /* Wallet rail: a right-hand slide-over that hosts the wallet capsule.
    Chrome only — it launches the wallet through the same host-mediated
