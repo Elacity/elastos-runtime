@@ -590,8 +590,10 @@ fn validate_component_owner_and_mode(
         let mode = metadata.mode() & 0o7777;
         let refused = if shared { 0o002 } else { 0o022 };
         let writable_by_others = mode & refused != 0;
+        // The sticky exception (root-owned /tmp, a user's sticky folder) is for
+        // OS ancestors only: below DATA a sticky folder is still refused.
         let sticky = mode & 0o1000 != 0;
-        if writable_by_others && !sticky {
+        if writable_by_others && !(shared && sticky) {
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
         }
     }
@@ -717,6 +719,20 @@ mod tests {
         let other = data.join("other");
         owner_only_dir(&other);
         assert!(validate_existing_path_components(&other).is_err());
+        // Sticky does not excuse group or world write below DATA.
+        for below in [&data.join("protected-content"), &custody, &root] {
+            for mode in [0o1770, 0o1777] {
+                fs::set_permissions(below, fs::Permissions::from_mode(mode)).unwrap();
+                assert!(matches!(
+                    validate_existing_path_components(&root),
+                    Err(CustodyProviderStateRootError::MissingOrUnsafe)
+                ));
+            }
+            fs::set_permissions(below, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // A /tmp-like sticky folder above DATA stays accepted.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        validate_existing_path_components(&root).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(matches!(
             validate_existing_path_components(&root),

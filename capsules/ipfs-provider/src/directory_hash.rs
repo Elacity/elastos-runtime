@@ -162,13 +162,11 @@ fn open_root_with_mode(path: &Path, mode: RootMode, data_root: &Path) -> io::Res
             // Canonical OS temp ancestors can be root-owned sticky directories.
             // Every component is opened without following links, including /tmp aliases.
             let owner = meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() };
-            let refused = if boundary.starts_with(&current) {
-                0o002
-            } else {
-                0o022
-            };
-            let protected =
-                meta.mode() & refused == 0 || (meta.uid() == 0 && meta.mode() & 0o1000 != 0);
+            // The sticky exception applies only to DATA and above; below it stays strict.
+            let shared = boundary.starts_with(&current);
+            let refused = if shared { 0o002 } else { 0o022 };
+            let protected = meta.mode() & refused == 0
+                || (shared && meta.uid() == 0 && meta.mode() & 0o1000 != 0);
             if !owner || !protected {
                 return Err(invalid("unsafe staged ancestor"));
             }
@@ -1764,6 +1762,15 @@ mod tests {
         // A data root that is not above the staged root leaves every ancestor strict.
         fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(open_root(&root, Path::new("/elastos-data-root-elsewhere")).is_err());
+        // Sticky does not excuse group or world write below DATA.
+        for mode in [0o1770, 0o1777] {
+            fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_root(&root, &data).is_err());
+        }
+        fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(0o755)).unwrap();
+        // An owned sticky group-writable folder above DATA stays accepted.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1775)).unwrap();
+        open_root(&root, &data).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(open_root(&root, &data).is_err());
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
