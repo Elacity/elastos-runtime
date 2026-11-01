@@ -42,6 +42,13 @@ const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
 // a short interval costs little and shows the display as soon as it is ready.
 const BROWSER_OPEN_POLL_INTERVAL_MS = 250;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
+// While a window close waits for Runtime to settle an open, the frame repeats
+// "pending" this often; Home extends the close on each one (shell-windows.js).
+const HOME_CLOSE_PENDING_NOTICE_MS = 10_000;
+const WINDOW_CLOSE_OPEN_POLL_MS = 1_000;
+// Each ownership probe of a window close has its own deadline, so one hung
+// request cannot hold the close and every Close retry behind it.
+const WINDOW_CLOSE_PROBE_TIMEOUT_MS = 10_000;
 const BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS = 5;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
 const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
@@ -151,6 +158,8 @@ let runtimeOwnershipTerminallyAbsent = false;
 let homeWindowCloseInFlight = false;
 // A Home Close that arrived while an open, summary or close was in flight; it runs when that settles.
 let deferredHomeWindowClose = null;
+// The network phase of an open or summary in flight; a Close aborts them so it never waits on a hung request.
+const windowCloseAbortControllers = new Set();
 let homeWindowTerminalCloseConfirmed = false;
 let pendingHomeWindowCloseDelivery = null;
 let selectedBrowserEngineId = params.get("browser_engine_id") || params.get("adapter_id") || "";
@@ -885,8 +894,9 @@ async function handleHomeBrowserWindowCloseRequest(event) {
   }
   const message = event.data;
   if (runtimeOpenInFlight > 0 || browserSummaryPromise || homeWindowCloseInFlight) {
-    // Close just closes: it waits for the action in flight and then runs, even if
-    // that action fails. The latest request receives the result; Home shows "Closing…".
+    // Close just closes. An open or summary still on the network is aborted, so the
+    // close runs at once; a running close finishes first. The latest request gets
+    // the result; Home shows "Closing…".
     deferredHomeWindowClose = message;
     postHomeBrowserWindowCloseResult(message, null, {
       state: "pending",
@@ -894,6 +904,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
       generation: 0,
       reason: homeWindowCloseInFlight ? "window_close_in_flight" : "runtime_open_in_flight",
     });
+    for (const controller of windowCloseAbortControllers) controller.abort();
     return true;
   }
   await closeHomeBrowserWindow(message);
@@ -916,7 +927,7 @@ async function closeHomeBrowserWindow(message) {
   homeWindowCloseInFlight = true;
   try {
     if (!owner) {
-      const ownership = await resolveRuntimeOwnershipForWindowClose();
+      const ownership = await awaitRuntimeOwnershipForWindowClose(message);
       if (ownership.state !== "owned") {
         if (ownership.state === "terminal") {
           pendingHomeWindowCloseDelivery = null;
@@ -1062,13 +1073,23 @@ function normalizeRuntimeOpenUrl(value) {
   }
 }
 
+async function fetchWindowCloseProbe(path, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WINDOW_CLOSE_PROBE_TIMEOUT_MS);
+  try {
+    return await fetchJson(path, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function settleUnresolvedRuntimeOpenForWindowClose(settlement) {
   let response;
   try {
     if (settlement.statusUrl) {
-      response = await fetchJson(settlement.statusUrl, { method: "GET" });
+      response = await fetchWindowCloseProbe(settlement.statusUrl, { method: "GET" });
     } else {
-      response = await fetchJson("/api/apps/browser/open", {
+      response = await fetchWindowCloseProbe("/api/apps/browser/open", {
         method: "POST",
         body: settlement.body,
       });
@@ -1152,7 +1173,7 @@ async function resolveRuntimeOwnershipForWindowClose() {
   }
   let summary;
   try {
-    summary = await fetchJson(
+    summary = await fetchWindowCloseProbe(
       `/api/apps/browser/summary?browser_instance=${encodeURIComponent(browserInstanceId)}`,
       { method: "GET" },
     );
@@ -1161,6 +1182,31 @@ async function resolveRuntimeOwnershipForWindowClose() {
   }
   browserSummary = summary;
   return classifyFreshWindowCloseSummary(summary);
+}
+
+// An open whose Runtime job is still running owns this window's cleanup. The close
+// waits for it within the open's own deadline and keeps Home's request alive with a
+// repeated "pending"; the page it yields is then closed and never displayed.
+async function awaitRuntimeOwnershipForWindowClose(message) {
+  let noticeAt = Date.now();
+  for (;;) {
+    const ownership = await resolveRuntimeOwnershipForWindowClose();
+    const settlement = unsettledRuntimeOpen;
+    if (
+      ownership.state !== "pending" ||
+      !["runtime_open_status_pending", "runtime_open_status_unavailable"].includes(ownership.reason) ||
+      !(Date.now() - settlement?.startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS)
+    ) {
+      return ownership;
+    }
+    if (Date.now() - noticeAt >= HOME_CLOSE_PENDING_NOTICE_MS) {
+      noticeAt = Date.now();
+      for (const request of new Set([message, deferredHomeWindowClose].filter(Boolean))) {
+        postHomeBrowserWindowCloseResult(request, null, ownership);
+      }
+    }
+    await wait(WINDOW_CLOSE_OPEN_POLL_MS);
+  }
 }
 
 function settleInitialRuntimeOpenPostFailure(settlement, error) {
@@ -2114,7 +2160,9 @@ async function fetchBrowserSummary({ remoteServices = true } = {}) {
   }
   const encoded = query.toString();
   const summaryPath = encoded ? `/api/apps/browser/summary?${encoded}` : "/api/apps/browser/summary";
-  browserSummaryPromise = fetchJson(summaryPath, { method: "GET" })
+  const summaryAbort = new AbortController();
+  windowCloseAbortControllers.add(summaryAbort);
+  browserSummaryPromise = fetchJson(summaryPath, { method: "GET", signal: summaryAbort.signal })
     .then((summary) => {
       browserSummary = summary;
       syncEngineSelect(summary);
@@ -2129,6 +2177,7 @@ async function fetchBrowserSummary({ remoteServices = true } = {}) {
     })
     .finally(() => {
       browserSummaryPromise = null;
+      windowCloseAbortControllers.delete(summaryAbort);
       resumeDeferredHomeBrowserWindowClose();
     });
   return browserSummaryPromise;
@@ -2210,7 +2259,7 @@ function browserOpenJobError(status) {
   return next;
 }
 
-async function waitForRuntimeOpen(response) {
+async function waitForRuntimeOpen(response, signal = null) {
   if (response?.schema === "elastos.browser.open-result/v1") {
     return response;
   }
@@ -2230,7 +2279,10 @@ async function waitForRuntimeOpen(response) {
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
-    const status = await fetchJson(response.status_url, { method: "GET" });
+    if (signal?.aborted) {
+      throw new Error("Browser window is closing.");
+    }
+    const status = await fetchJson(response.status_url, { method: "GET", signal });
     if (status?.schema !== "elastos.browser.open-status/v1") {
       throw new Error("Browser did not finish starting.");
     }
@@ -2282,6 +2334,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   });
   let openedOwner = null;
   let runtimePostStarted = false;
+  // A window Close aborts the network phase; Close then owns the cleanup of anything the open started.
+  const networkAbort = new AbortController();
+  windowCloseAbortControllers.add(networkAbort);
   runtimeOpenInFlight += 1;
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
@@ -2352,7 +2407,11 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       body: { ...body },
       page: null,
       statusUrl: "",
+      startedAt: Date.now(),
     };
+    if (networkAbort.signal.aborted) {
+      throw new Error("Browser window is closing.");
+    }
     runtimePostStarted = true;
     runtimeOwnershipTerminallyAbsent = false;
     unsettledRuntimeOpen = openSettlement;
@@ -2361,6 +2420,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       accepted = await fetchJson("/api/apps/browser/open", {
         method: "POST",
         body,
+        signal: networkAbort.signal,
       });
     } catch (error) {
       settleInitialRuntimeOpenPostFailure(openSettlement, error);
@@ -2372,12 +2432,13 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     ) {
       openSettlement.statusUrl = accepted.status_url;
     }
-    const response = await waitForRuntimeOpen(accepted);
+    const response = await waitForRuntimeOpen(accepted, networkAbort.signal);
     const openedPage = runtimeOpenResultPage(response);
     if (!openedPage) {
       throw new Error("Browser did not open the page.");
     }
     openSettlement.page = openedPage;
+    windowCloseAbortControllers.delete(networkAbort);
     if (remoteExitId && response?.stream_session?.backend !== remoteExitId) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
@@ -2428,6 +2489,10 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     if (!runtimePostStarted) {
       proveRuntimeOwnershipAbsentBeforeDispatch();
     }
+    if (networkAbort.signal.aborted && !openedOwner) {
+      // The window is closing; its Close settles whatever this open started.
+      throw error;
+    }
     if (
       openedOwner &&
       sameRuntimePageOwner(currentRuntimePageOwner(), openedOwner)
@@ -2450,6 +2515,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     throw error;
   } finally {
     runtimeOpenInFlight -= 1;
+    windowCloseAbortControllers.delete(networkAbort);
     setLoading(false);
     resumeDeferredHomeBrowserWindowClose();
   }
