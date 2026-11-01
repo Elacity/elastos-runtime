@@ -20,6 +20,59 @@ use std::os::{
 };
 
 #[cfg(unix)]
+fn create_data_directory_with_safe_modes(path: &Path) -> anyhow::Result<()> {
+    use std::fs;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    // Create each missing ancestor with mode 0755, then the final directory with 0700.
+    // Existing directories are left unchanged.
+
+    // First, ensure the final path doesn't exist, or return early if it does
+    if path.exists() {
+        return Ok(());
+    }
+
+    // Collect ancestors (excluding the final path) that need to be created
+    let mut ancestors = Vec::new();
+    if let Some(parent) = path.parent() {
+        let mut current = parent;
+        loop {
+            if !current.exists() {
+                ancestors.push(current);
+                match current.parent() {
+                    Some(p) => current = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Create ancestors with mode 0755 (owner rwx, group rx, other rx)
+    for ancestor in ancestors.iter().rev() {
+        if !ancestor.exists() {
+            fs::DirBuilder::new().mode(0o755).create(ancestor)?;
+        }
+    }
+
+    // Create the final data directory with mode 0700 (owner rwx only)
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    // Explicitly set permissions to ensure the mode is correct even if umask interfered
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_data_directory_with_safe_modes(path: &Path) -> anyhow::Result<()> {
+    use std::fs;
+    // On non-Unix platforms, use the standard create_dir_all
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 pub(super) struct IdentityFiles {
     root: File,
     directory: File,
@@ -41,7 +94,7 @@ impl IdentityFiles {
 
     fn open_mode(data_dir: &Path, create: bool) -> anyhow::Result<Self> {
         if create {
-            std::fs::create_dir_all(data_dir)?;
+            create_data_directory_with_safe_modes(data_dir)?;
         }
         let root = File::options()
             .read(true)

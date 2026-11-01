@@ -102,7 +102,7 @@ fn acquire_host_process_lock_inner(
     role: &str,
     addr: &str,
 ) -> anyhow::Result<FileLock> {
-    fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     let lock_path = host_lock_path(data_dir);
     let file = OpenOptions::new()
         .create(true)

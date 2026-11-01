@@ -395,7 +395,7 @@ pub fn load_operator_control(data_dir: &Path) -> Result<OperatorControlConfig> {
 }
 
 pub fn save_operator_control(data_dir: &Path, config: &OperatorControlConfig) -> Result<()> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     let path = operator_control_path(data_dir);
     let data = serde_json::to_vec_pretty(config)?;
     std::fs::write(&path, data)?;
