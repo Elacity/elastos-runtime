@@ -1079,11 +1079,16 @@ echo /Library/Developer/CommandLineTools
     def test_install_adds_one_marked_path_line_to_the_login_profile_and_uninstall_removes_it(self):
         did, head, release = installable_fixture()
         line = 'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
-        for system, machine, shell_path, profile in [("Linux", "x86_64", "/bin/bash", ".profile"),
-                                                     ("Darwin", "arm64", "/bin/zsh", ".zprofile")]:
-            with self.subTest(system=system), InstallerSandbox(head, release, did, system, machine) as sandbox:
+        # An existing empty ~/.bash_profile is the file bash reads, and must survive uninstall.
+        for system, machine, shell_path, profile, text in [
+                ("Linux", "x86_64", "/bin/bash", ".profile", "export EDITOR=vi"),
+                ("Linux", "x86_64", "/bin/bash", ".bash_profile", ""),
+                ("Darwin", "arm64", "/bin/zsh", ".zprofile", "export EDITOR=vi")]:
+            with self.subTest(system=system, profile=profile), \
+                    InstallerSandbox(head, release, did, system, machine) as sandbox:
                 path = sandbox.home / profile
-                path.write_text("export EDITOR=vi")
+                path.write_text(text)
+                kept = text + "\n" if text else ""
                 sandbox.respond("binary", RUNTIME_STUB)
                 if system == "Linux":
                     outputs = []
@@ -1091,7 +1096,7 @@ echo /Library/Developer/CommandLineTools
                         result, _ = sandbox.run("--install-only", env=[f"SHELL={shell_path}"])
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                         outputs.append(result.stdout)
-                    self.assertIn("Added ~/.local/bin to PATH in ~/.profile", outputs[0])
+                    self.assertIn(f"Added ~/.local/bin to PATH in ~/{profile}", outputs[0])
                     self.assertIn("To undo, delete the line ending in '# Added by the ElastOS installer'",
                                   outputs[0])
                     self.assertNotIn("to PATH in", outputs[1])
@@ -1102,12 +1107,13 @@ echo /Library/Developer/CommandLineTools
                                        'add_install_dir_to_login_profile\n', sandbox.home, shell_path)
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 # Added once, on its own line, after the existing text.
-                self.assertEqual(path.read_text(), "export EDITOR=vi\n" + line)
+                self.assertEqual(path.read_text(), kept + line)
 
                 result, _ = sandbox.run("--uninstall", env=[f"SHELL={shell_path}"])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"Removed the ElastOS PATH line from ~/{profile}", result.stdout)
-                self.assertEqual(path.read_text(), "export EDITOR=vi\n")
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.read_text(), kept)
 
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()
@@ -1449,7 +1455,8 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(requests, [])
             self.assertIn("Only your Recovery Kit can restore this identity", result.stdout + result.stderr)
-            self.assertEqual(self.files(sandbox), {})
+            # The install's PATH line is gone; the profile file itself is never deleted.
+            self.assertEqual(self.files(sandbox), {".profile": b""})
             self.assertFalse(sandbox.data.exists())
             self.assertFalse(sandbox.binary.exists())
 

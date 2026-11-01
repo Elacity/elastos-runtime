@@ -985,9 +985,10 @@ remove_login_profile_lines() {
         [[ -f "$profile" ]] && grep -q -e "${PATH_PROFILE_MARKER}\$" -- "$profile" || continue
         kept="$(mktemp)"
         # Rewrite in place, so a linked profile stays a link and keeps its mode.
+        # The file stays even when empty: it may have existed before the install,
+        # and removing a bash login file changes which one bash reads.
         if { grep -v -e "${PATH_PROFILE_MARKER}\$" -- "$profile" > "$kept" || [[ $? == 1 ]]; } &&
            cat -- "$kept" > "$profile"; then
-            [[ -s "$profile" || -L "$profile" ]] || rm -f -- "$profile"
             ok "Removed the ElastOS PATH line from $(display_path "$profile")"
         else
             warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete the line ending in '${PATH_PROFILE_MARKER}' by hand."
