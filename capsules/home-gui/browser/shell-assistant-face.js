@@ -19,6 +19,8 @@
    Contract with the frame (event.source pins the sender; the frame is
    opaque-sandboxed so target origin is "*"):
      Home → capsule   home-agent:open | home-agent:shelf-handover {on} | home-agent:close
+                      home-agent:open-link {url} (this Home has no Browser app:
+                      the capsule asks Home's link prompt for that address)
                       elastos:ui-preference {preferences} (on ready, and on every change)
      capsule → Home   home-agent:hello {docId} (document started) |
                       home-agent:ready {docId} (workspace loaded) | home-agent:shelf-metrics {width,height,radius}
@@ -30,21 +32,21 @@ import {
   LAYER_STATE,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261101c";
+} from "./shell-popovers.js?v=home-20261101d";
 import {
   agentStageId,
   bindAgentSpace,
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20261101c";
-import { isPhone } from "./shell-form-factor.js?v=home-20261101c";
+} from "./shell-stages.js?v=home-20261101d";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101d";
 import {
   createAssistantFrameReadiness,
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
-} from "./home-agent-message-contract.js?v=home-20261101c";
-import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261101c";
+} from "./home-agent-message-contract.js?v=home-20261101d";
+import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261101d";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "assistant";
@@ -423,8 +425,15 @@ function onFrameMessage(event) {
     }
     case "home-agent:open-browser": {
       const url = normalizeHomeAgentBrowserUrl(message);
-      if (url && browserAvailable && typeof deps?.openTarget === "function") {
+      if (!url) {
+        break;
+      }
+      if (browserAvailable && typeof deps?.openTarget === "function") {
         deps.openTarget("browser", { query: { url } });
+      } else {
+        // No Browser app: the capsule asks Home's own link prompt (#430),
+        // which shows the address and opens a tab only on Open link.
+        postToAssistantFrame({ type: "home-agent:open-link", url });
       }
       break;
     }

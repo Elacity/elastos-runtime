@@ -1,5 +1,5 @@
-import { isPhone } from "./shell-form-factor.js?v=home-20261101c";
-import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261101c";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101d";
+import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261101d";
 
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
@@ -63,9 +63,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20261101c", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20261101d", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20261101c", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20261101d", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 

@@ -413,6 +413,7 @@ const externalLinkApps = {
   "wallet-token": ["wallet", "Wallet"],
   "root-token": ["home-cli", "Home CLI"],
   "chat-token-": ["chat-room", "Chat"],
+  "assistant-token": ["assistant", "Assistant"],
 };
 let externalLinkGate = null;
 let externalLinkResult = null;
@@ -896,7 +897,9 @@ assert(
 
 // Home's web-link sheet (#430). Home opens an app's web link only after its
 // own sheet shows the Runtime-named app and the exact address and the person
-// presses Open link; window.open is recorded only inside these checks.
+// presses Open link; window.open is recorded only inside these checks. With
+// Home GUI active and the Browser app in the summary, Open hands the address
+// to Home GUI's Browser instead (the Assistant's path), never a tab.
 const openedLinks = [];
 const strictWindowOpen = window.open;
 function recordLinkOpen(...args) {
@@ -945,13 +948,27 @@ async function settleLinks() {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
-function assertOpenedLinks(expected, message) {
+let browserLinkCursor = shellMessages.length;
+function browserLinkOpens() {
+  const sent = shellMessages.slice(browserLinkCursor).map((message) => message.payload)
+    .filter((payload) => payload?.type === "home:gui-command" && payload.command === "open-target" &&
+      payload.target === "browser" && payload.query?.url !== undefined);
+  browserLinkCursor = shellMessages.length;
+  return sent;
+}
+// Every open since the last check went to `via` ("tab" or "browser"), exactly
+// these addresses, once each, and none went the other way.
+function assertOpenedLinks(expected, message, via = "tab") {
   const opened = openedLinks.splice(0);
+  const browser = browserLinkOpens();
   assert(
     JSON.stringify(opened) ===
-      JSON.stringify(expected.map((url) => [url, "_blank", "noopener,noreferrer"])),
+      JSON.stringify((via === "tab" ? expected : []).map((url) => [url, "_blank", "noopener,noreferrer"])) &&
+    JSON.stringify(browser) === JSON.stringify((via === "browser" ? expected : []).map((url) => ({
+      type: "home:gui-command", command: "open-target", target: "browser", query: { url },
+    }))),
     message,
-    opened,
+    { opened, browser },
   );
 }
 {
@@ -973,6 +990,8 @@ function assertOpenedLinks(expected, message) {
     url: "https://example.com/cli?x=1",
   }), "Home did not hand the Runtime the sender's own launch token and unchanged address", check);
   assertOpenedLinks([], "Home opened a Home CLI link before Open link");
+  // Home CLI is the active shell, so Home GUI cannot open Browser: a tab.
+  assert(linkNode("open").textContent === "Open link", "the Home CLI sheet did not say Open link", linkNode("open").textContent);
   pressLink("open");
   assertOpenedLinks(["https://example.com/cli?x=1"], "Open link did not open the Home CLI link once");
   assert(linkSheet().hidden, "the link sheet stayed open after Open link", linkSheet());
@@ -1403,6 +1422,8 @@ sendChildMessage("null", walletFrameWindow, {
   await settleLinks();
   assert(JSON.stringify(linkSheet()) === shownLinkSheet("People", "example.com", address),
     "Home did not name the asking app and the exact address", linkSheet());
+  assert(linkNode("open").textContent === "Open in Browser",
+    "with the Browser app the sheet did not say Open in Browser", linkNode("open").textContent);
   const checksWhileOpen = linkChecks();
   askLink(peopleFrameWindow, people, "https://evil.example/b");
   askLink(walletFrameWindow, "wallet-token", "https://evil.example/c");
@@ -1420,7 +1441,7 @@ sendChildMessage("null", walletFrameWindow, {
   assert(!linkSheet().hidden, "an immediate Open press closed the sheet", linkSheet());
   assertOpenedLinks([], "an Open press inside the 500 ms guard opened the link");
   pressLink("open");
-  assertOpenedLinks([address], "Open link did not open exactly the address shown");
+  assertOpenedLinks([address], "Open in Browser did not hand exactly the address shown to Browser", "browser");
   pressLink("open");
   assertOpenedLinks([], "a second Open press replayed the link");
 
@@ -1528,6 +1549,19 @@ for (const actor of ["assistant", "home-agent"]) {
   assert(count() === inboxBefore + 1, "registered composer opens Inbox", shellMessages);
   const inboxOpened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
   assert(inboxOpened.target === "inbox" && JSON.stringify(inboxOpened.query) === "{}", "exact Inbox destination", inboxOpened);
+  if (actor === "assistant") {
+    // A Home without the Browser app sends an Assistant link here (the face
+    // answers home-agent:open-link): the same sheet, naming the Assistant.
+    askLink(source, token, "https://docs.example/guide");
+    await settleLinks();
+    assert(JSON.stringify(linkSheet()) === shownLinkSheet("Assistant", "docs.example", "https://docs.example/guide"),
+      "an Assistant link did not show Home's link sheet with the exact address", linkSheet());
+    assertOpenedLinks([], "an Assistant link opened before Open link");
+    pressLink("cancel");
+    assert(linkSheet().hidden, "Cancel left the Assistant link sheet open", linkSheet());
+    pressLink("open");
+    assertOpenedLinks([], "a cancelled Assistant link opened");
+  }
 }
 
 {
@@ -2739,7 +2773,7 @@ await settleLinks();
 assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-new"),
   "the reconnected Chat could not ask for a link", linkSheet());
 pressLink("open");
-assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link did not open once");
+assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link did not open once", "browser");
 window.open = strictWindowOpen;
 assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && chatReconnectTimers.size === 0,
   "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
@@ -2818,7 +2852,7 @@ await settleLinks();
 assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-current"),
   "the old authority's late result replaced or hid the current request", linkSheet());
 pressLink("open");
-assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one");
+assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one", "browser");
 window.open = strictWindowOpen;
 acknowledgeChatCommit(refusedCommitPrepare, false, {});
 const beforeWrongCommitReceipt = openCommands();

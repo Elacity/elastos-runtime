@@ -55,7 +55,7 @@ import {
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
-} from "./home-external-link.js?v=home-links-20261029a";
+} from "./home-external-link.js?v=home-links-20261101a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -159,6 +159,15 @@ const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
   size: document.querySelector("#home-link-size"),
   status: document.querySelector("#home-link-status"),
   openSharedFile: (file, signal) => openHomeSharedFile(file, { openTarget: openTargetFromHomeGui, signal }),
+  // The same source the Assistant face uses: the Browser target is in this
+  // Home's summary. Home GUI opens it as the Assistant does, reusing the one
+  // Browser window; the command carries only the confirmed address.
+  browserAvailable: homeGuiCanOpenBrowser,
+  openInBrowser: (url) => {
+    openTargetFromHomeGui("browser", { query: { url } }).catch((error) => {
+      console.error("home could not open the link in Browser", error);
+    });
+  },
   isLive: externalLinkSenderIsLive,
   otherSheetShown: () => !homeClipboardPromptRoot.hidden,
 });
@@ -547,14 +556,20 @@ async function launchHomeTarget(target, query = {}) {
   return launched;
 }
 
+function homeGuiActive() {
+  return activeShellTarget(shellState.currentSummary) === HOME_GUI_SHELL_ID &&
+    shellState.activeShellRootTarget === HOME_GUI_SHELL_ID &&
+    !!activeShellFrame?.contentWindow;
+}
+
 function requireHomeGuiActive(action) {
-  if (
-    activeShellTarget(shellState.currentSummary) !== HOME_GUI_SHELL_ID ||
-    shellState.activeShellRootTarget !== HOME_GUI_SHELL_ID ||
-    !activeShellFrame?.contentWindow
-  ) {
+  if (!homeGuiActive()) {
     throw new Error(`${action} requires active ${HOME_GUI_SHELL_ID}`);
   }
+}
+
+function homeGuiCanOpenBrowser() {
+  return homeGuiActive() && !!targetById(shellState.currentSummary, "browser");
 }
 
 async function openTargetFromHomeGui(target, options = {}) {

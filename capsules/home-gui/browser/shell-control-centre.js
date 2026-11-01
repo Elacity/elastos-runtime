@@ -3,29 +3,29 @@ import {
   registerEscapeHandler,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261101c";
+} from "./shell-popovers.js?v=home-20261101d";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261101c";
+} from "./shell-motion.js?v=home-20261101d";
 import {
   focusModeEnabled,
   formatBadgeCount,
   setDesktopIconsVisible,
   shellState,
   targetById,
-} from "./shell-core.js?v=home-20261101c";
-import { uiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20261101c";
+} from "./shell-core.js?v=home-20261101d";
+import { uiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20261101d";
 import {
   dockAutoHideEnabled,
-} from "./shell-surface.js?v=home-20261101c";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20261101c";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20261101c";
-import { showSpotlight } from "./shell-spotlight.js?v=home-20261101c";
-import { openTarget } from "./shell-windows.js?v=home-20261101c";
-import { openExpose } from "./shell-expose.js?v=home-20261101c";
-import { summaryDisplayName } from "./shell-chrome.js?v=home-20261101c";
-import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261101c";
+} from "./shell-surface.js?v=home-20261101d";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20261101d";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20261101d";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20261101d";
+import { openTarget } from "./shell-windows.js?v=home-20261101d";
+import { openExpose } from "./shell-expose.js?v=home-20261101d";
+import { summaryDisplayName } from "./shell-chrome.js?v=home-20261101d";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261101d";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus
