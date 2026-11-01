@@ -960,9 +960,10 @@ login_profile() {
 # missing one is created exclusively) and must be this user's regular file with
 # a single name, so the line cannot land in another file such as Runtime data.
 # Only new bytes are written, at the end, in one write; its inode, mode, owner,
-# ACL and existing content stay. A failed or short write is cut back to the
-# original size and this returns 1 (profile unchanged); if even that cut fails,
-# it returns 2 and the profile may end in part of the line.
+# ACL and existing content stay. Returns 0 when the line was added, 1 when the
+# profile is unchanged (a failed or short write is cut back to the original
+# size), and 2 when the result is uncertain (the cut back or the close after a
+# write failed), so the profile may end in all or part of the line.
 append_login_profile_line() {
     python3 -I - "$@" <<'PY_LOGIN_PROFILE'
 import os
@@ -971,6 +972,8 @@ import sys
 
 path, line = sys.argv[1], os.fsencode(sys.argv[2])
 flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+outcome = 1
+wrote = False
 try:
     try:
         fd = os.open(path, flags)
@@ -978,25 +981,32 @@ try:
         fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         found = os.fstat(fd)
-        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.geteuid() or found.st_nlink != 1:
-            sys.exit(1)
-        size = os.lseek(fd, 0, os.SEEK_END)
-        # A last line without a newline would otherwise join this one.
-        new = (b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b"") + line + b"\n"
-        try:
-            written = os.write(fd, new)
-        except OSError:
-            written = -1
-        if written != len(new):
+        if stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and found.st_nlink == 1:
+            size = os.lseek(fd, 0, os.SEEK_END)
+            # A last line without a newline would otherwise join this one.
+            new = (b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b"") + line + b"\n"
+            wrote = True
             try:
-                os.ftruncate(fd, size)
+                written = os.write(fd, new)
             except OSError:
-                sys.exit(2)
-            sys.exit(1)
+                written = -1
+            if written == len(new):
+                outcome = 0
+            else:
+                try:
+                    os.ftruncate(fd, size)
+                except OSError:
+                    outcome = 2
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            if wrote:
+                outcome = 2
 except OSError:
-    sys.exit(1)
+    if wrote:
+        outcome = 2
+sys.exit(outcome)
 PY_LOGIN_PROFILE
 }
 
@@ -1016,7 +1026,7 @@ add_install_dir_to_login_profile() {
     local status=0
     append_login_profile_line "$profile" "$line" || status=$?
     if [[ "$status" -eq 2 ]]; then
-        warn "Could not finish adding a line to $(display_path "$profile"); open it, delete its last line if it is cut short, then add this line yourself: $(path_export_line)"
+        warn "Could not confirm the change to $(display_path "$profile"); open it and make sure its last line is exactly: $(path_export_line)"
         return 0
     elif [[ "$status" -ne 0 ]]; then
         warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be changed; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
