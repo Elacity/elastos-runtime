@@ -40,7 +40,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - Assistant can edit and delete a message you just sent, and Qwen2.5 1.5B answers ordinary requests.
 - Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
-- Web links in Chat and Documents open only after you see the address and choose Open link. Documents Autosave is off by default.
+- Web links in Chat and Documents open only after you see the address and choose Open. Links from Chat, Documents and Assistant open in the Browser app when the computer has it, otherwise in your own browser. Documents Autosave is off by default.
 - Home starts with any number of large Library files. Library is faster and checks an archive before Extract Here.
 - Setup shows the size of the Browser download on a Mac, and stops before it when the disk is too small while Home still installs. It says while Home is starting, Ctrl+C stops it, and if it fails it says to run elastos setup again. Without a desktop, it says how to open Home from another computer. If another program uses port 8090, Home says so and does not start.
 
@@ -258,10 +258,10 @@ Second release candidate for 2.0.0 on the test channel.
 
 ### Fixed
 
-- Since 2.0.0-rc.1: Browser no longer closes after about 8 minutes, fits any window size and opens faster. Ubuntu and Jetson install on a default account. Assistant follows Light or Dark at once, shows long lists in full and keeps its newest reply in view. System shows these notes as a list.
+- Since 2.0.0-rc.1: Browser no longer closes after about 8 minutes, fits any window size, opens faster and opens links from Chat. Ubuntu and Jetson install on a default account. Assistant follows Light or Dark at once, shows long lists in full and keeps its newest reply in view. System shows these notes as a list.
 - Assistant can edit and delete a message you just sent, and Qwen2.5 1.5B answers ordinary requests.
 - Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
-- Web links in Chat and Documents open only after you see the address and choose Open link. Documents Autosave is off by default.
+- Web links in Chat and Documents open only after you see the address and choose Open. Links from Chat, Documents and Assistant open in the Browser app when the computer has it, otherwise in your own browser. Documents Autosave is off by default.
 - Home starts with any number of large Library files. Library is faster and checks an archive before Extract Here.
 - Setup shows the size of the Browser download on a Mac, and stops before it when the disk is too small while Home still installs. It says while Home is starting, Ctrl+C stops it, and if it fails it says to run elastos setup again. Without a desktop, it says how to open Home from another computer. If another program uses port 8090, Home says so and does not start.
 
