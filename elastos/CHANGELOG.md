@@ -22,6 +22,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
+- Known issue: after `elastos update` or Undo in a terminal, Home stays stopped. Start it with `elastos home --browser` (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
@@ -47,7 +48,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Web pages open in a separate sandbox, and apps need permission to reach your private data. Releases are signed with a new key kept off the public server.
 - Browser gets security fixes (Chromium 155). On a Mac it downloads a new image of about 900 MB once after the update.
 - Not done yet: Home can still use every app's permissions, background services run with your account's rights, and approvals do not have a screen only ElastOS controls (#173).
-- Importing a Recovery Kit does not yet ask for your passkey again (#403). On Linux with KVM, the Browser network helper is installed with sudo without a file check (#406).
+- Importing a Recovery Kit does not yet ask for your passkey again (#403).
 - Guests cannot see the security log or use the web Terminal, which is off by default.
 
 ### Developer detail
@@ -241,6 +242,7 @@ Second release candidate for 2.0.0 on the test channel.
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
+- Known issue: after `elastos update` or Undo in a terminal, Home stays stopped. Start it with `elastos home --browser` (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
@@ -267,7 +269,7 @@ Second release candidate for 2.0.0 on the test channel.
 - Web pages open in a separate sandbox, and apps need permission to reach your private data. Releases are signed with a new key kept off the public server.
 - Browser gets security fixes (Chromium 155). On a Mac it downloads a new image of about 900 MB once after the update.
 - Not done yet: Home can still use every app's permissions, background services run with your account's rights, and approvals do not have a screen only ElastOS controls (#173).
-- Importing a Recovery Kit does not yet ask for your passkey again (#403). On Linux with KVM, the Browser network helper is installed with sudo without a file check (#406).
+- Importing a Recovery Kit does not yet ask for your passkey again (#403).
 - Guests cannot see the security log or use the web Terminal, which is off by default.
 
 ## [2.0.0-rc.1] - 2026-10-30
