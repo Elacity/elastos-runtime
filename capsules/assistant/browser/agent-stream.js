@@ -55,6 +55,8 @@ const liveTurnCanonical = {
 const STREAM_BUDGET_MS = 8;
 const STREAM_TRACE_LIMIT = 48;
 const FOLLOW_RESUME_PX = 96;
+/** A scroll this soon after the reader's wheel, touch or drag is theirs. */
+const READER_GESTURE_MS = 1000;
 /** One-shot markdown+KaTeX above this freezes Brave. Stream freeze slices stay ~800. */
 const RICH_MARKDOWN_MAX_CHARS = 8_000;
 const LONG_TASK_TRACE_LIMIT = 24;
@@ -778,9 +780,10 @@ export function updateJumpToLatestVisibility() {
     return;
   }
   const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-  btn.hidden = distance < 96 || !ctx?.turnBusy && distance < 160;
-  /* Show whenever user is meaningfully above bottom during/after turns. */
-  btn.hidden = distance < 120;
+  /* Offered whenever the reader is meaningfully above the end, except while a
+     reply streams and the room is following it (its own scroll events see
+     the reply a frame ahead of the follow). */
+  btn.hidden = scroller.classList.contains("is-follow-bottom") || distance < 120;
 }
 
 function commitAgentReply(session, answer, thinking = "", { partial = false, quiet = false, progress = null, run = null, turn = null } = {}) {
@@ -2245,14 +2248,39 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
 
   const scroller = host.streamScrollEl?.();
   const streamRoot = host.streamEl?.();
+  /* A scroll event alone does not say the reader moved: a block above the
+     end shrinking (the status line giving way to the reply) clamps scrollTop,
+     and the reply growing in the same frame leaves the end far below. Only a
+     scroll that follows the reader's own wheel, touch or scrollbar drag stops
+     the follow; any other one is layout, and the follow lands on the end. */
+  let readerHolding = false;
+  let readerGestureAt = -Infinity;
+  const noteReaderGesture = () => {
+    readerGestureAt = performance.now();
+  };
+  const onReaderHold = () => {
+    readerHolding = true;
+    noteReaderGesture();
+  };
+  const onReaderRelease = () => {
+    if (readerHolding) {
+      readerHolding = false;
+      noteReaderGesture();
+    }
+  };
   const onUserScroll = () => {
     if (followScrollQuiet || !scroller) {
       return;
     }
     const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
     if (distance > FOLLOW_RESUME_PX) {
-      if (stickToBottom) {
+      if (!stickToBottom) {
+        return;
+      }
+      if (readerHolding || performance.now() - readerGestureAt < READER_GESTURE_MS) {
         pauseFollow();
+      } else {
+        followAfterFlush();
       }
       return;
     }
@@ -2261,6 +2289,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
   };
   const onUserScrollUp = (event) => {
+    noteReaderGesture();
     if (event.deltaY < 0) {
       pauseFollow();
     }
@@ -2300,6 +2329,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   setFollowBottom(true);
   scroller?.addEventListener("scroll", onUserScroll, { passive: true });
   scroller?.addEventListener("wheel", onUserScrollUp, { passive: true });
+  scroller?.addEventListener("pointerdown", onReaderHold, { passive: true });
+  scroller?.addEventListener("touchstart", onReaderHold, { passive: true });
+  for (const type of ["pointerup", "pointercancel", "touchend", "touchcancel"]) {
+    window.addEventListener(type, onReaderRelease, { passive: true });
+  }
   streamRoot?.addEventListener("selectstart", onSelectStart);
   streamRoot?.addEventListener("pointerdown", onStreamPointer);
   streamRoot?.addEventListener("contextmenu", onContextMenu);
@@ -3097,6 +3131,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     scroller?.classList.remove("is-live-streaming", "is-follow-bottom");
     scroller?.removeEventListener("scroll", onUserScroll);
     scroller?.removeEventListener("wheel", onUserScrollUp);
+    scroller?.removeEventListener("pointerdown", onReaderHold);
+    scroller?.removeEventListener("touchstart", onReaderHold);
+    for (const type of ["pointerup", "pointercancel", "touchend", "touchcancel"]) {
+      window.removeEventListener(type, onReaderRelease);
+    }
     jumpBtn?.removeEventListener("click", onJumpLatest);
     streamRoot?.removeEventListener("selectstart", onSelectStart);
     streamRoot?.removeEventListener("pointerdown", onStreamPointer);
