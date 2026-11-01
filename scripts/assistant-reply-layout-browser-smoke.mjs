@@ -295,10 +295,11 @@ try {
   assert.equal(follow.jumpFrames, 0, `a reader who never left the end is not offered Jump to latest: ${JSON.stringify(follow)}`);
   seen.sentReplyBehindMs = follow.behindMs;
 
-  // A reader who moves up while a reply streams keeps their place, however
-  // they moved: the keyboard (Shift+Space on the transcript) or something
-  // that sets the scroll position directly, as a screen reader does. Then
-  // Jump to latest is offered.
+  // A reader who moves up while a reply streams keeps their place, by any
+  // amount and however they moved, while more of the reply keeps arriving:
+  // small steps (ArrowUp, a 40 px wheel), a page (Shift+Space), or a scroll
+  // position set directly, as a screen reader does. Then Jump to latest is
+  // offered.
   const scrollState = () => frame.evaluate(() => {
     const scroller = document.querySelector("#agent-harness-stream");
     const jump = document.querySelector("[data-agent-jump-latest]");
@@ -307,7 +308,27 @@ try {
       jump: Boolean(jump && !jump.hidden && jump.getBoundingClientRect().height > 0) };
   });
   const settled = () => frame.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
-  const readerMovesUp = async (label, moveUp, prepare = async () => {}) => {
+  const atEnd = () => frame.waitForFunction(() => {
+    const scroller = document.querySelector("#agent-harness-stream");
+    return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8;
+  }, null, { timeout: 5000 });
+  // Beside the messages, inside the transcript (frame and page share
+  // coordinates: both frames fill the page).
+  const gutter = () => frame.evaluate(() => {
+    const scroller = document.querySelector("#agent-harness-stream").getBoundingClientRect();
+    const column = document.querySelector("#agent-harness-stream-column").getBoundingClientRect();
+    return { x: Math.round((column.left + scroller.left) / 2), y: Math.round(scroller.top + scroller.height / 3) };
+  });
+  // The transcript takes the keyboard after a click a while ago: only the
+  // keys that follow move the reader.
+  const clickTranscriptAWhileAgo = async () => {
+    const point = await gutter();
+    assert.ok(point.x >= 8, `the transcript has room beside the messages: ${JSON.stringify(point)}`);
+    await page.mouse.click(point.x, point.y);
+    await page.waitForTimeout(1500);
+    await atEnd();
+  };
+  const readerMovesUp = async (label, move, prepare = async () => {}) => {
     stage = `a reader who moves up with ${label} while a reply streams`;
     const runId = `run-sent-${fixture.runs.size + 1}`;
     const marker = `End of the reply read with ${label}.`;
@@ -318,62 +339,73 @@ try {
       await page.waitForTimeout(20);
     }
     const run = fixture.runs.get(runId);
-    const chunks = `${gardenReply}\n${marker}\n`.match(/[\s\S]{1,300}/g);
-    const half = Math.ceil(chunks.length / 2);
-    for (const [index, text] of chunks.slice(0, half).entries()) {
-      run.push({ sequence: index + 1, kind: "text_delta", data: { text } });
+    const chunks = `${gardenReply}\n${marker}\n`.match(/[\s\S]{1,120}/g);
+    let sent = 0;
+    const pushChunk = async () => {
+      if (sent >= chunks.length) return;
+      run.push({ sequence: sent + 1, kind: "text_delta", data: { text: chunks[sent] } });
+      sent += 1;
       await page.waitForTimeout(10);
-    }
-    await room.locator(".agent-msg-agent.is-streaming").filter({ hasText: chunks[half - 1].trim().slice(-20) }).waitFor({ timeout: 5000 });
+    };
+    while (sent < 8) await pushChunk();
+    await room.locator(".agent-msg-agent.is-streaming").filter({ hasText: chunks[sent - 1].trim().slice(-15) }).waitFor({ timeout: 5000 });
     // A new message makes the room shrink and grow again as its reply starts
     // (the scroll position clamps down): the room still follows to the end.
-    await frame.waitForFunction(() => {
-      const scroller = document.querySelector("#agent-harness-stream");
-      return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8;
-    }, null, { timeout: 5000 }).catch(async () => assert.fail(`${label}: the room follows the start of the reply: ${JSON.stringify(await scrollState())}`));
+    await atEnd().catch(async () => assert.fail(`${label}: the room follows the start of the reply: ${JSON.stringify(await scrollState())}`));
     await prepare();
     const before = await scrollState();
-    await moveUp();
-    // Keyboard scrolling animates: wait until it stops moving.
-    for (let last = -1, now = (await scrollState()).top; now !== last;) {
-      await settled();
-      [last, now] = [now, (await scrollState()).top];
-    }
-    const held = await scrollState();
-    assert.ok(held.top < before.top - 100, `${label} moved the reader up: ${JSON.stringify({ before, held })}`);
-    for (const [index, text] of chunks.slice(half).entries()) {
-      run.push({ sequence: half + index + 1, kind: "text_delta", data: { text } });
-      await page.waitForTimeout(10);
-    }
+    // From the first move on, every frame: the reader is never pulled back
+    // down (scrollTop only stays or goes up; the reply growing below the
+    // reader does not move it).
+    await frame.evaluate(() => {
+      const scroller = document.querySelector("#agent-harness-stream");
+      window.__reader = { on: true, tops: [] };
+      const sample = () => {
+        if (!window.__reader.on) return;
+        window.__reader.tops.push(scroller.scrollTop);
+        requestAnimationFrame(sample);
+      };
+      sample();
+    });
+    await move(pushChunk);
+    while (sent < chunks.length) await pushChunk();
     run.push({ sequence: chunks.length + 1, kind: "completed", data: {} });
     await room.locator('.agent-msg-agent[data-stream-phase="presentation_done"]').filter({ hasText: marker })
       .waitFor({ state: "attached", timeout: 10000 });
     await settled();
     const end = await scrollState();
-    assert.ok(Math.abs(end.top - held.top) < 2 && end.fromEnd > 300,
-      `${label}: the reader keeps their place: ${JSON.stringify({ before, held, end })}`);
-    assert.ok(end.jump, `${label}: Jump to latest is offered: ${JSON.stringify(end)}`);
-    return held.top - before.top;
-  };
-  seen.shiftSpaceMovedPx = await readerMovesUp("Shift+Space", () => page.keyboard.press("Shift+Space"), async () => {
-    // Click the transcript beside the messages a while before paging up with
-    // the keyboard: only the key moves the reader.
-    const gutter = await frame.evaluate(() => {
-      const scroller = document.querySelector("#agent-harness-stream").getBoundingClientRect();
-      const column = document.querySelector("#agent-harness-stream-column").getBoundingClientRect();
-      return { x: Math.round((column.left - scroller.left) / 2), y: Math.round(scroller.height / 3) };
+    const pulledBackPx = await frame.evaluate(() => {
+      window.__reader.on = false;
+      const { tops } = window.__reader;
+      return Math.round(Math.max(0, ...tops.slice(1).map((top, i) => top - tops[i])));
     });
-    assert.ok(gutter.x >= 8, `the transcript has room beside the messages: ${JSON.stringify(gutter)}`);
-    await room.locator("#agent-harness-stream").click({ position: gutter });
-    await page.waitForTimeout(1500);
-    await frame.waitForFunction(() => {
-      const scroller = document.querySelector("#agent-harness-stream");
-      return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 8;
-    }, null, { timeout: 5000 });
+    assert.ok(pulledBackPx <= 2, `${label}: the reader is never pulled back toward the end (${pulledBackPx} px): ${JSON.stringify({ before, end })}`);
+    assert.ok(end.top < before.top - 30 && end.fromEnd > 300,
+      `${label}: the reader keeps their place above the end: ${JSON.stringify({ before, end })}`);
+    assert.ok(end.jump, `${label}: Jump to latest is offered: ${JSON.stringify(end)}`);
+    return end.top - before.top;
+  };
+  seen.smallStepsMovedPx = await readerMovesUp("ArrowUp and a 40 px wheel", async (pushChunk) => {
+    for (let step = 0; step < 4; step += 1) {
+      await page.keyboard.press("ArrowUp");
+      await pushChunk();
+      await page.mouse.wheel(0, -40);
+      await pushChunk();
+    }
+  }, async () => {
+    await clickTranscriptAWhileAgo();
+    const point = await gutter();
+    await page.mouse.move(point.x, point.y);
   });
-  seen.setScrollMovedPx = await readerMovesUp("a set scroll position", () => frame.evaluate(() => {
-    document.querySelector("#agent-harness-stream").scrollTop -= 600;
-  }));
+  seen.shiftSpaceMovedPx = await readerMovesUp("Shift+Space", async (pushChunk) => {
+    // More words arrive while the page-up scroll is still moving.
+    await page.keyboard.press("Shift+Space");
+    for (let i = 0; i < 4; i += 1) await pushChunk();
+  }, clickTranscriptAWhileAgo);
+  seen.setScrollMovedPx = await readerMovesUp("a set scroll position", async (pushChunk) => {
+    await frame.evaluate(() => { document.querySelector("#agent-harness-stream").scrollTop -= 600; });
+    for (let i = 0; i < 2; i += 1) await pushChunk();
+  });
 
   assert.deepEqual(errors, []);
   assert.deepEqual(pageErrors, []);

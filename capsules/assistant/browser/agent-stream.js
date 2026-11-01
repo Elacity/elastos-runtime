@@ -2253,15 +2253,16 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   const scroller = host.streamScrollEl?.();
   const streamRoot = host.streamEl?.();
   /* The direction of a scroll says who moved. The reader going up (wheel,
-     keys such as Shift+Space, a scrollbar, a screen reader) lowers scrollTop
-     and stops the follow, whatever caused it. The reply growing never lowers
-     it: the follow and the reply row's own scroll to the end move it down.
-     One layout case lowers it too: a block above the end shrinking clamps
-     scrollTop, and the reply may grow again before the scroll event, so the
-     end looks far below. A scroll up is therefore the reader's unless the
-     room could have shrunk since the last scroll (its furthest scroll
-     position dropped) and the reader gave no input (wheel, key, touch,
-     pointer) in the last second; then the follow lands on the end. */
+     keys such as ArrowUp or Shift+Space, a scrollbar, a screen reader)
+     lowers scrollTop and stops the follow, by any amount and whatever caused
+     it. The reply growing never lowers it: the follow and the reply row's
+     own scroll to the end move it down. One layout case lowers it too: a
+     block above the end shrinking clamps scrollTop. A scroll up is therefore
+     the reader's unless the room could have shrunk since the last scroll
+     (its furthest scroll position dropped) and the reader gave no input
+     (wheel, key, touch, pointer) in the last second; then the follow lands
+     on the end. Once stopped, only the reader scrolling down to the end, or
+     Jump to latest, starts it again. */
   if (scroller) {
     noteScrollPosition();
   }
@@ -2287,18 +2288,21 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     const top = scroller.scrollTop;
     const maxTop = scroller.scrollHeight - scroller.clientHeight;
     const movedUp = top < lastScrollTop - 1;
+    const movedDown = top > lastScrollTop + 1;
     const roomShrank = maxTop < lastMaxTop - 1;
     noteScrollPosition();
     const readerInput = readerHolding || performance.now() - readerInputAt < READER_INPUT_MS;
-    if (maxTop - top > FOLLOW_RESUME_PX) {
-      if (stickToBottom && movedUp && (readerInput || !roomShrank)) {
+    if (stickToBottom) {
+      if (movedUp && (readerInput || !roomShrank)) {
         pauseFollow();
-      } else if (stickToBottom) {
+      } else if (maxTop - top > 1) {
         followAfterFlush();
       }
       return;
     }
-    if (!stickToBottom) {
+    /* Paused: only the reader coming back down to the end resumes; the reply
+       growing or a layout clamp never does. */
+    if (movedDown && maxTop - top <= FOLLOW_RESUME_PX) {
       setFollowBottom(true);
     }
   };
