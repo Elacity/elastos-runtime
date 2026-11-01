@@ -1969,7 +1969,7 @@ body[data-home-link="reconnecting"] .notification-center-link {
 
 .home-notification-copy strong {
   overflow: hidden;
-  color: #fff;
+  color: var(--text);
   font-size: 13px;
   line-height: 1.25;
   text-overflow: ellipsis;
@@ -2008,9 +2008,13 @@ body[data-home-link="reconnecting"] .notification-center-link {
   height: 28px;
   border-radius: 6px;
   background:
-    rgba(255, 255, 255, 0.08)
+    var(--lift)
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E")
     center / 15px 15px no-repeat;
+}
+
+:root[data-el-theme="light"] .home-notification-dismiss {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d2438' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
 }
 
 .home-notification-action:hover,

@@ -3,23 +3,23 @@ import {
   mountGlyph,
   allVisibleTargets,
   desktopObjects,
-} from "./shell-core.js?v=home-20261031a";
-import { openFileObject } from "./shell-surface.js?v=home-20261031a";
+} from "./shell-core.js?v=home-20261031c";
+import { openFileObject } from "./shell-surface.js?v=home-20261031c";
 import {
   openTarget,
   focusWindow,
   browserWindowEntries,
   sortWindowEntriesByZOrder,
   browserWindowDisplayTitle,
-} from "./shell-windows.js?v=home-20261031a";
+} from "./shell-windows.js?v=home-20261031c";
 import {
   dismissWithMotion,
   isDismissing,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261031a";
-import { LAYER_STATE, registerStageLayer } from "./shell-popovers.js?v=home-20261031a";
-import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261031a";
-import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261031a";
+} from "./shell-motion.js?v=home-20261031c";
+import { LAYER_STATE, registerStageLayer } from "./shell-popovers.js?v=home-20261031c";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20261031c";
+import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261031c";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything
