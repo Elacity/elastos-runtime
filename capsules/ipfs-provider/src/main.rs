@@ -4088,14 +4088,27 @@ mod tests {
         lock.l_whence = libc::SEEK_SET as _;
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // The child never execs, so it inherits every fd of this
+        // multithreaded test binary, including other tests' startup flocks;
+        // it closes all but its own two before locking. Bound read pre-fork.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let max_fd = limit.rlim_cur.min(1 << 16) as libc::c_int;
+        let keep = [file.as_raw_fd(), pipe[1]];
         // The child makes only async-signal-safe calls.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
             unsafe {
-                let held = [u8::from(
-                    libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0,
-                )];
+                for fd in 0..max_fd {
+                    if fd != keep[0] && fd != keep[1] {
+                        libc::close(fd);
+                    }
+                }
+                let held = [u8::from(libc::fcntl(keep[0], libc::F_SETLK, &lock) == 0)];
                 libc::write(pipe[1], held.as_ptr().cast(), 1);
                 loop {
                     libc::pause();
