@@ -28,23 +28,23 @@
    switcher. It starts on the title bar only — capsule frames own their own
    touches — and cancels on horizontal drift. Presentation only. */
 
-import { HOME_GUI_HOST_SELECTORS, shellState } from "./shell-core.js?v=home-20261101b";
+import { HOME_GUI_HOST_SELECTORS, shellState } from "./shell-core.js?v=home-20261101c";
 import {
   STAGE_HISTORY_STATE,
   createStageHistory,
   isStageHistoryState,
-} from "./shell-phone-stage-history.js?v=home-20261101b";
-import { isPhone } from "./shell-form-factor.js?v=home-20261101b";
-import { minimizeWindow } from "./shell-windows.js?v=home-20261101b";
-import { exitFullscreenStage } from "./shell-stages.js?v=home-20261101b";
-import { isExposeOpen, openExpose } from "./shell-expose.js?v=home-20261101b";
+} from "./shell-phone-stage-history.js?v=home-20261101c";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101c";
+import { minimizeWindow } from "./shell-windows.js?v=home-20261101c";
+import { exitFullscreenStage } from "./shell-stages.js?v=home-20261101c";
+import { isExposeOpen, openExpose } from "./shell-expose.js?v=home-20261101c";
 import {
   LAYER_STATE,
   cancelStageGestures,
   registerStageGesture,
   registeredStageLayers,
-} from "./shell-popovers.js?v=home-20261101b";
-import { isDismissing } from "./shell-motion.js?v=home-20261101b";
+} from "./shell-popovers.js?v=home-20261101c";
+import { isDismissing } from "./shell-motion.js?v=home-20261101c";
 
 // A title-bar drag this far down opens the switcher…
 export const TITLE_SWIPE_DOWN_PX = 48;

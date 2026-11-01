@@ -18,14 +18,14 @@ import {
   desktopBackdrop,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20261101b";
+} from "./shell-core.js?v=home-20261101c";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20261101b";
-import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261101b";
-import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261101b";
-import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261101b";
+} from "./home-gui-authority.js?v=home-20261101c";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261101c";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261101c";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261101c";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
