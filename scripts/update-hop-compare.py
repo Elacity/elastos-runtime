@@ -1615,8 +1615,9 @@ def cli_verify_setup_support(root, manifest, home_path):
         for name, expected in zip(CLI_HOME_CACHE, values):
             path = cli_path(directory, folder + "/" + name)
             info = path.lstat()
+            # Setup writes these receipts with the person's umask (at least 022): owned, not writable by others.
             regular = (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
-                       and stat.S_IMODE(info.st_mode) == 0o600)
+                       and stat.S_IMODE(info.st_mode) & 0o7022 == 0)
             actual = path.read_text() if regular else None
             if regular and name == ".elastos-artifact-sha256":
                 # Archive receipts are bare sha256 hex; Homes set up by earlier releases keep the prefix.
@@ -2924,12 +2925,16 @@ def cli_process_executable(pid):
     return os.readlink(f"/proc/{pid}/exe")
 
 
-def cli_private_json(path, limit=256 * 1024):
+def cli_private_json(path, limit=256 * 1024, private=True):
+    """A Home record the observer reads. Private records are exactly 0600; the host lock
+    (private=False) follows the person's umask and must only be closed to others' writes."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
+        mode = stat.S_IMODE(info.st_mode)
         need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-             and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= limit, "private Home record ownership or bound differs")
+             and (mode == 0o600 if private else mode & 0o7022 == 0) and info.st_size <= limit,
+             "private Home record ownership or bound differs")
         raw = stream.read(limit + 1)
         need(len(raw) <= limit, "private Home record grew beyond its bound")
         def unique(pairs):
@@ -3017,7 +3022,7 @@ def cli_observe_initial_home(processes, manifest, home_path, process, status, re
          and re.fullmatch(r"[0-9a-f]{64}", coords["attach_secret"]), "live gateway coordinates differ")
     cli_home_base(coords["home_url"], public=True)
     cli_home_base(coords["api_url"])
-    host_lock = cli_private_json(directory / "host-process.lock", 4096)
+    host_lock = cli_private_json(directory / "host-process.lock", 4096, private=False)
     need(host_lock["pid"] == host_identity["pid"] and host_lock["role"] == "gateway"
          and host_lock["addr"] == "localhost:8090" and host_lock["generation"] == generation
          and lock_state(directory / "host-process.lock") == "held"

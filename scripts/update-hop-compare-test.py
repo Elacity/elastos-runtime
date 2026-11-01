@@ -1901,6 +1901,11 @@ class CliFixtureTests(unittest.TestCase):
         path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "ownership"):
             observer.cli_private_json(path)
+        # The host lock follows the person's umask: 0644 is read, group write is refused.
+        self.assertEqual(observer.cli_private_json(path, private=False), {"pid": 1})
+        path.chmod(0o664)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            observer.cli_private_json(path, private=False)
         for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"):
             with self.subTest(accepted=value):
                 self.assertEqual(observer.cli_home_base(value, public=True).port, 8090)
