@@ -2305,10 +2305,17 @@ class CliFixtureTests(unittest.TestCase):
                 umasks[label] = umask
                 return process
 
+            status = home / observer.CLI_DATA / "update-controller/status.json"
+
             def child(label):
                 def step(home_path, *args, umask=-1, **kwargs):
                     umasks[label] = umask
                     order.append(label)
+                    if label == "install":
+                        # The installer creates Home's data inside the fresh account's
+                        # ~/.local on Linux, so it cannot exist before the layout is made.
+                        status.parent.mkdir(parents=True)
+                        status.write_text("{}")
                     return {"exit": 0}
                 return step
 
@@ -2325,9 +2332,6 @@ class CliFixtureTests(unittest.TestCase):
                 # The same Home's state, read after prepare and Home close and before the update.
                 self.assertEqual((home_path, "prepare" in order, order[-1]), (home, True, "home-closed"))
                 return json.loads(json.dumps(state))
-            status = home / observer.CLI_DATA / "update-controller/status.json"
-            status.parent.mkdir(parents=True)
-            status.write_text("{}")
             with patch.object(observer, "cli_success", return_value=True), patch.object(observer, "cli_state", side_effect=state_now) as observed, \
                  patch.object(observer, "cli_private_json", return_value={"phase": "ready", "controller_pid": 4242}), \
                  patch.object(observer, "cli_observe_initial_home", return_value={"generation": 1, "authenticated_health": True}), \
