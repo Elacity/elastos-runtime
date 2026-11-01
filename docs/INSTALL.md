@@ -40,9 +40,9 @@ Browser VM work.
 The installer needs `curl` and a working `python3`. On a Mac without Apple's
 Command Line Tools, the installer opens Apple's installer for them. Click
 Install in Apple's window; the ElastOS installer continues by itself when the
-tools are installed. If it does not continue, or there is no terminal, run
-`xcode-select --install`, wait for it to finish, then run the install command
-again.
+tools are installed. It waits up to 20 minutes, and Ctrl+C stops it. If it
+stops, or there is no terminal, run `xcode-select --install`, wait for it to
+finish, then run the install command again.
 Setup and updates need outgoing UDP to port 4433 for Carrier.
 
 Carrier uses mDNS by default to find other Homes on the same local network.

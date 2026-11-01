@@ -22,7 +22,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
-- Known issue: after `elastos update` or Undo in a terminal, Home stays stopped. Start it with `elastos home --browser` (#509).
+- Known issue: after elastos update or Undo in a terminal, Home stays stopped. Start it with elastos home --browser (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
@@ -242,7 +242,7 @@ Second release candidate for 2.0.0 on the test channel.
 - Test channel Homes update to 2.0.0 in System and stay on the test channel. To move to Stable, run the install command.
 - From 0.7.1 or earlier, run the install command once, because releases have a new signing key. Your Home keeps its data.
 - If an update needs the install command, System shows it and keeps your version. If Home is stuck after an update, follow Recover an interrupted update in the install guide.
-- Known issue: after `elastos update` or Undo in a terminal, Home stays stopped. Start it with `elastos home --browser` (#509).
+- Known issue: after elastos update or Undo in a terminal, Home stays stopped. Start it with elastos home --browser (#509).
 - Known issue: updating in System from a test version older than 0.8.0-alpha.18 can fail on a slow device such as a Jetson.
 - Known issue: versions older than 0.8.0-alpha.24 cannot start with a Library file over 16 MB, or 64 MB in total. Update those with the install command and do not use Undo.
 - After Undo to 0.8.0-alpha.25, contacts you added by DID are hidden until you update again.
