@@ -2251,7 +2251,9 @@ const openHybrid = async (target, options = {}) => {
   shellWindows.openTarget(target, options);
   await settleOpen();
 };
-for (const target of hybridTargets) {
+// Browser is one window per user (2.0): its reuse contract is checked separately below.
+const multiWindowHybridTargets = hybridTargets.filter((target) => target.target !== "browser");
+for (const target of multiWindowHybridTargets) {
   shellCore.shellState.windows.clear();
   shellCore.shellState.activeWindowId = null;
   shellCore.shellState.recentUiAction = { key: "", at: 0 };
@@ -2278,13 +2280,8 @@ for (const target of hybridTargets) {
   const secondRoute = second.node.querySelector(".window-frame").dataset.route;
   assert(new URL(secondRoute, window.location.href).hash !== new URL(route, window.location.href).hash,
     `${target.target}: independent windows shared a launch token`);
-  if (target.target === "browser") {
-    assert(first.launchQuery.browser_instance !== second.launchQuery.browser_instance,
-      "Browser New Window shared its instance");
-  }
-  const query = hybridContentQueries[target.target] || (target.target === "browser"
-    ? { url: "https://example.invalid/hybrid", browser_engine_id: "fixture-engine" }
-    : { uri: "localhost://fixture/Documents", objectUri: "localhost://fixture/Documents/a.txt", action: "properties" });
+  const query = hybridContentQueries[target.target] ||
+    { uri: "localhost://fixture/Documents", objectUri: "localhost://fixture/Documents/a.txt", action: "properties" };
   await openHybrid(target.target, { query });
   assert(shellCore.shellState.windows.size === 3, `${target.target}: startup query was discarded by reuse`);
   const queryLaunch = restoredBrowserLaunches.at(-1);
@@ -2306,8 +2303,7 @@ for (const target of hybridTargets) {
     assert(shellCore.shellState.activeWindowId === routed.id && shellCore.shellState.windows.size === 3,
       "Library default did not reuse an existing URI-launched browse window");
   }
-  const authorizedQuery = hybridContentQueries[target.target] ? { ...hybridContentQueries[target.target] } : target.target === "browser"
-    ? { browser_instance: "browser:approved-instance", url: "https://example.invalid/approved" }
+  const authorizedQuery = hybridContentQueries[target.target] ? { ...hybridContentQueries[target.target] }
     : { mode: "attach", returnTarget: "browser", objectUri: "localhost://fixture/Documents/a.txt" };
   if (!hybridContentQueries[target.target]) {
     Object.assign(authorizedQuery, { home_token: "query-not-for-restore", unknown: "not-for-restore", chooser_request_id: "expired" });
@@ -2346,6 +2342,32 @@ for (const target of hybridTargets) {
     `${target.target}: restore changed a saved selector`);
   }
 }
+{
+  // One Browser window: every open (default, New Window, URL) focuses the live window.
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  const before = restoredBrowserLaunches.length;
+  shellWindows.openTarget("browser");
+  shellWindows.openTarget("browser", { newWindow: true });
+  await settleOpen();
+  const only = [...shellCore.shellState.windows.values()][0];
+  assert(only && shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === before + 1,
+    "browser: concurrent opens did not coalesce into one window");
+  const frame = only.node.querySelector(".window-frame");
+  const route = frame.dataset.route;
+  const posted = [];
+  frame.contentWindow = { postMessage: (message) => posted.push(message) };
+  await openHybrid("browser", { newWindow: true });
+  assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === before + 1 &&
+    shellCore.shellState.activeWindowId === only.id && frame.dataset.route === route,
+    "browser: explicit New Window did not focus the one live window");
+  await openHybrid("browser", { query: { url: "https://example.invalid/hybrid" } });
+  assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === before + 1 &&
+    posted.at(-1)?.type === "elastos.browser.navigate/v1" && posted.at(-1)?.url === "https://example.invalid/hybrid",
+    "browser: URL open did not navigate the one live window", posted);
+  assert(!shellWindows.supportsMenuNewWindow("browser"), "browser: New Window is offered");
+}
+console.log("[home-shell-regression] browser one window: PASS");
 // People's Message names a conversation; an open Chat window shows it.
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
@@ -2377,7 +2399,7 @@ await shellWindows.attachAuthorizedTarget({
 await openHybrid("library");
 assert(shellCore.shellState.windows.size === 2,
   "Library default Open reused the only picker instead of creating browse");
-console.log("[home-shell-regression] hybrid consumers: 6 PASS");
+console.log("[home-shell-regression] hybrid consumers: 5 PASS");
 for (const mode of ["attach", "archive-open", "archive-create"]) {
   await shellWindows.attachAuthorizedTarget({
     target: "library", title: "Library", attach_kind: "iframe", launch_status: "launched",
@@ -2475,7 +2497,7 @@ shellMenubar.bindMenubar({
   supportsNewWindow: shellWindows.supportsMenuNewWindow,
   openTarget: (target, options) => { menuLaunches.push({ target, options }); shellWindows.openTarget(target, options); },
 });
-for (const target of hybridTargets) {
+for (const target of multiWindowHybridTargets) {
   await openHybrid(target.target);
   const beforeMenu = restoredBrowserLaunches.length;
   shellCore.shellState.recentUiAction = { key: "", at: 0 };
@@ -2518,12 +2540,18 @@ for (const target of hybridTargets) {
   const raced = [...shellCore.shellState.windows.values()];
   assert(new Set(raced.map((entry) => new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash)).size === 3,
     `${target.target}: racing windows shared a launch token`);
-  if (target.target === "browser") {
-    assert(new Set(raced.map((entry) => entry.launchQuery.browser_instance)).size === 3,
-      "racing Browser windows shared an instance");
-  }
 }
 console.log("[home-shell-regression] hybrid menu/context/race: PASS");
+await openHybrid("browser");
+shellMenubar.syncMenubar();
+assert(!document.querySelector("#toolbar-menubar").children[0].children[1].children.some((row) => row.textContent === "New Window"),
+  "browser: File menu offers New Window");
+for (const source of ["desktop", "taskbar", "launcher"]) {
+  shellSurface.openDesktopContextMenu(80, 80, { kind: "target", targetId: "browser", source });
+  assert(!shellCore.desktopContextMenu.children.some((row) => row.textContent === "New Window"),
+    `browser: ${source} context menu offers New Window`);
+  shellSurface.hideDesktopContextMenu();
+}
 const hybridFolder = { uri: "localhost://fixture/Documents", name: "Documents", kind: "directory", capabilities: ["open", "list"] };
 shellCore.shellState.currentSummary.desktop_objects = { objects: [hybridFolder] };
 for (const action of ["open-desktop-object", "open-desktop-object-new-window"]) {
