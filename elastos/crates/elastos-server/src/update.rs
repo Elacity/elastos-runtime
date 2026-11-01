@@ -177,10 +177,25 @@ pub fn verify_source_channel(source: &TrustedSource, signed_channel: &str) -> an
     };
     anyhow::ensure!(
         subscribed == signed_channel || (subscribed == "canary" && signed_channel == "stable"),
-        "Signed release channel '{signed_channel}' differs from trusted source '{}' subscription '{subscribed}'",
-        source.name
+        "Signed release channel '{signed_channel}' differs from trusted source '{name}' subscription '{subscribed}'. To follow '{signed_channel}' releases on this Home, run: elastos source switch-channel {name} {signed_channel}, then try again.",
+        name = source.name
     );
     Ok(())
+}
+
+/// install.sh is the explicit way off a non-public channel such as the retired
+/// `jetson-test`, so such a Home may install a stable or canary release. Stable
+/// and canary Homes keep the update rule: the installer never moves stable to canary.
+fn verify_installer_channel(current: &TrustedSource, signed_channel: &str) -> anyhow::Result<()> {
+    const PUBLIC_CHANNELS: [&str; 2] = ["stable", "canary"];
+    let subscribed = current.channel.trim();
+    if !subscribed.is_empty()
+        && !PUBLIC_CHANNELS.contains(&subscribed)
+        && PUBLIC_CHANNELS.contains(&signed_channel)
+    {
+        return Ok(());
+    }
+    verify_source_channel(current, signed_channel)
 }
 
 /// Check metadata fetched by CID against the returned bytes. Published release
@@ -510,7 +525,7 @@ pub fn install_release(
             source.installed_version,
             current.installed_version
         );
-        verify_source_channel(&current, &source.channel)?;
+        verify_installer_channel(&current, &source.channel)?;
     } else {
         // Without a release record an existing Runtime could be newer than this one.
         anyhow::ensure!(
@@ -5197,11 +5212,47 @@ mod tests {
                 let paths = canary.each_ref().map(PathBuf::as_path);
                 let error = install_release(&data, &binary, paths, check).unwrap_err();
                 assert!(
-                    error.to_string().contains("differs from trusted source"),
+                    error.to_string().contains("differs from trusted source")
+                        && error.to_string().contains(
+                            "run: elastos source switch-channel default canary, then try again"
+                        ),
                     "{error:#}"
                 );
                 assert_eq!(files(fixture.path(), false), before);
             }
+        }
+
+        #[tokio::test]
+        async fn installer_moves_a_home_off_a_non_public_channel_to_canary_or_stable() {
+            let candidates = tempfile::tempdir().unwrap();
+            for (version, target) in [("0.8.1-alpha.1", "canary"), ("0.8.1", "stable")] {
+                let (_fixture, data, binary) = empty();
+                let jetson =
+                    channel_candidate(candidates.path(), &binary, "0.8.0", 7, "jetson-test");
+                install(&data, &binary, &jetson).unwrap();
+                let release = channel_candidate(candidates.path(), &binary, version, 7, target);
+                install(&data, &binary, &release).unwrap();
+                let sources = load_trusted_sources(&data).unwrap();
+                let source = sources.default_source().unwrap();
+                assert_eq!(
+                    (source.channel.as_str(), source.installed_version.as_str()),
+                    (target, version)
+                );
+                assert_eq!(std::fs::read(&binary).unwrap(), runtime(version));
+            }
+            // Between two non-public channels the subscription stays exact.
+            let (fixture, data, binary) = empty();
+            let jetson = channel_candidate(candidates.path(), &binary, "0.8.0", 7, "jetson-test");
+            install(&data, &binary, &jetson).unwrap();
+            let other = channel_candidate(candidates.path(), &binary, "0.8.1", 7, "nightly");
+            let before = files(fixture.path(), false);
+            let paths = other.each_ref().map(PathBuf::as_path);
+            let error = install_release(&data, &binary, paths, true).unwrap_err();
+            assert!(
+                error.to_string().contains("differs from trusted source"),
+                "{error:#}"
+            );
+            assert_eq!(files(fixture.path(), false), before);
         }
 
         #[tokio::test]
