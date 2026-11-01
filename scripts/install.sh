@@ -1357,23 +1357,22 @@ fi
 
 [[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
 
-# The installation writer refuses directories others can write. Check the real
-# directory, as the writer does after resolving symlinks; say how to fix it and
-# leave it unchanged.
+# Existing DATA/BIN roots keep their owner's group permissions. Check the real
+# user-owned directory for world-write permission and leave its mode unchanged.
+# File, lock and private staging checks retain their separate policies.
 require_safe_existing_dir() {
     local dir="$1" real
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
-    if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
-        die_exact "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you. Choose a location you own"
+    if [[ -n "$(find "$real" -maxdepth 0 -perm -o+w)" ]]; then
+        die_exact "Unsafe installation directory: $(printf '%q' "$real") is world-writable; fix with: chmod o-w $(printf '%q' "$real")"
     fi
 }
-# The runtime also refuses media tools under a parent others can write, such
-# as a group-writable ~/.local. Apply that rule to every existing ancestor of
-# the data directory now, before any download: owned by you or root, and not
-# group- or world-writable.
+# Existing ancestors keep their group permissions. Require ownership by you
+# or root and reject world-write permission before any download. Shared parents
+# keep their modes; an unsafe parent requires a safe installation location.
 dir_owner_mode() {
     # GNU stat -f reports the filesystem, so pick the syntax by what works.
     if stat -c '%u %a' / >/dev/null 2>&1; then
@@ -1390,13 +1389,10 @@ require_safe_parent_chain() {
         read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
         quoted="$(printf '%q' "$real")"
         if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
-            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+            die_exact "Unsafe parent directory: $quoted is not owned by you or root. Choose a user-owned location with safe parents"
         fi
-        if (( 8#$mode & 8#022 )); then
-            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
-                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
-            fi
-            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+        if (( 8#$mode & 8#002 )); then
+            die_exact "Unsafe parent directory: $quoted is world-writable. Choose a user-owned location with safe parents"
         fi
         [[ "$real" != "/" ]] || break
         real="$(dirname -- "$real")"

@@ -21,6 +21,9 @@ const TRUSTED_RUNTIME_ISSUER_FILE: &str = "trusted-runtime-issuer";
 const NODE_CUSTODY_SECRET_FILE: &str = "node-custody-secret";
 const NODE_SIGNING_KEY_FILE: &str = "node-signing-key";
 const DATA_ROOT_DIR: &str = "data";
+// The Runtime keeps custody state at DATA/protected-content/custody-provider/<root>
+// (elastos-server INACTIVE_CUSTODY_ROOT); that layout names the data root.
+const STATE_PARENT_IN_DATA: &str = "protected-content/custody-provider";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyProviderStateRootError {
@@ -437,7 +440,16 @@ fn validate_absolute_path_syntax(path: &Path) -> Result<(), CustodyProviderState
     Ok(())
 }
 
+/// The Runtime data directory holding `path`, when `path` follows the custody
+/// state layout; otherwise none, and every component keeps the strict rule.
+fn data_root_of(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|ancestor| ancestor.ends_with(STATE_PARENT_IN_DATA))
+        .and_then(|parent| parent.parent()?.parent())
+}
+
 fn validate_existing_path_components(path: &Path) -> Result<(), CustodyProviderStateRootError> {
+    let data_root = data_root_of(path);
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
@@ -449,7 +461,8 @@ fn validate_existing_path_components(path: &Path) -> Result<(), CustodyProviderS
                 if metadata.file_type().is_symlink() {
                     return Err(CustodyProviderStateRootError::MissingOrUnsafe);
                 }
-                validate_component_owner_and_mode(&metadata)?;
+                let shared = data_root.is_some_and(|data| data.starts_with(&current));
+                validate_component_owner_and_mode(&metadata, shared)?;
             }
             Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
                 return Err(CustodyProviderStateRootError::MissingOrUnsafe)
@@ -557,8 +570,13 @@ fn validate_owner_mode_and_links(
     Ok(())
 }
 
+/// `shared` marks the data directory and its ancestors: they keep their
+/// owner's group permissions (Ubuntu umask 002 makes ~/.local group-writable).
+/// Directories below the data directory are ElastOS's own and stay closed to
+/// group writes.
 fn validate_component_owner_and_mode(
     metadata: &fs::Metadata,
+    shared: bool,
 ) -> Result<(), CustodyProviderStateRootError> {
     #[cfg(unix)]
     {
@@ -570,7 +588,8 @@ fn validate_component_owner_and_mode(
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
         }
         let mode = metadata.mode() & 0o7777;
-        let writable_by_others = mode & 0o022 != 0;
+        let refused = if shared { 0o002 } else { 0o022 };
+        let writable_by_others = mode & refused != 0;
         let sticky = mode & 0o1000 != 0;
         if writable_by_others && !sticky {
             return Err(CustodyProviderStateRootError::MissingOrUnsafe);
@@ -667,6 +686,43 @@ mod tests {
     fn owner_only_dir(path: &Path) {
         fs::create_dir_all(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_components_accept_group_writable_data_ancestors_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
+        let shared = temp_root.join("local");
+        let data = shared.join("elastos");
+        let custody = data.join("protected-content/custody-provider");
+        let root = custody.join("inactive");
+        owner_only_dir(&root);
+        owner_only_dir(&custody);
+        owner_only_dir(&data.join("protected-content"));
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+        validate_existing_path_components(&root).unwrap();
+        validate_existing_path_components(&custody).unwrap();
+        // Below the data root ElastOS owns the folders; group write stays refused.
+        for below in [&data.join("protected-content"), &custody] {
+            fs::set_permissions(below, fs::Permissions::from_mode(0o770)).unwrap();
+            assert!(matches!(
+                validate_existing_path_components(&root),
+                Err(CustodyProviderStateRootError::MissingOrUnsafe)
+            ));
+            fs::set_permissions(below, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Outside the custody layout no data root is known: every folder stays strict.
+        let other = data.join("other");
+        owner_only_dir(&other);
+        assert!(validate_existing_path_components(&other).is_err());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            validate_existing_path_components(&root),
+            Err(CustodyProviderStateRootError::MissingOrUnsafe)
+        ));
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(target_os = "linux")]

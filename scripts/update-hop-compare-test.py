@@ -2182,7 +2182,7 @@ class CliFixtureTests(unittest.TestCase):
 
         def result(pinned="0.8.0-alpha.8"):
             refusals = {case: {"status": "passed"} for case in observer.CLI_REFUSALS}
-            return {"schema": "elastos.update-hop.result/v1", "status": "passed",
+            return {"schema": "elastos.update-hop.result/v1", "status": "passed", "platform": "x86_64-linux",
                     "old": {"version": pinned}, "new": {"version": "0.8.0-alpha.9"},
                     "previous_release": {"version": pinned},
                     "paths": {"m1-install": {"checks": {**refusals, "initial-home": {
@@ -2195,7 +2195,9 @@ class CliFixtureTests(unittest.TestCase):
                                               "next-updated": {"current_version": "0.8.0-alpha.10"}}},
                         "undo": {"status": "passed", "version": pinned,
                                  "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}},
-                              "m2-discovery": {"checks": {**json.loads(json.dumps(refusals)), observer.CLI_INSTALLER_CASE: {"status": "passed"}}}}}
+                              "m2-discovery": {"checks": {**json.loads(json.dumps(refusals)), observer.CLI_INSTALLER_CASE: {"status": "passed"},
+                                                          observer.CLI_UBUNTU_CASE: {"status": "passed", "home": {"authenticated_health": True},
+                                                                                     "update": {"from": "0.8.0-alpha.9", "to": "0.8.0-alpha.10"}}}}}}
         verdict = observer.cli_check_result(result())
         self.assertEqual((verdict["from"], verdict["to"], verdict["next"]), ("0.8.0-alpha.8", "0.8.0-alpha.9", "0.8.0-alpha.10"))
         self.assertEqual((verdict["cli_installer_required"], verdict["system_installer_required"]), (observer.CLI_INSTALLER_CASE,) * 2)
@@ -2209,6 +2211,11 @@ class CliFixtureTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "cannot install changed support from System"):
                         observer.cli_check_result(result(pinned))
+        # Only a Linux hop installs the default Ubuntu account layout.
+        mac = result()
+        mac.update(platform="aarch64-darwin")
+        mac["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)
+        self.assertEqual(observer.cli_check_result(mac)["next"], "0.8.0-alpha.10")
         home = lambda value: value["paths"]["m1-install"]["checks"]["initial-home"]  # noqa: E731
 
         # What alpha.6 recorded: its System refused changed support and kept Home, then its CLI
@@ -2246,6 +2253,10 @@ class CliFixtureTests(unittest.TestCase):
                   "controller did not fail": lambda value: home(value)["system"]["installer_required"].update(phase="updated"),
                   "Home restarted": lambda value: home(value)["system"]["installer_required"].update(home_kept=False),
                   "support changed": lambda value: home(value)["system"]["installer_required"].update(support_unchanged=False)}
+        faults.update({
+            "Ubuntu layout case missing": lambda value: value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE),
+            "Ubuntu layout case failed": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE].update(status="failed"),
+            "Ubuntu layout updated elsewhere": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE]["update"].update(to="0.8.0-alpha.9")})
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
                 value = result()

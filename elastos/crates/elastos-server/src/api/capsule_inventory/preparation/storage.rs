@@ -46,6 +46,16 @@ fn check_directory(meta: &Metadata, private: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The data root keeps its owner's group permissions (Ubuntu umask 002), as
+/// the installation writer admits it; preparation folders stay strict.
+fn check_data_root(meta: &Metadata) -> anyhow::Result<()> {
+    ensure!(
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o7002 == 0,
+        "unsafe preparation directory"
+    );
+    Ok(())
+}
+
 fn check_file(meta: &Metadata, limit: u64) -> anyhow::Result<()> {
     ensure!(
         meta.is_file()
@@ -124,7 +134,7 @@ pub(super) fn saved_inventory(data_path: &Path) -> anyhow::Result<PreparationInv
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(data_path)?;
-    check_directory(&data.metadata()?, false)?;
+    check_data_root(&data.metadata()?)?;
     let dir = open_at(&data, DIRECTORY, libc::O_RDONLY | libc::O_DIRECTORY)?;
     check_directory(&dir.metadata()?, true)?;
     // Refuse the same unsafe lock and temporary shapes a locked read refuses.
@@ -150,7 +160,7 @@ impl Inventory {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(data_path)?;
-        check_directory(&data.metadata()?, false)?;
+        check_data_root(&data.metadata()?)?;
         ensure!(
             same_inode(&data.metadata()?, &std::fs::symlink_metadata(data_path)?),
             "preparation root changed"
@@ -209,7 +219,7 @@ impl Inventory {
 
     fn revalidate(&self) -> anyhow::Result<()> {
         let current = std::fs::symlink_metadata(&self.data_path)?;
-        check_directory(&current, false)?;
+        check_data_root(&current)?;
         ensure!(
             same_inode(&current, &self.data.metadata()?),
             "preparation root replaced"
@@ -876,5 +886,22 @@ mod tests {
         inventory
             .worker_lock()
             .expect("the next worker must not wait for a command spawned under the last");
+    }
+
+    #[test]
+    fn inventory_accepts_group_writable_data_root_and_keeps_its_folder_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(root.path(), 0o770);
+        drop(Inventory::open(root.path(), true).unwrap());
+        set(&root.path().join(DIRECTORY.to_str().unwrap()), 0o770);
+        assert!(Inventory::open(root.path(), false).is_err());
+        set(&root.path().join(DIRECTORY.to_str().unwrap()), 0o700);
+        set(root.path(), 0o777);
+        assert!(Inventory::open(root.path(), false).is_err());
+        set(root.path(), 0o700);
     }
 }
