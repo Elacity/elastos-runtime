@@ -615,19 +615,7 @@ fn install_archive_reader(
     fs::create_dir_all(parent)?;
     let _install_lock = lock_installation(parent)?;
     validate_request(data, info, &dest, platform)?;
-    // A process interruption releases the lock. The next install discards only
-    // this installer's abandoned stage directories before starting a fresh set.
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(STAGING_PREFIX)
-            && entry.file_type()?.is_dir()
-        {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
+    remove_abandoned_stages(parent)?;
     // Same-volume staging allows a single rename/exchange at the commit point.
     let staging = tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
@@ -740,15 +728,43 @@ fn lock_installation(parent: &Path) -> anyhow::Result<crate::host_lock::FileLock
 /// both fit with the shared reserve kept free. Otherwise one sentence names the
 /// space needed, instead of a refusal after the whole download.
 pub(super) fn require_space(dest: &Path, info: &PlatformInfo) -> anyhow::Result<()> {
+    require_space_measured(dest, info, UNPACK_ESTIMATE, available_space)
+}
+
+fn require_space_measured(
+    dest: &Path,
+    info: &PlatformInfo,
+    unpacked: u64,
+    available: impl FnOnce(&Path) -> anyhow::Result<u64>,
+) -> anyhow::Result<()> {
     let parent = dest
         .parent()
         .context("Browser image install path has no parent")?;
     fs::create_dir_all(parent)?;
-    image_space(
-        available_space(parent)?,
-        info.size.unwrap_or_default(),
-        UNPACK_ESTIMATE,
-    )
+    // An unpack stopped by Ctrl+C or a crash leaves its stage behind; it must
+    // not count against the space a retry needs.
+    {
+        let _install_lock = lock_installation(parent)?;
+        remove_abandoned_stages(parent)?;
+    }
+    image_space(available(parent)?, info.size.unwrap_or_default(), unpacked)
+}
+
+/// A process interruption releases the install lock. With that lock held, the
+/// next install discards only this installer's abandoned stage directories.
+fn remove_abandoned_stages(parent: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+            && entry.file_type()?.is_dir()
+        {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn image_space(available: u64, archive: u64, unpacked: u64) -> anyhow::Result<()> {
@@ -1738,5 +1754,58 @@ mod tests {
         let mut other = info.clone();
         other.checksum = Some(format!("sha256:{}", "0".repeat(64)));
         assert!(!receipts_match(temp.path(), &other));
+    }
+
+    #[test]
+    fn browser_image_space_check_discards_an_interrupted_unpack_before_measuring() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join(INSTALL_PATH);
+        let parent = dest.parent().unwrap();
+        // Ctrl+C during unpack left a 3 GiB stage (sparse here) next to a set
+        // and Browser state that stay.
+        let abandoned = parent.join(format!("{STAGING_PREFIX}interrupted"));
+        fs::create_dir_all(abandoned.join(NAME)).unwrap();
+        fs::File::create(abandoned.join(NAME).join("rootfs.ext4"))
+            .unwrap()
+            .set_len(3 << 30)
+            .unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("rootfs.ext4"), b"working set").unwrap();
+        fs::write(parent.join("profile-state"), b"user-state").unwrap();
+        fn used(path: &Path) -> u64 {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = entry.metadata().unwrap();
+                    if meta.is_dir() {
+                        used(&entry.path())
+                    } else {
+                        meta.len()
+                    }
+                })
+                .sum()
+        }
+        // The disk fits the download and unpack only without the abandoned stage.
+        let (archive, unpacked) = (868 << 20, UNPACKED_SET_BYTES);
+        let disk = archive
+            + unpacked
+            + elastos_common::FREE_SPACE_RESERVE_BYTES
+            + (1 << 20)
+            + used(parent)
+            - (3 << 30);
+        let free = |path: &Path| -> anyhow::Result<u64> { Ok(disk - used(path)) };
+        assert!(image_space(free(parent).unwrap(), archive, unpacked).is_err());
+        let info = PlatformInfo {
+            size: Some(archive),
+            ..serde_json::from_value(json!({})).unwrap()
+        };
+        require_space_measured(&dest, &info, unpacked, free).unwrap();
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(dest.join("rootfs.ext4")).unwrap(), b"working set");
+        assert_eq!(
+            fs::read(parent.join("profile-state")).unwrap(),
+            b"user-state"
+        );
     }
 }
