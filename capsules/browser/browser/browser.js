@@ -149,6 +149,8 @@ let runtimeOpenInFlight = 0;
 let unsettledRuntimeOpen = null;
 let runtimeOwnershipTerminallyAbsent = false;
 let homeWindowCloseInFlight = false;
+// A Home Close that arrived while an open, summary or close was in flight; it runs when that settles.
+let deferredHomeWindowClose = null;
 let homeWindowTerminalCloseConfirmed = false;
 let pendingHomeWindowCloseDelivery = null;
 let selectedBrowserEngineId = params.get("browser_engine_id") || params.get("adapter_id") || "";
@@ -882,29 +884,35 @@ async function handleHomeBrowserWindowCloseRequest(event) {
     return false;
   }
   const message = event.data;
-  let page = currentPage || recoverableRuntimePage() || unsettledRuntimeOpen?.page;
-  let generation = page === currentPage ? currentPageGeneration : 0;
-  let owner = runtimePageOwner(page, generation);
-  if (
-    runtimeOpenInFlight > 0 ||
-    browserSummaryPromise ||
-    homeWindowCloseInFlight
-  ) {
-    showStatus(
-      "Browser ownership is changing. Close Browser again when the current action finishes.",
-      { sticky: true },
-    );
-    postHomeBrowserWindowCloseResult(message, owner, {
+  if (runtimeOpenInFlight > 0 || browserSummaryPromise || homeWindowCloseInFlight) {
+    // Close just closes: it waits for the action in flight and then runs, even if
+    // that action fails. The latest request receives the result; Home shows "Closing…".
+    deferredHomeWindowClose = message;
+    postHomeBrowserWindowCloseResult(message, null, {
       state: "pending",
-      page_id: owner?.page_id || "",
-      generation: owner?.generation || 0,
-      reason:
-        runtimeOpenInFlight > 0 || browserSummaryPromise
-          ? "runtime_open_in_flight"
-          : "window_close_in_flight",
+      page_id: "",
+      generation: 0,
+      reason: homeWindowCloseInFlight ? "window_close_in_flight" : "runtime_open_in_flight",
     });
     return true;
   }
+  await closeHomeBrowserWindow(message);
+  return true;
+}
+
+function resumeDeferredHomeBrowserWindowClose() {
+  if (!deferredHomeWindowClose || runtimeOpenInFlight > 0 || browserSummaryPromise || homeWindowCloseInFlight) {
+    return;
+  }
+  const message = deferredHomeWindowClose;
+  deferredHomeWindowClose = null;
+  void closeHomeBrowserWindow(message);
+}
+
+async function closeHomeBrowserWindow(message) {
+  let page = currentPage || recoverableRuntimePage() || unsettledRuntimeOpen?.page;
+  let generation = page === currentPage ? currentPageGeneration : 0;
+  let owner = runtimePageOwner(page, generation);
   homeWindowCloseInFlight = true;
   try {
     if (!owner) {
@@ -922,7 +930,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
           );
         }
         postHomeBrowserWindowCloseResult(message, null, ownership);
-        return true;
+        return;
       }
       page = ownership.page;
       generation = 0;
@@ -934,7 +942,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
           generation: 0,
           reason: "invalid_runtime_cleanup_handle",
         });
-        return true;
+        return;
       }
     }
     if (owner) {
@@ -983,8 +991,9 @@ async function handleHomeBrowserWindowCloseRequest(event) {
     postHomeBrowserWindowCloseResult(message, owner, null, _error);
   } finally {
     homeWindowCloseInFlight = false;
+    // A Close that arrived meanwhile runs next: it confirms absence, or retries a pending cleanup.
+    resumeDeferredHomeBrowserWindowClose();
   }
-  return true;
 }
 
 function runtimeOpenResultPage(response) {
@@ -2120,6 +2129,7 @@ async function fetchBrowserSummary({ remoteServices = true } = {}) {
     })
     .finally(() => {
       browserSummaryPromise = null;
+      resumeDeferredHomeBrowserWindowClose();
     });
   return browserSummaryPromise;
 }
@@ -2381,6 +2391,10 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     currentBrowserEngineId = browserEngineId;
     currentRemoteExitId = remoteExitId;
     publishRuntimePageForHost(currentPage);
+    // The window is closing: the deferred Close closes this page; it never shows.
+    if (deferredHomeWindowClose) {
+      return;
+    }
     currentDisplayMode = openedPage.display_session?.mode || "";
     syncDisplayInputFromSession(openedPage.display_session);
     currentView =
@@ -2437,6 +2451,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   } finally {
     runtimeOpenInFlight -= 1;
     setLoading(false);
+    resumeDeferredHomeBrowserWindowClose();
   }
 }
 

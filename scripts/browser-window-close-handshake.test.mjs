@@ -96,6 +96,8 @@ const handshakeSource = [
   "settleInitialRuntimeOpenPostFailure",
   "requestFreshRuntimeAuthority",
   "handleHomeBrowserWindowCloseRequest",
+  "resumeDeferredHomeBrowserWindowClose",
+  "closeHomeBrowserWindow",
 ]
   .map((name) => extractFunction(browserSource, name))
   .join("\n");
@@ -316,6 +318,7 @@ function createHarness({
     unsettledRuntimeOpen: unsettledOpen,
     runtimeOwnershipTerminallyAbsent: terminallyAbsent,
     homeWindowCloseInFlight: false,
+    deferredHomeWindowClose: null,
     homeWindowTerminalCloseConfirmed: false,
     pendingHomeWindowCloseDelivery: null,
     window: { parent },
@@ -372,7 +375,7 @@ function createHarness({
     },
   });
   vm.runInContext(
-    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, requestFreshRuntimeAuthority, settleInitialRuntimeOpenPostFailure };`,
+    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, requestFreshRuntimeAuthority, resumeDeferredHomeBrowserWindowClose, settleInitialRuntimeOpenPostFailure };`,
     context,
   );
   const request = {
@@ -383,6 +386,7 @@ function createHarness({
   };
   return {
     closeCalls,
+    context,
     fetchCalls,
     owner,
     parent,
@@ -395,6 +399,7 @@ function createHarness({
     handle: context.handshake.handleHomeBrowserWindowCloseRequest,
     normalizeOpenUrl: context.handshake.normalizeRuntimeOpenUrl,
     refreshAuthority: context.handshake.requestFreshRuntimeAuthority,
+    resume: context.handshake.resumeDeferredHomeBrowserWindowClose,
     settleInitial: context.handshake.settleInitialRuntimeOpenPostFailure,
   };
 }
@@ -1236,6 +1241,7 @@ test("viewer denial preserves an existing page before close or open dispatch", a
     fetchJson: () => assert.fail("Viewer rejection must precede Engine dispatch"),
     isAuthoritySessionError: () => false,
     friendlyOpenError: (error) => error.message,
+    resumeDeferredHomeBrowserWindowClose() {},
   });
   vm.runInContext(
     `${extractFunction(browserSource, "proveRuntimeOwnershipAbsentBeforeDispatch")}\n${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
@@ -1252,7 +1258,7 @@ test("viewer denial preserves an existing page before close or open dispatch", a
   assert.deepEqual(loading, [true, false]);
 });
 
-test("ownership-changing open returns pending without closing or claiming terminal", async () => {
+test("Close during an in-flight open waits silently, then closes once the open settles", async () => {
   const harness = createHarness({
     openInFlight: 1,
     outcome: {
@@ -1262,16 +1268,138 @@ test("ownership-changing open returns pending without closing or claiming termin
       terminal_kind: "closed",
     },
   });
-  await harness.handle({
-    origin: "null",
-    source: harness.parent,
-    data: harness.request,
-  });
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
   assert.equal(harness.closeCalls.length, 0);
-  assert.equal(harness.posted[0].message.state, "pending");
-  assert.equal(harness.posted[0].message.terminalKind, "");
-  assert.equal(harness.posted[0].message.reason, "runtime_open_in_flight");
-  assert.match(harness.statuses[0].message, /ownership is changing/);
+  assert.deepEqual(
+    [harness.posted[0].message.state, harness.posted[0].message.reason, harness.posted[0].message.pageId,
+      harness.posted[0].message.cleanupId, harness.posted[0].message.terminalKind],
+    ["pending", "runtime_open_in_flight", "", "", ""],
+    "a lifecycle-free pending receipt lets the later close bind the opened page",
+  );
+  assert.deepEqual(harness.statuses, [], "Close must not ask the person to close again");
+  harness.resume();
+  assert.equal(harness.closeCalls.length, 0, "Close waits while the open is still in flight");
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1);
+  assert.equal(harness.closeCalls[0].candidate, harness.owner);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.requestId, harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind],
+    ["request-exact", "terminal", "closed"],
+  );
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1, "a settled deferred Close runs once");
+});
+
+test("Close during an open that fails still closes the window", async () => {
+  const harness = createHarness({ openInFlight: 1, ownerless: true, outcome: null });
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  // The failed open proved Runtime holds no page for this window.
+  harness.context.runtimeOwnershipTerminallyAbsent = true;
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 0);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind, harness.posted.at(-1).message.pageId],
+    ["terminal", "no_page", ""],
+  );
+  assert.equal(harness.context.homeWindowTerminalCloseConfirmed, true);
+});
+
+test("a second Close during the in-flight open or close does not close twice", async () => {
+  let finishClose;
+  const harness = createHarness({ openInFlight: 1, outcome: null });
+  harness.context.closeRuntimePage = async (candidate, options) => {
+    harness.closeCalls.push({ candidate, options });
+    await new Promise((resolve) => { finishClose = resolve; });
+    harness.context.currentPage = null;
+    return { state: "terminal", page_id: "page-exact", generation: 7, terminal_kind: "closed" };
+  };
+  const second = { ...harness.request, requestId: "request-second" };
+  const third = { ...harness.request, requestId: "request-third" };
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  await harness.handle({ origin: "null", source: harness.parent, data: second });
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1);
+  await harness.handle({ origin: "null", source: harness.parent, data: third });
+  assert.equal(harness.posted.at(-1).message.reason, "window_close_in_flight");
+  finishClose();
+  for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1, "the page is closed once");
+  const results = harness.posted.map(({ message }) => [message.requestId, message.state, message.terminalKind]);
+  assert.deepEqual(results.filter(([, state]) => state === "terminal"), [
+    ["request-second", "terminal", "closed"],
+    ["request-third", "terminal", "no_page"],
+  ]);
+  assert.deepEqual(harness.statuses, []);
+});
+
+test("an open that completes after Close was requested never connects its display", async () => {
+  const opened = {
+    page_id: "page-opened",
+    runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-opened" },
+    display_session: { mode: "webrtc_remote_display" },
+  };
+  const events = [];
+  const context = vm.createContext({
+    runtimeOpenInFlight: 0,
+    homeWindowCloseInFlight: false,
+    pendingHomeWindowCloseDelivery: null,
+    homeWindowTerminalCloseConfirmed: false,
+    deferredHomeWindowClose: null,
+    currentPage: null,
+    currentPageGeneration: 0,
+    nextPageGeneration: 3,
+    unsettledRuntimeOpen: null,
+    runtimeOwnershipTerminallyAbsent: false,
+    currentRemoteExitId: "",
+    currentBrowserEngineId: "",
+    selectedRemoteExitId: "",
+    selectedBrowserEngineId: "",
+    browserInstanceId: "browser:0123456789abcdef0123456789abcdef",
+    lastRequestedUrl: "",
+    normalizeRuntimeOpenUrl: (value) => value,
+    visibleAddressForUrl: (value) => value,
+    browserEngineLabel: (value) => value,
+    browserExitLabel: (value) => value,
+    setLoading() {},
+    showStatus() {},
+    clearAddressDraft() {},
+    setCurrentUrl() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display", guaranteeLevel: "isolated" }),
+    requireViewer() {},
+    recoverableRuntimePage: () => null,
+    runtimePageOwner: (page, generation) => (page ? { page_id: page.page_id, generation, runtime_cleanup: page.runtime_cleanup } : null),
+    currentRuntimePageOwner: () => (context.currentPage ? { page_id: context.currentPage.page_id } : null),
+    sameRuntimePageOwner,
+    closeRuntimePage: async () => ({ state: "terminal" }),
+    requireTerminalRuntimePageCloseOutcome: (outcome) => outcome,
+    fetchJson: async () => ({ schema: "elastos.browser.open-accepted/v1", status_url: "/status" }),
+    settleInitialRuntimeOpenPostFailure() {},
+    async waitForRuntimeOpen() {
+      // Home asks to close the window while the open is still pending.
+      context.deferredHomeWindowClose = { requestId: "request-exact" };
+      return { stream_session: {} };
+    },
+    runtimeOpenResultPage: () => opened,
+    resetPageInputDelivery() {},
+    publishRuntimePageForHost: (page) => events.push(["publish", page?.page_id]),
+    connectRemoteDisplay: () => assert.fail("a closing window must not connect the display"),
+    resumeDeferredHomeBrowserWindowClose: () => events.push(["resume", context.runtimeOpenInFlight]),
+    cleanupPendingError: (outcome) => Object.assign(new Error("cleanup pending"), { cleanupOutcome: outcome }),
+  });
+  vm.runInContext(
+    `${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
+    context,
+  );
+  await context.requestRuntimeOpen("https://example.com/");
+  assert.equal(context.currentPage, opened, "the deferred Close needs the opened page to close it");
+  assert.deepEqual(events, [["publish", "page-opened"], ["resume", 0]]);
 });
 
 test("recoverable Runtime owner is closed exactly when no current page exists", async () => {
