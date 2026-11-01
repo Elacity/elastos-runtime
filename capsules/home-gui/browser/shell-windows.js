@@ -22,7 +22,7 @@ import {
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20261101b";
+} from "./shell-core.js?v=home-20261101c";
 import {
   fitWindowBounds,
   fitBrowserWindow,
@@ -32,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20261101b";
+} from "./shell-window-geometry.js?v=home-20261101c";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -52,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20261101b";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101b";
+} from "./shell-stages.js?v=home-20261101c";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101c";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -376,8 +376,10 @@ function isSingleWindowTarget(targetId, summary = shellState.currentSummary) {
 }
 
 /** Hybrid supplies a blank window. Multiple capsules own selection-aware
- * commands; absent policy retains the existing generic menu behavior. */
+ * commands; absent policy retains the existing generic menu behavior.
+ * Browser has one window (one live Browser page per user), so no New Window. */
 export function supportsMenuNewWindow(targetId) {
+  if (targetId === "browser") return false;
   const policy = targetById(shellState.currentSummary, targetId)?.window_policy;
   return policy !== "single" && policy !== "multiple";
 }

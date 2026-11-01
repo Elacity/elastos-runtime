@@ -5,7 +5,7 @@ import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import { createBrowserFrameFence } from "../capsules/browser/browser/browser-resize.js";
-import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
+import { normalizeUrl, requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
 import { friendlyOpenError, isAuthoritySessionError } from "../capsules/browser/browser/browser-status.js";
 import { sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
 
@@ -1762,19 +1762,18 @@ test("iframe unload and refresh remain teardown-only", () => {
 
 function browserReuseHarness({ windows = [], route = "/apps/browser/?browser_instance=b1#home_token=tok-1" } = {}) {
   const evidence = { creates: [], focused: [], posted: [] };
+  const launches = [];
   const shellState = { windows: new Map(), currentSummary: { targets: [] } };
-  for (const [id, z] of windows) {
+  const addEntry = (id, z, entryRoute = route) => {
     const frame = {
-      dataset: { route },
+      dataset: { route: entryRoute },
       contentWindow: { postMessage: (message, origin) => evidence.posted.push({ id, message, origin }) },
     };
-    shellState.windows.set(id, {
-      id,
-      kind: "browser",
-      targetId: "browser",
-      node: { style: { zIndex: String(z) }, querySelector: () => frame },
-    });
-  }
+    const entry = { id, kind: "browser", targetId: "browser", node: { style: { zIndex: String(z) }, querySelector: () => frame } };
+    shellState.windows.set(id, entry);
+    return entry;
+  };
+  for (const [id, z] of windows) addEntry(id, z);
   const context = {
     shellState,
     evidence,
@@ -1785,11 +1784,17 @@ function browserReuseHarness({ windows = [], route = "/apps/browser/?browser_ins
     isSingleWindowTarget: () => false,
     targetById: () => ({ window_policy: "hybrid" }),
     focusWindow: (id) => evidence.focused.push(id),
-    createBrowserTargetWindow: async (targetId, options) => {
+    // Deferred like the real Runtime launch: the window exists only once the
+    // test settles the launch.
+    createBrowserTargetWindow: (targetId, options) => {
       evidence.creates.push({ targetId, query: options.query });
-      const entry = { id: `new-${evidence.creates.length}`, kind: "browser", targetId, node: { style: {}, querySelector: () => null } };
-      shellState.windows.set(entry.id, entry);
-      return entry;
+      let settle;
+      const promise = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+      launches.push({
+        succeed: (id = `new-${launches.length}`) => settle.resolve(addEntry(id, 50)),
+        fail: () => settle.reject(new Error("launch failed")),
+      });
+      return promise;
     },
   };
   vm.runInNewContext(
@@ -1810,44 +1815,81 @@ function browserReuseHarness({ windows = [], route = "/apps/browser/?browser_ins
     ].join("\n"),
     context,
   );
+  context.launches = launches;
   return context;
 }
 
-test("a new Browser window focuses the live Browser window and navigates it instead of launching a second page", async () => {
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a new Browser open focuses the live Browser window and navigates it instead of launching a second page", async () => {
   const harness = browserReuseHarness({ windows: [["browser--1", 1], ["browser--2", 5]] });
   const entry = await harness.launch("browser", { newWindow: true, query: { url: "https://example.org/" } });
   assert.equal(entry.id, "browser--2");
-  assert.deepEqual(harness.evidence.creates, []);
+  assert.equal(harness.evidence.creates.length, 0);
   assert.deepEqual(harness.evidence.focused, ["browser--2"]);
-  assert.equal(harness.evidence.posted.length, 1);
   assert.deepEqual(
-    JSON.parse(JSON.stringify(harness.evidence.posted[0].message)),
-    { type: "elastos.browser.navigate/v1", homeToken: "tok-1", url: "https://example.org/" },
+    JSON.parse(JSON.stringify(harness.evidence.posted)),
+    [{ id: "browser--2", origin: "*", message: { type: "elastos.browser.navigate/v1", homeToken: "tok-1", url: "https://example.org/" } }],
   );
-
   const plain = await harness.launch("browser", { newWindow: true, query: {} });
   assert.equal(plain.id, "browser--2");
   assert.equal(harness.evidence.posted.length, 1, "a plain open only focuses");
-  assert.deepEqual(harness.evidence.creates, []);
+  assert.equal(harness.evidence.creates.length, 0);
 });
 
-test("Browser opens while the first window is still launching reuse that window", async () => {
+test("opens during a pending Browser launch join it and navigate once it exists", async () => {
   const harness = browserReuseHarness();
-  const [first, second] = await Promise.all([
-    harness.launch("browser", { query: {} }),
-    harness.launch("browser", { newWindow: true, query: {} }),
-  ]);
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { newWindow: true, query: { url: "https://example.org/" } });
+  await tick();
+  assert.equal(harness.evidence.creates.length, 1, "the second open must wait for the first launch");
+  harness.launches[0].succeed("browser--new");
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.id, "browser--new");
+  assert.equal(b.id, "browser--new");
   assert.equal(harness.evidence.creates.length, 1);
-  assert.equal(first.id, second.id);
+  assert.equal(harness.evidence.posted.length, 1);
+  assert.equal(harness.evidence.posted[0].message.url, "https://example.org/");
+});
+
+test("a failed pending launch lets the waiting open start its own launch", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { query: { url: "https://example.net/" } });
+  await tick();
+  harness.launches[0].fail();
+  await assert.rejects(first, /launch failed/);
+  await tick();
+  assert.equal(harness.evidence.creates.length, 2);
+  assert.equal(harness.evidence.creates[1].query.url, "https://example.net/");
+  harness.launches[1].succeed("browser--retry");
+  assert.equal((await second).id, "browser--retry");
+});
+
+test("a window closed during the pending launch is not reused", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { query: {} });
+  await tick();
+  harness.launches[0].succeed("browser--closed");
+  harness.shellState.windows.delete("browser--closed");
+  await first;
+  await tick();
+  assert.equal(harness.evidence.creates.length, 2, "the waiting open launches a fresh window");
+  harness.launches[1].succeed("browser--fresh");
+  assert.equal((await second).id, "browser--fresh");
 });
 
 test("sequential reopen after close still creates a Browser window", async () => {
   const harness = browserReuseHarness();
-  await harness.launch("browser", { query: {} });
+  const first = harness.launch("browser", { query: {} });
+  harness.launches[0].succeed("browser--a");
+  await first;
   harness.shellState.windows.clear();
-  await harness.launch("browser", { query: { url: "https://example.net/" } });
+  const second = harness.launch("browser", { query: { url: "https://example.net/" } });
+  harness.launches[1].succeed("browser--b");
+  assert.equal((await second).id, "browser--b");
   assert.equal(harness.evidence.creates.length, 2);
-  assert.equal(harness.evidence.creates[1].query.url, "https://example.net/");
 });
 
 test("an unreachable live Browser window explains the one-window limit", async () => {
@@ -1856,13 +1898,75 @@ test("an unreachable live Browser window explains the one-window limit", async (
     harness.launch("browser", { query: { url: "https://example.org/" } }),
     (error) => error.userMessage === "Only one Browser window can be open at a time. Close the other one first.",
   );
-  assert.deepEqual(harness.evidence.creates, []);
+  assert.equal(harness.evidence.creates.length, 0);
   assert.match(extractFunction(homeShellWindowsSource, "renderTargetLaunchError"), /error\?\.userMessage/);
 });
 
-test("Browser accepts Home's navigate request only from its own Home token", () => {
-  assert.match(
-    browserSource,
-    /payload\?\.type === "elastos\.browser\.navigate\/v1" &&\s*payload\.homeToken === launchToken &&/,
+test("Browser menus offer Show or Open Browser, never New Window", () => {
+  const supports = vm.runInNewContext(
+    `${extractFunction(homeShellWindowsSource, "supportsMenuNewWindow")}; supportsMenuNewWindow`,
+    { shellState: { currentSummary: {} }, targetById: () => ({ window_policy: "hybrid" }) },
   );
+  assert.equal(supports("browser"), false);
+  assert.equal(supports("library"), true);
+  const surfaceSource = fs.readFileSync(new URL("../capsules/home-gui/browser/shell-surface.js", import.meta.url), "utf8");
+  const items = (openCount, source) => vm.runInNewContext(
+    `${extractFunction(surfaceSource, "targetContextMenuItems")}; targetContextMenuItems`,
+    {
+      shellState: { currentSummary: {} },
+      supportsMenuNewWindow: supports,
+      sortWindowEntriesByZOrder: (entries) => entries,
+      browserWindowEntriesForTarget: () => Array.from({ length: openCount }, (_, i) => ({ id: `w${i}` })),
+      browserWindowDisplayTitle: (entry) => entry.id,
+      targetTitle: () => "Browser",
+      desktopPinMenuItem: () => ({ action: "pin" }),
+      taskbarPinMenuItem: () => ({ action: "pin-taskbar" }),
+      appendTargetGroupManagementItems: () => {},
+      isPhone: () => false,
+    },
+  )({ targetId: "browser", source });
+  for (const source of ["taskbar", "desktop", "launcher"]) {
+    const shown = items(1, source).map((item) => item.label);
+    assert.ok(shown.includes("Show Browser"), `${source}: ${shown}`);
+    assert.ok(!shown.includes("New Window"), source);
+    assert.ok(items(0, source).some((item) => item.label === "Open Browser" && item.action === "open-target"), source);
+  }
+});
+
+function browserNavigateReceiver() {
+  const parent = { name: "home-gui" };
+  const top = { name: "home-shell" };
+  const context = {
+    window: { parent, top },
+    launchToken: "tok-1",
+    HOME_GUI_OPAQUE_ORIGIN: "null",
+    normalizeUrl,
+  };
+  vm.runInNewContext(
+    `${extractFunction(browserSource, "hasExactMessageKeys")}\n${extractFunction(browserSource, "homeBrowserNavigateUrl")}\nglobalThis.receive = homeBrowserNavigateUrl;`,
+    context,
+  );
+  const message = (overrides = {}) => ({ type: "elastos.browser.navigate/v1", homeToken: "tok-1", url: "https://example.org/", ...overrides });
+  return { receive: context.receive, parent, top, message, context };
+}
+
+test("Browser accepts Home's navigate request only from its Home parent with its own token", () => {
+  const { receive, parent, top, message, context } = browserNavigateReceiver();
+  assert.equal(receive({ origin: "null", source: parent, data: message() }), "https://example.org/");
+  assert.equal(receive({ origin: "null", source: top, data: message() }), "", "top");
+  assert.equal(receive({ origin: "null", source: { name: "sibling" }, data: message() }), "", "sibling frame");
+  assert.equal(receive({ origin: "http://127.0.0.1:61180", source: parent, data: message() }), "", "wrong origin");
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "tok-2" }) }), "", "wrong token");
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "" }) }), "", "empty token");
+  assert.equal(receive({ origin: "null", source: parent, data: { ...message(), extra: 1 } }), "", "extra keys");
+  for (const url of ["javascript:alert(1)", "file:///etc/passwd", "elastos://home", "", "   "]) {
+    assert.equal(receive({ origin: "null", source: parent, data: message({ url }) }), "", url);
+  }
+  context.launchToken = "";
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "" }) }), "", "no launch token");
+});
+
+test("Browser handles Home's navigate request before the top-level host guard", () => {
+  const listener = browserSource.slice(browserSource.indexOf("const homeNavigateUrl = homeBrowserNavigateUrl(event);"));
+  assert.ok(listener.indexOf("navigateAddress(homeNavigateUrl)") < listener.indexOf("event.source !== window.top"));
 });

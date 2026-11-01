@@ -51,7 +51,7 @@ import {
   focusModeEnabled,
   pushUiPreferencesToFrameWindow,
   escapeHtml,
-} from "./shell-core.js?v=home-20261101b";
+} from "./shell-core.js?v=home-20261101c";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -69,26 +69,26 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20261101b";
-import { playUiSound } from "./shell-sounds.js?v=home-20261101b";
+} from "./shell-windows.js?v=home-20261101c";
+import { playUiSound } from "./shell-sounds.js?v=home-20261101c";
 import {
   bindAssistantFace,
   syncAssistantFaceAvailability,
-} from "./shell-assistant-face.js?v=home-20261101b";
+} from "./shell-assistant-face.js?v=home-20261101c";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   registerStageLayer,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20261101b";
+} from "./shell-popovers.js?v=home-20261101c";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261101b";
-import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20261101b";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20261101b";
-import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20261101b";
-import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261101b";
+} from "./shell-motion.js?v=home-20261101c";
+import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20261101c";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20261101c";
+import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20261101c";
+import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261101c";
 import {
   PHONE_ASSISTANT_TARGET,
   PHONE_DOCK_SLOTS,
@@ -98,19 +98,19 @@ import {
   phoneDockTargetIds,
   phoneHomePages,
   removePhoneHomeTarget,
-} from "./shell-phone-home.js?v=home-20261101b";
+} from "./shell-phone-home.js?v=home-20261101c";
 import {
   bindPhoneHomePager,
   phoneHomePerPage,
   renderPhoneHomePages,
-} from "./shell-phone-home-pager.js?v=home-20261101b";
+} from "./shell-phone-home-pager.js?v=home-20261101c";
 import {
   bindPhoneHomeEdit,
   enterPhoneHomeEdit,
   isPhoneHomeDragging,
   isPhoneHomeEditing,
-} from "./shell-phone-home-edit.js?v=home-20261101b";
-import { agentStageId, announceStage, setActiveStage } from "./shell-stages.js?v=home-20261101b";
+} from "./shell-phone-home-edit.js?v=home-20261101c";
+import { agentStageId, announceStage, setActiveStage } from "./shell-stages.js?v=home-20261101c";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -2253,11 +2253,12 @@ function targetContextMenuItems(target) {
     }
     items.push({ kind: "divider" });
   }
+  const title = targetTitle(shellState.currentSummary, target.targetId);
   items.push({
     action: newWindow ? "open-target-new-window" : "open-target",
-    label: !newWindow
-      ? `Open ${targetTitle(shellState.currentSummary, target.targetId)}`
-      : "New Window",
+    label: newWindow
+      ? "New Window"
+      : `${target.targetId === "browser" && openWindows.length > 0 ? "Show" : "Open"} ${title}`,
   });
   if (target.source === "desktop") {
     items.push({ action: "rename-desktop-icon", label: "Rename" });
