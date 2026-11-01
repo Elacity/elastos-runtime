@@ -11,21 +11,21 @@ import {
   desktopBackdrop,
   mountGlyph,
   shellState,
-} from "./shell-core.js?v=home-20261031b";
+} from "./shell-core.js?v=home-20261031c";
 import {
   browserWindowEntries,
   closeWindow,
   focusWindow,
   sortWindowEntriesByZOrder,
-} from "./shell-windows.js?v=home-20261031b";
+} from "./shell-windows.js?v=home-20261031c";
 import {
   closeOtherShellPopovers,
   LAYER_STATE,
   registerEscapeHandler,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261031b";
-import { isPhone } from "./shell-form-factor.js?v=home-20261031b";
+} from "./shell-popovers.js?v=home-20261031c";
+import { isPhone } from "./shell-form-factor.js?v=home-20261031c";
 import {
   addDesktopSpace,
   assignWindowToDesktop,
@@ -43,7 +43,7 @@ import {
   syncStagePresentation,
   syncSpacePager,
   flipRectMotion,
-} from "./shell-stages.js?v=home-20261031b";
+} from "./shell-stages.js?v=home-20261031c";
 
 /* Mission Control lays out the Spaces that hold windows. The Agent room holds
    none and is reached from the Dock and the Space switcher, not from here. */

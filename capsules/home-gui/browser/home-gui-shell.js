@@ -12,19 +12,19 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20261031b";
+} from "./home-gui.js?v=home-20261031c";
 import {
   acceptHomeBrowserContextId,
   desktopBackdrop,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20261031b";
+} from "./shell-core.js?v=home-20261031c";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20261031b";
-import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261031b";
-import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261031b";
+} from "./home-gui-authority.js?v=home-20261031c";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261031c";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261031c";
 import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261030a";
 
 const route = new URL(window.location.href);

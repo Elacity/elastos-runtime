@@ -38,7 +38,7 @@ globalThis.window = {
 
 // Same specifiers (including the cache-busting query) as home-gui.js, so the
 // test drives the module instances Home GUI uses.
-const version = "home-20261031b";
+const version = "home-20261031c";
 const core = await import(`../capsules/home-gui/browser/shell-core.js?v=${version}`);
 const face = await import(`../capsules/home-gui/browser/shell-assistant-face.js?v=${version}`);
 

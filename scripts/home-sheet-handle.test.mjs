@@ -13,7 +13,7 @@ import {
 import {
   cancelStageGestures,
   registeredStageGestures,
-} from "../capsules/home-gui/browser/shell-popovers.js?v=home-20261031b";
+} from "../capsules/home-gui/browser/shell-popovers.js?v=home-20261031c";
 
 function fakeNode() {
   const listeners = new Map();

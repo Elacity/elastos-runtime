@@ -4,7 +4,9 @@
 // as installed. Numbered lists of ten or more items keep every marker whole
 // ("10.", "20."), in a saved reply and in one that streamed in, and while a
 // turn runs its status line ("Working out the best approach…") and then the
-// newest reply sit fully above the composer, not behind it.
+// newest reply sit fully above the composer, not behind it. A reader at the
+// end who sends a message follows its long reply to the end, while it
+// streams and once it settles, without being offered Jump to latest.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
@@ -17,11 +19,24 @@ const root = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const schema = "elastos.assistant.workspace/v2";
 const homeToken = "assistant-layout-fixture";
 const textOffer = { id: "offer:text-fixture", title: "Text fixture", operation: "text.generate",
+  context: { context_window_tokens: 8192, max_output_tokens: 1024 },
   input_modalities: ["text/plain"], output_modalities: ["text/plain"] };
 const numbered = (count, label) => Array.from({ length: count }, (_, i) => `${i + 1}. ${label} ${i + 1}`).join("\n");
 const filler = "A sentence that fills the room so the transcript scrolls. ".repeat(12);
 const savedList = `Here are twelve:\n\n${numbered(12, "Saved step")}`;
 const streamedList = `Here are twenty-five:\n\n${numbered(25, "Streamed step")}`;
+// A long Markdown reply like a hosted model's: taller than the room.
+const gardenReply = [
+  "Planning a garden goes best in a few **clear steps**.\n\n",
+  ...Array.from({ length: 6 }, (_, i) => [
+    `## Step ${i + 1}: ${["Choose the site", "Test the soil", "Pick the plants", "Draw the beds", "Set up water", "Plant and mulch"][i]}\n\n`,
+    `${"Look at the light, the wind and the soil before deciding anything else. ".repeat(3)}\n\n`,
+    "- **First:** note the sun hours\n- **Second:** note where water pools\n- Third: mark paths\n\n",
+  ].join("")),
+  "```text\nbed A: tomatoes, basil\nbed B: beans, lettuce\n```\n\n",
+  "| Plant | Sun |\n| --- | --- |\n| Tomato | Full |\n| Lettuce | Part |\n\n",
+  "That is the whole plan: the last line of the reply.\n",
+].join("");
 
 const history = [];
 for (let i = 0; i < 4; i += 1) {
@@ -40,7 +55,7 @@ const busyRoom = {
       state: "streaming", startedAt: Date.now() - 1000 } }],
 };
 
-const fixture = { stored: { schema, revision: 1, document: busyRoom }, events: [] };
+const fixture = { stored: { schema, revision: 1, document: busyRoom }, events: [], runs: new Map() };
 const errors = [];
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
@@ -88,10 +103,16 @@ const server = createServer(async (req, res) => {
         json({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [] }); return;
       }
       if (url.pathname === "/api/provider/model/runs_get") { json({ run_id: input.run_id }); return; }
+      if (url.pathname === "/api/provider/model/runs_create") {
+        const runId = `run-sent-${fixture.runs.size + 1}`;
+        fixture.runs.set(runId, []);
+        json({ run_id: runId, status: "running", sequence_cursor: 0 }); return;
+      }
       if (url.pathname === "/api/provider/model/runs_events") {
-        assert.equal(input.run_id, "run-layout");
+        const runEvents = input.run_id === "run-layout" ? fixture.events : fixture.runs.get(input.run_id);
+        assert.ok(runEvents, `events of a known run: ${input.run_id}`);
         const after = Number(input.after_sequence) || 0;
-        const events = fixture.events.filter(event => event.sequence > after);
+        const events = runEvents.filter(event => event.sequence > after);
         json({ events, next_cursor: Math.max(after, ...events.map(event => event.sequence)), has_more: false });
         return;
       }
@@ -167,6 +188,7 @@ try {
   browser = await chromium.launch({ headless: true, ...(process.env.BRAVE_BIN ? { executablePath: process.env.BRAVE_BIN } : {}) });
   page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   page.on("pageerror", error => pageErrors.push(`${stage}: ${error}`));
+  page.on("console", message => { if (message.text().startsWith("DBG")) console.log(message.text()); });
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const room = page.frameLocator("iframe").frameLocator("iframe");
   await room.locator(".agent-msg").nth(history.length - 1).waitFor({ state: "attached" });
@@ -222,9 +244,61 @@ try {
   for (const list of markers) {
     assert.ok(list.worstRoomPx >= 0, `every marker of a ${list.items}-item list is whole: ${JSON.stringify(markers)}`);
   }
+
+  // The reader at the end sends a message. The status line shows, then a
+  // fast hosted model's long reply streams in (taller than the room): the
+  // status line giving way to the reply must not read as the reader
+  // scrolling up. The room follows the reply while it streams and after it
+  // settles into its history render.
+  stage = "a sent message's long reply";
+  await input.fill("");
+  await frame.evaluate(() => {
+    const scroller = document.querySelector("#agent-harness-stream");
+    window.__follow = { on: true, samples: [] };
+    const sample = () => {
+      if (!window.__follow.on) return;
+      const jump = document.querySelector("[data-agent-jump-latest]");
+      window.__follow.samples.push({ t: performance.now(), jump: Boolean(jump && !jump.hidden),
+        fromEnd: Math.round(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) });
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
+  await input.fill("How do I plan a garden?");
+  await input.press("Enter");
+  await room.locator(".agent-progress:not([hidden])").last().filter({ hasText: "Working out the best approach" })
+    .waitFor({ timeout: 10000 });
+  // The model takes a few seconds to its first words (the status line has
+  // settled). Its first chunk lands with the reply row's own scroll to the
+  // end; the next scroll event then sees the end 200+ px away.
+  await page.waitForTimeout(3000);
+  const sent = fixture.runs.get("run-sent-1");
+  assert.ok(sent, "the message started a run");
+  const replyChunks = gardenReply.match(/[\s\S]{1,300}/g);
+  for (const [index, text] of replyChunks.entries()) {
+    sent.push({ sequence: index + 1, kind: "text_delta", data: { text } });
+    await page.waitForTimeout(10);
+  }
+  sent.push({ sequence: replyChunks.length + 1, kind: "completed", data: {} });
+  await room.locator('.agent-msg-agent[data-stream-phase="presentation_done"]').filter({ hasText: "the last line of the reply" })
+    .waitFor({ state: "attached", timeout: 10000 });
+  seen.sentReply = await expectNewestAboveComposer(".agent-msg-agent", "a sent message's long reply, once settled");
+  const follow = await frame.evaluate(() => {
+    window.__follow.on = false;
+    let behindMs = 0, since = null;
+    for (const { t, fromEnd } of window.__follow.samples) {
+      if (fromEnd > 8) { since ??= t; behindMs = Math.max(behindMs, t - since); } else since = null;
+    }
+    return { behindMs: Math.round(behindMs), jumpFrames: window.__follow.samples.filter(sample => sample.jump).length };
+  });
+  // A flush paints a frame before the follow lands; never longer than that.
+  assert.ok(follow.behindMs < 250, `the room follows the streaming reply: ${JSON.stringify(follow)}`);
+  assert.equal(follow.jumpFrames, 0, `a reader who never left the end is not offered Jump to latest: ${JSON.stringify(follow)}`);
+  seen.sentReplyBehindMs = follow.behindMs;
+
   assert.deepEqual(errors, []);
   assert.deepEqual(pageErrors, []);
-  console.log(`PASS Assistant reply layout: px above the composer ${JSON.stringify(seen)}; list markers whole (${markers.map(list => `${list.items} items, ${list.worstRoomPx}px spare`).join("; ")})`);
+  console.log(`PASS Assistant reply layout: px above the composer, longest ms behind a streaming reply ${JSON.stringify(seen)}; list markers whole (${markers.map(list => `${list.items} items, ${list.worstRoomPx}px spare`).join("; ")})`);
 } catch (error) {
   console.error(`Assistant reply layout smoke failed at ${stage}`);
   console.error(JSON.stringify({ errors, pageErrors }, null, 1));
