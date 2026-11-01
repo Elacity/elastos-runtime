@@ -1111,7 +1111,7 @@ fn join_release_network(
         manifest.collaboration_network.as_ref(),
         fetched,
     )?;
-    tracing::info!(?outcome, "release collaboration network applied");
+    tracing::debug!(?outcome, "release collaboration network applied");
     Ok(outcome)
 }
 

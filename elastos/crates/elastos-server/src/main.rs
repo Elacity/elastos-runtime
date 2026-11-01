@@ -1352,7 +1352,7 @@ async fn run() -> anyhow::Result<()> {
     ) {
         match NOFILE_RAISE.get() {
             Some(Ok((before, after))) => {
-                tracing::info!("open-file soft limit {after} (was {before})")
+                tracing::debug!("open-file soft limit {after} (was {before})")
             }
             Some(Err(err)) => tracing::warn!("could not raise open-file limit: {err}"),
             None => {}
