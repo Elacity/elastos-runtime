@@ -259,3 +259,16 @@ test("readiness failures explain the repair while cleanup retains priority", () 
     assert.doesNotMatch(friendlyOpenError(error), message);
   }
 });
+
+test("one-page capacity refusal says only one Browser window can be open", () => {
+  for (const state of ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"]) {
+    const error = openError(state);
+    error.payload.code = "browser_capacity_unavailable";
+    const message = friendlyOpenError(error);
+    assert.equal(message, "Only one Browser window can be open at a time. Close the other one first.");
+    assert.doesNotMatch(message, /fail/i);
+  }
+  const acquired = openError("terminal_post_effect_cleanup", { page_acquired: true });
+  acquired.payload.code = "browser_capacity_unavailable";
+  assert.doesNotMatch(friendlyOpenError(acquired), /Only one Browser window/);
+});

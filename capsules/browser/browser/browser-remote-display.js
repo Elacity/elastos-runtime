@@ -1,4 +1,4 @@
-import { collectWebrtcStats } from "./browser-status.js?v=browser-20260907c";
+import { collectWebrtcStats } from "./browser-status.js?v=browser-20261101c";
 import {
   iceCandidateType,
   normalizeDisplayIceServers,

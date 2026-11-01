@@ -7,7 +7,7 @@ import {
   normalizeUrl,
   sameBrowserStreamTarget,
   visibleAddressForUrl,
-} from "./browser-runtime-api.js?v=browser-20260907c";
+} from "./browser-runtime-api.js?v=browser-20261101c";
 import {
   createBrowserClipboardBridge,
 } from "./browser-clipboard.js?v=browser-20261022d";
@@ -27,8 +27,8 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260907c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261101b";
+} from "./browser-status.js?v=browser-20261101c";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261101c";
 import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261015a";
 
 const STATUS_TTL_MS = 4200;
@@ -1898,6 +1898,17 @@ window.addEventListener("message", (event) => {
     return;
   }
   const payload = event.data && typeof event.data === "object" ? event.data : null;
+  if (
+    payload?.type === "elastos.browser.navigate/v1" &&
+    payload.homeToken === launchToken &&
+    typeof payload.url === "string" &&
+    payload.url.length > 0
+  ) {
+    // Home reuses this window for a new Browser open instead of starting a
+    // second page (one live Browser page per user).
+    navigateAddress(payload.url).catch(() => {});
+    return;
+  }
   if (payload?.type !== "browser:file-picker-selection") {
     return;
   }
