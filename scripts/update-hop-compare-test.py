@@ -701,7 +701,7 @@ class CliFixtureTests(unittest.TestCase):
         for mode in (0o600, 0o644):
             lock.chmod(mode)
             self.assertEqual(observer.cli_coordination(home)["status"], "released")
-        for mode in (0o664, 0o666, 0o646):
+        for mode in (0o664, 0o646, 0o4600):
             lock.chmod(mode)
             with self.subTest(mode=oct(mode)), self.assertRaisesRegex(ValueError, "coordination file mode differs"):
                 observer.cli_coordination(home)
@@ -727,7 +727,7 @@ class CliFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeats a field"):
             observer.cli_state(self.manifest, home)
         observer.write(lock, valid)
-        lock.chmod(0o644)
+        lock.chmod(0o664)
         with self.assertRaisesRegex(ValueError, "file mode differs"):
             observer.cli_state(self.manifest, home)
 
