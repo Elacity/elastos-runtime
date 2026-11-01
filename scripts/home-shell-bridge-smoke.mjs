@@ -2621,6 +2621,27 @@ sendChildMessage("null", systemFrameWindow, {
   type: "home:app-ready",
   homeToken: "system-token",
 });
+{
+  // A visible-target app (System) may open Browser, but only empty: an address
+  // from an app must go through Home's link sheet, never straight to Browser.
+  const browserOpens = () => shellMessages
+    .map((message) => message.payload)
+    .filter((payload) => payload?.type === "home:gui-command" && payload.command === "open-target" && payload.target === "browser");
+  const before = browserOpens().length;
+  const checksBefore = linkChecks();
+  for (const query of [{ url: "https://evil.example/" }, { url: "https://evil.example/", extra: "1" },
+    { browser_instance: "x" }, ["https://evil.example/"], "https://evil.example/", null]) {
+    sendChildMessage("null", systemFrameWindow, { type: "home:open-target", homeToken: "system-token", target: "browser", query });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(browserOpens().length === before && linkChecks() === checksBefore && linkSheet().hidden,
+    "an app opened Browser with an address, bypassing Home's link sheet", browserOpens().slice(before));
+  sendChildMessage("null", systemFrameWindow, { type: "home:open-target", homeToken: "system-token", target: "browser", query: {} });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(JSON.stringify(browserOpens().slice(before)) ===
+    JSON.stringify([{ type: "home:gui-command", command: "open-target", target: "browser", query: {} }]),
+  "System could not open an empty Browser", browserOpens().slice(before));
+}
 const stepUpBeginsBeforeClosedMessage = requests.filter(
   (request) => request.url === "/api/auth/passkey-step-up/begin",
 ).length;

@@ -2100,6 +2100,15 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
+  // An app opens Browser only empty. A web address from an app goes through
+  // Home's link sheet (home:open-external, #430), never straight into Browser.
+  if (context.kind === "app-frame" && target === "browser" && data.query !== undefined && (
+    !data.query || typeof data.query !== "object" || Array.isArray(data.query) ||
+    Object.keys(data.query).length !== 0
+  )) {
+    console.warn("home ignored an app's Browser open with a query", context.targetId);
+    return;
+  }
   if (context.targetId === "chat-room" && ["people", "inbox"].includes(target)) {
     if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
       || !data.query || typeof data.query !== "object" || Array.isArray(data.query)) return;
