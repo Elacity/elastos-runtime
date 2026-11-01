@@ -173,7 +173,7 @@ assert.ok(
   "HTTP links use the source-pinned Home Browser handoff instead of capsule popups",
 );
 assert.ok(
-  homeFace.includes('postToAssistantFrame({ type: "home-agent:open-link", url })') &&
+  homeFace.includes('postToAssistantFrame({ type: "home-agent:open-link", url: message.url })') &&
     entry.includes('message?.type === "home-agent:open-link"') &&
     harnessHost.includes('window.top.postMessage({ type: "home:open-external", url, homeToken }, origin)') &&
     !capsuleScripts.some(([, source]) => /window\.open\(/.test(source)),

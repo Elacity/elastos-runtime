@@ -129,10 +129,19 @@ test("an Assistant link opens in Browser, or asks Home's link prompt when this H
   frameSays({ type: "home-agent:open-browser", url });
   assert.equal(opens.length, 1, "no Browser app: nothing opens in Home GUI");
   assert.deepEqual(linkReplies(), [{ type: "home-agent:open-link", url, target: "*" }]);
+  // The reply carries the capsule's own string, not Home GUI's normal form, so
+  // the capsule can match it: no trailing slash, a mixed-case host.
+  for (const raw of ["https://example.com", "https://Docs.Example/Guide"]) {
+    frameSays({ type: "home-agent:open-browser", url: raw });
+    assert.equal(linkReplies().at(-1).url, raw);
+  }
+  frameSays({ type: "home-agent:open-browser", url });
+  assert.equal(linkReplies().length, 4, "every click is answered");
 
   // A link the face would not hand to Browser is not handed to the prompt either.
   frameSays({ type: "home-agent:open-browser", url: "javascript:alert(1)" });
   frameSays({ type: "home-agent:open-browser", url, extra: true });
-  assert.equal(linkReplies().length, 1);
+  frameSays({ type: "home-agent:open-browser", url: ` ${url}` });
+  assert.equal(linkReplies().length, 4);
   delete byId["#assistant-toggle"];
 });

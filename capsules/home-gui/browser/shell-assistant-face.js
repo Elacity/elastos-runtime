@@ -432,8 +432,11 @@ function onFrameMessage(event) {
         deps.openTarget("browser", { query: { url } });
       } else {
         // No Browser app: the capsule asks Home's own link prompt (#430),
-        // which shows the address and opens a tab only on Open link.
-        postToAssistantFrame({ type: "home-agent:open-link", url });
+        // which shows the address and opens a tab only on Open link. The
+        // reply carries the capsule's own string (checked above), so the
+        // capsule can match it to the link it asked about; the Runtime
+        // canonicalizes it for the sheet.
+        postToAssistantFrame({ type: "home-agent:open-link", url: message.url });
       }
       break;
     }

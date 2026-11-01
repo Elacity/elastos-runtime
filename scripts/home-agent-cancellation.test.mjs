@@ -460,6 +460,14 @@ test("an Assistant link asks Home GUI for Browser first and Home's link prompt o
   assert.deepEqual(toTop, [{ origin: "https://home.example", message: { type: "home:open-external", url, homeToken: "fixture" } }]);
   assert.equal(openWebLinkThroughHomePrompt(url), false, "one prompt per click");
   assert.equal(toTop.length, 1);
+  // Home GUI answers with the capsule's own string, so a link with no trailing
+  // slash or a mixed-case host still reaches the prompt, on every click.
+  for (const raw of ["https://example.com", "https://Docs.Example/Guide", "https://example.com"]) {
+    openWebLink(raw);
+    assert.equal(openWebLinkThroughHomePrompt(raw), true, raw);
+    assert.deepEqual(toTop.at(-1), { origin: "https://home.example", message: { type: "home:open-external", url: raw, homeToken: "fixture" } });
+  }
+  assert.equal(toTop.length, 4);
   window.location.href = prior.href; window.top = prior.top; window.parent = prior.parent;
 });
 
