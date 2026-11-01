@@ -22,7 +22,7 @@ import {
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20261031c";
+} from "./shell-core.js?v=home-20261101a";
 import {
   fitWindowBounds,
   fitBrowserWindow,
@@ -32,7 +32,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20261031c";
+} from "./shell-window-geometry.js?v=home-20261101a";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -52,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20261031c";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261031c";
+} from "./shell-stages.js?v=home-20261101a";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101a";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -346,8 +346,13 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
-// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries.
+// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries. A Browser
+// frame that stops answering is given up after this long without a "pending".
 const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 50_000;
+// Each "pending" extends the close (browser.js repeats it every 10s while Runtime
+// settles an open), up to this cap: above Browser's 5-minute open deadline plus
+// the close retry schedule.
+const BROWSER_WINDOW_CLOSE_CAP_MS = 360_000;
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
@@ -1158,6 +1163,7 @@ function handleBrowserWindowCloseResult(event) {
     if (!record.lifecycle && hasLifecycle) {
       record.lifecycle = Object.freeze(lifecycle);
     }
+    armBrowserWindowCloseTimeout(record);
     return;
   }
   if (message.state === "error") {
@@ -1295,6 +1301,16 @@ function handleDocumentsPreferenceMessage(event) {
   }
 }
 
+// The close is given up (Retry) after BROWSER_WINDOW_CLOSE_TIMEOUT_MS without a
+// "pending" from the frame, and never later than BROWSER_WINDOW_CLOSE_CAP_MS.
+function armBrowserWindowCloseTimeout(record) {
+  window.clearTimeout(record.timeout);
+  const remaining = record.startedAt + BROWSER_WINDOW_CLOSE_CAP_MS - Date.now();
+  record.timeout = window.setTimeout(() => {
+    settleBrowserWindowClose(record, false);
+  }, Math.max(0, Math.min(BROWSER_WINDOW_CLOSE_TIMEOUT_MS, remaining)));
+}
+
 function requestBrowserWindowClose(entry) {
   if (entry.browserCloseRequest) {
     return entry.browserCloseRequest.promise;
@@ -1316,10 +1332,9 @@ function requestBrowserWindowClose(entry) {
     requestId,
     resolve: resolveRequest,
     timeout: 0,
+    startedAt: Date.now(),
   };
-  record.timeout = window.setTimeout(() => {
-    settleBrowserWindowClose(record, false);
-  }, BROWSER_WINDOW_CLOSE_TIMEOUT_MS);
+  armBrowserWindowCloseTimeout(record);
   entry.browserCloseRequest = record;
   pendingBrowserWindowCloses.set(requestId, record);
   markBrowserWindowCloseState(entry, "pending");

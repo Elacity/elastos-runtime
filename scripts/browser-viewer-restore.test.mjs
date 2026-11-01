@@ -360,7 +360,8 @@ test('summary authority failure reaches startup renewal without a replacement op
     requestRuntimeOpen: async value => opens.push(value),
     isAuthoritySessionError: value => value.status === 401,
     friendlyOpenError: value => value.message,
-    requestHomeRelaunch: value => { renewals.push(value); return true; }, resumeDeferredHomeBrowserWindowClose() {} });
+    requestHomeRelaunch: value => { renewals.push(value); return true; }, resumeDeferredHomeBrowserWindowClose() {},
+    AbortController, windowCloseAbortControllers: new Set() });
   vm.runInContext(declaration('fetchBrowserSummary'), h.state);
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
   assert.deepEqual(renewals, ['Browser authority expired']);

@@ -17,12 +17,12 @@ import {
   canonicalTargetTitle,
   targetTitle,
   targetById,
-} from "./shell-core.js?v=home-20261031c";
+} from "./shell-core.js?v=home-20261101a";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20261031c";
-import { registerStageLayer } from "./shell-popovers.js?v=home-20261031c";
+} from "./shell-motion.js?v=home-20261101a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20261101a";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */
