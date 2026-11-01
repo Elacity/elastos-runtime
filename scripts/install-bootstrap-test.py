@@ -1202,6 +1202,56 @@ echo /Library/Developer/CommandLineTools
                 self.assertEqual(profile.is_symlink(), kind == "symlink")
                 self.assertTrue(profile.samefile(target))
 
+    def test_profile_swapped_for_a_link_during_an_edit_leaves_the_link_target_unchanged(self):
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        marked = line + " # Added by the ElastOS installer\n"
+        # The link target holds the marked line too, so a write through the link changes it.
+        sentinel = '{"sentinel": true}\n' + marked
+        swap = 'mv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null; ln -s -- "$SENTINEL" "$PROFILE"\n'
+        # The swap runs right after the profile is admitted, or after its old
+        # content is read and just before the new content takes its name.
+        hooks = {
+            "admission": 'eval "admitted_$(declare -f profile_admit)"\n'
+                         'profile_admit() {\nadmitted_profile_admit "$@" || return 1\n' + swap + '}\n',
+            "read": ''.join(f'eval "original_$(declare -f {edit})"\n'
+                            f'{edit}() {{\noriginal_{edit} "$@" || return 1\n{swap}}}\n'
+                            for edit in ("profile_with_line", "profile_without_line")),
+        }
+        actions = {"add": 'add_install_dir_to_login_profile\n',
+                   "remove": 'remove_login_profile_lines "$HOME/.local/bin"\n'}
+        # (action, profile before, hook, profile after or None when left unchanged)
+        cases = [("add", "export EDITOR=vi\n", "admission", None),
+                 ("add", None, "admission", None),
+                 ("add", "export EDITOR=vi\n", "read", "export EDITOR=vi\n" + marked),
+                 ("remove", "export EDITOR=vi\n" + marked, "admission", None),
+                 ("remove", "export EDITOR=vi\n" + marked, "read", "export EDITOR=vi\n")]
+        for action, before, hook, after in cases:
+            with self.subTest(action=action, before=before, hook=hook), \
+                    tempfile.TemporaryDirectory(prefix="installer-profile-swap-") as directory:
+                home, target = Path(directory, "home"), Path(directory, "runtime-data.json")
+                home.mkdir()
+                target.write_text(sentinel)
+                profile = home / ".profile"
+                if before is not None:
+                    profile.write_text(before)
+                    profile.chmod(0o640)
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               'PROFILE="$1/.profile" SENTINEL="$2"\n' + hooks[hook] + actions[action],
+                               home, target)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_text(), sentinel)
+                self.assertEqual([p.name for p in home.iterdir() if p.name.startswith(".elastos-profile.")], [])
+                if after is None:
+                    self.assertTrue(profile.is_symlink())
+                    self.assertIn("yourself: export PATH=", result.stdout)
+                    if before is not None:
+                        self.assertEqual(Path(f"{profile}.moved").read_text(), before)
+                else:
+                    # The new content replaced the link; the profile keeps its mode.
+                    self.assertFalse(profile.is_symlink())
+                    self.assertEqual(profile.read_text(), after)
+                    self.assertEqual(profile.stat().st_mode & 0o777, 0o640)
+
     def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
         did, head, release = installable_fixture()
         for case in ("opted out", "already on PATH"):

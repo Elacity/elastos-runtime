@@ -955,14 +955,73 @@ login_profile() {
     esac
 }
 
+# "device inode owner links mode" of the path $1 itself, or of the open file on
+# standard input when no path is given (GNU stat "-" and BSD stat without a
+# file use fstat). GNU stat -f reports the filesystem, so pick the syntax by what works.
+file_identity() {
+    if stat -c '%d' / >/dev/null 2>&1; then
+        stat -c '%d %i %u %h %a' -- "${1:--}"
+    else
+        stat -f '%d %i %u %l %Lp' ${1:+-- "$1"}
+    fi
+}
+
 # The installer edits a profile only when it is missing (then created new) or is
 # this user's own regular file with a single name. A symlink or a second hard
-# link could make the edit land in another file, such as Runtime data.
-profile_is_editable() {
-    local profile="$1"
+# link could make the edit land in another file, such as Runtime data. Prints
+# "missing" or the admitted file's identity.
+profile_admit() {
+    local profile="$1" identity uid links
     [[ ! -L "$profile" ]] || return 1
-    [[ -e "$profile" ]] || return 0
-    [[ -f "$profile" && -O "$profile" && -n "$(find "$profile" -maxdepth 0 -links 1 2>/dev/null)" ]]
+    if [[ ! -e "$profile" ]]; then
+        echo missing
+        return 0
+    fi
+    [[ -f "$profile" ]] || return 1
+    identity="$(file_identity "$profile")" || return 1
+    read -r _ _ uid links _ <<< "$identity"
+    [[ "$uid" == "$(id -u)" && "$links" == 1 ]] || return 1
+    printf '%s\n' "$identity"
+}
+
+# Profile edits: the old content on stdin, the new content into the file $1.
+profile_with_line() {
+    cat > "$1" || return 1
+    # A last line without a newline would otherwise join this one.
+    if [[ -s "$1" && -n "$(tail -c 1 -- "$1")" ]]; then printf '\n' >> "$1" || return 1; fi
+    printf '%s\n' "$2" >> "$1"
+}
+profile_without_line() {
+    grep -vxF -- "$2" > "$1" || [[ $? == 1 ]]
+}
+
+# Applies EDIT with LINE to an admitted profile without ever writing through its
+# path: the old content is read only from the opened admitted file, and the new
+# content is a file in the same folder that then takes the profile's name
+# (exclusively for a missing profile), so a link swapped in after admission is
+# replaced, never followed. Returns 1 with the profile unchanged otherwise.
+replace_login_profile() {
+    local profile="$1" edit="$2" line="$3" admitted tmp
+    admitted="$(profile_admit "$profile")" || return 1
+    tmp="$(mktemp "${profile%/*}/.elastos-profile.XXXXXX" 2>/dev/null)" || return 1
+    if [[ "$admitted" == missing ]]; then
+        if "$edit" "$tmp" "$line" < /dev/null &&
+           chmod "$(printf '%o' $((0666 & ~$(umask))))" "$tmp" &&
+           ln -n -- "$tmp" "$profile" 2>/dev/null; then
+            rm -f -- "$tmp"
+            return 0
+        fi
+    elif { exec 3<"$profile"; } 2>/dev/null; then
+        if [[ "$(file_identity <&3 2>/dev/null)" == "$admitted" ]] &&
+           "$edit" "$tmp" "$line" <&3 && chmod "${admitted##* }" "$tmp" &&
+           mv -f -- "$tmp" "$profile" 2>/dev/null; then
+            exec 3<&-
+            return 0
+        fi
+        exec 3<&-
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 # One marked line in the login profile, so `elastos` is found after a restart
@@ -978,14 +1037,8 @@ add_install_dir_to_login_profile() {
     if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
         return 0
     fi
-    if ! profile_is_editable "$profile"; then
-        warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
-        return 0
-    fi
-    # A last line without a newline would otherwise join this one.
-    if ! { if [[ -s "$profile" && -n "$(tail -c 1 -- "$profile")" ]]; then printf '\n'; fi
-           printf '%s\n' "$line"; } 2>/dev/null >> "$profile"; then
-        warn "Could not add ElastOS to PATH in $(display_path "$profile"); use the full path below."
+    if ! replace_login_profile "$profile" profile_with_line "$line"; then
+        warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be replaced; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
         return 0
     fi
     PATH_PROFILE_UPDATED=true
@@ -996,25 +1049,17 @@ add_install_dir_to_login_profile() {
 # Uninstall removes the exact line the installer added for this install
 # directory, from every profile it may use; other installs' lines stay.
 remove_login_profile_lines() {
-    local line profile kept
+    local line profile
     line="$(path_export_line "$1") ${PATH_PROFILE_MARKER}"
     for profile in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
         [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile" || continue
-        if ! profile_is_editable "$profile"; then
-            warn "Left $(display_path "$profile") unchanged because it is linked to another file or is not your own plain file; delete this line from it yourself: $line"
-            continue
-        fi
-        kept="$(mktemp)"
-        # Rewrite in place, so the profile keeps its mode.
         # The file stays even when empty: it may have existed before the install,
         # and removing a bash login file changes which one bash reads.
-        if { grep -vxF -- "$line" "$profile" > "$kept" || [[ $? == 1 ]]; } &&
-           cat -- "$kept" > "$profile"; then
+        if replace_login_profile "$profile" profile_without_line "$line"; then
             ok "Removed the ElastOS PATH line from $(display_path "$profile")"
         else
-            warn "Could not remove the ElastOS PATH line from $(display_path "$profile"); delete this line from it yourself: $line"
+            warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be replaced; delete this line from it yourself: $line"
         fi
-        rm -f -- "$kept"
     done
 }
 
