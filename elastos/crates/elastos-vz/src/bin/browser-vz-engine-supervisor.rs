@@ -4336,6 +4336,9 @@ fn spawn_egress_bridge(
     max_sessions: usize,
     turn_peers: Option<TurnPeerScope>,
 ) -> tokio::task::JoinHandle<bool> {
+    // Media sessions (the TURN-guarded bridge) open the Runtime relay only after the
+    // guest's first bytes: see `wait_for_guest_first_bytes`.
+    let defer_runtime_relay = turn_peers.is_some();
     tokio::spawn(async move {
         let mut session_id = 0_u64;
         let mut workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -4389,6 +4392,11 @@ fn spawn_egress_bridge(
                         let _session_slot = session_slot;
                         let guest_stream = File::from(fd);
                         let result = (|| -> Result<(), String> {
+                            if defer_runtime_relay
+                                && !wait_for_guest_first_bytes(&guest_stream, &worker_shutdown)?
+                            {
+                                return Ok(());
+                            }
                             let runtime_stream = UnixStream::connect(host_path).map_err(|err| {
                                 format!("Browser VM Runtime Exit relay unavailable: {err}")
                             })?;
@@ -4423,6 +4431,51 @@ fn spawn_egress_bridge(
         }
         workers_joined
     })
+}
+
+/// Waits for the first bytes of a pre-opened media session without consuming them.
+/// Returns false when the guest closes it first or shutdown starts; the caller then
+/// never opens the Runtime relay. Opening it eagerly made the Runtime connect to TURN
+/// for every idle session; TURN drops a connection without an allocation after 60 s,
+/// so the host closed 14 idle guest connections first every minute. Apple's
+/// Virtualization service (macOS 26.6) keeps a descriptor for each of those and traps
+/// when it runs out ("Internal Virtualization error" ~485 s after start).
+fn wait_for_guest_first_bytes(guest: &impl AsRawFd, shutdown: &AtomicBool) -> Result<bool, String> {
+    let fd = guest.as_raw_fd();
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+        if ready == 0 {
+            continue;
+        }
+        if ready > 0 {
+            let mut first = 0_u8;
+            // SAFETY: peeks at most one byte into `first`, which outlives the call.
+            let peeked = unsafe {
+                libc::recv(
+                    fd,
+                    (&mut first as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if peeked >= 0 {
+                return Ok(peeked > 0);
+            }
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) {
+            return Err(error.to_string());
+        }
+    }
 }
 
 enum DuplexStream {
@@ -6660,6 +6713,40 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn media_session_opens_runtime_relay_only_after_guest_bytes() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Idle: still waiting after several poll rounds, then shutdown ends the wait.
+        let (_guest_client, guest_bridge) = UnixStream::pair().unwrap();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx
+                .send(wait_for_guest_first_bytes(&guest_bridge, &worker_shutdown))
+                .unwrap();
+        });
+        assert!(started_rx.recv_timeout(Duration::from_millis(700)).is_err());
+        shutdown.store(true, Ordering::Relaxed);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(false)
+        );
+        worker.join().unwrap();
+
+        let idle = AtomicBool::new(false);
+        // First guest bytes start the session; they stay unread for the relay.
+        let (mut guest_client, mut guest_bridge) = UnixStream::pair().unwrap();
+        guest_client.write_all(b"x").unwrap();
+        assert_eq!(wait_for_guest_first_bytes(&guest_bridge, &idle), Ok(true));
+        let mut first = [0];
+        guest_bridge.read_exact(&mut first).unwrap();
+        assert_eq!(first, *b"x");
+        // A guest that closes without sending never gets a Runtime relay.
+        let (guest_client, guest_bridge) = UnixStream::pair().unwrap();
+        drop(guest_client);
+        assert_eq!(wait_for_guest_first_bytes(&guest_bridge, &idle), Ok(false));
     }
 
     #[test]

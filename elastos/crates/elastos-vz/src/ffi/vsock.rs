@@ -49,14 +49,10 @@ pub(crate) fn build_vsock_device() -> Retained<VZVirtioSocketDeviceConfiguration
 /// VM's associated dispatch queue; we marshal its result onto a
 /// Tokio oneshot for `.await` ergonomics.
 ///
-/// The returned [`OwnedFd`] is a `dup` of
-/// `VZVirtioSocketConnection.fileDescriptor` — we drop the
-/// Apple-owned connection inside the completion handler (which
-/// closes its own fd via the dealloc dance Apple documents),
-/// and the kernel keeps the underlying socket alive until our
-/// duplicate closes. This mirrors the
-/// `VZFileHandleSerialPortAttachment` fd-dup pattern used by the
-/// Carrier console.
+/// The returned [`OwnedFd`] duplicates the descriptor owned by
+/// `VZVirtioSocketConnection`. After the duplication attempt, close
+/// the original through the connection API. Rust owns the duplicate;
+/// borrowing the callback object does not transfer Objective-C ownership.
 pub(crate) async fn connect_vsock(
     vm: Arc<super::lifecycle::SendableVm>,
     queue: Arc<VzDispatchQueue>,
@@ -166,10 +162,18 @@ fn vsock_connect_result(
     // long as either side holds a fd.
     // SAFETY: `fd` is a live socket fd Apple just handed us.
     let dup_fd = unsafe { libc::dup(fd) };
-    if dup_fd < 0 {
+    // Capture errno before the connection API performs its own cleanup.
+    let dup_error = if dup_fd < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: conn_ref is borrowed from the live completion argument. Its
+    // API owns the original descriptor; libc::close must not bypass it.
+    unsafe { conn_ref.close() };
+    if let Some(error) = dup_error {
         return Err(format!(
-            "vz {op}: dup() of VZVirtioSocketConnection fd failed: {}",
-            std::io::Error::last_os_error()
+            "vz {op}: dup() of VZVirtioSocketConnection fd failed: {error}"
         ));
     }
     // SAFETY: `dup_fd` is a freshly-duplicated socket fd with
