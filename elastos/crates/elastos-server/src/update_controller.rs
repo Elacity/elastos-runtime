@@ -2170,7 +2170,7 @@ pub(crate) async fn finalize_principal_root_backups_after_start(data_dir: PathBu
         match finalize_after_start_attempt(&data_dir).await {
             Ok(Some(removed)) => {
                 if removed > 0 {
-                    tracing::info!(removed, "Verified migration backup payload removed.");
+                    tracing::debug!(removed, "Verified migration backup payload removed.");
                 }
                 return;
             }
