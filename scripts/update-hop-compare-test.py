@@ -2345,9 +2345,10 @@ class CliFixtureTests(unittest.TestCase):
             processes = SimpleNamespace(spawn=spawn, roots={})
             evidence = {}
 
-            def state_now(manifest_value, home_path):
-                # The same Home's state, read after prepare and Home close and before the update.
-                self.assertEqual((home_path, "prepare" in order, order[-1]), (home, True, "home-closed"))
+            def state_now(manifest_value, home_path, coordination=True):
+                # The same Home's state, read after prepare and Home close and before the update;
+                # the stopped gateway's lock is not an offline upgrade lock, so it is not admitted.
+                self.assertEqual((home_path, "prepare" in order, order[-1], coordination), (home, True, "home-closed", False))
                 return json.loads(json.dumps(state))
             with patch.object(observer, "cli_success", return_value=True), patch.object(observer, "cli_state", side_effect=state_now) as observed, \
                  patch.object(observer, "cli_private_json", return_value={"phase": "ready", "controller_pid": 4242}), \

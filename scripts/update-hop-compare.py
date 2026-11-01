@@ -2787,9 +2787,12 @@ def cli_legacy_installed_metadata(home_path):
     return snapshot
 
 
-def cli_state(manifest, home_path):
+def cli_state(manifest, home_path, coordination=True):
+    """This Home's installed files and data. The Runtime lock last written by an offline CLI
+    upgrade is admitted (coordination=True); after a Home gateway ran, the lock names that
+    gateway instead, so a caller that just stopped Home skips that admission."""
     directory = home_path / CLI_DATA
-    coordination = cli_coordination(home_path)
+    coordination = cli_coordination(home_path) if coordination else None
     sources = cli_json(directory / "sources.json")
     need(sources["default_source"] == "default" and len(sources["sources"]) == 1, "one installer-owned source required")
     return {"binary": digest(home_path / ".local/bin/elastos"),
@@ -3389,8 +3392,9 @@ def cli_ubuntu_layout(processes, manifest, home_path, evidence, steps):
             os.killpg(process.pid, signal.SIGTERM)
         evidence["home_exit"] = process.wait(timeout=35)
     need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
-    # This Home's own state after prepare and Home close; the update must keep it.
-    before = cli_state(manifest, home_path)
+    # This Home's own state after prepare and Home close; the update must keep it. The lock
+    # now names the gateway that just stopped, so only files and data are read here.
+    before = cli_state(manifest, home_path, coordination=False)
     steps.phase(CLI_SYSTEM_PHASE)
     reply = steps.command(home_path, ["update"], "ubuntu-update", umask=CLI_UBUNTU_UMASK)
     need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
