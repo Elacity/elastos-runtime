@@ -694,6 +694,18 @@ class CliFixtureTests(unittest.TestCase):
         other.write_bytes(b"changed user data")
         self.assertNotEqual(after["data"], observer.cli_state(self.manifest, home)["data"])
 
+    def test_coordination_file_follows_the_umask_but_is_never_writable_by_others(self):
+        # The Runtime creates host-process.lock with the person's umask (0644 under
+        # Ubuntu's 002 after its 022 clamp) inside the 0700 data directory.
+        home, lock = self.coordination_fixture()
+        for mode in (0o600, 0o644):
+            lock.chmod(mode)
+            self.assertEqual(observer.cli_coordination(home)["status"], "released")
+        for mode in (0o664, 0o646, 0o4600):
+            lock.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(ValueError, "coordination file mode differs"):
+                observer.cli_coordination(home)
+
     def test_coordination_refuses_held_flock(self):
         home, lock = self.coordination_fixture()
         with lock.open("rb") as owner:
@@ -715,7 +727,7 @@ class CliFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeats a field"):
             observer.cli_state(self.manifest, home)
         observer.write(lock, valid)
-        lock.chmod(0o644)
+        lock.chmod(0o664)
         with self.assertRaisesRegex(ValueError, "file mode differs"):
             observer.cli_state(self.manifest, home)
 
