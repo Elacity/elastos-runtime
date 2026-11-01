@@ -1507,7 +1507,9 @@ jobs:
           python3 scripts/update-hop-compare.py inspect "$CI_HOP_ROOT/package/fixture.json"
           python3 scripts/update-hop-compare.py run "$CI_HOP_ROOT/package/fixture.json" "$CI_HOP_ROOT/package/results"
       - name: require the update from the published release, no new provider warnings and Undo
-        run: python3 scripts/update-hop-compare.py check-result "$CI_HOP_ROOT/package/results/result.json" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -euo pipefail
+          python3 scripts/update-hop-compare.py check-result "$CI_HOP_ROOT/package/results/result.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: retain the safe CI hop receipt
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

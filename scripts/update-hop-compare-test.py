@@ -2198,7 +2198,8 @@ class CliFixtureTests(unittest.TestCase):
                               "m2-discovery": {"checks": {**json.loads(json.dumps(refusals)), observer.CLI_INSTALLER_CASE: {"status": "passed"},
                                                           observer.CLI_UBUNTU_CASE: {"status": "passed", "home": {"authenticated_health": True},
                                                                                      "update": {"from": "0.8.0-alpha.9", "to": "0.8.0-alpha.10"}}}}}}
-        verdict = observer.cli_check_result(result())
+        linux = "x86_64-linux"
+        verdict = observer.cli_check_result(result(), linux)
         self.assertEqual((verdict["from"], verdict["to"], verdict["next"]), ("0.8.0-alpha.8", "0.8.0-alpha.9", "0.8.0-alpha.10"))
         self.assertEqual((verdict["cli_installer_required"], verdict["system_installer_required"]), (observer.CLI_INSTALLER_CASE,) * 2)
         # From 0.8.0-alpha.7 on, a published System installs changed support (#246), by version
@@ -2207,15 +2208,15 @@ class CliFixtureTests(unittest.TestCase):
                                  ("0.8.0-alpha.6", False), ("0.7.9", False)):
             with self.subTest(pinned=pinned):
                 if installs:
-                    self.assertEqual(observer.cli_check_result(result(pinned))["from"], pinned)
+                    self.assertEqual(observer.cli_check_result(result(pinned), linux)["from"], pinned)
                 else:
                     with self.assertRaisesRegex(ValueError, "cannot install changed support from System"):
-                        observer.cli_check_result(result(pinned))
+                        observer.cli_check_result(result(pinned), linux)
         # Only a Linux hop installs the default Ubuntu account layout.
         mac = result()
         mac.update(platform="aarch64-darwin")
         mac["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)
-        self.assertEqual(observer.cli_check_result(mac)["next"], "0.8.0-alpha.10")
+        self.assertEqual(observer.cli_check_result(mac, "aarch64-darwin")["next"], "0.8.0-alpha.10")
         home = lambda value: value["paths"]["m1-install"]["checks"]["initial-home"]  # noqa: E731
 
         # What alpha.6 recorded: its System refused changed support and kept Home, then its CLI
@@ -2228,7 +2229,7 @@ class CliFixtureTests(unittest.TestCase):
         home(restored)["system"]["published_system"].update(phase="restored", to="0.8.0-alpha.8")
         for value in (alpha6, restored):
             with self.assertRaisesRegex(ValueError, "System did not install the release with changed support"):
-                observer.cli_check_result(value)
+                observer.cli_check_result(value, linux)
         faults = {"failed run": lambda value: value.update(status="failed", failure="System did not update"),
                   "new provider warning": lambda value: home(value)["system"]["provider_warnings"].update(new=["provider refused"]),
                   "same-build hop": lambda value: value.pop("previous_release"),
@@ -2256,12 +2257,94 @@ class CliFixtureTests(unittest.TestCase):
         faults.update({
             "Ubuntu layout case missing": lambda value: value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE),
             "Ubuntu layout case failed": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE].update(status="failed"),
-            "Ubuntu layout updated elsewhere": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE]["update"].update(to="0.8.0-alpha.9")})
+            "Ubuntu layout updated elsewhere": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE]["update"].update(to="0.8.0-alpha.9"),
+            # A Linux runner's result without its platform, or naming a Mac, cannot skip the Ubuntu case.
+            "platform missing": lambda value: (value.pop("platform"), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)),
+            "platform untyped": lambda value: (value.update(platform=None), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)),
+            "Mac result on Linux": lambda value: (value.update(platform="aarch64-darwin"), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE))})
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
                 value = result()
                 fault(value)
-                observer.cli_check_result(value)
+                observer.cli_check_result(value, linux)
+        # The verdict names this host's release platform; it does not trust the result's.
+        with self.assertRaisesRegex(ValueError, "this host's release platform"):
+            observer.cli_check_result(mac, linux)
+        with patch.object(observer.sys, "argv", ["observer", "check-result", str(self.root / "result.json")]), \
+             patch.object(observer, "cli_json", return_value=mac), patch.object(observer, "cli_host_platform", return_value=linux), \
+             patch.object(observer.os, "umask"), patch.object(observer.signal, "signal"), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertNotEqual(observer.main(), 0)
+        self.assertIn("this host's release platform", stderr.getvalue())
+
+    def test_cli_processes_umask_reaches_only_the_child(self):
+        output = self.root / "umask"
+        output.mkdir()
+        processes = observer.CliProcesses(output)
+        inherited = os.umask(0o077)
+        try:
+            reply = processes.command(["/bin/sh", "-c", "umask"], {"PATH": "/usr/bin:/bin"}, output, "child", umask=0o002)
+            self.assertEqual(os.umask(0o077), 0o077)
+        finally:
+            os.umask(inherited)
+        self.assertEqual((reply["exit"], processes.text("child").strip()), (0, "0002"))
+        for stream in processes.streams:
+            stream.close()
+
+    def test_ubuntu_layout_gives_umask_002_only_to_children_and_keeps_this_homes_data(self):
+        manifest = {"files": {"opener": {"sha256": "o"}}, "consumer": {"files": {observer.CLI_OPENER: "opener"}},
+                    "new": {"version": "0.8.0-alpha.9"}, observer.CLI_SYSTEM_PHASE: {"version": "0.8.0-alpha.10"}}
+        state = {"preserved": {"identity": {"identity/device.key": {"sha256": "a"}}}, "data": {"state/value": {"sha256": "b"}}}
+
+        def run(name, after):
+            home = self.root / ("ubuntu-" + name)
+            home.mkdir()
+            umasks, order = {}, []
+            process = SimpleNamespace(pid=4242, poll=lambda: None, wait=lambda timeout=None: order.append("home-closed") or 0)
+
+            def spawn(argv, env, cwd, label, umask=-1):
+                umasks[label] = umask
+                return process
+
+            def child(label):
+                def step(home_path, *args, umask=-1, **kwargs):
+                    umasks[label] = umask
+                    order.append(label)
+                    return {"exit": 0}
+                return step
+
+            def verify(home_path, name, label, fresh):
+                order.append(label)
+                return after if name == observer.CLI_SYSTEM_PHASE else None
+
+            steps = SimpleNamespace(phase=lambda name: order.append("phase-" + name), install=child("install"), setup=child("setup"),
+                                    verify=verify, prepare=lambda *args: order.append("prepare"), command=child("update"))
+            processes = SimpleNamespace(spawn=spawn, roots={})
+            evidence = {}
+
+            def state_now(manifest_value, home_path):
+                # The same Home's state, read after prepare and Home close and before the update.
+                self.assertEqual((home_path, "prepare" in order, order[-1]), (home, True, "home-closed"))
+                return json.loads(json.dumps(state))
+            status = home / observer.CLI_DATA / "update-controller/status.json"
+            status.parent.mkdir(parents=True)
+            status.write_text("{}")
+            with patch.object(observer, "cli_success", return_value=True), patch.object(observer, "cli_state", side_effect=state_now) as observed, \
+                 patch.object(observer, "cli_private_json", return_value={"phase": "ready", "controller_pid": 4242}), \
+                 patch.object(observer, "cli_observe_initial_home", return_value={"generation": 1, "authenticated_health": True}), \
+                 patch.object(observer.os, "umask", side_effect=AssertionError("observer umask changed")), patch.object(observer.os, "killpg"):
+                observer.cli_ubuntu_layout(processes, manifest, home, evidence, steps)
+            observed.assert_called_once()
+            return umasks, evidence
+
+        umasks, evidence = run("same", state)
+        self.assertEqual(umasks, {"install": 0o002, "setup": 0o002, "ubuntu-home": 0o002, "update": 0o002})
+        self.assertEqual((evidence["status"], evidence["update"]["to"]), ("passed", "0.8.0-alpha.10"))
+        for name, change in (("preserved", lambda value: value["preserved"]["identity"].update({"identity/device.key": None})),
+                             ("data", lambda value: value["data"].update({"state/value": {"sha256": "c"}}))):
+            changed = json.loads(json.dumps(state))
+            change(changed)
+            with self.subTest(changed=name), self.assertRaisesRegex(ValueError, "update changed preserved data"):
+                run(name, changed)
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac or Linux CI"):
