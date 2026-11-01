@@ -453,7 +453,16 @@ of that key exists.
 
 `--install-dir` moves only the binary. Everything else in the data directory is
 yours: identity keys, wallets, recovery material and user files. ElastOS adds
-no login items, launch agents, desktop entries or shell profile changes.
+no login items, launch agents or desktop entries.
+
+The installer adds one line to your login profile so new terminals find
+`elastos`: `~/.zprofile` for zsh; for bash, the first of `~/.bash_profile`,
+`~/.bash_login` or `~/.profile` that exists, else `~/.profile`; for other
+shells, `~/.zprofile` on macOS and `~/.profile` on Linux. The line ends with
+`# Added by the ElastOS installer`, and the installer prints which file it
+changed. It adds nothing when the install folder is already on PATH or the line
+is already there. To skip it, set `ELASTOS_NO_MODIFY_PATH=1` when you run the
+install command. Uninstall removes the line and keeps the rest of the file.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
