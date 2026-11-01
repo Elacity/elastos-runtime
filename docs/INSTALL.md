@@ -474,7 +474,10 @@ shells, `~/.zprofile` on macOS and `~/.profile` on Linux. The line ends with
 `# Added by the ElastOS installer`, and the installer prints which file it
 changed. It adds nothing when the install folder is already on PATH or the line
 is already there. To skip it, set `ELASTOS_NO_MODIFY_PATH=1` when you run the
-install command. Uninstall removes the line and keeps the rest of the file.
+install command. Uninstall removes the line it added for the same install
+folder and keeps the rest of the file. A profile that is a link, has a second
+hard link or is not your own file stays unchanged; the installer prints the
+line for you to add or remove yourself.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and

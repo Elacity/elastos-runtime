@@ -177,8 +177,10 @@ pub fn verify_source_channel(source: &TrustedSource, signed_channel: &str) -> an
     };
     anyhow::ensure!(
         subscribed == signed_channel || (subscribed == "canary" && signed_channel == "stable"),
-        "Signed release channel '{signed_channel}' differs from trusted source '{name}' subscription '{subscribed}'. To follow '{signed_channel}' releases on this Home, run: elastos source switch-channel {name} {signed_channel}, then try again.",
-        name = source.name
+        "Signed release channel '{signed_channel}' differs from trusted source '{name}' subscription '{subscribed}'. To follow '{signed_channel}' releases on this Home, run: elastos source switch-channel {quoted_name} {quoted_channel}, then try again.",
+        name = source.name,
+        quoted_name = crate::install_transaction::shell_quote(&source.name),
+        quoted_channel = crate::install_transaction::shell_quote(signed_channel)
     );
     Ok(())
 }
@@ -2385,6 +2387,31 @@ mod tests {
         .unwrap();
         verify_source_channel(&jetson, "jetson-test").unwrap();
         assert!(verify_source_channel(&jetson, "stable").is_err());
+    }
+
+    #[test]
+    fn channel_hint_command_keeps_each_name_one_shell_word() {
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "team releases", "publisher_dids": ["did:key:fixture"], "channel": "stable"
+        }))
+        .unwrap();
+        let error = verify_source_channel(&source, "team's canary")
+            .unwrap_err()
+            .to_string();
+        let command = error
+            .split_once("run: ")
+            .and_then(|(_, rest)| rest.strip_suffix(", then try again."))
+            .unwrap_or_else(|| panic!("{error}"));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("elastos() {{ printf '%s\\n' \"$@\"; }}\n{command}"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "source\nswitch-channel\nteam releases\nteam's canary\n"
+        );
     }
 
     #[test]
@@ -5214,7 +5241,7 @@ mod tests {
                 assert!(
                     error.to_string().contains("differs from trusted source")
                         && error.to_string().contains(
-                            "run: elastos source switch-channel default canary, then try again"
+                            "run: elastos source switch-channel 'default' 'canary', then try again"
                         ),
                     "{error:#}"
                 );

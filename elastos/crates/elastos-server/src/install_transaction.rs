@@ -1397,9 +1397,14 @@ impl InstallTransaction {
     }
 }
 
+/// Quote a value as one POSIX shell word, so a printed command pastes as shown.
+pub(crate) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Quote a path so a repair command pastes into a POSIX shell for any path.
 pub(crate) fn shell_quote_path(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    shell_quote(&path.display().to_string())
 }
 
 fn check_directory(path: &Path) -> anyhow::Result<()> {
