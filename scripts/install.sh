@@ -961,7 +961,8 @@ login_profile() {
 # a single name, so the line cannot land in another file such as Runtime data.
 # Only new bytes are written, at the end, in one write; its inode, mode, owner,
 # ACL and existing content stay. A failed or short write is cut back to the
-# original size. Otherwise the profile is left unchanged and this returns 1.
+# original size and this returns 1 (profile unchanged); if even that cut fails,
+# it returns 2 and the profile may end in part of the line.
 append_login_profile_line() {
     python3 -I - "$@" <<'PY_LOGIN_PROFILE'
 import os
@@ -987,7 +988,10 @@ try:
         except OSError:
             written = -1
         if written != len(new):
-            os.ftruncate(fd, size)
+            try:
+                os.ftruncate(fd, size)
+            except OSError:
+                sys.exit(2)
             sys.exit(1)
     finally:
         os.close(fd)
@@ -1009,7 +1013,12 @@ add_install_dir_to_login_profile() {
     if [[ -f "$profile" ]] && grep -qxF -- "$line" "$profile"; then
         return 0
     fi
-    if ! append_login_profile_line "$profile" "$line"; then
+    local status=0
+    append_login_profile_line "$profile" "$line" || status=$?
+    if [[ "$status" -eq 2 ]]; then
+        warn "Could not finish adding a line to $(display_path "$profile"); open it, delete its last line if it is cut short, then add this line yourself: $(path_export_line)"
+        return 0
+    elif [[ "$status" -ne 0 ]]; then
         warn "Left $(display_path "$profile") unchanged because it is linked to another file, is not your own plain file or could not be changed; so new terminals find elastos, add this line to it yourself: $(path_export_line)"
         return 0
     fi
