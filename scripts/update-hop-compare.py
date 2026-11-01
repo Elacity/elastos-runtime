@@ -3500,48 +3500,53 @@ def cli_run(config, output, local_rehearsal=None):
         result["paths"]["m2-discovery"]["checks"][CLI_UBUNTU_CASE] = evidence
         processes.roots[str(home_path / ".local/bin/elastos")] = {
             manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("new", CLI_SYSTEM_PHASE)}
-        inherited = os.umask(0o002)
-        try:
-            for path in shared:
-                path.mkdir(mode=0o775)
-                need(path.stat().st_mode & 0o777 == 0o775, "Ubuntu layout fixture is not group-writable")
-            phase("new")
-            reply = install(home_path, "ubuntu-install", "new")
-            need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
-                 + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
-            setup(home_path, "ubuntu-setup", "new")
-            verify(home_path, "new", "ubuntu-version", fresh=True)
-            prepare(home_path, "ubuntu", "new")
-            env = cli_environment(home_path)
-            env["ELASTOS_CARRIER_MDNS"] = "0"
-            opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
-            env["PATH"] = str(opener.parent) + ":" + env["PATH"]
-            processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
-            process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home")
+
+        def as_user(run, *args):
+            # The person's commands run with umask 002; the harness's own fixture writes keep 077.
+            inherited = os.umask(0o002)
             try:
-                status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
-                while ready is None and process.poll() is None and time.monotonic() < deadline:
-                    status = cli_private_json(status_path) if status_path.exists() else {}
-                    if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
-                        ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
-                    else:
-                        time.sleep(.2)
-                need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
-                     + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
-                evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
+                return run(*args)
             finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                evidence["home_exit"] = process.wait(timeout=35)
-            need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
-            phase(CLI_SYSTEM_PHASE)
-            reply = command(home_path, ["update"], "ubuntu-update")
-            need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
-                 + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
-            verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
-            need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
+                os.umask(inherited)
+
+        for path in shared:
+            path.mkdir(mode=0o775)
+            path.chmod(0o775)
+        phase("new")
+        reply = as_user(install, home_path, "ubuntu-install", "new")
+        need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
+             + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
+        as_user(setup, home_path, "ubuntu-setup", "new")
+        verify(home_path, "new", "ubuntu-version", fresh=True)
+        prepare(home_path, "ubuntu", "new")
+        env = cli_environment(home_path)
+        env["ELASTOS_CARRIER_MDNS"] = "0"
+        opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
+        env["PATH"] = str(opener.parent) + ":" + env["PATH"]
+        processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
+        process = as_user(processes.spawn, [str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home")
+        try:
+            status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
+            while ready is None and process.poll() is None and time.monotonic() < deadline:
+                status = cli_private_json(status_path) if status_path.exists() else {}
+                if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
+                    ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
+                else:
+                    time.sleep(.2)
+            need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
+                 + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
+            evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
         finally:
-            os.umask(inherited)
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            evidence["home_exit"] = process.wait(timeout=35)
+        need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
+        phase(CLI_SYSTEM_PHASE)
+        reply = as_user(command, home_path, ["update"], "ubuntu-update")
+        need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
+             + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
+        verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
+        need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
         evidence.update(status="passed", update={"from": manifest["new"]["version"], "to": manifest[CLI_SYSTEM_PHASE]["version"]})
 
     try:
