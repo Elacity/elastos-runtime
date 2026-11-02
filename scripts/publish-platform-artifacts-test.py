@@ -17,6 +17,8 @@ import unittest
 
 PUBLISHER = Path(__file__).resolve().with_name("publish-release.sh")
 CHECKER = PUBLISHER.with_name("components-release-integrity-check.py")
+# create_capsule_tar output for the fixed tree in test_capsule_archive_is_portable_and_reproducible.
+CAPSULE_ARCHIVE_SHA256 = "4a1a13e15b080d0382892a3ebfc1b99aa19c365f513b4a304bcc8d69da41f426"
 spec = importlib.util.spec_from_file_location("components_integrity", CHECKER)
 integrity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(integrity)
@@ -329,6 +331,12 @@ touch "$TEST_FALSE_SUCCESS"
                 path.chmod(0o755 if path.is_dir() or path.name.startswith("launch") else 0o600)
             pack(archives[1])
             self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+            # The same bytes on every build worker: the gzip member uses stored
+            # deflate blocks, never the host's compressor (Apple's libz on macOS 15
+            # and Linux zlib differ). This digest is checked on the Mac pre-push
+            # gate and on Linux CI.
+            self.assertEqual(hashlib.sha256(archives[0].read_bytes()).hexdigest(), CAPSULE_ARCHIVE_SHA256)
+            self.assertEqual(archives[0].read_bytes()[:10], b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
             with tarfile.open(archives[0]) as archive:
                 entries = archive.getmembers()
                 self.assertEqual([e.name for e in entries], sorted(e.name for e in entries))

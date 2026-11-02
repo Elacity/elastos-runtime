@@ -617,10 +617,12 @@ create_capsule_tar() {
     local stage_root="$2"
     local capsule_name="$3"
     python3 - "$archive" "$stage_root" "$capsule_name" <<'PY'
-import gzip
+import io
 from pathlib import Path
+import struct
 import sys
 import tarfile
+import zlib
 
 archive, stage_root, capsule_name = sys.argv[1:]
 
@@ -639,12 +641,25 @@ def normalize(info):
     )
     return info
 
-# tarfile sorts recursive entries. The gzip header must also be independent
-# of the output filename and wall clock, on both macOS and Linux.
+# tarfile sorts recursive entries.
+tar = io.BytesIO()
+with tarfile.open(fileobj=tar, mode="w", format=tarfile.PAX_FORMAT) as package:
+    package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+data = tar.getvalue()
+
+# Universal assets must be byte-identical on every build worker. The host's
+# deflate (zlib on Linux, Apple's libz on macOS 15) emits different bytes for
+# the same input, so the gzip member is written here with stored (uncompressed)
+# deflate blocks: fixed header without name or time, blocks of at most 65535
+# bytes, then CRC-32 and length. Any gzip reader accepts it.
 with open(archive, "wb") as output:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+    output.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for index, chunk in enumerate(chunks):
+        last = index == len(chunks) - 1
+        output.write(bytes([1 if last else 0]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF))
+        output.write(chunk)
+    output.write(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
 PY
 }
 
