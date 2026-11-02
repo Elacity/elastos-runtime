@@ -299,5 +299,5 @@ the resulting composition end to end.
 
 Protected content is off by default in 0.8.0. Home shows its surfaces only
 after `elastos config set protected_content true`.
-[#388](https://github.com/Elacity/elastos-runtime/issues/388) owns the rebuild
+[#388](https://github.com/elastos/elastos-runtime/issues/388) owns the rebuild
 after 0.8.0, its ordered proof and its acceptance.

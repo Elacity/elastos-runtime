@@ -65,7 +65,7 @@ bootstrap: its Carrier node ID is the `node_id` in the head profile's
 refuse Chat to and from it (the refusal logs at debug: `Community bootstrap
 endpoints carry discovery metadata only`). This happens when a test network
 was created from a person's own Home. Progress on letting participants serve
-as bootstrap: [#324](https://github.com/Elacity/elastos-runtime/issues/324).
+as bootstrap: [#324](https://github.com/elastos/elastos-runtime/issues/324).
 
 To confirm, compare the Home's `carrier: isolated <did> (port <port>)` log
 line, whose did:key encodes the node ID, with the `node_id` in the network

@@ -2,7 +2,7 @@
 
 Each top-level ledger has one job:
 
-- [GitHub issues](https://github.com/Elacity/elastos-runtime/issues): current behavior, known gaps and open work
+- [GitHub issues](https://github.com/elastos/elastos-runtime/issues): current behavior, known gaps and open work
 - [ROADMAP.md](../ROADMAP.md): future direction
 - [elastos/CHANGELOG.md](../elastos/CHANGELOG.md): released history
 - [PRINCIPLES.md](../PRINCIPLES.md): decision constraints

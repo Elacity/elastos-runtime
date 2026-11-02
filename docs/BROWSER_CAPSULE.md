@@ -1,7 +1,7 @@
 # Browser Capsule Architecture
 
 > Architecture target, not current shipped behavior. For current proof level see
-> [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+> [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 The shared wire definitions and version rules are in
 [Browser contract](BROWSER_PROTOCOL.md). Device roles, resource requirements and
@@ -1068,7 +1068,7 @@ approved remote Engine through Runtime and Carrier. The guest input hash permits
 reuse while its recipe, locked dependencies and build options remain identical.
 In 0.8.0, Browser is available on Apple Silicon Macs only; Linux ARM64
 (Jetson) and Linux x86-64 Homes do not show it. Jetson support is tracked in
-[#90](https://github.com/Elacity/elastos-runtime/issues/90).
+[#90](https://github.com/elastos/elastos-runtime/issues/90).
 
 The first installed journey covers Home sign-in, a decoded WebRTC page,
 navigate/type/scroll/click/reload, Close and profile reopen. Repeat that journey

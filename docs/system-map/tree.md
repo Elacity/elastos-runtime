@@ -2,7 +2,7 @@
 
 This map names stable responsibility areas in this source tree. Exact install
 membership comes from [`components.json`](../../components.json), current truth
-from [GitHub issues](https://github.com/Elacity/elastos-runtime/issues), and supported contracts from the linked
+from [GitHub issues](https://github.com/elastos/elastos-runtime/issues), and supported contracts from the linked
 documentation. This file must not be used as release evidence.
 
 The [layered C4 model](c4.md) owns the system diagrams. This file owns the path

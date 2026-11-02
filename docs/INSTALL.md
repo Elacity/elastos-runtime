@@ -18,7 +18,7 @@ An enabled Terminal runs commands with the host user's rights.
 The [data, keys and backups](#data-keys-and-backups) section explains current
 host access and the protection target for hosted and locked self-hosted Homes.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -346,10 +346,10 @@ in place, and stay connected to the network Home updates over.
    it was finishing, and a System update that stopped while it was replacing an
    app. The command a message names then stops with the same message every
    time. Do not delete or move any files. Ask for help in
-   [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) and
+   [GitHub issues](https://github.com/elastos/elastos-runtime/issues) and
    include the output of `elastos --version` and the exact message. We are
    fixing this in a later update
-   ([#108](https://github.com/Elacity/elastos-runtime/issues/108)).
+   ([#108](https://github.com/elastos/elastos-runtime/issues/108)).
 
 A Home with an installed update controller keeps its controller Runtime and
 private receipt in the data directory. The controller of the version that runs
@@ -483,7 +483,7 @@ The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+from the version label or a successful setup. [Install/update acceptance](https://github.com/elastos/elastos-runtime/issues/89)
 owns exact public-manifest parity evidence.
 
 ## Remove ElastOS
@@ -527,7 +527,7 @@ material; keep it under your own control.
 
 Use hosted accounts only for public demos. Keep wallets, private data and
 recovery material on your own device until
-[hosted protection](https://github.com/Elacity/elastos-runtime/issues/209) passes
+[hosted protection](https://github.com/elastos/elastos-runtime/issues/209) passes
 its acceptance gate. The seed operator can read hosted data, wallet keys and
 recovery phrases stored on the seed. Host-side encryption with keys stored
 beside the data leaves those secrets accessible to that operator.

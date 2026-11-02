@@ -20,7 +20,7 @@ approval of the contact.
 Use these documents as the sources of truth:
 
 - [Principles](../PRINCIPLES.md): stable implementation constraints.
-- [GitHub issues](https://github.com/Elacity/elastos-runtime/issues): verified behavior, known limitations and open work.
+- [GitHub issues](https://github.com/elastos/elastos-runtime/issues): verified behavior, known limitations and open work.
 - [Architecture](ARCHITECTURE.md): trust boundaries and component ownership.
 - [Capsule model](CAPSULE_MODEL.md): package, execution, and isolation model.
 - [Capsule authoring](CAPSULE_AUTHORING.md): checked manifest and template path.

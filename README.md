@@ -5,7 +5,7 @@ authority of each caller before allowing an effect. People sign in to Home
 with passkeys.
 
 For release history, see [elastos/CHANGELOG.md](elastos/CHANGELOG.md).
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own current
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues) own current
 acceptance and verification. A source checkout and a published installation have
 separate artifact identities and verification records.
 
@@ -28,12 +28,12 @@ The seed operator can read hosted data, wallet keys and recovery material.
 Passkeys control sign-in; stored data and keys remain accessible to the Runtime
 account and root while Home is locked. Protection against hosted operators and
 root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+is the target of [hosted protection](https://github.com/elastos/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/elastos/elastos-runtime/issues/210).
 An unlocked self-hosted Home trusts its owner and their host software. Recovery
 from a stolen device or profile key requires a new identity.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -122,8 +122,8 @@ admission is a separate, node-local verification decision. See the
 
 ## Status and verification
 
-Use [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for current
-behavior, known gaps and proof. [Install and update #89](https://github.com/Elacity/elastos-runtime/issues/89)
+Use [GitHub issues](https://github.com/elastos/elastos-runtime/issues) for current
+behavior, known gaps and proof. [Install and update #89](https://github.com/elastos/elastos-runtime/issues/89)
 owns installed release acceptance. A source checkout and a published install
 have separate artifact identities; source checks alone do not prove installed
 product or Browser support.
@@ -148,7 +148,7 @@ elastos-runtime/
 
 - [Getting started](docs/GETTING_STARTED.md): install, build, and create a capsule
 - [Documentation map](docs/README.md): complete guide and contract index
-- [Isolation plan](https://github.com/Elacity/elastos-runtime/issues/173): current boundaries and acceptance gates
+- [Isolation plan](https://github.com/elastos/elastos-runtime/issues/173): current boundaries and acceptance gates
 - [Principles](PRINCIPLES.md): decision constraints
 - [Architecture](docs/ARCHITECTURE.md): trust and responsibility boundaries
 - [Capsule authoring](docs/CAPSULE_AUTHORING.md): supported Component and web-projection paths

@@ -87,7 +87,7 @@ The owning issue keeps one record, edited in place, with these six items:
 
 ## Creating Work Branches
 
-Every task branch uses [develop](https://github.com/Elacity/elastos-runtime/tree/develop)
+Every task branch uses [develop](https://github.com/elastos/elastos-runtime/tree/develop)
 as its base and PR target unless the owning issue names another base. This is
 standing approval; do not ask for each task. Fetch the current base before
 branching. If the base moves, check compatibility before merging; history

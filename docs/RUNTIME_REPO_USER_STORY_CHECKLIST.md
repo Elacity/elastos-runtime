@@ -3,7 +3,7 @@
 This checklist defines evidence to collect; it does not declare that a check
 passed.
 
-Current behavior, known limitations and open work belong in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Release history belongs in
+Current behavior, known limitations and open work belong in [GitHub issues](https://github.com/elastos/elastos-runtime/issues). Release history belongs in
 [elastos/CHANGELOG.md](../elastos/CHANGELOG.md).
 
 ## Proof rules
@@ -120,7 +120,7 @@ provider evidence pass together.
 
 The bounded Browser claim and its restart, login-retention,
 profile-protection, and performance limitations are recorded in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Do not advertise general-purpose, cross-platform, or
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues). Do not advertise general-purpose, cross-platform, or
 arbitrary-dapp Browser reliability without the matching acceptance evidence.
 
 ## Release gate
