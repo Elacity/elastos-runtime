@@ -1,0 +1,93 @@
+{
+  "source_commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+  "source_tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+  "scope": "Isolated Node fixtures; no installed Browser or hardware acceptance.",
+  "node_version": "v26.5.0",
+  "script_sha256": "193451d9b254219957b878e9b6511ef5e1cf722c294650d7beb4777677f6b30b",
+  "mutations": {
+    "strict": "Prefix the extracted VM script with use strict.",
+    "strict-with-bindings": "Also inject the two exact production let declarations: datachannelSendGeneration and datachannelSendDisplay."
+  },
+  "files": {
+    "capsules/browser/browser/browser-clipboard.js": "65a6414c04cf920af6143228a7b2a29aa5ee914c9d974ffc8b856f10861e1ce7",
+    "capsules/browser/browser/browser-clipboard.test.mjs": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+    "capsules/browser/browser/browser-input.js": "203ae4076c3fde7a5ae67d639b2541f57c80844bbad2b3d2a556b8e05b1fcf0a",
+    "capsules/browser/browser/browser-input-surface.js": "6e309de7a164b2b7efbe64788206f10f775497693487eb205c80bdd30b8b9084",
+    "capsules/browser/browser/browser-input-surface.test.mjs": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+    "capsules/browser/browser/browser-page-cleanup.js": "7cd522948a051b03077900737a0977dcfc329a55bc459176845d064ca7e05d8a",
+    "capsules/browser/browser/browser.js": "7556888d2eb166914e19731a5cfa6ee7182728497cd2839664417d233b733748",
+    "scripts/browser-input-ordering.test.mjs": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278"
+  },
+  "runs": [
+    {
+      "name": "pinned-v2",
+      "command": [
+        "node",
+        "--test",
+        "capsules/browser/browser/browser-clipboard.test.mjs",
+        "capsules/browser/browser/browser-input-surface.test.mjs",
+        "scripts/browser-input-ordering.test.mjs"
+      ],
+      "fixture_test_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+      "exit_code": 0,
+      "elapsed_seconds": 4.593,
+      "counts": {
+        "tests": 71,
+        "pass": 71,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "log": "root-browser-delta-pinned-v2.log",
+      "log_sha256": "7b7b4fece383525932664649fd5e4543d8baa83679ac046f6edfc77b5ee2db8d"
+    },
+    {
+      "name": "strict-v2",
+      "command": [
+        "node",
+        "--test",
+        "capsules/browser/browser/browser-clipboard.test.mjs",
+        "capsules/browser/browser/browser-input-surface.test.mjs",
+        "scripts/browser-input-ordering.test.mjs"
+      ],
+      "fixture_test_sha256": "a0da0ccd28f2e4201f1035ea4d660312179d4835828cfc5f5ad80fe358bd6fda",
+      "exit_code": 1,
+      "elapsed_seconds": 1.407,
+      "counts": {
+        "tests": 71,
+        "pass": 56,
+        "fail": 15,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "log": "root-browser-delta-strict-v2.log",
+      "log_sha256": "732c9c7758e7382251b95f90f2971482e08fe55ae2180cfd44ad13d2448562f3"
+    },
+    {
+      "name": "strict-with-bindings-v2",
+      "command": [
+        "node",
+        "--test",
+        "capsules/browser/browser/browser-clipboard.test.mjs",
+        "capsules/browser/browser/browser-input-surface.test.mjs",
+        "scripts/browser-input-ordering.test.mjs"
+      ],
+      "fixture_test_sha256": "36c56f0ac242d730d3311c0283c52194f8fd3568cb685a291a7d5ac50bea0527",
+      "exit_code": 0,
+      "elapsed_seconds": 4.587,
+      "counts": {
+        "tests": 71,
+        "pass": 71,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      },
+      "log": "root-browser-delta-strict-with-bindings-v2.log",
+      "log_sha256": "a379283d78f453b5a55be1462ad2f793150e007f889d421601423e452f5c47e4"
+    }
+  ],
+  "temporary_fixture_removed": true
+}

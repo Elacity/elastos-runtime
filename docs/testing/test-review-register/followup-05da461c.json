@@ -1,0 +1,2643 @@
+{
+  "schema": "elastos.test-audit.postpin-review/v1",
+  "owner": "https://github.com/Elacity/elastos-runtime/issues/194",
+  "source": {
+    "candidate": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+    "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+    "previous_candidate": "460b1888d344f52cebd1c25866be88ff4085f035",
+    "relation": "2 commits ahead; supplemental review, excluded from the 460b census"
+  },
+  "files": [
+    {
+      "path": "capsules/browser/browser/browser-clipboard.js",
+      "sha256": "65a6414c04cf920af6143228a7b2a29aa5ee914c9d974ffc8b856f10861e1ce7",
+      "lines": 424,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+      "sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+      "lines": 382,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/browser-input-surface.js",
+      "sha256": "6e309de7a164b2b7efbe64788206f10f775497693487eb205c80bdd30b8b9084",
+      "lines": 623,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+      "sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+      "lines": 311,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/browser-remote-display.js",
+      "sha256": "dc51f427fd81b04f1495517834619157c73e47e28d57478d889f106b8012b08d",
+      "lines": 1427,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/browser.js",
+      "sha256": "7556888d2eb166914e19731a5cfa6ee7182728497cd2839664417d233b733748",
+      "lines": 2866,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "capsules/browser/browser/index.html",
+      "sha256": "31a2e3eb3f07bc175a67514c1f71e0ca3ea11de2f301ef7dc4bced2884ed53e7",
+      "lines": 115,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "scripts/browser-input-ordering.test.mjs",
+      "sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+      "lines": 496,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    },
+    {
+      "path": "scripts/browser-text-select-smoke.mjs",
+      "sha256": "390373048a7c30b76c5201edb50b41dfe6e9d7a04579d6a27156cad8fa088d85",
+      "lines": 137,
+      "scope": "Complete changed hunks read; test files, clipboard bridge, input surface and text-select smoke read fully; browser.js dispatcher/barrier state and remote-display bind/close/connection/getter contexts read. index.html cache references reconciled."
+    }
+  ],
+  "counts": {
+    "expanded_registrations": 71,
+    "declarations": 54,
+    "test_files": 3,
+    "changed_files": 9,
+    "dispositions": {
+      "retain": 26,
+      "improve": 45
+    }
+  },
+  "reviews": [
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::accepts exactly 65,536 UTF-8 bytes and rejects one byte more",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 132,
+        "end_line": 146,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "e42b42a63e50f15d4162d2c0e05f8fca6dbb9ce3032f928e9d0d42fd828c61c2"
+      },
+      "kind": "node-static-registration",
+      "name": "accepts exactly 65,536 UTF-8 bytes and rejects one byte more",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The multibyte boundary and one-byte-over control distinguish UTF-8 byte limits from character counts.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep exact boundary and one-byte-over controls."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::canonical base64 decoding is strict and bounded",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 148,
+        "end_line": 156,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "982051c5c31619c6e832c132f1d7f37f0f9dadda2bf69e1a01d21ef795ed9084"
+      },
+      "kind": "node-static-registration",
+      "name": "canonical base64 decoding is strict and bounded",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Independent malformed, noncanonical padding-bit and invalid UTF-8 vectors exercise decoding errors.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep these distinct decoding vectors; upstream-message branch coverage is separate."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::unsolicited remote Clipboard content cannot write the host Clipboard",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 158,
+        "end_line": 167,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "14b4a6bd9838711b53cc8d04fa475487cec80d741eabd63527b6306fd98be881"
+      },
+      "kind": "node-static-registration",
+      "name": "unsolicited remote Clipboard content cannot write the host Clipboard",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Both complete and chunked unsolicited inputs are delivered and the host-write observer stays empty.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep both encodings and the host-write observation."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::explicit local copy binds remote content to one exact Home request",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 169,
+        "end_line": 197,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "ede0fb6c4c62f0d8567b2f1a4ee828d2f13c96e7a8d978a0fd1fd71a7ceb32f3"
+      },
+      "kind": "node-static-registration",
+      "name": "explicit local copy binds remote content to one exact Home request",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Before-read refusal, exact two guest commands, request ID, text and duplicate delivery are observed.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the exact dispatch/request/value sequence; real Home approval is separate acceptance."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::copy success is reported only after the matching Home request succeeds",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 199,
+        "end_line": 216,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "a453d7a7ee973ad3749a5c9895740f5517321d50a6e23e283fa5f2c255cb962d"
+      },
+      "kind": "node-static-registration",
+      "name": "copy success is reported only after the matching Home request succeeds",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "A held write promise distinguishes status before and after completion.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the pending-then-resolved observer and add separate Home failure coverage when editing this journey."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::a repeated copy while one is pending is ignored quietly without duplicate guest effects",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 218,
+        "end_line": 224,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "b964225263421aeab2ce1497f47c555ba03eeecd18829e2fb0acaa197f3513af"
+      },
+      "kind": "node-static-registration",
+      "name": "a repeated copy while one is pending is ignored quietly without duplicate guest effects",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The changed behavior checks only the pre-read phase and send count.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Repeat during read wait and held Home write; assert exact command sequence, single request identity and eventual result."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-CLIPBOARD-CONTROLS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::upstream Selkies clipboard reply completes a pending copy",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 231,
+        "end_line": 237,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "c6f8e2018f7489bc917be7d16540fd704a99cbd043bff5a566ed59f266585ccd"
+      },
+      "kind": "node-static-registration",
+      "name": "upstream Selkies clipboard reply completes a pending copy",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The new wire shape delivers exact Unicode text once to the attributed Home request with success status.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the independent upstream-shaped message and exact output."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::unsolicited upstream clipboard pushes are ignored",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 239,
+        "end_line": 249,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "61d9b06cdd3105eb463f0c69daffed27faf450897f3067c59b172ff698bf3fdc"
+      },
+      "kind": "node-static-registration",
+      "name": "unsolicited upstream clipboard pushes are ignored",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The same valid wire format is refused before intent/read and accepted after read, giving a positive control.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the three distinct stages; real guest reply correlation remains an integration boundary."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::oversized or malformed upstream clipboard replies are refused",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 251,
+        "end_line": 261,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "4cb79557a4781b9f093f9c07ead11e700e78b02354a13a744bbb8427834c264a"
+      },
+      "kind": "node-static-registration",
+      "name": "oversized or malformed upstream clipboard replies are refused",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "Malformed/absent/oversized inputs leave host writes empty and a valid subsequent message proves recovery.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Split invalid vectors into named independent fixtures; include invalid UTF-8, noncanonical base64, post-timeout and pending-host cases for this wire branch."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-CLIPBOARD-CONTROLS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::replacement page ownership rejects stale remote Clipboard content",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 263,
+        "end_line": 269,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "6ae2bd4513f416d200739086d878bc8ad44132e4a8c713c5849e71669024ee2f"
+      },
+      "kind": "node-static-registration",
+      "name": "replacement page ownership rejects stale remote Clipboard content",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "A changed page ID between copy intent and valid delivery prevents the observed host write.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Retain this scoped page-ID case; existing private lifecycle acceptance remains separate."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::copy intent timeout clears state and allows a later request",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 271,
+        "end_line": 280,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "b1861efd624a1127cbee2a5a8a6d751513c875765f18788dff6d9e643de82a17"
+      },
+      "kind": "node-static-registration",
+      "name": "copy intent timeout clears state and allows a later request",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The fake timer proves timeout status and permits another send, but does not finish that later request.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Deliver the late old response and complete the fresh request with exact request and write assertions."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-CLIPBOARD-CONTROLS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::malformed, oversized, non-text, and invalid UTF-8 messages cannot write",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 282,
+        "end_line": 296,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "f5f83c984e0e7f8b154af03d63896abaeaabd811042f3cc37747782979710ea0"
+      },
+      "kind": "node-static-registration",
+      "name": "malformed, oversized, non-text, and invalid UTF-8 messages cannot write",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Each invalid message uses a fresh pending intent and observes the host-write boundary.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep isolated vectors and teardown; pair with the valid complete-message control."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::bounded chunk assembly writes once for an explicit local copy",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 298,
+        "end_line": 312,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "bbcdc7a3911538411234da258254bbdfdc4042fa5801f98c95bfaba2fb690066"
+      },
+      "kind": "node-static-registration",
+      "name": "bounded chunk assembly writes once for an explicit local copy",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Uneven chunks reconstruct exact Unicode text, and a duplicate end produces no second write.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the reconstructed bytes and duplicate-end observation."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::chunk count, per-chunk bytes, total bytes, and MIME remain bounded",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 314,
+        "end_line": 345,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "d07301d8f5aebfbbfc47c146d021aafbc00b609d2a1c2256e0eb0177f0f67ef4"
+      },
+      "kind": "node-static-registration",
+      "name": "chunk count, per-chunk bytes, total bytes, and MIME remain bounded",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "All four negative stages share an intent and only a final empty-write assertion; some overflowing payloads are also invalid complete base64.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Use fresh fixtures and valid-at-the-boundary payloads with one invalid dimension; add accepted limit controls and a valid recovery message."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-CLIPBOARD-CONTROLS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::teardown clears assembly and cancels an active Home write",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 347,
+        "end_line": 363,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "25164d5fa5e03cd69f33a5f94b881bb5671a33433318896ab4a10c81c36fb3e3"
+      },
+      "kind": "node-static-registration",
+      "name": "teardown clears assembly and cancels an active Home write",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The case holds a complete-message host write, observes cancellation and suppresses late status; it does not create a chunk assembly.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Add a separate started-assembly teardown and late-chunk case; preserve the held-write cancellation case and private lifecycle checks."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-CLIPBOARD-CONTROLS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-clipboard.test.mjs::host paste remains Runtime-mediated and bounded",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-clipboard.test.mjs",
+        "line": 365,
+        "end_line": 382,
+        "file_sha256": "a223b518a83e9102c1f8ccec0664482389bfe5601fe25900b95295edb193eb02",
+        "body_sha256": "cecc4fd037742c6021e9981d77b1ba5a977ebd522065326fab1c4e3be121028c"
+      },
+      "kind": "node-static-registration",
+      "name": "host paste remains Runtime-mediated and bounded",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "Exact multibyte boundary text reaches the Runtime operation once; oversized input rejects with the send count unchanged.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the actual bridge and exact Runtime request."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::explicit ClipboardEvent accepts only text/plain",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 21,
+        "end_line": 40,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "b7d0dcd8a685108d99ecf623c7aff18d654701205c1dd7c2338f675fb5d5890e"
+      },
+      "kind": "node-static-registration",
+      "name": "explicit ClipboardEvent accepts only text/plain",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::missing or malformed ClipboardEvent data is rejected",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 42,
+        "end_line": 56,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "2a0490f700cd1de867220ed57645c6cfaf3078db903aace49575b5a0887bf709"
+      },
+      "kind": "node-static-registration",
+      "name": "missing or malformed ClipboardEvent data is rejected",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::mouse event encodes as one Selkies held-button or release message",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 140,
+        "end_line": 143,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "6e02fc6c48b06fa74d9441e0cca843766fe0de785aecdac3be7bf18e37c26e98"
+      },
+      "kind": "node-static-registration",
+      "name": "mouse event encodes as one Selkies held-button or release message",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::a drag stays with its page: a replaced page ends it without sending to the replacement",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 145,
+        "end_line": 156,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "11bf9197d0713dc09da8e96b3ce099162b6f2fb61f89ae129eeae3f329ffc25d"
+      },
+      "kind": "node-static-registration",
+      "name": "a drag stays with its page: a replaced page ends it without sending to the replacement",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "Replacement behavior is useful, but the fixture uses object-reference ownership and duplicates the production release guard in its fake.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Add composition with actual runtimePageOwner/sameRuntimePageOwner and release dispatch; distinguish page ID, cleanup handle and generation, including equal-owner fresh objects."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-OWNER-INTEGRATION"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::a move after page replacement ends the drag, and a fresh gesture on the new page works",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 158,
+        "end_line": 178,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "47e836dca8725ce8037715a2b0c9591815aba1b6a99113e46b27c8bb280ffaed"
+      },
+      "kind": "node-static-registration",
+      "name": "a move after page replacement ends the drag, and a fresh gesture on the new page works",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "Replacement behavior is useful, but the fixture uses object-reference ownership and duplicates the production release guard in its fake.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Add composition with actual runtimePageOwner/sameRuntimePageOwner and release dispatch; distinguish page ID, cleanup handle and generation, including equal-owner fresh objects."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-OWNER-INTEGRATION"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::blur after page replacement retires the drag without a replacement-page release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 180,
+        "end_line": 188,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "012eb414d1bf01823e074c9886218f8aad874934c2f2d9af8312528fc1ade98e"
+      },
+      "kind": "node-static-registration",
+      "name": "blur after page replacement retires the drag without a replacement-page release",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "Replacement behavior is useful, but the fixture uses object-reference ownership and duplicates the production release guard in its fake.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Add composition with actual runtimePageOwner/sameRuntimePageOwner and release dispatch; distinguish page ID, cleanup handle and generation, including equal-owner fresh objects."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-OWNER-INTEGRATION"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::datachannel mouse drag sends press, frame-throttled moves, release, and no click",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 190,
+        "end_line": 209,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "a0d85ad839f3c50977ac2875b792e0a8f1a8199482dde5ae1373cd2246c6feea"
+      },
+      "kind": "node-static-registration",
+      "name": "datachannel mouse drag sends press, frame-throttled moves, release, and no click",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::a press without movement keeps the Runtime click",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 211,
+        "end_line": 218,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "138e8e89eda293f9f4f8463ebe1783d145a017d73a5de20bbf2662559e4b1181"
+      },
+      "kind": "node-static-registration",
+      "name": "a press without movement keeps the Runtime click",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::pointercancel during a drag sends the release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 220,
+        "end_line": 230,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "1195789a25752bee0aac76fae12ecf43db98342c852c7640f330de8e966dbb5e"
+      },
+      "kind": "node-static-registration",
+      "name": "pointercancel during a drag sends the release",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::lostpointercapture during a drag sends the release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 240,
+        "end_line": 250,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "14d1d05cf708e81e5053a74ef30f07c1bf4c85a75c3bf8abf7fb65aac4de2d5c"
+      },
+      "kind": "node-static-registration",
+      "name": "lostpointercapture during a drag sends the release",
+      "parameters": {
+        "name": "lostpointercapture",
+        "end": {
+          "$function": "ArrowFunctionExpression",
+          "line": 233
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::window blur during a drag sends the release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 240,
+        "end_line": 250,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "14d1d05cf708e81e5053a74ef30f07c1bf4c85a75c3bf8abf7fb65aac4de2d5c"
+      },
+      "kind": "node-static-registration",
+      "name": "window blur during a drag sends the release",
+      "parameters": {
+        "name": "window blur",
+        "end": {
+          "$function": "ArrowFunctionExpression",
+          "line": 234
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::pagehide during a drag sends the release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 240,
+        "end_line": 250,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "14d1d05cf708e81e5053a74ef30f07c1bf4c85a75c3bf8abf7fb65aac4de2d5c"
+      },
+      "kind": "node-static-registration",
+      "name": "pagehide during a drag sends the release",
+      "parameters": {
+        "name": "pagehide",
+        "end": {
+          "$function": "ArrowFunctionExpression",
+          "line": 235
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::hidden tab during a drag sends the release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 240,
+        "end_line": 250,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "14d1d05cf708e81e5053a74ef30f07c1bf4c85a75c3bf8abf7fb65aac4de2d5c"
+      },
+      "kind": "node-static-registration",
+      "name": "hidden tab during a drag sends the release",
+      "parameters": {
+        "name": "hidden tab",
+        "end": {
+          "$function": "ArrowFunctionExpression",
+          "line": 236
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::a visible-tab visibilitychange does not end the drag",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 252,
+        "end_line": 259,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "080160f392b6fc5a9544f8ed8cbb67d6b30d6a09c99a0f1bc22d87de5bc6aca4"
+      },
+      "kind": "node-static-registration",
+      "name": "a visible-tab visibilitychange does not end the drag",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::a drag leaving the video clamps to its edge",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 261,
+        "end_line": 272,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "a48047c2b5d689827c02e50eccbca2dd40fe9d76fab2692f54a52046986ce650"
+      },
+      "kind": "node-static-registration",
+      "name": "a drag leaving the video clamps to its edge",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::queued moves of an ended drag are stale",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 274,
+        "end_line": 281,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "89b3acb18b019ce68a5dfb0b147cb4134e6257452222d5fdbbbb04e1475d3dbe"
+      },
+      "kind": "node-static-registration",
+      "name": "queued moves of an ended drag are stale",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::Runtime-route input falls back to today's click without drag messages",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 283,
+        "end_line": 291,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "0494bc91ea6ea2d3b56d6e9f479e35a4c03192e541da6fc2d7ba4139b8057c06"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime-route input falls back to today's click without drag messages",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::touch pan and non-primary buttons do not start a mouse drag",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 293,
+        "end_line": 299,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "91602c40ad57be2f54c35d936e236a4841e721af26e11474bd7d80342e161968"
+      },
+      "kind": "node-static-registration",
+      "name": "touch pan and non-primary buttons do not start a mouse drag",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The body supplies a right mouse button only; its name also claims touch-pan coverage.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Add explicit touch/pen vectors or narrow the name to the tested non-primary mouse button."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-TOUCH-VECTOR"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "capsules/browser/browser/browser-input-surface.test.mjs::Cmd+A and Ctrl+A send the guest Ctrl+A select-all",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "capsules/browser/browser/browser-input-surface.test.mjs",
+        "line": 301,
+        "end_line": 311,
+        "file_sha256": "bbb1e276a7b11c49d3acd655a372a0f9abe0ba46790e509d35e96b90b600f30f",
+        "body_sha256": "e0a74d6d5ed71af98b87ba73253976e763a10b8faa61cfc44d6d612bfd4c5379"
+      },
+      "kind": "node-static-registration",
+      "name": "Cmd+A and Ctrl+A send the guest Ctrl+A select-all",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "retain",
+        "reason": "The actual input surface processes the named event sequence and checks the resulting input values or stale/capture state.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep this scoped input-surface behavior check; the fake target/channel does not prove guest delivery."
+        ]
+      },
+      "finding_ids": [],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::rapid r/e/d waits for each Runtime ack and preserves the observed recovered suffix",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 96,
+        "end_line": 109,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "58f38f3c1592eef49643290336f09524ae0e089c05818d1edabc20554a437f69"
+      },
+      "kind": "node-static-registration",
+      "name": "rapid r/e/d waits for each Runtime ack and preserves the observed recovered suffix",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Backspace dispatch waits behind unresolved Runtime text",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 117,
+        "end_line": 126,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "c3401d16fc5d1e4a3c31aa05869c58fd4268791ec8c8ddce888ab9b79e5c7221"
+      },
+      "kind": "node-static-registration",
+      "name": "Backspace dispatch waits behind unresolved Runtime text",
+      "parameters": {
+        "event": {
+          "type": "key",
+          "key": "Backspace"
+        },
+        "name": "Backspace",
+        "messages": [
+          "kd,65288",
+          "ku,65288"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Enter dispatch waits behind unresolved Runtime text",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 117,
+        "end_line": 126,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "c3401d16fc5d1e4a3c31aa05869c58fd4268791ec8c8ddce888ab9b79e5c7221"
+      },
+      "kind": "node-static-registration",
+      "name": "Enter dispatch waits behind unresolved Runtime text",
+      "parameters": {
+        "event": {
+          "type": "key",
+          "key": "Enter"
+        },
+        "name": "Enter",
+        "messages": [
+          "kd,65293",
+          "ku,65293"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Drag press dispatch waits behind unresolved Runtime text",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 117,
+        "end_line": 126,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "c3401d16fc5d1e4a3c31aa05869c58fd4268791ec8c8ddce888ab9b79e5c7221"
+      },
+      "kind": "node-static-registration",
+      "name": "Drag press dispatch waits behind unresolved Runtime text",
+      "parameters": {
+        "event": {
+          "type": "mouse",
+          "x": 15,
+          "y": 20,
+          "buttons": 1
+        },
+        "name": "Drag press",
+        "messages": [
+          "m,15,20,1,0"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Drag release dispatch waits behind unresolved Runtime text",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 117,
+        "end_line": 126,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "c3401d16fc5d1e4a3c31aa05869c58fd4268791ec8c8ddce888ab9b79e5c7221"
+      },
+      "kind": "node-static-registration",
+      "name": "Drag release dispatch waits behind unresolved Runtime text",
+      "parameters": {
+        "event": {
+          "type": "mouse",
+          "x": 30,
+          "y": 20,
+          "buttons": 0
+        },
+        "name": "Drag release",
+        "messages": [
+          "m,30,20,0,0"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Select all dispatch waits behind unresolved Runtime text",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 117,
+        "end_line": 126,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "c3401d16fc5d1e4a3c31aa05869c58fd4268791ec8c8ddce888ab9b79e5c7221"
+      },
+      "kind": "node-static-registration",
+      "name": "Select all dispatch waits behind unresolved Runtime text",
+      "parameters": {
+        "event": {
+          "type": "key_combo",
+          "keysyms": [
+            65507,
+            97
+          ]
+        },
+        "name": "Select all",
+        "messages": [
+          "kd,65507",
+          "kd,97",
+          "ku,97",
+          "ku,65507"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::click completion precedes paste_text at the Engine",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 131,
+        "end_line": 141,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "320835be564f5fe16d602d45a658c8d86345955bd6c913f2952bc6c0229bde35"
+      },
+      "kind": "node-static-registration",
+      "name": "click completion precedes paste_text at the Engine",
+      "parameters": {
+        "events": [
+          {
+            "type": "click",
+            "x": 15,
+            "y": 20
+          },
+          {
+            "type": "paste_text",
+            "text": "B"
+          }
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::paste_text completion precedes click at the Engine",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 131,
+        "end_line": 141,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "320835be564f5fe16d602d45a658c8d86345955bd6c913f2952bc6c0229bde35"
+      },
+      "kind": "node-static-registration",
+      "name": "paste_text completion precedes click at the Engine",
+      "parameters": {
+        "events": [
+          {
+            "type": "paste_text",
+            "text": "B"
+          },
+          {
+            "type": "click",
+            "x": 15,
+            "y": 20
+          }
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::uncertain click delivery cancels queued text instead of inserting into an unknown focus",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 143,
+        "end_line": 150,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "226532447dad38a3d93e47d89567076667792dd17746906b292e15416656f2eb"
+      },
+      "kind": "node-static-registration",
+      "name": "uncertain click delivery cancels queued text instead of inserting into an unknown focus",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::multiple Runtime text and paste operations each await their predecessor",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 152,
+        "end_line": 164,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "256170faf28746fd6c8d4766c50244371c991ba713c1f5d3be5e58dfeb1b5a11"
+      },
+      "kind": "node-static-registration",
+      "name": "multiple Runtime text and paste operations each await their predecessor",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::generation change discards waiting input and ignores late success",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "generation change discards waiting input and ignores late success",
+      "parameters": {
+        "change": "generation",
+        "outcome": "success"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::generation change discards waiting input and ignores late error",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "generation change discards waiting input and ignores late error",
+      "parameters": {
+        "change": "generation",
+        "outcome": "error"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::page change discards waiting input and ignores late success",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "page change discards waiting input and ignores late success",
+      "parameters": {
+        "change": "page",
+        "outcome": "success"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::page change discards waiting input and ignores late error",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "page change discards waiting input and ignores late error",
+      "parameters": {
+        "change": "page",
+        "outcome": "error"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::cleanup change discards waiting input and ignores late success",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "cleanup change discards waiting input and ignores late success",
+      "parameters": {
+        "change": "cleanup",
+        "outcome": "success"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::cleanup change discards waiting input and ignores late error",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 168,
+        "end_line": 191,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "9d31b143bbb0a8c3bbee7441ddb9442ca55a0ca5ebe8738c88fed9d08dd6712d"
+      },
+      "kind": "node-static-registration",
+      "name": "cleanup change discards waiting input and ignores late error",
+      "parameters": {
+        "change": "cleanup",
+        "outcome": "error"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::closing the page discards queued input and late response mutations",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 195,
+        "end_line": 206,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "55801ed215a4af3305992b5a91de58dd261a1c96b475e2fc24f1a0bcf3b8c86d"
+      },
+      "kind": "node-static-registration",
+      "name": "closing the page discards queued input and late response mutations",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::late old-owner success leaves the replacement owner's active queue intact",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 208,
+        "end_line": 226,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "097f6e272117bdf1e55d50dcecce39a0ad1e934f129d1c834ff1927381434c0a"
+      },
+      "kind": "node-static-registration",
+      "name": "late old-owner success leaves the replacement owner's active queue intact",
+      "parameters": {
+        "outcome": "success"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::late old-owner error leaves the replacement owner's active queue intact",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 208,
+        "end_line": 226,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "097f6e272117bdf1e55d50dcecce39a0ad1e934f129d1c834ff1927381434c0a"
+      },
+      "kind": "node-static-registration",
+      "name": "late old-owner error leaves the replacement owner's active queue intact",
+      "parameters": {
+        "outcome": "error"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::uncertain dispatch failure abandons queued dependents without replay; fresh input can proceed",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 228,
+        "end_line": 248,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "0ae5b49a4ba9e325f169763cd735ab31128db63127f90eb623d7a95d9b560393"
+      },
+      "kind": "node-static-registration",
+      "name": "uncertain dispatch failure abandons queued dependents without replay; fresh input can proceed",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::known missing page starts cleanup once and rejects original failure while abandoning queued input",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 250,
+        "end_line": 276,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "32a07c353dda232f702ffede2a153b4d6b6507dc762824e3b8be2f11b9359da3"
+      },
+      "kind": "node-static-registration",
+      "name": "known missing page starts cleanup once and rejects original failure while abandoning queued input",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::synchronous data-channel failure also abandons inputs already behind it",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 278,
+        "end_line": 291,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "3602a79979f1e4237dac4a142588022fbccb480d1792814457b589829a04f293"
+      },
+      "kind": "node-static-registration",
+      "name": "synchronous data-channel failure also abandons inputs already behind it",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::actual clipboard bridge reads and writes after an acknowledged queued copy",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 293,
+        "end_line": 353,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "3f25fd553c6ae1f28c27f1a7140fa65d01bc40ea8bccfb96dc1ff287e68055c3"
+      },
+      "kind": "node-static-registration",
+      "name": "actual clipboard bridge reads and writes after an acknowledged queued copy",
+      "parameters": {
+        "outcome": "success"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::actual clipboard bridge cannot continue a canceled queued copy",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 293,
+        "end_line": 353,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "3f25fd553c6ae1f28c27f1a7140fa65d01bc40ea8bccfb96dc1ff287e68055c3"
+      },
+      "kind": "node-static-registration",
+      "name": "actual clipboard bridge cannot continue a canceled queued copy",
+      "parameters": {
+        "outcome": "failure"
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::128 pending inputs are bounded; overflow preserves accepted order and capacity returns after ack",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 355,
+        "end_line": 375,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "135353af8856a47cb329a24cdd4f3885664fa55a2894c84c782ab5dfdb0c9db7"
+      },
+      "kind": "node-static-registration",
+      "name": "128 pending inputs are bounded; overflow preserves accepted order and capacity returns after ack",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime text after a drag release waits for the datachannel settle barrier",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 383,
+        "end_line": 393,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "f152127b2c13ea71f317e4a0ecea2c8d3cdf5823a91186716603e506f8068a4d"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime text after a drag release waits for the datachannel settle barrier",
+      "parameters": {
+        "name": "drag release",
+        "first": {
+          "type": "mouse",
+          "x": 30,
+          "y": 20,
+          "buttons": 0
+        },
+        "messages": [
+          "m,30,20,0,0"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime text after a Cmd+A select-all waits for the datachannel settle barrier",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 383,
+        "end_line": 393,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "f152127b2c13ea71f317e4a0ecea2c8d3cdf5823a91186716603e506f8068a4d"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime text after a Cmd+A select-all waits for the datachannel settle barrier",
+      "parameters": {
+        "name": "Cmd+A select-all",
+        "first": {
+          "type": "key_combo",
+          "keysyms": [
+            65507,
+            97
+          ]
+        },
+        "messages": [
+          "kd,65507",
+          "kd,97",
+          "ku,97",
+          "ku,65507"
+        ]
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime text with no preceding datachannel input has no barrier delay",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 395,
+        "end_line": 401,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "42b3fdc4b733128f0658c79bc8bddb89e1753c0dcf2147652912bd5db764769f"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime text with no preceding datachannel input has no barrier delay",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::a buffered datachannel holds Runtime text until it drains and settles",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 403,
+        "end_line": 416,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "a0c7637bfe768c57685b3d5e261db72ab600d23c1dacde135666c6320e89d793"
+      },
+      "kind": "node-static-registration",
+      "name": "a buffered datachannel holds Runtime text until it drains and settles",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::a datachannel that never drains fails the barrier visibly instead of reordering",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 418,
+        "end_line": 425,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "e7d5b0bc05616bd45b5696cd00d3dd82c62fe36bab81c38b2f278a348cad7750"
+      },
+      "kind": "node-static-registration",
+      "name": "a datachannel that never drains fails the barrier visibly instead of reordering",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::a stalled Runtime request does not hold the drag release",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 427,
+        "end_line": 436,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "da0d3a9508c6f710f7ca60298aabe50c0ed9d3da362fb1c816022a85a9a70ee9"
+      },
+      "kind": "node-static-registration",
+      "name": "a stalled Runtime request does not hold the drag release",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime text after a direct drag release waits for its drain and settle",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 438,
+        "end_line": 448,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "e9d418d59ae97b30f0a2aa7ce78a21558060b9d61f5016798a5206c662b0a1a3"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime text after a direct drag release waits for its drain and settle",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::a drag release for a replaced page is dropped, not sent to the replacement",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 450,
+        "end_line": 455,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "8ab8d98254a1d9a996124c38b0d29d8d78e4386014ab4002afa52d6ab53cb716"
+      },
+      "kind": "node-static-registration",
+      "name": "a drag release for a replaced page is dropped, not sent to the replacement",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel closes with bytes pending",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 460,
+        "end_line": 478,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "09d627b7388a3d9908d167d954ed38fc544b7c1d56a3c7c416e320963dd5f8cd"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime input is refused, not settled, when the channel closes with bytes pending",
+      "parameters": {
+        "name": "closes",
+        "lose": {
+          "$function": "ArrowFunctionExpression",
+          "line": 458
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Bind and replace a real remote-display fixture channel so the production generation update, rather than a manually incremented counter, drives refusal; observe bounded completion and a fresh successful request. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS",
+        "POSTPIN-CHANNEL-INTEGRATION"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel reconnects on the same page with bytes pending",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 460,
+        "end_line": 478,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "09d627b7388a3d9908d167d954ed38fc544b7c1d56a3c7c416e320963dd5f8cd"
+      },
+      "kind": "node-static-registration",
+      "name": "Runtime input is refused, not settled, when the channel reconnects on the same page with bytes pending",
+      "parameters": {
+        "name": "reconnects on the same page",
+        "lose": {
+          "$function": "ArrowFunctionExpression",
+          "line": 459
+        }
+      },
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Bind and replace a real remote-display fixture channel so the production generation update, rather than a manually incremented counter, drives refusal; observe bounded completion and a fresh successful request. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS",
+        "POSTPIN-CHANNEL-INTEGRATION"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "scripts/browser-input-ordering.test.mjs::settle starts at the observed drain, not at the first check",
+      "source": {
+        "commit": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+        "tree": "cfef92b9db42be4d5fdabdcbf550579f37e9e519",
+        "path": "scripts/browser-input-ordering.test.mjs",
+        "line": 480,
+        "end_line": 496,
+        "file_sha256": "ffc4d4061982c03f9f99ad2a4d990760b942741f2f6c5a33aaa033472e2f9278",
+        "body_sha256": "dad5d47d054970d3ca7a57aa424dd11ece6372bd00b801b6461b6814d3c3f42b"
+      },
+      "kind": "node-static-registration",
+      "name": "settle starts at the observed drain, not at the first check",
+      "parameters": {},
+      "review": {
+        "method": "manual-full-body-and-local-fixture",
+        "body_read": true,
+        "disposition": "improve",
+        "reason": "The named FIFO/dispatch/settlement behavior has explicit request/effect assertions, but extracted production functions run in a non-strict VM missing two production lexical declarations.",
+        "scope": "All three test files and their local fixtures were directly read; actual clipboard/input surface/encoder and owner helper were read fully. Browser dispatcher and remote-display changes were read in their relevant enclosing functions. No full Browser transitive/hardware acceptance.",
+        "actions": [
+          "Keep the behavior oracle; execute the complete module boundary or preserve strict mode and all required state declarations. The strict control fails 15 of the 36 ordering cases until the two declarations are restored. Treat local-buffer timing as a heuristic; guest application/order needs a separate end-to-end oracle. Prefer an injected monotonic clock over elapsed wall-clock sleeps."
+        ]
+      },
+      "finding_ids": [
+        "POSTPIN-STRICT-HARNESS"
+      ],
+      "execution": {
+        "receipt": "followup-execution-05da461c.json",
+        "run": "pinned-v2",
+        "result": "pass"
+      }
+    }
+  ],
+  "standalone_review": {
+    "path": "scripts/browser-text-select-smoke.mjs",
+    "body_read": true,
+    "disposition": "improve",
+    "reason": "The added host-write and status assertions check actual UI event wiring into the bridge. The Runtime/datachannel/Home implementations are fixture stand-ins; the channel records encoded strings, not guest-selected text. The second-copy surface error callback is a no-op, so the assertion observes bridge statuses only.",
+    "action": "Retain this DOM wiring smoke; capture every surface status, and add a separate real guest-selection/Home-approval journey with exact installed candidate evidence. Preserve browser-close cleanup and include late page errors in the final outcome.",
+    "execution": "Source-only for this smoke in this follow-up; no installed/browser launch claimed."
+  },
+  "findings": [
+    {
+      "id": "POSTPIN-STRICT-HARNESS",
+      "severity": "P2",
+      "title": "Preserve production strict mode and state in the ordering harness",
+      "evidence": "Pinned71/71 pass; strict-only56/71 pass with missing lexical bindings; strict plus the two exact declarations71/71 pass. This is a test harness defect, not a demonstrated production failure.",
+      "affected_ids": [
+        "scripts/browser-input-ordering.test.mjs::rapid r/e/d waits for each Runtime ack and preserves the observed recovered suffix",
+        "scripts/browser-input-ordering.test.mjs::Backspace dispatch waits behind unresolved Runtime text",
+        "scripts/browser-input-ordering.test.mjs::Enter dispatch waits behind unresolved Runtime text",
+        "scripts/browser-input-ordering.test.mjs::Drag press dispatch waits behind unresolved Runtime text",
+        "scripts/browser-input-ordering.test.mjs::Drag release dispatch waits behind unresolved Runtime text",
+        "scripts/browser-input-ordering.test.mjs::Select all dispatch waits behind unresolved Runtime text",
+        "scripts/browser-input-ordering.test.mjs::click completion precedes paste_text at the Engine",
+        "scripts/browser-input-ordering.test.mjs::paste_text completion precedes click at the Engine",
+        "scripts/browser-input-ordering.test.mjs::uncertain click delivery cancels queued text instead of inserting into an unknown focus",
+        "scripts/browser-input-ordering.test.mjs::multiple Runtime text and paste operations each await their predecessor",
+        "scripts/browser-input-ordering.test.mjs::generation change discards waiting input and ignores late success",
+        "scripts/browser-input-ordering.test.mjs::generation change discards waiting input and ignores late error",
+        "scripts/browser-input-ordering.test.mjs::page change discards waiting input and ignores late success",
+        "scripts/browser-input-ordering.test.mjs::page change discards waiting input and ignores late error",
+        "scripts/browser-input-ordering.test.mjs::cleanup change discards waiting input and ignores late success",
+        "scripts/browser-input-ordering.test.mjs::cleanup change discards waiting input and ignores late error",
+        "scripts/browser-input-ordering.test.mjs::closing the page discards queued input and late response mutations",
+        "scripts/browser-input-ordering.test.mjs::late old-owner success leaves the replacement owner's active queue intact",
+        "scripts/browser-input-ordering.test.mjs::late old-owner error leaves the replacement owner's active queue intact",
+        "scripts/browser-input-ordering.test.mjs::uncertain dispatch failure abandons queued dependents without replay; fresh input can proceed",
+        "scripts/browser-input-ordering.test.mjs::known missing page starts cleanup once and rejects original failure while abandoning queued input",
+        "scripts/browser-input-ordering.test.mjs::synchronous data-channel failure also abandons inputs already behind it",
+        "scripts/browser-input-ordering.test.mjs::actual clipboard bridge reads and writes after an acknowledged queued copy",
+        "scripts/browser-input-ordering.test.mjs::actual clipboard bridge cannot continue a canceled queued copy",
+        "scripts/browser-input-ordering.test.mjs::128 pending inputs are bounded; overflow preserves accepted order and capacity returns after ack",
+        "scripts/browser-input-ordering.test.mjs::Runtime text after a drag release waits for the datachannel settle barrier",
+        "scripts/browser-input-ordering.test.mjs::Runtime text after a Cmd+A select-all waits for the datachannel settle barrier",
+        "scripts/browser-input-ordering.test.mjs::Runtime text with no preceding datachannel input has no barrier delay",
+        "scripts/browser-input-ordering.test.mjs::a buffered datachannel holds Runtime text until it drains and settles",
+        "scripts/browser-input-ordering.test.mjs::a datachannel that never drains fails the barrier visibly instead of reordering",
+        "scripts/browser-input-ordering.test.mjs::a stalled Runtime request does not hold the drag release",
+        "scripts/browser-input-ordering.test.mjs::Runtime text after a direct drag release waits for its drain and settle",
+        "scripts/browser-input-ordering.test.mjs::a drag release for a replaced page is dropped, not sent to the replacement",
+        "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel closes with bytes pending",
+        "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel reconnects on the same page with bytes pending",
+        "scripts/browser-input-ordering.test.mjs::settle starts at the observed drain, not at the first check"
+      ]
+    },
+    {
+      "id": "POSTPIN-OWNER-INTEGRATION",
+      "severity": "P2",
+      "title": "Compose actual owner and release logic in drag replacement fixtures",
+      "affected_ids": [
+        "capsules/browser/browser/browser-input-surface.test.mjs::a drag stays with its page: a replaced page ends it without sending to the replacement",
+        "capsules/browser/browser/browser-input-surface.test.mjs::a move after page replacement ends the drag, and a fresh gesture on the new page works",
+        "capsules/browser/browser/browser-input-surface.test.mjs::blur after page replacement retires the drag without a replacement-page release"
+      ]
+    },
+    {
+      "id": "POSTPIN-CHANNEL-INTEGRATION",
+      "severity": "P2",
+      "title": "Observe channel generation through production binding",
+      "affected_ids": [
+        "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel closes with bytes pending",
+        "scripts/browser-input-ordering.test.mjs::Runtime input is refused, not settled, when the channel reconnects on the same page with bytes pending"
+      ]
+    },
+    {
+      "id": "POSTPIN-CLIPBOARD-CONTROLS",
+      "severity": "P2",
+      "title": "Add independent phase and boundary controls to clipboard tests",
+      "affected_ids": [
+        "capsules/browser/browser/browser-clipboard.test.mjs::a repeated copy while one is pending is ignored quietly without duplicate guest effects",
+        "capsules/browser/browser/browser-clipboard.test.mjs::oversized or malformed upstream clipboard replies are refused",
+        "capsules/browser/browser/browser-clipboard.test.mjs::copy intent timeout clears state and allows a later request",
+        "capsules/browser/browser/browser-clipboard.test.mjs::chunk count, per-chunk bytes, total bytes, and MIME remain bounded",
+        "capsules/browser/browser/browser-clipboard.test.mjs::teardown clears assembly and cancels an active Home write"
+      ]
+    },
+    {
+      "id": "POSTPIN-TOUCH-VECTOR",
+      "severity": "P3",
+      "title": "Make the touch-pan claim match its supplied events",
+      "affected_ids": [
+        "capsules/browser/browser/browser-input-surface.test.mjs::touch pan and non-primary buttons do not start a mouse drag"
+      ]
+    }
+  ],
+  "execution_receipt": {
+    "file": "followup-execution-05da461c.json",
+    "sha256": "7529a8074a11da7c8e29f331b037456d553380b96a93a2b142576bfb557b0ef8",
+    "private_original_sha256": "7529a8074a11da7c8e29f331b037456d553380b96a93a2b142576bfb557b0ef8"
+  },
+  "limitations": [
+    "This separately pinned follow-up does not change earlier body hashes or imply a new exhaustive census.",
+    "Private clipboard lifecycle findings retain their existing private evidence and acceptance ownership.",
+    "No Rust, VM, installed Home, clipboard permission, native guest or hardware/media journey executed."
+  ]
+}
