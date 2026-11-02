@@ -157,6 +157,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -165,6 +166,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import zlib
 from types import SimpleNamespace
 
 
@@ -1834,7 +1836,9 @@ def cli_previous_members(archive, prefix, destination):
 
 def cli_capsule_archive(folder, name):
     """A capsule archive as releases build it (publish-release.sh create_capsule_tar), from
-    the files setup extracted, without setup's cache receipts."""
+    the files setup extracted, without setup's cache receipts. Returns each encoding a
+    release may have used: the stored-deflate gzip of 2.0.0-rc.2 and later, then the host
+    deflate of earlier releases; the caller keeps the one the signed descriptor names."""
     def normalize(info):
         if Path(info.name).name in CLI_HOME_CACHE:
             return None
@@ -1843,11 +1847,20 @@ def cli_capsule_archive(folder, name):
         info.pax_headers = {}
         info.mode = 0o777 if info.issym() else (0o755 if info.isdir() or info.mode & 0o111 else 0o644)
         return info
-    output = io.BytesIO()
-    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            package.add(folder, arcname=name, filter=normalize)
-    return output.getvalue()
+    tar = io.BytesIO()
+    with tarfile.open(fileobj=tar, mode="w", format=tarfile.PAX_FORMAT) as package:
+        package.add(folder, arcname=name, filter=normalize)
+    data = tar.getvalue()
+    stored = io.BytesIO()
+    stored.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for index, chunk in enumerate(chunks):
+        stored.write(bytes([1 if index == len(chunks) - 1 else 0]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF) + chunk)
+    stored.write(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
+    deflated = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=deflated, mtime=0) as compressed:
+        compressed.write(data)
+    return [stored.getvalue(), deflated.getvalue()]
 
 
 def cli_previous_layout(output, release, component_platform, artifact, executable, receipt):
@@ -2002,9 +2015,9 @@ def cli_install_previous_release(home_path, output, pin_path=None):
         installed, name = cli_path(data, selected["install_path"]), "artifacts/" + selected["release_path"]
         if not selected.get("extract_path"):
             return take(installed, name, selected["checksum"].removeprefix("sha256:"))
-        raw = cli_capsule_archive(installed, selected["extract_path"])
-        need(len(raw) == selected["size"] and "sha256:" + hashlib.sha256(raw).hexdigest() == selected["checksum"],
-             name + " differs from its signed hash")
+        raw = next((candidate for candidate in cli_capsule_archive(installed, selected["extract_path"])
+                    if len(candidate) == selected["size"] and "sha256:" + hashlib.sha256(candidate).hexdigest() == selected["checksum"]), None)
+        need(raw is not None, name + " differs from its signed hash")
         target = cli_path(output, name)
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         target.write_bytes(raw)
