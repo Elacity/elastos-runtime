@@ -2,11 +2,12 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync } from "node:fs";
 import vm from "node:vm";
+import { ownerRecoveryCommand } from "../capsules/home/browser/owner-recovery-command.js";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const source = readFileSync(new URL("../capsules/home/browser/shell-auth.js", import.meta.url), "utf8")
-  .replace(/^import\s*\{[\s\S]*?\}\s*from\s*"[^"]+";\n/, "")
+  .replace(/^import\s*\{[\s\S]*?\}\s*from\s*"[^"]+";\n/gm, "")
   .replace(/export /g, "");
 const key = "elastos.home.pending-registration/v1";
 const grant = { schema: "elastos.auth.passkey.verify/v2", principal_id: "owner",
@@ -15,7 +16,7 @@ const recoveryBundle = { schema: "elastos.full-recovery-bundle/v1", principal_id
   people_identity: { profile_authority_bundle: { signed_profile: "fixture-profile-material" } } };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function fixture({ guest = false, purpose = "create", terminalLoss = false } = {}) {
+function fixture({ guest = false, purpose = "create", terminalLoss = false, ownerRecovery = false } = {}) {
   const values = new Map();
   const requests = [];
   const writes = [];
@@ -50,6 +51,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
     };
     let opened = null;
     const context = vm.createContext({
+      ownerRecoveryCommand, location: { origin: "https://home.test", hostname: "home.test" },
       document: { querySelector: element, getElementById: id => element("#" + id), body: element("body") },
       window: { PublicKeyCredential: {}, location: { protocol: "https:" }, sessionStorage: storage, atob, btoa,
         addEventListener() {}, clearTimeout() {}, setTimeout() {}, setInterval() { return 1; }, clearInterval() {} },
@@ -65,10 +67,21 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
           response: { clientDataJSON: new Uint8Array([2]).buffer, authenticatorData: new Uint8Array([3]).buffer,
             signature: new Uint8Array([4]).buffer, userHandle: null } };
       } } },
-      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, atob, btoa,
+      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, AbortController, AbortSignal, atob, btoa,
       setHomeAuthorityToken() {}, clearHomeAuthorityToken() {},
       async fetchJson(path, options = {}) {
         requests.push({ path, options });
+        if (path.startsWith("/api/auth/owner-recovery/")) {
+          assert.equal(options.method, "POST");
+          assert.equal(options.headers["x-elastos-owner-recovery"], "terminal-code");
+          if (path.endsWith("/begin")) return { schema: "elastos.auth.passkey.register.begin/v1", ceremony_id: "recovery",
+            options: { publicKey: { challenge: "AQ", user: { id: "AQ" }, excludeCredentials: [] } } };
+          const request = JSON.parse(options.body);
+          assert.deepEqual(Object.keys(request).sort(), ["bundle", "ceremony_id", "response"]);
+          assert.equal(request.ceremony_id, "recovery");
+          if (responseMode === "rejected") { const error = Error("not accepted"); error.status = 403; throw error; }
+          return grant;
+        }
         if (path === "/api/auth/recovery/status") return { principal_id: "owner", localhost_root: "temporary-root" };
         if (path === "/api/auth/recovery/full-import") {
           assert.equal(options.headers["x-elastos-home-token"], grant.home_token);
@@ -83,7 +96,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
         if (path === "/api/auth/sessions/refresh") return grant;
         if (path === "/api/apps/home/summary") return { authority: { signed_in: true },
           identity: { profile_readiness: { status: "ready" }, profile: { display_name: "Original Person" } } };
-        if (path.endsWith("/status")) return { registered: guest || verified,
+        if (path.endsWith("/status")) return { registered: guest || verified || ownerRecovery,
           owner_setup_pending: !guest && verified && !terminalLoss && !acknowledged, guest_registration_enabled: guest };
         if (path.includes("/authenticate/")) return path.endsWith("/begin")
           ? { options: { publicKey: { challenge: "AQ", allowCredentials: [] } } } : grant;
@@ -114,13 +127,13 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
         return grant;
       },
     });
-    vm.runInContext(source + "\nglobalThis.fixture = { showHomeUnlock, bindHomeUnlock, runPasskeyCreate, selectRecoveryKit };", context);
+    vm.runInContext(source + "\nglobalThis.fixture = { showHomeUnlock, bindHomeUnlock, runPasskeyCreate, runOwnerRecovery, selectRecoveryKit };", context);
     const api = context.fixture;
     api.bindHomeUnlock();
     const onOpen = (response, flow) => { opened = JSON.parse(JSON.stringify({ response, flow })); };
     return { element, api, opened: () => opened, async show() { await api.showHomeUnlock(onOpen); },
       async selectKit(bundle = recoveryBundle) {
-        element("#home-recovery-file").files = [{ size: 100, text: async () => JSON.stringify(bundle) }];
+        element("#home-recovery-file").files = [{ name: "my-recovery-kit.json", size: 100, text: async () => JSON.stringify(bundle) }];
         await api.selectRecoveryKit();
       },
       async choose() {
@@ -279,11 +292,15 @@ for (const raw of ["{", "x".repeat(65537), JSON.stringify({ schema: key, home_to
   assert.deepEqual(next.opened(), { response: grant, flow: { enrollmentPurpose: "create" } });
 }
 
-for (const guest of [false, true]) for (const reason of ["cancelled", "timed out"]) {
+for (const guest of [false, true]) for (const [name, reason] of [["NotAllowedError", "cancelled"], ["AbortError", "timed out"]]) {
   const f = fixture({ guest }), home = f.reload();
   await home.show(); await home.choose();
-  f.afterCreate(() => { const error = Error(reason); error.name = "NotAllowedError"; throw error; });
-  await assert.rejects(home.api.runPasskeyCreate(), new RegExp(reason));
+  f.afterCreate(() => { const error = Error(reason); error.name = name; throw error; });
+  await assert.rejects(home.api.runPasskeyCreate(), error => {
+    assert.match(error.message, /^No passkey was saved\. .*Windows Hello.*security key\. Then choose Resume setup\.$/);
+    assert.doesNotMatch(error.message, new RegExp(reason));
+    return true;
+  });
   const pending = JSON.parse(f.values.get(key));
   assert.equal(pending.ceremony_id, null);
   assert.equal(pending.response, null);
@@ -313,6 +330,7 @@ for (const guest of [false, true]) for (const reason of ["cancelled", "timed out
   create.checked = true; create.emit("change");
   assert.equal(home.element("#home-unlock-name").hidden, false);
   assert.doesNotMatch(home.element("#home-unlock-copy").textContent, /Recovery Kit/);
+  assert.match(home.element("#home-unlock-copy").textContent, /saved on this computer, a phone or a security key/);
 }
 for (const field of ["ceremony", "id", "rawId", "clientDataJson", "attestationObject", "name", "c1-start", "c1-end", "extra"]) {
   const f = fixture(), home = f.reload();
@@ -408,6 +426,8 @@ for (const stage of ["before-begin", "after-create"]) {
   assert.equal(f.creates(), 0, "kit without Profile started a passkey");
   const encrypted = { schema: "elastos.full-recovery-bundle.package/v1", ciphertext: "fixture-secret-ciphertext" };
   await home.selectKit(encrypted);
+  assert.match(home.element("#home-unlock-status").textContent, /^Kit selected: my-recovery-kit\.json\. Enter its password/,
+    "the cleared picker says No file chosen, so the status names the accepted kit");
   await home.api.runPasskeyCreate();
   assert.equal(f.creates(), 0, "empty password started a passkey");
   assert.match(home.element("#home-unlock-status").textContent, /Enter.*password/);
@@ -448,8 +468,8 @@ for (const stage of ["before-begin", "after-create"]) {
 {
   const f = fixture({ purpose: "recover" }), home = f.reload();
   await home.show(); await home.choose();
-  f.afterCreate(() => { throw Error("Passkey cancelled"); });
-  await assert.rejects(home.api.runPasskeyCreate(), /cancelled/);
+  f.afterCreate(() => { const error = Error("Passkey cancelled"); error.name = "NotAllowedError"; throw error; });
+  await assert.rejects(home.api.runPasskeyCreate(), { name: "NotAllowedError", message: "Passkey cancelled" });
   assert.equal(home.element("#home-unlock-primary").textContent, "Choose Recovery Kit");
   assert.equal(f.requests.filter(r => r.path === "/api/auth/recovery/full-import").length, 0);
   assert.equal(home.opened(), null);
@@ -461,6 +481,41 @@ for (const peopleStatus of ["absent", "incomplete"]) {
     people_identity_restore: { status: peopleStatus }, wallet_restore: { status: "complete" }, runtime_audit: { status: "complete" } }));
   await assert.rejects(home.api.runPasskeyCreate(), /Profile/);
   assert.equal(home.opened(), null, "missing signed Profile opened a replacement account");
+}
+
+// Owner who lost every passkey, guest registration off: the sign-in screen
+// offers recovery with the terminal code and the Recovery Kit.
+for (const outcome of ["accepted", "rejected"]) {
+  const f = fixture({ purpose: "recover", ownerRecovery: true }), home = f.reload();
+  await home.show();
+  assert.equal(home.element("#home-unlock-secondary").hidden, true, "guest registration stays off");
+  assert.equal(home.element("#home-owner-recovery-code").hidden, true);
+  home.element("#home-recover-owner").emit("click");
+  assert.equal(home.element("#home-unlock-title").textContent, "Recover this Home");
+  assert.match(home.element("#home-unlock-copy").textContent, /elastos identity arm-owner-recovery/);
+  assert.equal(home.element("#home-owner-recovery-code").hidden, false);
+  assert.equal(home.element("#home-owner-recovery-code-label").hidden, false);
+  assert.equal(home.element("#home-recovery-kit").hidden, false);
+  assert.equal(home.element("#home-unlock-primary").textContent, "Choose Recovery Kit");
+  await home.api.runOwnerRecovery();
+  assert.match(home.element("#home-unlock-status").textContent, /code from the terminal/);
+  assert.equal(f.creates(), 0);
+  home.element("#home-owner-recovery-code").value = "terminal-code";
+  await home.selectKit();
+  assert.equal(home.element("#home-unlock-primary").textContent, "Continue with passkey");
+  if (outcome === "rejected") {
+    f.response("rejected");
+    await assert.rejects(home.api.runOwnerRecovery(), /Recovery Kit of this Home's owner/);
+    assert.equal(f.requests.filter(r => r.path === "/api/auth/recovery/full-import").length, 0);
+    assert.equal(home.opened(), null);
+    continue;
+  }
+  await home.api.runOwnerRecovery();
+  assert.equal(f.creates(), 1);
+  assert.ok(f.requests.findIndex(r => r.path === "/api/auth/owner-recovery/complete")
+    < f.requests.findIndex(r => r.path === "/api/auth/recovery/full-import"));
+  assert.equal(home.element("#home-owner-recovery-code").value, "");
+  assert.ok(home.opened());
 }
 
 // Execute the host's actual boot and unlock callback with effects recorded.
@@ -572,7 +627,7 @@ if (process.argv.includes("--browser")) {
       assert(url.pathname.startsWith("/apps/home/"));
       if (name === "home-shell-host.js") {
         return route.fulfill({ contentType: "text/javascript", body: `
-          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-20260802a";
+          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-update-20261003a";
           document.querySelector("#home-shell-boot-mask").hidden = true;
           bindHomeUnlock();
           await showHomeUnlock(() => { throw new Error("Unexpected enrollment dispatch"); });

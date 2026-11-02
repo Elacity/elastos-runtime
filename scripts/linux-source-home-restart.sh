@@ -291,7 +291,7 @@ def validate_installation_receipt(receipt_path, data_dir, gateway, source_root):
 
 def validate_asset_parity(source_root, data_dir):
     result = {}
-    for name in ("home", "services"):
+    for name in ("home", "system"):
         source = source_root / "capsules" / name / "browser" / "index.html"
         installed = data_dir / "capsules" / name / "browser" / "index.html"
         source_hash = sha256_file(source, MAX_PAGE)
@@ -903,7 +903,29 @@ def run_upgrade(gateway, data_dir, home, xdg_data_home, rollback, log_path):
     finally:
         os.close(log_fd)
     if result.returncode != 0:
+        print_last_error_line(log_path, data_dir)
         reject("principal_root_upgrade_failed")
+
+
+def print_last_error_line(log_path, data_dir):
+    # The refusal names the file and the action; show it, nothing else, with
+    # the data directory as <data-dir>. The log keeps the full text.
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 65536))
+            tail = log.read().decode("utf-8", "replace")
+    except OSError:
+        return
+    lines = [line for line in tail.splitlines() if line.startswith("Error:")]
+    if lines:
+        text = lines[-1]
+        data_dir = str(data_dir).rstrip("/")
+        prefixes = {data_dir, os.path.realpath(data_dir)} if data_dir else set()
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            text = text.replace(prefix, "<data-dir>")
+        text = "".join(ch if ch.isprintable() else "?" for ch in text)[:4096]
+        print(f"linux-source-home-restart: {text}", file=sys.stderr)
 
 
 def fetch_page(url):
@@ -966,7 +988,7 @@ def receipt_payload(context, *, ok, dry_run, error=None, process=None, proof=Non
         "data_dir": str(context["data_dir"]),
         "addr": context["addr"],
         "home_url": context["home_url"],
-        "services_url": context["services_url"],
+        "system_url": context["system_url"],
         "gateway_bin": str(context["gateway"]),
         "gateway_bin_sha256": context["installed_runtime_sha256"],
         "installation_receipt_sha256": context["installation_receipt_sha256"],
@@ -1040,7 +1062,7 @@ def build_context(source_root, values, home, xdg, host, port):
         "addr": values.addr,
         "port": port,
         "home_url": f"http://{probe_host}:{port}/home/",
-        "services_url": f"http://{probe_host}:{port}/apps/services/",
+        "system_url": f"http://{probe_host}:{port}/apps/system/",
         "gateway_log": data_dir / "logs" / f"gateway-{stamp}-{os.getpid()}.log",
         "upgrade_log": data_dir / "logs" / f"principal-root-upgrade-{stamp}-{os.getpid()}.json",
         "pid_file": data_dir / "run" / "gateway.pid",
@@ -1138,14 +1160,14 @@ def active_restart(context, wait_seconds):
             gateway,
             addr,
             runtime_hash,
-            [context["home_url"], context["services_url"]],
+            [context["home_url"], context["system_url"]],
             wait_seconds,
         )
         listeners = listener_pids(context["port"])
         if listeners != {pid}:
             reject("exclusive_listener_failed")
         proof = {}
-        for name, (status, body) in zip(("home", "services"), results):
+        for name, (status, body) in zip(("home", "system"), results):
             served_hash = sha256_bytes(body)
             if (
                 status != 200

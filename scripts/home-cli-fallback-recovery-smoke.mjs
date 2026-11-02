@@ -10,6 +10,7 @@ const timers = [];
 let terminalStartCount = 0;
 let activeShellRequestCount = 0;
 let resolveRetriedTerminalStart = null;
+let terminalPolicyRefused = false;
 
 class FakeElement {
   constructor(selector = "") {
@@ -203,6 +204,9 @@ globalThis.fetch = async (url, init = {}) => {
   requests.push({ url: String(url), method: init.method || "GET", headers: init.headers || {}, body });
   if (url === "/api/apps/home-cli/terminal/sessions") {
     terminalStartCount += 1;
+    if (terminalPolicyRefused) {
+      return failedResponse(403, "Web terminal requires host developer mode and closed guest registration.");
+    }
     if (terminalStartCount === 1 || terminalStartCount === 3) {
       return failedResponse(503, "simulated terminal start failure");
     }
@@ -428,5 +432,23 @@ assert(
   "home-cli fallback sent recovery to the wrong parent origin",
   parentMessages,
 );
+
+terminalPolicyRefused = true;
+for (const listener of fallbackRefresh.listeners.get("click") || []) {
+  listener();
+}
+await waitFor(
+  () => output.textContent.includes("Runtime refused web terminal access."),
+  "home-cli did not explain a terminal policy refusal",
+  () => ({ output: output.textContent, requests }),
+);
+assert(output.textContent.includes("developer mode and guest registration"), "home-cli policy refusal lost operator guidance");
+assert(fallbackRefresh.hidden === true, "home-cli offered repeated refresh after a policy refusal");
+assert(fallbackDesktop.hidden === false, "home-cli hid Desktop recovery after a policy refusal");
+assert(document.activeElement === fallbackDesktop, "home-cli policy refusal lost Desktop recovery focus");
+for (const listener of fallbackDesktop.listeners.get("click") || []) {
+  await listener();
+}
+assert(activeShellRequestCount === 3, "home-cli policy refusal blocked the Runtime-owned Desktop recovery");
 
 console.log("[home-cli-fallback-recovery] PASS");

@@ -26,5 +26,13 @@ export function createHomeNavigationClient({ homeToken, homeOrigin, enabled = tr
     unloading = false;
     if (attached()) windowRef.top.postMessage({ type: "home:app-ready", homeToken }, homeOrigin);
   });
-  return { setQuery(value) { query = { ...value }; publish(); } };
+  return {
+    setQuery(value) { query = { ...value }; publish(); },
+    setHomeToken(value) {
+      homeToken = value;
+      requestId = "";
+      sequence = 0;
+      if (attached()) windowRef.top.postMessage({ type: "home:app-ready", homeToken }, homeOrigin);
+    },
+  };
 }

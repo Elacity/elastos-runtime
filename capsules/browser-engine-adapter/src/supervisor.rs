@@ -4,6 +4,20 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// The adapter owns the writer; transient launchers pass only the reader on.
+fn configure_helper_owner(command: &mut Command) -> std::io::Result<()> {
+    use elastos_common::process_lifetime::ParentLifetime;
+    use std::sync::OnceLock;
+    if ParentLifetime::configure_inherited(command)? {
+        return Ok(());
+    }
+    static OWNER: OnceLock<std::io::Result<ParentLifetime>> = OnceLock::new();
+    match OWNER.get_or_init(ParentLifetime::new) {
+        Ok(owner) => owner.configure(command),
+        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+    }
+}
+
 const MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -115,6 +129,8 @@ pub(super) fn run_supervisor_launch(
     if transport.is_none() {
         command.env("ELASTOS_BROWSER_ENGINE_REQUEST", &serialized);
     }
+    configure_helper_owner(&mut command)
+        .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
     let mut child = command
         .spawn()
         .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
@@ -203,15 +219,16 @@ fn kill_and_reap(child: &mut std::process::Child) {
 }
 
 pub(super) fn run_supervisor_prewarm(supervisor: &EngineSupervisorConfig) -> Result<Value, String> {
-    let mut child = Command::new(&supervisor.program)
+    let mut command = Command::new(&supervisor.program);
+    command
         .args(&supervisor.args)
         .envs(&supervisor.env)
         .env("ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(Stdio::piped());
+    configure_helper_owner(&mut command).map_err(|err| err.to_string())?;
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     let deadline = Instant::now() + Duration::from_millis(supervisor.timeout_ms.min(30_000));
     let status = loop {
         match child.try_wait() {
@@ -780,6 +797,7 @@ mod private_request_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn private_request_write_failure_kills_and_reaps_child() {
         let marker = std::env::temp_dir().join(format!(
             "elastos-browser-private-request-{}-{}",
@@ -796,7 +814,7 @@ mod private_request_tests {
             ])
             .arg(&marker)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
@@ -814,9 +832,15 @@ mod private_request_tests {
             );
         }
 
+        // A pipe read end forces a write error independently of inherited readers.
+        let read_end: std::os::fd::OwnedFd = child.stdout.take().unwrap().into();
+        child.stdin = Some(read_end.into());
         let result = write_private_supervisor_request(&mut child, b"private request");
 
-        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("private request write failed"));
         assert!(child.try_wait().unwrap().is_some());
         let _ = fs::remove_file(marker);
     }

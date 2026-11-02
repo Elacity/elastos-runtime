@@ -4,7 +4,7 @@ import {
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
 import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
-import { applyRunEventsPage, parseCursor } from "./model-contract.js";
+import { applyRunEventsPage, parseCursor, newModelRequestId, isExpiredInvocationRefusal } from "./model-contract.js";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
@@ -398,6 +398,7 @@ export function createAssistantApp({
     }
   }
   let offersEpoch = 0;
+  let draftEditVersion = 0;
   let disposed = false;
   let pollInFlight = false;
   const homeClipboard = homeClipboardClientFactory({
@@ -547,6 +548,15 @@ export function createAssistantApp({
     return { response, payload };
   }
 
+  function reconcileSelectedModelHint() {
+    if (state.offersLoading || state.workspaceLoading || state.offersError || state.workspaceError || state.selectedModelCid == null) return;
+    const offer = selectedModelOffer(state.textOffers, state.selectedOfferId, state.selectedModelCid, state.models);
+    if (offer && state.selectedOfferId !== offer.id) {
+      state.selectedOfferId = offer.id;
+      markWorkspaceDirty();
+    }
+  }
+
   async function loadOffers() {
     const epoch = ++offersEpoch;
     state.offersLoading = true;
@@ -589,10 +599,11 @@ export function createAssistantApp({
       return;
     }
     if (
-      !state.workspaceLoading && !state.selectedOfferId
+      !state.workspaceLoading && state.selectedModelCid == null && !state.selectedOfferId
     ) {
       state.selectedOfferId = state.textOffers[0]?.id ?? null;
     }
+    reconcileSelectedModelHint();
     if (
       !state.selectedStudioOfferId
     ) {
@@ -630,6 +641,7 @@ export function createAssistantApp({
     state.workspaceRevision = workspace.revision;
     state.sessions = workspace.sessions;
     state.draft = workspace.draft;
+    draftEditVersion += 1;
     state.selectedOfferId = workspace.selected_offer_id;
     state.selectedModelCid = workspace.selected_model_cid;
       state.workspaceVersion = 0;
@@ -654,10 +666,11 @@ export function createAssistantApp({
     state.activeMode = activeSession?.mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
     if (
       state.textOffers.length &&
-      !state.selectedOfferId && !state.offersError
+      state.selectedModelCid == null && !state.selectedOfferId && !state.offersError
     ) {
       state.selectedOfferId = state.textOffers[0].id;
     }
+    reconcileSelectedModelHint();
     if (
       !state.offersLoading &&
       !state.offersError &&
@@ -757,12 +770,13 @@ export function createAssistantApp({
   }
 
   function appendUserMessage(session, prompt) {
+    const message = {
+      role: "user",
+      content: boundedText(prompt, MAX_MESSAGE_CONTENT_BYTES),
+    };
     session.messages = [
       ...session.messages,
-      {
-        role: "user",
-        content: boundedText(prompt, MAX_MESSAGE_CONTENT_BYTES),
-      },
+      message,
     ].slice(-MAX_MESSAGES_PER_SESSION);
     if (
       session.messages.filter((message) => message.role === "user").length === 1 &&
@@ -771,6 +785,7 @@ export function createAssistantApp({
       session.title = titleFromPrompt(prompt, session.mode);
     }
     replaceSession(session);
+    return message;
   }
 
   function setSessionMode(mode) {
@@ -912,19 +927,21 @@ export function createAssistantApp({
       return;
     }
     state.draft = boundedText(text, MAX_DRAFT_BYTES);
+    draftEditVersion += 1;
     markWorkspaceDirty();
     notify();
   }
 
   function setSelectedOfferId(nextOfferId, modelCid = null) {
     const offers = state.activeMode === MODE_STUDIO ? state.studioOffers : state.textOffers;
-    if (state.offersLoading || state.workspaceLoading || state.offersError || !selectedModelOffer(offers, nextOfferId, modelCid, state.models)) return;
+    const offer = selectedModelOffer(offers, nextOfferId, modelCid, state.models);
+    if (state.offersLoading || state.workspaceLoading || state.offersError || !offer) return;
     if (state.activeMode === MODE_STUDIO) {
       state.selectedStudioOfferId = nextOfferId || null;
       notify();
       return;
     }
-    state.selectedOfferId = nextOfferId || null;
+    state.selectedOfferId = offer.id;
     state.selectedModelCid = modelCid;
     markWorkspaceDirty();
     notify();
@@ -1150,8 +1167,8 @@ export function createAssistantApp({
       setStatus("Assistant session is full.");
       return false;
     }
+    const pendingUserMessage = session ? appendUserMessage(session, prompt) : null;
     if (session) {
-      appendUserMessage(session, prompt);
       state.draft = "";
     } else {
       state.studioProgress = null;
@@ -1163,7 +1180,8 @@ export function createAssistantApp({
       notify();
       return false;
     }
-    const createRequestId = cryptoRef.randomUUID();
+    const createRequestId = newModelRequestId(nowFn(), cryptoRef);
+    const submittedDraftVersion = draftEditVersion;
     // Reserve the request identity synchronously, before either persistence or
     // network work can yield. A second click observes this pending run.
     const pendingRun = {
@@ -1204,6 +1222,22 @@ export function createAssistantApp({
       return false;
     }
     if (!response.ok || payload?.status === "error") {
+      if (response.status === 409 && isExpiredInvocationRefusal(payload, {
+        request_id: createRequestId, offer_id: offer.id, operation: offer.operation,
+      })) {
+        pendingRun.status = "not_sent";
+        pendingRun.terminal = true;
+        state.statusMessage = "This request is no longer valid. Check your device's clock, then try again.";
+        const currentSession = session && findSession(state.sessions, session.id);
+        if (currentSession) {
+          currentSession.messages = currentSession.messages.filter(message => message !== pendingUserMessage);
+          replaceSession(currentSession);
+        }
+        if (session && !state.draft && draftEditVersion === submittedDraftVersion) state.draft = promptSource;
+        if (session) markWorkspaceDirty();
+        notify();
+        return false;
+      }
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
       pendingRun.status = "settlement_unknown";
       if (session) {

@@ -1,10 +1,7 @@
 fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     print_cli_page_header(snapshot, "Home");
     println!("A compact Home shell for working CLI journeys.");
-    println!(
-        "Version: runtime {}  home {}",
-        snapshot.version, DASHBOARD_VERSION
-    );
+    println!("Version: runtime {}", snapshot.version);
 
     println!();
     println!("Now");
@@ -359,14 +356,11 @@ fn handle_shared_line_command(input: &str, snapshot: &HomeSnapshot) -> Result<bo
         "people" => {
             print_cli_people(snapshot);
         }
-        "mywebsite" => {
-            print_cli_mywebsite(snapshot);
-        }
         "wallet" => {
             print_cli_wallet(snapshot);
         }
         "exits" => {
-            print_cli_services(snapshot, "remote_exit");
+            print_cli_exits(snapshot);
         }
         "system" => {
             print_cli_system(snapshot, &arg);
@@ -436,38 +430,6 @@ fn line_arg_tail(args: &[&str], start: usize) -> Option<String> {
         None
     } else {
         Some(value.to_string())
-    }
-}
-
-fn mywebsite_line_action(input: &str) -> Result<Option<String>> {
-    let mut parts = input.split_whitespace();
-    let Some(raw_name) = parts.next() else {
-        return Ok(None);
-    };
-    if normalize_contract_command(raw_name) != "mywebsite" {
-        return Ok(None);
-    }
-
-    let Some(raw_verb) = parts.next() else {
-        return Ok(None);
-    };
-    let verb = normalize_lookup(raw_verb);
-    match verb.as_str() {
-        "status" => Ok(None),
-        "stage" => {
-            let path = parts.collect::<Vec<_>>().join(" ");
-            let path = path.trim();
-            if path.is_empty() {
-                anyhow::bail!("usage: mywebsite stage <dir>");
-            }
-            Ok(Some(format!("site-stage:{path}")))
-        }
-        "preview" | "serve" => Ok(Some("site-local".to_string())),
-        "publish" | "public" | "go-public" => Ok(Some("site-ephemeral".to_string())),
-        "open" => Ok(Some("site-open".to_string())),
-        _ => anyhow::bail!(
-            "unknown MyWebSite command: {raw_verb}. Try status, stage <dir>, preview, publish, or open"
-        ),
     }
 }
 
@@ -581,7 +543,6 @@ fn print_cli_debug(snapshot: &HomeSnapshot, arg: &str) {
             print_cli_contacts(snapshot);
         }
         "spaces" => print_cli_spaces(snapshot, raw_name, &rest),
-        "services" => print_cli_services(snapshot, ""),
         "browser" => print_cli_browser(snapshot),
         "contract" => print_cli_contract(snapshot),
         "terminal" => print_cli_terminal_contract(snapshot),
@@ -605,7 +566,6 @@ fn print_cli_debug_help(snapshot: &HomeSnapshot) {
     println!("  debug audit <capsule>       provenance and trust facts");
     println!("  debug people                People internals, room, and transport facts");
     println!("  debug spaces [root]         root and WebSpace projection");
-    println!("  debug services              local and remote service offers");
     println!("  debug browser               Browser target and exit facts");
     println!("  debug terminal              Runtime PTY terminal contract");
     println!("  debug contract              shared capsule interface model");
@@ -617,7 +577,7 @@ fn normalize_debug_command(input: &str) -> String {
         "affordance" | "interface" | "interfaces" | "ifaces" => "affordances".to_string(),
         "gate" => "gates".to_string(),
         "trust" | "provenance" => "audit".to_string(),
-        "roots" | "places" | "mywebsite" | "public" | "local" | "webspaces" => "spaces".to_string(),
+        "roots" | "places" | "public" | "local" | "webspaces" => "spaces".to_string(),
         "shortcuts" | "keys" => "terminal".to_string(),
         "model" | "interface-contract" => "contract".to_string(),
         other => other.to_string(),
@@ -1201,7 +1161,7 @@ fn print_cli_system_section(snapshot: &HomeSnapshot, title: &str, lines: &[Strin
 fn print_cli_spaces(snapshot: &HomeSnapshot, raw_name: &str, arg: &str) {
     let query = space_query_for_command(raw_name, arg);
     if query.is_empty() {
-        print_cli_section(snapshot, "Spaces", &spaces_summary_lines(snapshot));
+        print_cli_section(snapshot, "Spaces", &spaces_summary_lines());
         return;
     }
 
@@ -1214,12 +1174,12 @@ fn print_cli_spaces(snapshot: &HomeSnapshot, raw_name: &str, arg: &str) {
         print_cli_page_header(snapshot, "Spaces");
         println!("Spaces");
         println!("  Unknown root: {}", query.trim());
-        println!("  Try: MyWebSite, Public, Local, WebSpaces");
+        println!("  Try: Public, Local, WebSpaces");
         return;
     };
 
     let title = format!("Spaces / {}", root.name);
-    print_cli_section(snapshot, &title, &space_detail_lines(root, snapshot, 80));
+    print_cli_section(snapshot, &title, &space_detail_lines(root, 80));
 }
 
 fn space_query_for_command(raw_name: &str, arg: &str) -> String {
@@ -1230,57 +1190,11 @@ fn space_query_for_command(raw_name: &str, arg: &str) -> String {
 
     let normalized = normalize_lookup(raw_name);
     match normalized.as_str() {
-        "mywebsite" => "MyWebSite".to_string(),
         "public" => "Public".to_string(),
         "local" => "Local".to_string(),
         "webspaces" => "WebSpaces".to_string(),
         _ => String::new(),
     }
-}
-
-fn print_cli_mywebsite(snapshot: &HomeSnapshot) {
-    print_cli_section(snapshot, "MyWebSite", &mywebsite_task_lines(snapshot));
-}
-
-fn mywebsite_task_lines(snapshot: &HomeSnapshot) -> Vec<String> {
-    let mut lines = vec![
-        format!("Status   {}", website_summary(snapshot)),
-        "Stage    mywebsite stage <dir>".to_string(),
-        format!(
-            "Preview  mywebsite preview ({})",
-            action_state_label(action_by_id(snapshot, "site-local"))
-        ),
-        format!(
-            "Publish  mywebsite publish ({})",
-            action_state_label(action_by_id(snapshot, "site-ephemeral"))
-        ),
-        format!(
-            "Open     mywebsite open ({})",
-            action_state_label(action_by_id(snapshot, "site-open"))
-        ),
-    ];
-
-    if let Some(url) = snapshot.site.local_url.as_deref() {
-        lines.push(format!("Preview  {}", url.trim_end_matches('/')));
-    }
-    if let Some(release) = snapshot.site.active_release.as_deref() {
-        let live = snapshot
-            .site
-            .active_channel
-            .as_deref()
-            .map(|channel| format!("{} on {}", release, channel))
-            .unwrap_or_else(|| release.to_string());
-        lines.push(format!("Live     {live}"));
-    } else if snapshot.site.release_count > 0 {
-        lines.push(format!("Releases {}", snapshot.site.release_count));
-    }
-    if let Some(cid) = snapshot.site.active_bundle_cid.as_deref() {
-        lines.push(format!("Bundle   elastos://{}", cid));
-    }
-    if !snapshot.site.staged {
-        lines.push("Next     stage a directory containing index.html".to_string());
-    }
-    lines
 }
 
 fn print_cli_inbox(snapshot: &HomeSnapshot) {
@@ -1388,68 +1302,35 @@ fn print_cli_wallet(snapshot: &HomeSnapshot) {
     }
 }
 
-fn print_cli_services(snapshot: &HomeSnapshot, kind_filter: &str) {
-    let offers = cli_service_offers(snapshot, kind_filter);
-    let title = if kind_filter == "remote_exit" {
-        "Browser Exits"
-    } else {
-        "Services"
-    };
-    print_cli_page_header(snapshot, title);
-    println!("{title}");
-    if offers.is_empty() {
-        if kind_filter == "remote_exit" {
-            println!("  No Browser Exit offers visible in this snapshot.");
-        } else {
-            println!("  No service offers visible in this snapshot.");
-        }
+fn print_cli_exits(snapshot: &HomeSnapshot) {
+    let exits = cli_service_offers(snapshot, "remote_exit");
+    print_cli_page_header(snapshot, "Browser Exits");
+    println!("Browser Exits");
+    if exits.is_empty() {
+        println!("  No Browser Exit offers visible in this snapshot.");
         return;
     }
-    for offer in offers.iter().take(12) {
-        let id = first_json_text(offer, &["offer_id", "id"]);
-        let kind = first_json_text(offer, &["service_kind", "kind"]);
-        let name = first_json_text(offer, &["service_display_name", "display_name"]);
-        let status = first_json_text(offer, &["status"]);
-        let route = first_json_text(offer, &["route"]);
-        if kind_filter == "remote_exit" {
-            println!(
-                "  {:<30} {}",
-                if name.is_empty() {
-                    if id.is_empty() {
-                        "Browser Exit"
-                    } else {
-                        id
-                    }
-                } else {
-                    name
-                },
-                if status.is_empty() {
-                    "available"
-                } else {
-                    status
-                }
-            );
-            continue;
-        }
+    for exit in exits.iter().take(12) {
+        let id = first_json_text(exit, &["offer_id", "id"]);
+        let name = first_json_text(exit, &["service_display_name", "display_name"]);
+        let status = first_json_text(exit, &["status"]);
+        let name = match (name.is_empty(), id.is_empty()) {
+            (false, _) => name,
+            (true, false) => id,
+            (true, true) => "Browser Exit",
+        };
         println!(
-            "  {:<30} {:<12} {:<12} {}{}",
-            if id.is_empty() { "offer" } else { id },
-            if kind.is_empty() { "service" } else { kind },
+            "  {:<30} {}",
+            name,
             if status.is_empty() {
                 "available"
             } else {
                 status
-            },
-            if name.is_empty() { id } else { name },
-            if route.is_empty() {
-                String::new()
-            } else {
-                format!(" -> {route}")
             }
         );
     }
-    if offers.len() > 12 {
-        println!("  ... {} more offers", offers.len() - 12);
+    if exits.len() > 12 {
+        println!("  ... {} more offers", exits.len() - 12);
     }
 }
 

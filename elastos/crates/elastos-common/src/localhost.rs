@@ -184,6 +184,15 @@ pub fn publisher_release_manifest_path(base_dir: &Path) -> PathBuf {
     publisher_root_path(base_dir).join("release.json")
 }
 
+/// Installed signed inputs belong to Runtime, independently of Publisher output.
+pub fn installation_release_head_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("installation/release-head.json")
+}
+
+pub fn installation_release_manifest_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("installation/release.json")
+}
+
 pub fn publisher_install_script_path(base_dir: &Path) -> PathBuf {
     publisher_root_path(base_dir).join("install.sh")
 }

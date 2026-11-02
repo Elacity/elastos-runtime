@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const source = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const functionSource = (name) => {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert.ok(start >= 0, `missing ${name}`);
@@ -39,13 +39,15 @@ function backend() {
 function editor(server, current = server.docs.get("did:one")) {
   const context = vm.createContext({
     state: { current: { ...current }, currentSessionId: 1, dirty: true, documents: [], mode: "shell", homeToken: "fixture-token" },
-    elements: { titleInput: { value: current.title }, editor: { value: current.body } },
+    elements: { titleInput: { value: current.title }, editor: { value: current.body },
+      shareShell: { classList: { add() {}, remove() {} } }, documentsShell: { classList: { add() {}, remove() {} } } },
     saveInFlight: null, autosaveQueued: false, pendingHomeWindowCloseTarget: null,
     saveRecovery: null, documentSelectionSequence: 0, queuedSaveTarget: null, savedWorkingCopy: { ...current },
+    unsavedDocuments: new Map(),
     isLibraryFileProjection: () => false, isDraftDocument: (doc) => doc.doc_did.startsWith("draft:"),
-    documentIdentity: (doc) => doc.doc_did,
+    documentIdentity: (doc) => (doc.doc_did ? "document:" + doc.doc_did : "draft"),
     documentsProviderApi: (...args) => server.request(...args),
-    clearAutosaveTimer() {}, setStatus() {}, clearStatus() {}, scheduleStatusClear() {},
+    clearAutosaveTimer() {}, showError() {}, clearStatus() {},
     renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.titleInput.value = context.state.current.title; context.elements.editor.value = context.state.current.body; }, refreshPreviewFromEditor() {}, renderHistory() {},
     upsertDocumentListItem() {}, reportSaveFailure() {}, scheduleAutosave() {},
     navigationMessages: [],
@@ -54,7 +56,7 @@ function editor(server, current = server.docs.get("did:one")) {
     confirmInCapsule: async () => false,
     chooseInCapsule: async () => "cancel",
   });
-  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent"].map(functionSource).join("\n"), context);
+  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "reconcileKeptAfterSave", "requireSavedWorkingCopy", "saveCurrent", "unsavedKey", "keepUnsavedCurrent", "prepareToLeaveCurrent", "restoreUnsavedDocument", "selectDocument", "saveAsCurrent", "summaryListItems"].map(functionSource).join("\n"), context);
   return context;
 }
 
@@ -177,10 +179,7 @@ test("unchanged GET permits only explicit conditional retry; mixed outcome prese
   }
 });
 
-test("Rust trim/default title contract also reconciles lost replies and long titles", async () => {
-  const rust = readFileSync(new URL("../elastos/crates/elastos-server/src/documents.rs", import.meta.url), "utf8");
-  assert.match(rust, /DOCUMENTS_DEFAULT_TITLE: &str = "Untitled"/);
-  assert.match(rust, /fn documents_normalize_title[\s\S]*?\.map\(str::trim\)[\s\S]*?\.unwrap_or\(default_title\)[\s\S]*?\.to_string\(\)/);
+test("trimmed and default titles also reconcile lost replies and long titles", async () => {
   for (const title of ["", "   ", "  Trim me  ", "Long".repeat(40)]) {
     const server = backend(), app = editor(server), request = server.request;
     app.elements.titleInput.value = title;
@@ -215,12 +214,37 @@ test("selection GET keeps edits made while awaiting replies", async () => {
   app.state.dirty = false;
   server.request = async (op, payload) => { const result = await request(op, payload); if (op === "get") await held.promise; return result; };
   const selecting = app.selectDocument("did:two");
+  await new Promise(setImmediate);
+  assert.ok(server.requests.some(({ op }) => op === "get"), "the selection GET is under way");
   app.elements.editor.value = "Edited during selection";
   app.state.dirty = true;
   held.resolve();
   await selecting;
   assert.equal(app.state.current.doc_did, "did:one");
   assert.equal(app.elements.editor.value, "Edited during selection");
+});
+
+test("switching documents keeps unsaved text in this window and brings it back without asking", async () => {
+  const server = backend(), app = editor(server);
+  server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+  const firstRevision = server.docs.get("did:one").revision;
+  app.chooseInCapsule = async () => { throw new Error("switching must not ask"); };
+  app.elements.editor.value = "Kept while away";
+  app.state.dirty = true;
+  await app.selectDocument("did:two");
+  assert.equal(app.state.current.doc_did, "did:two");
+  assert.equal(app.state.dirty, false);
+  assert.equal(app.unsavedDocuments.get("document:did:one").document.body, "Kept while away");
+  const reads = server.requests.filter(({ op }) => op === "get").length;
+  await app.selectDocument("did:one");
+  assert.equal(server.requests.filter(({ op }) => op === "get").length, reads, "coming back reads nothing");
+  assert.equal(app.state.current.doc_did, "did:one");
+  assert.equal(app.state.dirty, true);
+  assert.equal(app.elements.editor.value, "Kept while away");
+  assert.equal(app.unsavedDocuments.size, 0);
+  await app.saveCurrent();
+  assert.equal(server.docs.get("did:one").body, "Kept while away");
+  assert.equal(server.requests.find(({ op }) => op === "save").if_revision, firstRevision);
 });
 
 test("late save recovery GET cannot replace or write into a newer selection", async () => {
@@ -273,4 +297,155 @@ test("queued saves remain bound to the selected session", async () => {
   assert.equal(server.requests.filter(({ op }) => op === "save").length, 1);
   assert.equal(app.state.current.doc_did, "did:three");
   assert.equal(app.elements.editor.value, "Keep three");
+});
+
+function libraryEditor(file) {
+  const context = vm.createContext({
+    atob, btoa, TextDecoder, TextEncoder,
+    state: { current: { doc_did: "", library_object_uri: file.uri, revision: file.revision, title: "notes.txt", body: file.body,
+      file_name: "notes.txt", mime: "text/plain" }, currentSessionId: 1, dirty: true, documents: [], mode: "shell" },
+    elements: { titleInput: { value: "notes.txt" }, editor: { value: file.body } },
+    saveInFlight: null, autosaveQueued: false, pendingHomeWindowCloseTarget: null,
+    saveRecovery: null, documentSelectionSequence: 0, queuedSaveTarget: null, savedWorkingCopy: null,
+    isLibraryFileProjection: (doc) => !!doc?.library_object_uri, isDraftDocument: () => false,
+    documentIdentity: (doc) => `library:${doc.library_object_uri}`,
+    libraryObjectApi: (...args) => file.request(...args),
+    clearAutosaveTimer() {}, showError() {}, clearStatus() {}, sortDocuments() {},
+    renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.editor.value = context.state.current.body; },
+    refreshPreviewFromEditor() {}, upsertDocumentListItem() {}, reportSaveFailure() {}, scheduleAutosave() {},
+    homeNavigation: { setQuery() {} },
+    setDirty(value) { context.state.dirty = value; },
+  });
+  vm.runInContext(["base64ToUtf8", "utf8ToBase64", "updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget",
+    "applySavedDocumentState", "reconcileKeptAfterSave", "saveCurrent"].map(functionSource).join("\n"), context);
+  return context;
+}
+
+function libraryFile(body) {
+  const file = { uri: "localhost://Users/me/Documents/notes.txt", body, revision: "", writes: 0, reply: "ok" };
+  const stamp = () => { file.revision = createHash("sha256").update(file.body).digest("hex"); };
+  stamp();
+  file.change = (next) => { file.body = next; stamp(); };
+  file.request = async (op, payload) => {
+    if (op === "read") {
+      return { object: { uri: file.uri, name: "notes.txt", revision: file.revision }, data: Buffer.from(file.body).toString("base64") };
+    }
+    assert.equal(op, "write");
+    if (file.reply === "lost-before-write") throw new Error("Documents did not answer in time. Your edits are kept.");
+    if (payload.if_revision !== file.revision) throw new Error("File changed since it was read.");
+    file.writes += 1;
+    file.change(Buffer.from(payload.data, "base64").toString());
+    if (file.reply === "lost-after-write") throw new Error("Documents did not answer in time. Your edits are kept.");
+    return { object: { uri: file.uri, name: "notes.txt", revision: file.revision } };
+  };
+  return file;
+}
+
+test("a Library-file save whose reply was lost after it wrote does not leave later saves stuck", async () => {
+  const file = libraryFile("Old"), app = libraryEditor(file);
+  app.elements.editor.value = "Mine";
+  file.reply = "lost-after-write";
+  await assert.rejects(app.saveCurrent(), /did not answer in time/);
+  assert.equal(file.body, "Mine");
+  file.reply = "ok";
+  app.elements.editor.value = "Mine and more";
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine and more");
+  assert.equal(app.state.current.revision, file.revision);
+  assert.equal(app.state.dirty, false);
+  app.elements.editor.value = "Mine and more, later";
+  app.state.dirty = true;
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine and more, later");
+});
+
+test("a Library-file save that never landed retries, and a file changed meanwhile is never overwritten", async () => {
+  const file = libraryFile("Old"), app = libraryEditor(file);
+  app.elements.editor.value = "Mine";
+  file.reply = "lost-before-write";
+  await assert.rejects(app.saveCurrent());
+  file.reply = "ok";
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine");
+
+  const other = libraryFile("Old"), stuck = libraryEditor(other);
+  stuck.elements.editor.value = "Mine";
+  other.reply = "lost-before-write";
+  await assert.rejects(stuck.saveCurrent());
+  other.reply = "ok";
+  other.change("Theirs");
+  await assert.rejects(stuck.saveCurrent(), /changed since you opened it/);
+  assert.equal(other.body, "Theirs");
+  assert.equal(stuck.elements.editor.value, "Mine");
+  assert.equal(stuck.state.dirty, true);
+});
+
+test("a save that finishes after its document was left settles the kept text", async () => {
+  for (const editedAfterSave of [false, true]) {
+    const server = backend(), app = editor(server), held = deferred(), request = server.request;
+    server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+    server.request = async (op, payload) => { const result = await request(op, payload); if (op === "save") await held.promise; return result; };
+    app.elements.editor.value = "Sent";
+    const saving = app.saveCurrent();
+    if (editedAfterSave) app.elements.editor.value = "Sent, then more";
+    server.request = async (op, payload) => {
+      const result = await request(op, payload);
+      if (op === "save" && payload.body === "Sent") await held.promise;
+      return result;
+    };
+    await app.selectDocument("did:two");
+    assert.equal(app.state.current.doc_did, "did:two", "leaving does not wait for a stored document's save");
+    held.resolve();
+    await saving;
+    assert.equal(server.docs.get("did:one").body, "Sent");
+    if (!editedAfterSave) {
+      assert.equal(app.unsavedDocuments.size, 0, "the kept text was what saved");
+      continue;
+    }
+    assert.equal(app.unsavedDocuments.get("document:did:one").document.revision, server.docs.get("did:one").revision);
+    await app.selectDocument("did:one");
+    await app.saveCurrent();
+    assert.equal(server.docs.get("did:one").body, "Sent, then more", "the later edit saves on the new revision");
+  }
+});
+
+test("a new document created before its first save failed is listed, with its text kept", async () => {
+  const server = backend(), app = editor(server, { doc_did: "draft:one", title: "Draft", body: "Keep me" });
+  const listed = [];
+  app.upsertDocumentListItem = (document) => listed.push(document.doc_did);
+  const request = server.request;
+  server.request = async (op, payload) => { if (op === "save") throw new Error("save failed"); return request(op, payload); };
+  await assert.rejects(app.saveCurrent());
+  assert.deepEqual(listed, ["did:created-1"], "the created document is listed as soon as it exists");
+  server.request = request;
+  await app.selectDocument("did:one");
+  assert.equal(app.unsavedDocuments.get("document:did:created-1").document.body, "Keep me");
+  await app.selectDocument("did:created-1");
+  assert.equal(app.elements.editor.value, "Keep me");
+  assert.equal(app.state.dirty, true);
+});
+
+test("a delete that finishes after another document was opened leaves that document's edits alone", async () => {
+  const server = backend(), app = editor(server), held = deferred(), request = server.request;
+  server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+  vm.runInContext(["requestDeleteCurrent"].map(functionSource).join("\n"), app);
+  app.state.dirty = false;
+  app.confirmInCapsule = async () => true;
+  server.request = async (op, payload) => {
+    if (op === "delete") { await held.promise; server.docs.delete(payload.doc_did); return { ok: true }; }
+    return request(op, payload);
+  };
+  const deleting = app.requestDeleteCurrent();
+  await new Promise(setImmediate);
+  await app.selectDocument("did:two");
+  app.elements.editor.value = "Edits to Two";
+  app.state.dirty = true;
+  held.resolve();
+  await deleting;
+  assert.equal(app.state.current.doc_did, "did:two");
+  assert.equal(app.elements.editor.value, "Edits to Two");
+  assert.equal(app.state.dirty, true, "the open document keeps its unsaved state");
+  server.put({ doc_did: "did:three", title: "Three", body: "Three" });
+  await app.selectDocument("did:three");
+  assert.equal(app.unsavedDocuments.get("document:did:two")?.document.body, "Edits to Two", "leaving keeps its text");
 });

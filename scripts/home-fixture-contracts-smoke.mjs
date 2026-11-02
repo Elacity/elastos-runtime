@@ -1,14 +1,42 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { checkProductData } from "./check-product-data.mjs";
 import vm from "node:vm";
 import test from "node:test";
 import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 const require = createRequire(import.meta.url);
+
+test("valid product data leaves Home isolation and Runtime projection evidence open", () => {
+  assert(checkProductData().capsules > 0);
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("./home-shell-objective-audit.mjs", import.meta.url)), "--require-complete"], { encoding: "utf8" });
+  assert.equal(result.status, 1, result.stderr);
+  const audit = JSON.parse(result.stdout);
+  for (const id of ["home_gui_boundary", "capsule_interface_projection", "operator_browser_ux_manual"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, false, id);
+  }
+  assert.match(audit.criteria.find((entry) => entry.id === "capsule_interface_projection").missing, /installed \/api\/capsules\/contracts\/audit/);
+});
+
+test("source defaults require accepted VM media and matching human evidence", () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("./browser-objective-audit.mjs", import.meta.url))], { encoding: "utf8" });
+  assert.equal(result.status, 1, result.stderr);
+  const audit = JSON.parse(result.stdout);
+  for (const id of ["single_vm_engine", "retired_native_engine_absent"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, true, id);
+  }
+  for (const id of ["vm_product_media_accepted", "manual_ux_accepted"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, false, id);
+  }
+  assert.equal(audit.product_provider_accepted, false);
+});
 const hostedDriver = read("scripts/browser-hosted-product-display-smoke.sh")
   .split("node - <<'NODE'\n")[1].split("\nNODE")[0];
 async function hostedAdapterFixture(mode) {
@@ -86,47 +114,23 @@ function fn(source, name) {
   assert(start >= 0, name);
   return source.slice(start, source.indexOf("\n}", start) + 2);
 }
-const entropy = read("scripts/home-entropy-check.mjs");
-function traversalFixture() {
-  const entry = (name, directory = false) => ({ name, isDirectory: () => directory, isFile: () => !directory });
-  const directories = new Map([
-    ["/fixture", [entry("target", true), entry("target-build", true), entry("docs", true), entry("README.md")]],
-    ["/fixture/docs", [entry("contract.md")]],
-  ]);
-  const files = new Map([["/fixture/README.md", "[contract](docs/contract.md)"], ["/fixture/docs/contract.md", "Current source contract."]]);
-  const context = vm.createContext({
-    repoRootPath: "/fixture", resolve, dirname,
-    assert: (condition, message, details) => assert(condition, `${message}: ${JSON.stringify(details)}`),
-    existsSync: (path) => directories.has(path) || files.has(path) || ["/fixture/target", "/fixture/target-build"].includes(path),
-    readdirSync: (path) => {
-      assert(directories.has(path), `must not traverse rebuildable output: ${path}`);
-      return directories.get(path);
-    },
-    readFileSync: (path) => {
-      if (!files.has(path)) throw new Error(`ENOENT: ${path}`);
-      return files.get(path);
-    },
-  });
-  for (const name of ["listMarkdownFiles", "listTextFiles", "listFilesRecursive", "isTestOrGeneratedPath", "assertMarkdownLocalLinksResolve"]) vm.runInContext(fn(entropy, name), context);
-  return { context, files };
-}
-test("all entropy walks exclude the configured build output and retain source docs", () => {
-  assert.match(read(".cargo/config.toml"), /^build-dir = "target-build"$/m);
-  for (const name of ["listMarkdownFiles", "listTextFiles", "listFilesRecursive"]) {
-    const { context } = traversalFixture();
-    assert.deepEqual(Array.from(context[name]("/fixture")).sort(), ["/fixture/README.md", "/fixture/docs/contract.md"]);
+test("product data refuses missing input and missing declared install assets", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "home-data-refusal-"));
+  try {
+    assert.throws(() => checkProductData(fixture), /ENOENT/);
+    const capsuleRoot = join(fixture, "capsules/assistant");
+    mkdirSync(join(capsuleRoot, "browser"), { recursive: true });
+    mkdirSync(join(fixture, "elastos/capsules"), { recursive: true });
+    const manifestPath = join(capsuleRoot, "capsule.json");
+    writeFileSync(manifestPath, read("capsules/assistant/capsule.json"));
+    assert.throws(() => checkProductData(fixture), /missing entrypoint/);
+    writeFileSync(join(capsuleRoot, "browser/index.html"), "");
+    assert.throws(() => checkProductData(fixture), /missing 32px icon/);
+    writeFileSync(manifestPath, "{");
+    assert.throws(() => checkProductData(fixture), SyntaxError);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
-  const { context } = traversalFixture();
-  assert(context.isTestOrGeneratedPath("/fixture/target-build/debug/generated.rs"));
-  assert(!context.isTestOrGeneratedPath("/fixture/docs/contract.md"));
-});
-test("broken source links and source read failures still fail entropy", () => {
-  const { context, files } = traversalFixture();
-  context.assertMarkdownLocalLinksResolve();
-  files.set("/fixture/docs/contract.md", "[missing](missing.md)");
-  assert.throws(() => context.assertMarkdownLocalLinksResolve(), /Markdown local links must resolve/);
-  files.delete("/fixture/docs/contract.md");
-  assert.throws(() => context.assertMarkdownLocalLinksResolve(), /ENOENT/);
 });
 
 const lifecycle = read("scripts/home-browser-restored-lifecycle-headless-smoke.mjs");
@@ -140,7 +144,7 @@ test("restored-lifecycle summary satisfies the actual Home appearance parser", (
   assert.equal(summary.authority.session_id, "fixture-session");
   for (const field of ["notifications", "desktop_objects", "capsule_catalog", "capsule_interfaces"]) assert(!Array.isArray(summary[field]), field);
   assert.match(lifecycle, /ELASTOS_BROWSER_EXECUTABLE/);
-  assert.match(lifecycle, /elastos.people.discovery\/v1/);
+  assert.doesNotMatch(lifecycle, /collaboration\/presence/, "Home no longer announces Community presence");
 });
 test("bootstrap wait fails before polling after a captured page error", async () => {
   const context = vm.createContext({
@@ -150,25 +154,6 @@ test("bootstrap wait fails before polling after a captured page error", async ()
   });
   vm.runInContext(fn(lifecycle, "waitFor"), context);
   await assert.rejects(context.waitFor(() => false, 15_000, "Home bootstrap"), /fixture bootstrap exception/);
-});
-test("presence fixture retains Home token admission and the Runtime response shape", async () => {
-  const responses = [];
-  const context = vm.createContext({
-    homeAuthorityToken: "fixture-home-token",
-    assert: (condition, message) => assert(condition, message),
-    json: (_res, status, body) => responses.push({ status, body }),
-    readBody: async (req) => req.body,
-  });
-  for (const name of ["requireToken", "handleApi"]) vm.runInContext(fn(lifecycle, name), context);
-  const url = new URL("https://fixture.test/api/apps/home/collaboration/presence");
-  const req = { method: "POST", headers: { "x-elastos-home-token": "fixture-home-token" }, body: {} };
-  assert.equal(await context.handleApi(req, {}, url), true);
-  assert.equal(responses[0].status, 200);
-  assert.equal(responses[0].body.schema, "elastos.people.discovery/v1");
-  assert.equal(responses[0].body.configured, false);
-  await context.handleApi({ ...req, headers: {} }, {}, url);
-  assert.equal(responses[1].status, 401);
-  await assert.rejects(context.handleApi({ ...req, body: { principal_id: "other" } }, {}, url), /empty admitted request/);
 });
 test("System fixture retains four tests and bootstrap assertions without temporary tracing", () => {
   const source = read("scripts/system-window-policy-browser-smoke.mjs");

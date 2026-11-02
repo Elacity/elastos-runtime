@@ -153,6 +153,16 @@ impl RunningVm {
         format!("{:?}", self.status)
     }
 
+    /// Release only a freshly observed terminal native object, then join its
+    /// console reader. A map entry or cached status cannot establish this proof.
+    pub(crate) async fn release_terminal_native_vm(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(machine) = self.handle.as_mut() {
+            return machine.release_terminal_object().await;
+        }
+        false
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn take_guest_exit_receiver(
         &self,

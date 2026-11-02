@@ -16,7 +16,7 @@
       "aliases": ["status", "summary", "whoami"],
       "usage": "home",
       "summary": "Home dashboard summary",
-      "description": "Show Home status, the active view, Inbox, apps, and services.",
+      "description": "Show Home status, the active view, Inbox, and apps.",
       "surface": ["home-cli"]
     },
     {
@@ -31,8 +31,8 @@
       "name": "people",
       "aliases": ["contacts", "contact", "discovery"],
       "usage": "people",
-      "summary": "People and discovery",
-      "description": "Show your profile, contacts, pending requests, discovery, and People actions.",
+      "summary": "People and Public",
+      "description": "Show your profile, contacts, pending requests, Public, and People actions.",
       "surface": ["home-cli"]
     },
     {
@@ -49,14 +49,6 @@
       "usage": "system [shell <home-gui>|updates|profile|diagnostics]",
       "summary": "System settings",
       "description": "Show Home view, update, profile, and device status. Technical details stay under debug topics.",
-      "surface": ["home-cli"]
-    },
-    {
-      "name": "mywebsite",
-      "aliases": ["site", "website", "spaces"],
-      "usage": "mywebsite [status|stage <dir>|preview|publish|open]",
-      "summary": "Advanced MyWebSite tasks",
-      "description": "Advanced command for MyWebSite status, staging a local directory, starting a local preview, publishing a temporary public URL, or explicitly opening the preview in a browser.",
       "surface": ["home-cli"]
     },
     {
@@ -86,7 +78,7 @@
     {
       "name": "debug",
       "aliases": ["dev"],
-      "usage": "debug [capsules|inspect <capsule>|affordances [capsule]|gates [capsule]|audit <capsule>|people|spaces [root]|services|browser|terminal|contract]",
+      "usage": "debug [capsules|inspect <capsule>|affordances [capsule]|gates [capsule]|audit <capsule>|people|spaces [root]|browser|terminal|contract]",
       "summary": "Developer facts and projections",
       "description": "Debug command for diagnostics hidden from the default Home CLI product surface. Debug rows are declared capability descriptors, not grants.",
       "surface": ["home-cli"]

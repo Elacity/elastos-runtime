@@ -49,7 +49,7 @@ pub async fn browser_session_request(
             }
             let secure = super::gateway::request_uses_tls(&headers);
             let mut response = Json(output.clone()).into_response();
-            match set_browser_request_cookie_header(&output.request_id, secure) {
+            match set_browser_request_cookie_header(&output.status_secret, secure) {
                 Ok(cookie) => {
                     response.headers_mut().append(SET_COOKIE, cookie);
                     response
@@ -70,20 +70,19 @@ pub async fn browser_session_request_status(
     if state.collaboration_chat_product_port.is_some() {
         return configured_collaboration_browser_session_unsupported_response();
     }
-    if super::gateway::cookie_value_from_headers(&headers, BROWSER_SESSION_REQUEST_COOKIE)
-        .as_deref()
-        != Some(request_id.as_str())
-    {
+    let Some(status_secret) =
+        super::gateway::cookie_value_from_headers(&headers, BROWSER_SESSION_REQUEST_COOKIE)
+    else {
         return (
             StatusCode::FORBIDDEN,
             "web guest request is not bound to this browser",
         )
             .into_response();
-    }
+    };
 
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::room_service::browser_access_status(&data_dir, &request_id)
+        crate::room_service::browser_access_status(&data_dir, &request_id, &status_secret)
     })
     .await
     {
@@ -102,11 +101,11 @@ fn configured_collaboration_browser_session_unsupported_response() -> Response {
 }
 
 fn set_browser_request_cookie_header(
-    request_id: &str,
+    status_secret: &str,
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
     let mut value = format!(
-        "{BROWSER_SESSION_REQUEST_COOKIE}={request_id}; Max-Age={BROWSER_SESSION_REQUEST_COOKIE_MAX_AGE_SECS}; Path=/api/browser/session/request; HttpOnly; SameSite=Lax"
+        "{BROWSER_SESSION_REQUEST_COOKIE}={status_secret}; Max-Age={BROWSER_SESSION_REQUEST_COOKIE_MAX_AGE_SECS}; Path=/api/browser/session/request; HttpOnly; SameSite=Lax"
     );
     if secure {
         value.push_str("; Secure");
@@ -123,6 +122,7 @@ fn browser_session_error_response(err: anyhow::Error) -> Response {
         || text.contains("not part of this conversation")
         || text.contains("browser access is not allowed")
         || text.contains("web guest access is not allowed")
+        || text.contains("is not bound to this browser")
     {
         StatusCode::FORBIDDEN
     } else if text.contains("invalid or expired session") {

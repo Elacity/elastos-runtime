@@ -1,4 +1,4 @@
-import { collectWebrtcStats } from "./browser-status.js?v=browser-20260907c";
+import { collectWebrtcStats } from "./browser-status.js?v=browser-20261101d";
 import {
   iceCandidateType,
   normalizeDisplayIceServers,
@@ -14,6 +14,8 @@ const WEBRTC_DISCONNECT_GRACE_MS = 10000;
 const WEBRTC_ENGINE_CANDIDATE_POLL_MS = 300;
 const WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS = 40;
 const WEBRTC_FRAME_WATCH_MS = 3000;
+// Each signaling request has its own deadline; connect() also aborts on its caller's signal.
+const WEBRTC_SIGNAL_TIMEOUT_MS = 15000;
 
 export function createBrowserRemoteDisplay({
   debugMetrics,
@@ -36,10 +38,14 @@ export function createBrowserRemoteDisplay({
   updateMetrics,
 }) {
   let peerConnection = null;
+  // The caller's AbortSignal for the connect() in progress (a window Close aborts it).
+  let connectAbortSignal = null;
   let connectGeneration = 0;
   let viewerOwnerActive = () => false;
   let audioPeerConnection = null;
   let inputChannel = null;
+  let inputDrainedAt = 0;
+  let inputChannelGeneration = 0;
   let mediaStream = null;
   let trackReady = false;
   let connectTimer = 0;
@@ -525,6 +531,8 @@ export function createBrowserRemoteDisplay({
 
   function bindInputChannel(channel) {
     inputChannel = channel || null;
+    // A rebound channel cannot vouch for bytes sent on the previous one.
+    inputChannelGeneration += 1;
     if (!inputChannel) {
       return;
     }
@@ -537,6 +545,14 @@ export function createBrowserRemoteDisplay({
     inputChannel.addEventListener("message", handleRemoteInputChannelMessage);
     inputChannel.addEventListener("close", teardownBoundInputChannel);
     inputChannel.addEventListener("error", teardownBoundInputChannel);
+    // Timestamp when queued input actually leaves the browser, so dependent
+    // Runtime input settles from the observed drain rather than the send.
+    inputChannel.bufferedAmountLowThreshold = 0;
+    inputChannel.addEventListener("bufferedamountlow", () => {
+      if (inputChannel === boundInputChannel) {
+        inputDrainedAt = Date.now();
+      }
+    });
     if (inputChannel.readyState === "open") {
       emitMediaDiagnostic("viewer_input_channel_open", "input");
       return;
@@ -660,10 +676,17 @@ export function createBrowserRemoteDisplay({
   async function sendRuntimeSignal(connection, displaySession, options) {
     if (!isCurrentDisplayPeer(connection)) return null;
     const generation = displaySession.display_generation;
+    const request = new AbortController();
+    const external = connectAbortSignal;
+    const abort = () => request.abort();
+    if (external?.aborted) abort();
+    else external?.addEventListener("abort", abort, { once: true });
+    const deadline = window.setTimeout(abort, WEBRTC_SIGNAL_TIMEOUT_MS);
     try {
       const response = await fetchJson(displaySession.signaling_url, {
         ...options,
         body: { ...options.body, ...(generation ? { display_generation: generation } : {}) },
+        signal: request.signal,
       });
       if (!isCurrentDisplayPeer(connection)) return null;
       if (generation && response?.display_generation !== generation) {
@@ -673,6 +696,9 @@ export function createBrowserRemoteDisplay({
     } catch (error) {
       if (isCurrentDisplayPeer(connection)) throw error;
       return null;
+    } finally {
+      window.clearTimeout(deadline);
+      external?.removeEventListener("abort", abort);
     }
   }
 
@@ -909,7 +935,19 @@ export function createBrowserRemoteDisplay({
     return { ...displaySession, display_generation: generation };
   }
 
-  async function connect(displaySession, enginePage) {
+  async function connect(displaySession, enginePage, { signal = null } = {}) {
+    if (signal?.aborted) {
+      throw new Error("Browser window is closing.");
+    }
+    connectAbortSignal = signal;
+    try {
+      return await connectDisplay(displaySession, enginePage);
+    } finally {
+      if (connectAbortSignal === signal) connectAbortSignal = null;
+    }
+  }
+
+  async function connectDisplay(displaySession, enginePage) {
     const ownerActive = captureViewerOwnerGuard();
     if (!ownerActive()) return;
     // Each peer keeps the Runtime capability decision from its own attachment.
@@ -1371,6 +1409,18 @@ export function createBrowserRemoteDisplay({
     return Boolean(inputChannel && inputChannel.readyState === "open");
   }
 
+  function inputBufferedAmount() {
+    return Number(inputChannel?.bufferedAmount || 0);
+  }
+
+  function lastInputDrainAt() {
+    return inputDrainedAt;
+  }
+
+  function currentInputChannelGeneration() {
+    return inputChannelGeneration;
+  }
+
   function isTrackReady() {
     return trackReady;
   }
@@ -1390,8 +1440,11 @@ export function createBrowserRemoteDisplay({
   return {
     close,
     connect,
+    inputBufferedAmount,
     inputChannelOpen,
     isTrackReady,
+    lastInputDrainAt,
+    currentInputChannelGeneration,
     metricsState,
     refreshMetrics,
     sendInputMessages,

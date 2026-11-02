@@ -647,7 +647,11 @@ mod tests {
 
     #[test]
     fn private_ipfs_preparation_operations_have_no_capsule_mapping() {
-        for op in ["runtime_prepare_backend", "runtime_hash_staged_directory"] {
+        for op in [
+            "runtime_prepare_backend",
+            "runtime_hash_staged_directory",
+            "runtime_add_local_object",
+        ] {
             assert!(build_capability_resource("ipfs", op, &serde_json::json!({})).is_err());
             assert!(provider_operation_action("ipfs", op).is_none());
         }

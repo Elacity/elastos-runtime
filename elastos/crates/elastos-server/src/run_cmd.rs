@@ -32,7 +32,19 @@ pub async fn run_capsule(
     let manifest = load_valid_manifest_if_present(&capsule_dir).await?;
 
     if let Some(ref manifest) = manifest {
-        match manifest.capsule_type {
+        match manifest.execution_type() {
+            elastos_common::CapsuleType::WebProjection => {
+                anyhow::bail!("Web projection '{}' opens through Home", manifest.name);
+            }
+            elastos_common::CapsuleType::NativeHost => {
+                anyhow::bail!(
+                    "Native host helper '{}' is launched only by Runtime",
+                    manifest.name
+                );
+            }
+            elastos_common::CapsuleType::NativeProvider => {
+                anyhow::bail!("Native provider '{}' is launched only through trusted Runtime components; capsule manifests grant no native execution", manifest.name);
+            }
             elastos_common::CapsuleType::MicroVM => {
                 return run_microvm_via_operator_runtime(manifest, &capsule_args).await;
             }
@@ -296,6 +308,50 @@ impl Drop for ScopedTerminalEnv {
         match &self.rows_prev {
             Some(value) => std::env::set_var("ELASTOS_TERM_ROWS", value),
             None => std::env::remove_var("ELASTOS_TERM_ROWS"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_refuses_projection_and_arbitrary_native_manifests() {
+        for (source, expected) in [
+            (
+                include_str!("../../../../templates/capsules/web-app/capsule.json"),
+                "opens through Home",
+            ),
+            (
+                include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
+                "trusted Runtime components",
+            ),
+            (
+                include_str!("../../../../capsules/model-provider/capsule.json"),
+                "trusted Runtime components",
+            ),
+            (
+                include_str!("../../../../capsules/home/capsule.json"),
+                "opens through Home",
+            ),
+            (
+                include_str!("../../../capsules/shell/capsule.json"),
+                "launched only by Runtime",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("capsule.json"), source).unwrap();
+            let error = run_capsule(
+                Some(directory.path().to_path_buf()),
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
         }
     }
 }

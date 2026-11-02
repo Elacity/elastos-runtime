@@ -400,6 +400,11 @@ code {
   line-height: 1.4;
 }
 
+:root[data-el-form-factor="phone"] .service-terms {
+  align-items: center;
+  min-height: var(--el-touch-target);
+}
+
 .service-confirm-actions {
   display: flex;
   flex-wrap: wrap;

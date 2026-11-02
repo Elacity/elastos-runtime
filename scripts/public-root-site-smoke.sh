@@ -15,8 +15,8 @@ grep -qi '^x-elastos-site-origin: localhost://MyWebSite' "$HEADERS_FILE" \
 grep -q '<title>ElastOS Runtime</title>' "$BODY_FILE" \
     || { echo "[public-root-site-smoke] root page did not render the expected site title" >&2; sed -n '1,80p' "$BODY_FILE" >&2; exit 1; }
 
-if grep -q '<title>ElastOS Gateway</title>' "$BODY_FILE"; then
-    echo "[public-root-site-smoke] root page fell back to the generic gateway landing page" >&2
+if grep -q '<title>ElastOS Home</title>' "$BODY_FILE"; then
+    echo "[public-root-site-smoke] root page fell back to the plain ElastOS Home landing page" >&2
     sed -n '1,80p' "$BODY_FILE" >&2
     exit 1
 fi

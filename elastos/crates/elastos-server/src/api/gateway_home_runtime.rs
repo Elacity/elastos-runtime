@@ -350,12 +350,16 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     targets
 }
 
+/// Targets Home shows in its launcher and on its desktop. Wallet connectors
+/// open from Wallet and Archive opens archives from Library, so both stay
+/// launchable but are not listed.
 pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,
         WALLET_METAMASK_CAPSULE_ID
             | WALLET_UNISAT_CAPSULE_ID
             | WALLET_WALLETCONNECT_CAPSULE_ID
+            | "archive-manager"
             | "home-agent"
     )
 }
@@ -444,6 +448,18 @@ pub(super) async fn launch_runtime_backed_home_target(
     }
     if manifest.is_runtime_projection() {
         return None;
+    }
+    if matches!(
+        manifest.execution_type(),
+        CapsuleType::NativeProvider | CapsuleType::NativeHost
+    ) {
+        return Some(GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some(
+                "Native helpers are launched through trusted Runtime components".to_string(),
+            ),
+        });
     }
 
     let runtime_capsule_dir =
@@ -868,13 +884,11 @@ fn app_shell_title(name: &str) -> String {
 
 fn app_shell_description(name: &str, manifest_description: Option<String>) -> String {
     match name {
-        DOCUMENTS_CAPSULE_ID => {
-            "Create, edit, and publish markdown documents from this device.".to_string()
-        }
+        DOCUMENTS_CAPSULE_ID => "Write Markdown and text documents.".to_string(),
         CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
-            "Browse installed apps, services, viewers, and content.".to_string()
+            "Find apps, viewers, content and models you can open or get.".to_string()
         }
         PEOPLE_CAPSULE_ID => "Manage people and local discovery.".to_string(),
         INBOX_CAPSULE_ID => "Review messages, requests, and approvals.".to_string(),
@@ -940,8 +954,8 @@ pub(super) fn home_state(data_dir: &std::path::Path) -> HomeState {
     let people = home_people_summary(&room_summary, identity.did.as_deref());
     let services = home_services_summary(data_dir, &room_summary, &people);
     let mut notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
-    // Legacy hosted-route prompts are projected from private owner decisions
-    // only in Inbox. Keep them out of the shared Home notification summary.
+    // Legacy hosted-route prompts in the store are superseded by the owner's
+    // private decisions (gateway_inbox::owner_hosted_routes).
     notifications.entries.retain(|entry| {
         !entry
             .action_ref
@@ -1000,6 +1014,7 @@ fn home_site_summary(data_dir: &std::path::Path) -> HomeSiteSummary {
 
 fn home_room_summary(summary: crate::room_service::RoomSummary) -> HomeRoomSummary {
     HomeRoomSummary {
+        latest_seq: summary.latest_seq,
         room_slug: summary.room_slug,
         title: summary.room_control.title,
         member_count: summary.room_control.member_count,
@@ -1084,6 +1099,7 @@ fn home_people_summary(
                 // Room membership rows have no presence basis of their own; a
                 // room participant with an active session is the signal here.
                 reachable: None,
+                delivery_detail: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1162,7 +1178,7 @@ pub(super) fn home_service_offers_for_people_contact(
         display_name: format!("{}'s Browser Engine", contact.display_name),
         provider_uri: Some("elastos://browser-engine/*".to_string()),
         provider_label: "Remote Engine".to_string(),
-        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
+        policy_summary: "Ask this person to run Browser pages with a profile stored on their Runtime. They must share their Browser Engine in Services and approve in Inbox before Browser can use it. Your Runtime keeps control of the page and its selected Exit. Existing profiles require an approved transfer.".to_string(),
         status: "requestable".to_string(), enabled: false, grant_required: true,
         grant_scope: crate::carrier::browser_engine_binding::EXECUTION_SCOPE.to_string(),
         capsule_contract: "browser -> Runtime service grant -> owner-bound Engine page".to_string(),
@@ -1856,6 +1872,45 @@ async fn home_list_runtime_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_shell_metadata_refuses_generic_home_launch_before_runtime_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path();
+        let capsule_dir = data_dir.join("capsules/shell");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            include_str!("../../../../capsules/shell/capsule.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("components.json"),
+            serde_json::json!({
+                "external": { "shell": { "install_path": "capsules/shell", "platforms": {} } },
+                "capsules": {}, "profiles": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: "fixture".to_string(),
+            session_id: "fixture".to_string(),
+            proof_binding_id: None,
+            grant_id: "fixture".to_string(),
+        };
+        let outcome = launch_runtime_backed_home_target(data_dir, "shell", &context)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome.capsule_id.is_none());
+        assert!(outcome
+            .detail
+            .unwrap()
+            .contains("trusted Runtime components"));
+        assert!(!crate::runtime_control::home_runtime_coord_path(data_dir).exists());
+        assert!(!data_dir.join("managed-runtimes").exists());
+    }
 
     #[test]
     fn declared_capsule_icon_resolves_to_that_capsule_own_asset_routes() {

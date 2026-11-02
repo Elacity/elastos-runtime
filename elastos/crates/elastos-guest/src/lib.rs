@@ -110,16 +110,6 @@ pub fn is_elastos_runtime() -> bool {
     std::env::var("ELASTOS_CAPSULE_NAME").is_ok() || std::env::var("ELASTOS_CAPSULE_ID").is_ok()
 }
 
-/// ElastOS SDK / capsule build version.
-///
-/// Release builds can stamp `ELASTOS_RELEASE_VERSION` so capsules report the
-/// same human-facing version as the runtime. Local builds fall back to the
-/// package version with a `-dev` suffix to make drift obvious.
-pub const VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
-
 /// Log a message to the runtime
 ///
 /// Uses stdout which routes through WASI.
@@ -160,10 +150,5 @@ mod tests {
         assert!(info.name().is_empty());
         assert!(info.id().is_empty());
         assert!(!info.is_elastos_runtime());
-    }
-
-    #[test]
-    fn test_version() {
-        assert_ne!(VERSION, "");
     }
 }

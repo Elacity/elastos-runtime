@@ -6,9 +6,8 @@ Policy and proof follow the operation's meaning and possible consequences, not
 its transport.
 
 [PRINCIPLES.md](../PRINCIPLES.md) owns the stable authority rules.
-[ARCHITECTURE.md](ARCHITECTURE.md) owns layer responsibilities, and
-[state.md](../state.md) records what the current branch proves. This document
-defines the effect contract that connects those rules.
+[ARCHITECTURE.md](ARCHITECTURE.md) owns layer responsibilities.
+This document defines the effect contract that connects those rules.
 
 ## One effect path
 
@@ -178,10 +177,8 @@ propose an actuation; it cannot approve or authorize its own proposal.
 
 ## Current implementation boundary
 
-The dated implementation facts and open proof belong in
-[state.md](../state.md#consequence-aware-effect-truth). This contract defines
-acceptance requirements; implementation and target evidence establish product
-support.
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own implementation facts and proof.
+This contract defines acceptance requirements; implementation and target evidence establish product support.
 
 Do not call the first physical provider ready until a stranger can verify all
 of the following on the installed target:

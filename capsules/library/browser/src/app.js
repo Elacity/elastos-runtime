@@ -1,31 +1,36 @@
+import { sharedFileMarkup, sharedFileName } from "./shared-file.js?v=library-links-20261028b";
 import {
   archiveLibraryObjectPayload,
-  baseName,
-  contentCid,
+  canPublishObject,
   escapeHtml,
   hasCapability,
   inTrash,
   isBlockedObject,
   isDirectory,
+  isProtectedContent,
+  isSharingBroken,
   isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
+  libraryErrorText,
+  matchRoot,
   parentUri,
-  publishedCid,
+  pathCrumbs,
+  publishedLink,
   viewerOptions,
 } from "./model.js";
-import { createLibraryRuntime } from "./api.js?v=library-20260711c";
+import { createLibraryRuntime } from "./api.js?v=library-20261028a";
 import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
-import { createLibraryActions } from "./actions.js?v=library-20260711d";
-import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
+import { createLibraryActions } from "./actions.js?v=library-20261029b";
+import { createLibraryDialog } from "./dialog.js?v=library-20261029a";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
 import { createLibraryMenu } from "./menu.js";
 import { createLibraryNavigation } from "./navigation.js";
 import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
-import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
+import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20261029a";
 import { createLibrarySelection } from "./selection.js";
 import {
   MUTATING_PROVIDER_OPS,
@@ -70,7 +75,6 @@ import {
       uploadObject,
       downloadObjectRaw,
       openTarget,
-      openPublishedUri,
       deliverToTarget,
       closeSelf,
     } = createLibraryRuntime({ getHomeToken: () => state.homeToken });
@@ -107,6 +111,9 @@ import {
     };
     let homeChromeReady = false;
     let lastHomeMenuManifestSignature = "";
+    // Set by every change in this window; the next folder load re-reads the
+    // roots' item state (Public's and Trash's emptiness).
+    let rootStateStale = false;
     let renderContent = () => {};
     let renderFooter = () => {};
     let scheduleContentRender = () => {};
@@ -123,6 +130,7 @@ import {
     let compressObjectToZip = async () => {};
     let compressSelectedObjectsToZip = async () => {};
     let copySelectedObjectsTo = async () => {};
+    let copyPublishedLink = async () => {};
     let copyText = async () => {};
     let createFolder = async () => {};
     let createTextDocument = async () => {};
@@ -132,6 +140,7 @@ import {
     let downloadObjectAsZip = async () => {};
     let downloadSelectedObjects = async () => {};
     let downloadSelectedObjectsAsZip = async () => {};
+    let downloadSharedFile = async () => {};
     let emptyTrash = async () => {};
     let extractArchiveObject = async () => {};
     let moveSelectedObjectsTo = async () => {};
@@ -145,7 +154,7 @@ import {
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
     let setClipboard = () => {};
-    let shareObject = async () => {};
+    let shareAgain = async () => {};
     let showStatusObject = async () => {};
     let trashObject = async () => {};
     let trashSelectedObjects = async () => {};
@@ -153,10 +162,12 @@ import {
     let unpublishSelectedObjects = async () => {};
     let uploadFiles = async () => {};
     const {
+      allVisible,
       clearSelection,
       isSelected,
       objectByUri,
       prepareDragSelection,
+      pruneSelectionToVisible,
       selectAllVisible,
       selectedObjects,
       selectOnly,
@@ -199,9 +210,11 @@ import {
     });
     const {
       hideMenu,
+      hideMenuIfTargetsHidden,
       menuAction,
       renderMenu,
     } = createLibraryMenu({
+      allVisible,
       contextMenu: elements.contextMenu,
       perf,
       showError,
@@ -209,19 +222,23 @@ import {
     const {
       bindDialogEvents,
       confirmDestructive,
+      confirmPublish,
       hideDialog,
+      hideDialogIfTargetsHidden,
+      offerDownload,
       showObjectStatus,
       showProtectAndListDialog,
       showProperties,
-      showShareDialog,
-      showShareReceipt,
+      showPublishedLink,
       showSharedAccessReceipt,
     } = createLibraryDialog({
+      allVisible,
       copyText: (...args) => copyText(...args),
       dialog: elements.dialog,
       hideMenu,
       objectByUri,
       onBeforeClose: () => revokePreviewUrl(),
+      roots: () => state.roots,
     });
     ({
       previewObject,
@@ -243,6 +260,7 @@ import {
       elements,
       isSelected,
       perf,
+      releaseHiddenTargets,
       selectedObjects,
       state,
       visibleObjects,
@@ -275,6 +293,7 @@ import {
       compressObjectToZip,
       compressSelectedObjectsToZip,
       copySelectedObjectsTo,
+      copyPublishedLink,
       copyText,
       createFolder,
       createTextDocument,
@@ -284,6 +303,7 @@ import {
       downloadObjectAsZip,
       downloadSelectedObjects,
       downloadSelectedObjectsAsZip,
+      downloadSharedFile,
       emptyTrash,
       extractArchiveObject,
       moveSelectedObjectsTo,
@@ -297,7 +317,7 @@ import {
       restoreObject,
       restoreSelectedObjects,
       setClipboard,
-      shareObject,
+      shareAgain,
       showStatusObject,
       trashObject,
       trashSelectedObjects,
@@ -308,13 +328,14 @@ import {
       clearSelection,
       closeSelf,
       confirmDestructive,
+      confirmPublish,
       currentFolderReadOnly,
       deliverToTarget,
       downloadObjectRaw,
       loadCurrentFolder,
       loadRoots,
       navigate,
-      openPublishedUri,
+      offerDownload,
       openTarget,
       previewObject,
       providerApi,
@@ -326,12 +347,14 @@ import {
       showObjectStatus,
       showProtectAndListDialog,
       showProperties,
-      showShareDialog,
-      showShareReceipt,
+      showPublishedLink,
       showSharedAccessReceipt,
       startCreateObject,
       state,
-      uploadObject,
+      uploadObject: (...args) => {
+        rootStateStale = true;
+        return uploadObject(...args);
+      },
       writeResourceIdentifier: (identifier) =>
         homeClipboard.writeText(identifier, {
           purpose: "resource.identifier",
@@ -392,6 +415,7 @@ import {
         state.folderCache.clear();
         state.folderPrefetches.clear();
         perf.folderCacheSize = 0;
+        rootStateStale = true;
       }
       return result;
     }
@@ -405,10 +429,7 @@ import {
     }
 
     function activeRootForUri(uri) {
-      const value = String(uri || "");
-      return state.roots
-        .filter((root) => value === root.uri || value.startsWith(root.uri + "/"))
-        .sort((left, right) => right.uri.length - left.uri.length)[0] || null;
+      return matchRoot(state.roots, uri);
     }
 
     function currentFolderReadOnly() {
@@ -577,7 +598,7 @@ import {
 
     function handleMenuCommand(command) {
       if (command === "refresh") {
-        loadCurrentFolder().catch(showError);
+        refreshCurrentFolder().catch(showError);
         return;
       }
       if (command === "toggle-search") {
@@ -664,14 +685,32 @@ import {
     }
 
     async function loadRoots() {
+      rootStateStale = false;
       const data = await providerApi("roots");
       state.roots = orderRoots(Array.isArray(data.roots) ? data.roots : []);
       if (!state.currentUri && state.roots.length) {
         const documents = state.roots.find((root) => root.id === "documents");
-        const initialRoot = state.initialUri ? rootForUri(state.initialUri) : null;
+        const initialRoot = state.initialUri ? activeRootForUri(state.initialUri) : null;
         state.currentUri = initialRoot ? state.initialUri : (documents || state.roots[0]).uri;
       }
       renderPlaces();
+    }
+
+    // Updates each root's item state in place and re-applies which places
+    // show, without rebuilding the sidebar.
+    async function refreshRootState() {
+      rootStateStale = false;
+      const data = await providerApi("roots");
+      const fresh = new Map((Array.isArray(data.roots) ? data.roots : []).map((root) => [root.uri, root]));
+      for (const root of state.roots) {
+        if (fresh.has(root.uri)) root.metadata = fresh.get(root.uri).metadata;
+      }
+      syncPlacesActive();
+    }
+
+    function refreshCurrentFolder() {
+      rootStateStale = true;
+      return loadCurrentFolder();
     }
 
     function orderRoots(roots) {
@@ -711,6 +750,7 @@ import {
     async function loadCurrentFolder(options = {}) {
       if (!state.currentUri) return;
       const loadSeq = ++state.loadSeq;
+      if (rootStateStale) refreshRootState().catch(showError);
       const uri = state.currentUri;
       const cached = options.useCache ? state.folderCache.get(uri) : null;
       let renderedCached = false;
@@ -835,6 +875,7 @@ import {
         button.dataset.uri = root.uri;
         button.dataset.rootId = rootKey(root);
         button.dataset.active = active ? "true" : "false";
+        button.hidden = placeHidden(root, active);
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
@@ -885,7 +926,14 @@ import {
         const active = activeRoot?.uri === uri;
         button.className = active ? "place window-sidebar-item window-sidebar-item-active" : "place window-sidebar-item";
         button.dataset.active = active ? "true" : "false";
+        button.hidden = placeHidden(state.roots.find((root) => root.uri === uri), active);
       }
+    }
+
+    // Library offers no Publish, so an empty Public place would only suggest
+    // sharing: it shows while it holds items or is open.
+    function placeHidden(root, active) {
+      return root?.id === "public" && root.metadata?.empty !== false && !active;
     }
 
     function syncRouteChrome() {
@@ -922,19 +970,11 @@ import {
 
     function renderBreadcrumbs() {
       elements.breadcrumbs.innerHTML = "";
-      const root = rootForUri(state.currentUri);
-      if (!root) return;
-      const segments = state.currentUri === root.uri
-        ? []
-        : state.currentUri.slice(root.uri.length + 1).split("/").filter(Boolean);
-      const rootButton = crumbButton(root.label, root.uri, segments.length === 0);
-      elements.breadcrumbs.appendChild(rootButton);
-      let cursor = root.uri;
-      for (let index = 0; index < segments.length; index += 1) {
-        cursor += "/" + segments[index];
-        elements.breadcrumbs.appendChild(pathSeparator());
-        elements.breadcrumbs.appendChild(crumbButton(decodeURIComponent(segments[index]), cursor, index === segments.length - 1));
-      }
+      const crumbs = pathCrumbs(state.roots, state.currentUri);
+      crumbs.forEach((crumb, index) => {
+        if (index) elements.breadcrumbs.appendChild(pathSeparator());
+        elements.breadcrumbs.appendChild(crumbButton(crumb.label, crumb.uri, index === crumbs.length - 1));
+      });
     }
 
     function pathSeparator() {
@@ -958,6 +998,13 @@ import {
       return visibleObjectsForState(state);
     }
 
+    // A redraw that hides items drops them from the selection and closes menus or dialogs bound to them (#441).
+    function releaseHiddenTargets() {
+      pruneSelectionToVisible();
+      hideMenuIfTargetsHidden();
+      hideDialogIfTargetsHidden();
+    }
+
     function showMenuForObject(object, x, y) {
       if (!isSelected(object.uri)) {
         selectOnly(object.uri);
@@ -970,7 +1017,7 @@ import {
       const actions = [];
       if (isBlockedObject(object)) {
         actions.push(menuAction("Properties", () => showProperties(object)));
-        renderMenu(actions, x, y);
+        renderMenu(actions, x, y, [object.uri]);
         return;
       }
       if (isDirectory(object)) {
@@ -1008,14 +1055,21 @@ import {
           } else if (isPolicyGatedArchive(object)) {
             actions.push(menuAction("Archive Support", () => showArchiveSupport(object)));
           }
-            if (object.published) {
-              actions.push(menuAction("Status", () => showStatusObject(object)));
-              if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
-              if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
-              if (hasCapability(object, "share")) actions.push(menuAction("Share", () => shareObject(object)));
-              if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
-          } else if (hasCapability(object, "publish")) {
-            actions.push(menuAction("Publish", () => publishObject(object)));
+          if (object.published && isProtectedContent(object)) {
+            // Protected content keeps its own status and repair actions.
+            actions.push(menuAction("Status", () => showStatusObject(object)));
+            if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
+            if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
+            if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
+          } else if (object.published) {
+            if (isSharingBroken(object)) {
+              if (hasCapability(object, "repair")) actions.push(menuAction("Share again", () => shareAgain(object)));
+            } else if (publishedLink(object)) {
+              actions.push(menuAction("Copy link", () => copyPublishedLink(object)));
+            }
+            if (hasCapability(object, "unpublish")) actions.push(menuAction("Stop sharing", () => unpublishObject(object)));
+          } else {
+            if (canPublishObject(object)) actions.push(menuAction("Share with contacts", () => publishObject(object)));
             if (isRuntimeCustodyProtectableVideo(object)) {
               actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
             }
@@ -1037,27 +1091,8 @@ import {
         if (hasCapability(object, "delete_permanently")) actions.push(menuAction("Delete Permanently", () => deleteObject(object)));
       }
       actions.push("-");
-      const localContentCid = contentCid(object);
-      const publicCid = publishedCid(object);
-      if (localContentCid) {
-        actions.push(
-          menuAction("Copy Content CID", () =>
-            copyText(
-              localContentCid,
-              "content CID",
-              "resource.identifier",
-            )),
-        );
-      }
-      if (object.published && publicCid) {
-        actions.push(menuAction("Copy Published Link", () => copyText(
-          "elastos://" + publicCid,
-          "published link",
-          "resource.uri",
-        )));
-      }
       actions.push(menuAction("Properties", () => showProperties(object)));
-      renderMenu(actions, x, y);
+      renderMenu(actions, x, y, [object.uri]);
     }
 
     function isPolicyGatedArchive(object) {
@@ -1065,14 +1100,11 @@ import {
     }
 
     function showArchiveSupport(object) {
-      const support = object?.metadata?.archive_support || {};
-      const family = support.family || "archive";
       const archiveViewer = viewerOptions(object).find((viewer) => viewer?.id === "archive-manager");
       if (archiveViewer && openWithViewer(object, archiveViewer.id)) {
         setStatus(`Opening ${object.name || "archive"} in Archive.`);
         return;
       }
-      setStatus(`${object.name || "Archive"} is a ${family} archive. Extraction is disabled pending dependency and release-policy review.`);
       showProperties(object);
     }
 
@@ -1097,7 +1129,6 @@ import {
       const actions = [];
       const objects = selectedObjects();
       const files = objects.filter((object) => !isDirectory(object) && !inTrash(object) && !isBlockedObject(object));
-      const unpublished = files.filter((object) => !object.published);
       const published = files.filter((object) => object.published);
       const trash = objects.filter(inTrash);
       const active = objects.filter((object) => !inTrash(object) && !isBlockedObject(object));
@@ -1115,15 +1146,15 @@ import {
       ) {
         actions.push(menuAction("Compress Selected to ZIP", compressSelectedObjectsToZip));
       }
-      if (unpublished.some((object) => hasCapability(object, "publish"))) actions.push(menuAction("Publish Selected", publishSelectedObjects));
-      if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Unpublish Selected", unpublishSelectedObjects));
+      if (files.some(canPublishObject)) actions.push(menuAction("Share selected with contacts", publishSelectedObjects));
+      if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Stop sharing selected", unpublishSelectedObjects));
       if (active.length) actions.push("-");
       if (active.some((object) => hasCapability(object, "move"))) actions.push(menuAction("Cut", () => setClipboard("move", active)));
       if (active.some((object) => hasCapability(object, "copy"))) actions.push(menuAction("Copy", () => setClipboard("copy", active)));
       if (active.some((object) => hasCapability(object, "trash"))) actions.push(menuAction("Delete", trashSelectedObjects));
       if (trash.length) actions.push(menuAction("Restore", restoreSelectedObjects));
       if (permanentlyDeletable) actions.push(menuAction("Delete Permanently", deleteSelectedObjects));
-      renderMenu(actions, x, y);
+      renderMenu(actions, x, y, objects.map((object) => object.uri));
     }
 
     function showBackgroundMenu(x, y) {
@@ -1147,7 +1178,7 @@ import {
         ],
       }));
       actions.push("-");
-      actions.push(menuAction("Refresh", loadCurrentFolder));
+      actions.push(menuAction("Refresh", refreshCurrentFolder));
       actions.push(menuAction("Show Hidden", () => toggleShowHidden(), { checked: state.showHidden }));
       actions.push("-");
       if (!readOnly) {
@@ -1166,19 +1197,11 @@ import {
       renderMenu(actions, x, y);
     }
 
-    function showFolderProperties() {
-      const root = rootForUri(state.currentUri);
-      showProperties({
-        uri: state.currentUri,
-        name: root?.uri === state.currentUri ? root.label : baseName(state.currentUri),
-        kind: "directory",
-        mime: "inode/directory",
-        size: 0,
-        modified_at: 0,
-        revision: "-",
-        availability: "local-only",
-        viewers: [],
-      });
+    async function showFolderProperties() {
+      const uri = state.currentUri;
+      const { object } = await providerApi("stat", { uri });
+      const root = state.roots.find((entry) => entry.uri === uri);
+      showProperties(root ? { ...object, name: root.label } : object);
     }
 
     function setSort(sort) {
@@ -1211,7 +1234,7 @@ import {
 
     function showError(error) {
       console.error(error);
-      setStatus(error && error.message ? error.message : "Library action failed.");
+      setStatus(libraryErrorText(error) || (error && error.message ? error.message : "Library action failed."));
     }
 
     function bindEvents() {
@@ -1260,7 +1283,7 @@ import {
         handleBrowserPopState,
         hideDialog,
         hideMenu,
-        loadCurrentFolder,
+        refreshCurrentFolder,
         moveSelectedObjectsTo,
         navigate,
         navigateBack,
@@ -1311,6 +1334,20 @@ import {
       } catch (error) {
         showError(error);
         elements.content.innerHTML = '<div class="empty"><div><h2>Library could not open</h2><p>Close Library and try again.</p></div></div>';
+      } finally {
+        const sharedCid = queryParams.get("cid");
+        const sharedName = sharedFileName(queryParams.get("name"));
+        if (state.mode === "browse" && sharedCid) {
+          elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
+          elements.dialog.classList.remove("hidden");
+          elements.dialog.querySelector("[data-shared-download]").addEventListener("click", () => {
+            setStatus("Downloading shared file...");
+            downloadSharedFile(sharedCid, sharedName)
+              .then(() => setStatus("Downloaded the shared file."))
+              .catch(showError);
+          });
+          setStatus("Shared file is ready to download.");
+        }
       }
     }
 

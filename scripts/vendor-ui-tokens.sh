@@ -25,7 +25,8 @@ PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`j
 # Entries are the browser-serving dir relative to capsules/ — most apps serve
 # from a browser/ subdir; viewer-style capsules serve straight from their root.
 # home/browser is the shell host (unlock surface); home-gui/browser is the GUI
-# shell package. home-cli stays out: its terminal surface is capsule-local xterm
+# shell package; assistant/browser is the Assistant room Home frames like any
+# capsule. home-cli stays out: its terminal surface is capsule-local xterm
 # rendering by contract. The vendored theme runtime owns no browser-profile
 # storage, so it is safe in an opaque capsule; only the host installs a
 # persistence adapter, in its own non-vendored file.
@@ -33,6 +34,7 @@ TARGETS=(
   browser/browser
   home/browser
   home-gui/browser
+  assistant/browser
   system/browser
   services/browser
   people/browser
@@ -108,19 +110,18 @@ for target_dir in "${TARGETS[@]}"; do
   fi
 done
 
-for target_dir in marketplace/browser system/browser; do
-  for asset in model-management.js model-management.css; do
-    model_source="capsules/_shared/$asset"
-    model_target="capsules/$target_dir/$asset"
-    if [[ "$MODE" == "--check" ]]; then
-      if ! cmp -s "$model_source" "$model_target"; then
-        echo "[vendor-ui] DRIFT: $model_target" >&2
-        FAILED=1
-      fi
-    else
-      cp "$model_source" "$model_target"
+# Marketplace uses only the controller; its compact rows take Marketplace's own list styles.
+for model_target in marketplace/browser/model-management.js system/browser/model-management.js system/browser/model-management.css; do
+  model_source="capsules/_shared/${model_target##*/}"
+  model_target="capsules/$model_target"
+  if [[ "$MODE" == "--check" ]]; then
+    if ! cmp -s "$model_source" "$model_target"; then
+      echo "[vendor-ui] DRIFT: $model_target" >&2
+      FAILED=1
     fi
-  done
+  else
+    cp "$model_source" "$model_target"
+  fi
 done
 
 # Marketplace and Assistant present the same provider-owned model facts.
@@ -134,6 +135,19 @@ if [[ "$MODE" == "--check" ]]; then
 else
   cp "$model_facts_source" "$model_facts_target"
 fi
+
+# The phone push drawer ships only to capsules whose sidebar uses it.
+for target_dir in marketplace/browser documents/browser system/browser; do
+  drawer_target="capsules/$target_dir/elastos-drawer.js"
+  if [[ "$MODE" == "--check" ]]; then
+    if ! cmp -s capsules/_shared/elastos-drawer.js "$drawer_target"; then
+      echo "[vendor-ui] DRIFT: $drawer_target" >&2
+      FAILED=1
+    fi
+  else
+    cp capsules/_shared/elastos-drawer.js "$drawer_target"
+  fi
+done
 
 for target_dir in assistant/browser; do
   model_target="capsules/$target_dir/model-selection.js"

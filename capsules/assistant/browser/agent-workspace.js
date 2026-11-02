@@ -10,6 +10,7 @@ import {
   applyUsageLedger,
 } from "./agent-state.js";
 import {
+  DEFAULT_LIVE_SYSTEM_PROMPT,
   clampLiveMaxTokens,
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
@@ -25,6 +26,14 @@ import { cloneWorkspace } from "./workspace-transition.js";
 
 export const AGENT_WORKSPACE_V = 1;
 export const MAX_DRAFT_PART_TEXT = 40_000;
+
+/** The default instruction is saved as "" so a Home follows the current
+   default. Workspaces saved by 0.8.0-alpha.24 and older hold the full text of
+   the default they shipped with (#455); loading that exact text migrates it. */
+const SAVED_DEFAULT_UP_TO_ALPHA_24 =
+  "You are the ElastOS Home Agent, running privately on this machine. " +
+  "You have no tools and no capsule authority in this session; answer from " +
+  "knowledge only, and say so plainly when a task would need a tool or grant.";
 
 /** @type {null | Record<string, Function>} */
 let store = null;
@@ -156,7 +165,7 @@ export function getAgentWorkspaceSnapshot() {
     sessionMode: sessionMode === "studio" ? "studio" : sessionMode === "build" ? "build" : "chat",
     liveOfferId: String(liveOfferChoice() || ""),
     selectedModelCid: liveContentChoice() ?? null,
-    systemPrompt: normalizeLiveSystemPrompt(store.getSystemPrompt?.() || ""),
+    systemPrompt: savedSystemPrompt(store.getSystemPrompt?.()),
     agentNotes: normalizeAgentNotes(store.getAgentNotes?.() || ""),
     maxTokens: clampLiveMaxTokens(store.getMaxTokens?.()),
     reasoningEffort:
@@ -176,6 +185,11 @@ export function getAgentWorkspaceSnapshot() {
     return null;
   }
   return snapshot;
+}
+
+function savedSystemPrompt(value) {
+  const prompt = normalizeLiveSystemPrompt(value || "");
+  return prompt === DEFAULT_LIVE_SYSTEM_PROMPT ? "" : prompt;
 }
 
 const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -230,7 +244,8 @@ export function applyAgentWorkspaceSnapshot(raw) {
   }
   selectLiveOffer(raw.liveOfferId ?? "", raw.selectedModelCid ?? null);
   if (typeof raw.systemPrompt === "string") {
-    store.setSystemPrompt?.(normalizeLiveSystemPrompt(raw.systemPrompt));
+    const saved = raw.systemPrompt === SAVED_DEFAULT_UP_TO_ALPHA_24 ? "" : raw.systemPrompt;
+    store.setSystemPrompt?.(normalizeLiveSystemPrompt(saved));
   }
   if (typeof raw.agentNotes === "string") {
     store.setAgentNotes?.(normalizeAgentNotes(raw.agentNotes));

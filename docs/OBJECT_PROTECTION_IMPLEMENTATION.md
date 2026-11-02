@@ -30,7 +30,7 @@ before implementing a second real cryptographic backend.
 
 Resolve the approved integration commit before editing; symbols and release
 state can move. [Protected content](PROTECTED_CONTENT.md) describes the selected
-protocol and its acceptance requirements. Read [state.md](../state.md) for
+protocol and its acceptance requirements. Read [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for
 verified source and installed behavior. Record the exact implementation and
 verification revisions there or in a dated evidence record.
 
@@ -265,6 +265,5 @@ slice. Record exact commands and results at implementation time. Source tests
 establish source behavior; installed and cross-device acceptance need their own
 artifact-bound evidence under [AGENTS.md](../AGENTS.md).
 
-Update [TASKS.md](../TASKS.md) as slices close. Add verified behavior to
-[state.md](../state.md) only after its evidence exists. Keep this guide focused
+Close each slice in its GitHub issue once its evidence exists. Keep this guide focused
 on the stable boundary rather than accumulating release logs or operator paths.

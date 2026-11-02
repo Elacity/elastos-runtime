@@ -18,7 +18,7 @@ const routeEnd = source.indexOf('      if (req.method === "POST" && url.pathname
 assert.ok(routeStart > 0 && routeEnd > routeStart);
 const route = source.slice(routeStart, routeEnd);
 const functions = ['safeId', 'validateAbsolutePath', 'readJsonBody', 'requestJsonOverUnix',
-  'browserDisplayControlError', 'postJsonOverUnix', 'activePageGuestControl', 'proxyGuestPageWebrtc']
+  'browserDisplayControlError', 'postJsonOverUnix', 'vmOwnsExactPage', 'ownedVmRecord', 'activePageGuestControl', 'proxyGuestPageWebrtc']
   .map(declaration).join('\n');
 const cases = [
   ['display_attach_busy', 409], ['display_generation_mismatch', 409], ['display_owner_changed', 409],

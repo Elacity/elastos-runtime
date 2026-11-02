@@ -104,7 +104,7 @@ assert(
   "Wallet must not offer Allow without exact review details",
 );
 
-const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/index.html", import.meta.url), "utf8");
+const inbox = fs.readFileSync(new URL("../capsules/inbox/browser/inbox.js", import.meta.url), "utf8");
 const reviewBranch = inbox.slice(
   inbox.indexOf('actionId.startsWith("wallet-review-request:")'),
   inbox.indexOf('actionId.startsWith("capability-approve-request:")'),

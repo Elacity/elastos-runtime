@@ -161,6 +161,7 @@ class Fixture:
         for name in (
             AUDIT,
             "components-release-integrity-check.py",
+            "release-platforms.json",
             "installed-provider-verify.sh",
         ):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)

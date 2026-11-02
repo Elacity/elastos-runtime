@@ -38,6 +38,5 @@ run cargo test --manifest-path elastos/Cargo.toml -p elastos-server gateway_bloc
 run bash -n scripts/vendor-walletconnect-adapter.sh
 run scripts/walletconnect-connector-config-smoke.sh
 run node scripts/home-fresh-passkey-authority-smoke.mjs
-run node scripts/home-entropy-check.mjs
-run scripts/check-wci-alignment.sh
+run node scripts/check-product-data.mjs
 run scripts/recovery-kit-live-smoke.sh

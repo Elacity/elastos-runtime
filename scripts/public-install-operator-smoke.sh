@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Disposable test Homes never join the Community network a release pins (setup and update skip it).
+export ELASTOS_COLLABORATION_STARTUP_MODE=isolated
 
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/runtime-cleanup.sh"
+
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 TARGET_ADDR="${ELASTOS_OPERATOR_TARGET_ADDR:-127.0.0.1:33100}"
-SRC_HOME="$(mktemp -d /tmp/elastos-public-operator-src-XXXXXX)"
-DST_HOME="$(mktemp -d /tmp/elastos-public-operator-dst-XXXXXX)"
+SRC_HOME="$(smoke_home_dir public-operator-src)"
+DST_HOME="$(smoke_home_dir public-operator-dst)"
 
 cleanup() {
     if [[ -f "${DST_HOME}/serve.pid" ]]; then
@@ -32,10 +36,10 @@ install_operator_home() {
         exit 1
     fi
 
-    echo "[public-operator] setup --profile operator in ${home_dir}"
+    echo "[public-operator] setup --with shell,localhost-provider,did-provider in ${home_dir}"
     HOME="${home_dir}" \
     XDG_DATA_HOME="${home_dir}/xdg-data" \
-    "${bin}" setup --profile operator \
+    "${bin}" setup --with shell,localhost-provider,did-provider \
         >"${home_dir}/setup.log"
 }
 

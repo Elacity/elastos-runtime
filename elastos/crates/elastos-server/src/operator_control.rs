@@ -1,7 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +10,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::sync::Mutex;
 
 use crate::carrier::decode_ticket_endpoints;
@@ -37,6 +36,9 @@ pub const OPERATOR_ACTION_ROOM_READ: &str = "room.read";
 pub const OPERATOR_ACTION_ROOM_APPROVE: &str = "room.approve";
 pub const OPERATOR_ACTION_ROOM_DENY: &str = "room.deny";
 pub const OPERATOR_ACTION_ROOM_OPEN: &str = "room.open";
+/// Lets a Carrier peer place content replicas on this node. It is a
+/// storage permission for the peer, not a remote operator command.
+pub const OPERATOR_ACTION_CONTENT_REPLICA: &str = "content.replica";
 
 const OPERATOR_CONFIG_SCHEMA: &str = "elastos.operator-control/v1";
 const OPERATOR_REQUEST_DOMAIN: &str = "elastos.operator.request.v1";
@@ -44,6 +46,16 @@ const OPERATOR_RESPONSE_DOMAIN: &str = "elastos.operator.response.v1";
 const OPERATOR_AUDIT_FILE: &str = "operator-control-audit.jsonl";
 const OPERATOR_REQUEST_LOG_FILE: &str = "operator-control-requests.jsonl";
 const OPERATOR_CONNECT_TIMEOUT_SECS: u64 = 10;
+const OPERATOR_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_UPDATE_METADATA_BYTES: usize = 256 * 1024;
+/// A signed operator request is an action, a request id and small arguments.
+/// It is read before the signature is checked, so it stays small and quick.
+const OPERATOR_REQUEST_MAX_BYTES: u64 = 64 * 1024;
+const OPERATOR_REQUEST_WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+/// The largest answer carries update metadata, escaped and signed.
+const OPERATOR_RESPONSE_MAX_BYTES: u64 = 4 * MAX_UPDATE_METADATA_BYTES as u64;
+/// `update.apply` answers after the install finishes.
+const OPERATOR_RESPONSE_WAIT: Duration = Duration::from_secs(60 * 60);
 const OPERATOR_TS_SKEW_SECS: u64 = 5 * 60;
 const REQUEST_STATE_RESERVED: &str = "reserved";
 const REQUEST_STATE_COMPLETED: &str = "completed";
@@ -119,11 +131,61 @@ pub struct OperatorUpdateCheck {
     pub update_available: bool,
     pub discovery: String,
     #[serde(default)]
-    pub working_gateway: Option<String>,
-    #[serde(default)]
     pub head_cid: Option<String>,
     #[serde(default)]
     pub release_cid: Option<String>,
+    #[serde(default)]
+    pub publisher_did: String,
+    #[serde(default)]
+    pub changes: Vec<String>,
+}
+
+/// The operation signals this owner on completion or cancellation. Its separate
+/// task retains the close future until the short-lived endpoint has drained.
+struct OperatorCarrierDrain {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OperatorCarrierDrain {
+    fn new(close: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let (signal, shutdown) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = shutdown.await;
+            close.await;
+        });
+        Self {
+            signal: Some(signal),
+            task: Some(task),
+        }
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.signal.take();
+        self.task
+            .take()
+            .expect("Carrier drain task remains owned")
+            .await
+            .context("drain temporary operator Carrier client")
+    }
+}
+
+struct OperatorCarrierSession {
+    client: Arc<crate::carrier::CarrierClient>,
+    drain: OperatorCarrierDrain,
+}
+
+impl OperatorCarrierSession {
+    fn new(client: crate::carrier::CarrierClient) -> Self {
+        let client = Arc::new(client);
+        let closing = client.clone();
+        let drain = OperatorCarrierDrain::new(async move { closing.close().await });
+        Self { client, drain }
+    }
+
+    async fn finish(self) -> Result<()> {
+        self.drain.finish().await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -310,6 +372,7 @@ pub fn supported_actions() -> &'static [&'static str] {
         OPERATOR_ACTION_ROOM_APPROVE,
         OPERATOR_ACTION_ROOM_DENY,
         OPERATOR_ACTION_ROOM_OPEN,
+        OPERATOR_ACTION_CONTENT_REPLICA,
     ]
 }
 
@@ -367,6 +430,17 @@ pub fn upsert_peer(data_dir: &Path, mut peer: OperatorPeer) -> Result<OperatorPe
     config.peers.sort_by(|a, b| a.did.cmp(&b.did));
     save_operator_control(data_dir, &config)?;
     Ok(peer)
+}
+
+/// The actions the owner granted to `did` in the operator peer store, or
+/// `None` when the peer is not registered (or the store cannot be read).
+pub fn granted_peer_actions(data_dir: &Path, did: &str) -> Option<Vec<String>> {
+    load_operator_control(data_dir)
+        .ok()?
+        .peers
+        .into_iter()
+        .find(|peer| peer.did == did)
+        .map(|peer| peer.allow)
 }
 
 pub fn remove_peer(data_dir: &Path, did: &str) -> Result<Option<OperatorPeer>> {
@@ -434,81 +508,232 @@ pub async fn gather_local_node_status(data_dir: &Path) -> Result<OperatorNodeSta
 
 pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdateCheck> {
     let source = load_default_trusted_source(data_dir)?;
-    let primary_publisher =
-        source.publisher_dids.first().cloned().ok_or_else(|| {
-            anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
-        })?;
-
-    let current_version = source.installed_version.clone();
-    let client = crate::carrier::CarrierClient::connect_trusted_source(
-        &source,
-        OPERATOR_CONNECT_TIMEOUT_SECS,
+    crate::update::installed_release_version(&source.installed_version)?;
+    let client = tokio::time::timeout(
+        Duration::from_secs(OPERATOR_CONNECT_TIMEOUT_SECS),
+        crate::carrier::CarrierClient::connect_trusted_source(
+            &source,
+            OPERATOR_CONNECT_TIMEOUT_SECS,
+        ),
     )
     .await
+    .context(crate::update::UpdateSourceUnavailable)?
     .with_context(|| {
         format!(
             "Carrier connection to trusted source '{}' failed. Remote operator update check stays Carrier-only.",
             source.name
         )
-    })?;
-    let release = client.release_head().await.with_context(|| {
-        format!(
-            "Carrier discovery from trusted source '{}' failed to return a release head.",
-            source.name
-        )
-    })?;
-    let release = release.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Carrier discovery from trusted source '{}' returned no release head.",
-            source.name
-        )
-    })?;
-    let head_cid = release
-        .get("head_cid")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
-    let head_bytes = client
-        .fetch_file("release-head.json")
+    }).context(crate::update::UpdateSourceUnavailable)?;
+    let session = OperatorCarrierSession::new(client);
+    let result = tokio::time::timeout(
+        OPERATOR_UPDATE_CHECK_TIMEOUT,
+        gather_update_check_with_client(&session.client, &source),
+    )
+    .await
+    .context(crate::update::UpdateSourceUnavailable)
+    .and_then(|result| result);
+    let drained = session.finish().await;
+    result.and_then(|check| drained.map(|()| check))
+}
+
+async fn gather_update_check_with_client(
+    client: &crate::carrier::CarrierClient,
+    source: &TrustedSource,
+) -> Result<OperatorUpdateCheck> {
+    let primary_publisher =
+        source.publisher_dids.first().cloned().ok_or_else(|| {
+            anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
+        })?;
+    let discovered = crate::update::discover_carrier_release_head(client, source)
         .await
         .with_context(|| {
             format!(
-                "Carrier fetch of release-head.json from trusted source '{}' failed.",
+                "Carrier release discovery for trusted source '{}' failed",
                 source.name
             )
         })?;
+    anyhow::ensure!(
+        discovered.bytes.len() <= MAX_UPDATE_METADATA_BYTES,
+        "signed release head is too large"
+    );
+    let head = verify_release_envelope(
+        &discovered.bytes,
+        "elastos.release.head.v1",
+        &primary_publisher,
+    )?;
+    let release_cid = bounded_release_text(&head["payload"], "latest_release_cid", 128)?;
+    cid::Cid::try_from(release_cid).context("signed release head CID is invalid")?;
+    let release_bytes = client
+        .fetch_content(release_cid, None)
+        .await
+        .context(crate::update::UpdateSourceUnavailable)?;
+    verified_update_check(source, &discovered, &release_bytes)
+}
 
-    let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)?;
-    let latest_version = head["payload"]["version"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let release_cid = head["payload"]["latest_release_cid"]
-        .as_str()
-        .map(|value| value.to_string())
-        .filter(|value| !value.is_empty());
-
-    let channel = normalized_channel(&source);
+fn verified_update_check(
+    source: &TrustedSource,
+    discovered: &crate::update::DiscoveredHead,
+    release_bytes: &[u8],
+) -> Result<OperatorUpdateCheck> {
+    anyhow::ensure!(
+        discovered.bytes.len() <= MAX_UPDATE_METADATA_BYTES
+            && release_bytes.len() <= MAX_UPDATE_METADATA_BYTES,
+        "signed update metadata is too large"
+    );
+    anyhow::ensure!(
+        !source.name.is_empty()
+            && source.name.len() <= 128
+            && source.installed_version.len() <= 128
+            && normalized_channel(source).len() <= 64,
+        "trusted update source fields exceed their bounds"
+    );
+    let publisher_did = source
+        .publisher_dids
+        .first()
+        .filter(|did| !did.is_empty() && did.len() <= 256)
+        .context("trusted update source requires a publisher DID")?;
+    let head =
+        verify_release_envelope(&discovered.bytes, "elastos.release.head.v1", publisher_did)?;
+    if let Some(cid) = &discovered.head_cid {
+        anyhow::ensure!(cid.len() <= 128, "signed update head CID is too long");
+        crate::update::verify_release_metadata_cid(cid, &discovered.bytes)?;
+    }
+    let head_payload = &head["payload"];
+    if let Some(signer) = head_payload.get("signer_did") {
+        anyhow::ensure!(
+            signer.as_str() == Some(publisher_did.as_str()),
+            "signed update head publisher differs from its trusted source"
+        );
+    }
+    let release_cid = bounded_release_text(head_payload, "latest_release_cid", 128)?;
+    crate::update::verify_release_metadata_cid(release_cid, release_bytes)?;
+    let (release, _) = verify_release_envelope_against_dids(
+        release_bytes,
+        "elastos.release.v1",
+        &source.publisher_dids,
+    )?;
+    crate::update::verify_release_binding(&head, release_bytes, &release)?;
+    let latest_version = bounded_release_text(head_payload, "version", 128)?;
+    let channel = bounded_release_text(head_payload, "channel", 64)?;
+    crate::update::verify_source_channel(source, channel)?;
+    let payload = &release["payload"];
+    let origin = payload["source"]
+        .as_object()
+        .context("signed release requires source commit and tree")?;
+    anyhow::ensure!(origin.len() == 2, "signed release source fields differ");
+    for field in ["commit", "tree"] {
+        let oid = bounded_release_text(&payload["source"], field, 40)?;
+        anyhow::ensure!(
+            oid.len() == 40
+                && oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "signed release source {field} is invalid"
+        );
+    }
+    if let Some(head_origin) = head_payload.get("source") {
+        anyhow::ensure!(
+            head_origin == &payload["source"],
+            "signed update head and release source differ"
+        );
+    }
+    let platform = &payload["platforms"][crate::update::detect_release_platform()];
+    for artifact in ["binary", "components"] {
+        let descriptor = &platform[artifact];
+        let cid = cid::Cid::try_from(bounded_release_text(descriptor, "cid", 128)?)
+            .with_context(|| format!("signed release {artifact} CID is invalid"))?;
+        anyhow::ensure!(
+            matches!(cid.codec(), 0x55 | 0x70)
+                && cid.hash().code() == 0x12
+                && cid.hash().digest().len() == 32,
+            "signed release {artifact} CID is unsupported"
+        );
+        let hash = bounded_release_text(descriptor, "sha256", 64)?;
+        anyhow::ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && descriptor["size"].as_u64().is_some_and(|size| size > 0),
+            "signed release {artifact} descriptor is invalid"
+        );
+        if cid.codec() == 0x55 {
+            anyhow::ensure!(
+                hex::encode(cid.hash().digest()) == hash,
+                "signed release {artifact} raw CID differs from its SHA-256"
+            );
+        }
+    }
+    let changes = match payload.get("changes") {
+        None => Vec::new(),
+        Some(value) => {
+            let entries = value
+                .as_array()
+                .context("signed release changes must be a string array")?;
+            anyhow::ensure!(entries.len() <= 32, "signed release has too many changes");
+            let mut total = 0usize;
+            let mut changes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let change = entry
+                    .as_str()
+                    .context("signed release changes must be strings")?;
+                total = total.saturating_add(change.len());
+                anyhow::ensure!(
+                    !change.trim().is_empty()
+                        && change.len() <= 500
+                        && total <= 8 * 1024
+                        && !change.chars().any(char::is_control),
+                    "signed release changes exceed their text bounds"
+                );
+                changes.push(change.to_owned());
+            }
+            changes
+        }
+    };
+    let update_available =
+        match crate::update::compare_release_versions(&source.installed_version, latest_version)? {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Less => anyhow::bail!(
+                "Signed release {latest_version} is older than installed release {}",
+                source.installed_version
+            ),
+        };
     Ok(OperatorUpdateCheck {
-        source_name: source.name,
-        channel,
-        current_version,
-        latest_version: latest_version.clone(),
-        update_available: latest_version != source.installed_version,
+        source_name: source.name.clone(),
+        channel: channel.to_owned(),
+        current_version: source.installed_version.clone(),
+        latest_version: latest_version.to_owned(),
+        update_available,
         discovery: "Carrier".to_string(),
-        working_gateway: None,
-        head_cid,
-        release_cid,
+        head_cid: discovered.head_cid.clone(),
+        release_cid: Some(release_cid.to_owned()),
+        publisher_did: publisher_did.clone(),
+        changes,
     })
+}
+
+fn bounded_release_text<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str> {
+    value[field]
+        .as_str()
+        .filter(|text| {
+            !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+        })
+        .with_context(|| format!("signed release {field} is invalid"))
 }
 
 pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> {
     let source = load_default_trusted_source(data_dir)?;
+    crate::update::installed_release_version(&source.installed_version)?;
     let source_name = source.name.clone();
     let channel = normalized_channel(&source);
     let previous_version = source.installed_version.clone();
 
-    let carrier_client = Arc::new(
+    let session = OperatorCarrierSession::new(
         crate::carrier::CarrierClient::connect_trusted_source(
             &source,
             OPERATOR_CONNECT_TIMEOUT_SECS,
@@ -516,49 +741,41 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         .await
         .with_context(|| {
             format!(
-                "Carrier connection to trusted source '{}' failed. Remote operator apply stays Carrier-only; use a local explicit transport override if you intentionally need web transport.",
+                "Carrier connection to trusted source '{}' failed. Remote operator apply stays Carrier-only.",
                 source.name
             )
         })?,
     );
 
-    let platform = crate::update::detect_release_platform().to_string();
-    let fetch_counter = Arc::new(AtomicUsize::new(0));
-    let carrier_for_fetch = carrier_client.clone();
-    let fetch_fn: crate::update::FetchFn = Box::new(move |_cid, _gateways| {
+    let carrier_for_fetch = session.client.clone();
+    let fetch_fn: crate::update::FetchFn = Box::new(move |cid| {
         let client = carrier_for_fetch.clone();
-        let counter = fetch_counter.clone();
-        let platform = platform.clone();
-        Box::pin(async move {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let path = match n {
-                0 => "release-head.json".to_string(),
-                1 => "release.json".to_string(),
-                2 => format!("elastos-{}", platform),
-                3 => format!("components-{}.json", platform),
-                _ => return Err(anyhow::anyhow!("unexpected operator update fetch #{}", n)),
-            };
-            client.fetch_file(&path).await
-        })
+        Box::pin(async move { client.fetch_content(&cid, None).await })
     });
 
-    let try_p2p: crate::update::TryP2pFn = Box::new(|source, publisher_did| {
-        Box::pin(async move { try_operator_p2p_discovery(&source, &publisher_did).await })
+    let carrier_for_discovery = session.client.clone();
+    let try_p2p: crate::update::TryP2pFn = Box::new(move |source, _publisher_did| {
+        let client = carrier_for_discovery.clone();
+        Box::pin(async move { try_operator_p2p_discovery(&client, &source).await })
     });
 
-    crate::update::run_update_for_data_dir(
+    let result = crate::update::run_update_for_data_dir_in_context(
         data_dir,
         &fetch_fn,
         Some(&try_p2p),
         false,
         None,
-        false,
-        Vec::new(),
         env!("ELASTOS_VERSION"),
         true,
         false,
+        false,
+        crate::setup::FirstPartyCarrierContext::Runtime,
     )
-    .await?;
+    .await;
+    drop(fetch_fn);
+    drop(try_p2p);
+    let drained = session.finish().await;
+    result.and(drained)?;
 
     let installed_source = load_default_trusted_source(data_dir)?;
     let installed_version = installed_source.installed_version.clone();
@@ -894,17 +1111,12 @@ fn normalized_channel(source: &TrustedSource) -> String {
 }
 
 async fn try_operator_p2p_discovery(
+    client: &crate::carrier::CarrierClient,
     source: &TrustedSource,
-    _publisher_did: &str,
-) -> Option<String> {
-    let client = crate::carrier::CarrierClient::connect_trusted_source(
-        source,
-        OPERATOR_CONNECT_TIMEOUT_SECS + 5,
-    )
-    .await
-    .ok()?;
-    let release = client.release_head().await.ok()??;
-    release["head_cid"].as_str().map(|value| value.to_string())
+) -> Result<Option<crate::update::DiscoveredHead>> {
+    crate::update::discover_carrier_release_head(client, source)
+        .await
+        .map(Some)
 }
 
 fn now_ts() -> u64 {
@@ -944,6 +1156,11 @@ fn verify_request_envelope(
     envelope_bytes: &[u8],
     expected_requesters: &[String],
 ) -> Result<OperatorRequestPayload> {
+    // The envelope check treats an empty trusted set as "any signer"; an
+    // operator request verifies only against a configured peer.
+    if expected_requesters.is_empty() {
+        anyhow::bail!("requester DID is not configured for operator control");
+    }
     let (value, signer_did) = verify_release_envelope_against_dids(
         envelope_bytes,
         OPERATOR_REQUEST_DOMAIN,
@@ -1041,6 +1258,7 @@ async fn handle_operator_connection(
     conn: iroh::endpoint::Connection,
     ctx: OperatorRuntimeContext,
 ) -> Result<()> {
+    let peer = conn.remote_id();
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -1048,7 +1266,7 @@ async fn handle_operator_connection(
         };
         let stream_ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx).await {
+            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx, peer).await {
                 tracing::debug!("operator control stream error: {:#}", err);
             }
         });
@@ -1060,10 +1278,14 @@ async fn handle_operator_stream(
     send: &mut iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     ctx: &OperatorRuntimeContext,
+    peer: iroh::EndpointId,
 ) -> Result<()> {
-    let mut reader = BufReader::new(recv);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = crate::carrier::read_peer_line(
+        &mut BufReader::new(recv),
+        OPERATOR_REQUEST_MAX_BYTES,
+        OPERATOR_REQUEST_WAIT,
+    )
+    .await?;
 
     let request_meta = extract_request_meta(line.as_bytes());
     let request_id = request_meta
@@ -1086,30 +1308,39 @@ async fn handle_operator_stream(
     let expected_requesters: Vec<String> =
         config.peers.iter().map(|peer| peer.did.clone()).collect();
 
-    let response = match verify_request_envelope(line.trim().as_bytes(), &expected_requesters) {
+    let verified = verify_request_envelope(line.trim().as_bytes(), &expected_requesters);
+    let authenticated = verified.is_ok();
+    let response = match verified {
         Ok(request) => build_operator_response(ctx, &config, request).await,
-        Err(err) => OperatorResponsePayload {
-            version: 1,
-            request_id,
-            accepted: false,
-            target_did: ctx.local_did.clone(),
-            ts: now_ts(),
-            result: serde_json::Value::Null,
-            error: Some(err.to_string()),
-        },
+        Err(err) => {
+            tracing::debug!("operator control request from {peer} did not verify");
+            OperatorResponsePayload {
+                version: 1,
+                request_id,
+                accepted: false,
+                target_did: ctx.local_did.clone(),
+                ts: now_ts(),
+                result: serde_json::Value::Null,
+                error: Some(err.to_string()),
+            }
+        }
     };
 
-    append_audit_entry(
-        &ctx.data_dir,
-        AuditEntry {
-            ts: response.ts,
-            request_id: response.request_id.clone(),
-            requester_did,
-            action,
-            accepted: response.accepted,
-            error: response.error.clone(),
-        },
-    );
+    // Requests whose envelope verified are audited, accepted or denied; the
+    // audit file is also the replay record for read-only actions.
+    if authenticated {
+        append_audit_entry(
+            &ctx.data_dir,
+            AuditEntry {
+                ts: response.ts,
+                request_id: response.request_id.clone(),
+                requester_did,
+                action,
+                accepted: response.accepted,
+                error: response.error.clone(),
+            },
+        );
+    }
 
     let (signing_key, _did) = elastos_identity::load_or_create_did(&ctx.data_dir)?;
     let envelope = sign_envelope(&signing_key, OPERATOR_RESPONSE_DOMAIN, &response)?;
@@ -1353,9 +1584,7 @@ async fn deny_local_room_request(
 
 pub async fn start_local_room_gateway(data_dir: &Path, addr: &str) -> Result<OperatorRoomOpen> {
     if !room_capsule_installed(data_dir) {
-        anyhow::bail!(
-            "Room browser capsule is not installed. Run `elastos setup --profile demo` first."
-        );
+        anyhow::bail!("Room browser capsule is not installed. Run `elastos setup` first.");
     }
 
     let coords = read_runtime_coords(data_dir).await.ok_or_else(|| {
@@ -1646,9 +1875,12 @@ impl OperatorClient {
         send.write_all(&bytes).await?;
         send.finish()?;
 
-        let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = crate::carrier::read_peer_line(
+            &mut BufReader::new(recv),
+            OPERATOR_RESPONSE_MAX_BYTES,
+            OPERATOR_RESPONSE_WAIT,
+        )
+        .await?;
         if line.trim().is_empty() {
             anyhow::bail!("operator peer returned an empty response");
         }
@@ -1673,10 +1905,334 @@ mod tests {
     use elastos_runtime::signature::generate_keypair;
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn operator_carrier_drain_finishes_once_before_returning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let drain = OperatorCarrierDrain::new(async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        drain.finish().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_runs_after_operation_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let result: Result<()> = async {
+            let _drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = closed.send(());
+            });
+            anyhow::bail!("fixture refusal")
+        }
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_survives_operation_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let _drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = closed.send(());
+            });
+            let _ = ready.send(());
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_carrier_drain_survives_cancellation_during_close() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let (release, paused) = tokio::sync::oneshot::channel();
+        let (closed, finished) = tokio::sync::oneshot::channel();
+        let operation = tokio::spawn(async move {
+            let drain = OperatorCarrierDrain::new(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = started.send(());
+                let _ = paused.await;
+                let _ = closed.send(());
+            });
+            drain.finish().await
+        });
+        starting.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn signed_check_fixture(
+        change_release: impl FnOnce(&mut serde_json::Value),
+        change_head: impl FnOnce(&mut serde_json::Value),
+    ) -> (TrustedSource, crate::update::DiscoveredHead, Vec<u8>) {
+        use sha2::Digest;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let publisher = crate::crypto::encode_signing_key_did(&key);
+        let raw_cid = |bytes: &[u8]| {
+            let digest = sha2::Sha256::digest(bytes);
+            let hash = cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap();
+            cid::Cid::new_v1(0x55, hash).to_string()
+        };
+        let envelope = |payload: &serde_json::Value, domain: &str| {
+            let (signature, signer_did) =
+                domain_separated_sign(&key, domain, &serde_json::to_vec(payload).unwrap());
+            serde_json::to_vec(&serde_json::json!({
+                "payload": payload, "signature": signature, "signer_did": signer_did
+            }))
+            .unwrap()
+        };
+        let descriptor = |bytes: &[u8]| {
+            serde_json::json!({
+                "cid": raw_cid(bytes), "sha256": hex::encode(sha2::Sha256::digest(bytes)),
+                "size": bytes.len()
+            })
+        };
+        let origin = serde_json::json!({"commit": "a".repeat(40), "tree": "b".repeat(40)});
+        let mut release = serde_json::json!({
+            "schema": "elastos.release/v1", "version": "0.7.2", "channel": "stable",
+            "source": origin, "changes": ["Home can restart after a signed update."],
+            "platforms": {(crate::update::detect_release_platform()): {
+                "binary": descriptor(b"fixture-runtime"), "components": descriptor(b"{}")
+            }}
+        });
+        change_release(&mut release);
+        let release_bytes = envelope(&release, "elastos.release.v1");
+        let release_cid = raw_cid(&release_bytes);
+        let mut head = serde_json::json!({
+            "schema": "elastos.release.head/v1", "version": "0.7.2", "channel": "stable",
+            "source": origin, "signer_did": publisher, "latest_release_cid": release_cid,
+            "release_sha256": hex::encode(sha2::Sha256::digest(&release_bytes))
+        });
+        change_head(&mut head);
+        let head_bytes = envelope(&head, "elastos.release.head.v1");
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": [publisher], "channel": "stable",
+            "installed_version": "0.7.1"
+        }))
+        .unwrap();
+        (
+            source,
+            crate::update::DiscoveredHead {
+                head_cid: Some(raw_cid(&head_bytes)),
+                bytes: head_bytes,
+            },
+            release_bytes,
+        )
+    }
+
+    #[test]
+    fn signed_update_check_returns_exact_admitted_choice_and_changes() {
+        let (source, head, release) = signed_check_fixture(|_| {}, |_| {});
+        let check = verified_update_check(&source, &head, &release).unwrap();
+        assert_eq!(check.source_name, source.name);
+        assert_eq!(check.channel, "stable");
+        assert_eq!(check.publisher_did, source.publisher_dids[0]);
+        assert_eq!(check.current_version, "0.7.1");
+        assert_eq!(check.latest_version, "0.7.2");
+        assert!(check.update_available);
+        assert_eq!(check.head_cid, head.head_cid);
+        assert_eq!(
+            check.release_cid.as_deref(),
+            serde_json::from_slice::<serde_json::Value>(&head.bytes).unwrap()["payload"]
+                ["latest_release_cid"]
+                .as_str()
+        );
+        assert_eq!(
+            check.changes,
+            vec!["Home can restart after a signed update."]
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_update_refuses_invalid_installed_version_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut source, _, _) = signed_check_fixture(|_| {}, |_| {});
+        source.installed_version = "broken".into();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let check = gather_local_update_check(dir.path()).await.unwrap_err();
+        let apply = apply_local_update(dir.path()).await.unwrap_err();
+        for error in [check, apply] {
+            assert!(error.is::<crate::update::InvalidInstalledVersion>());
+            assert!(error.to_string().contains("elastos update --force"));
+        }
+    }
+
+    #[test]
+    fn signed_update_check_refuses_invalid_installed_version_with_local_repair_hint() {
+        let (mut source, head, release) = signed_check_fixture(|_| {}, |_| {});
+        source.installed_version = "broken".into();
+        let error = verified_update_check(&source, &head, &release).unwrap_err();
+        assert!(error.is::<crate::update::InvalidInstalledVersion>());
+        assert!(error.to_string().contains("elastos update --force"));
+    }
+
+    #[test]
+    fn signed_update_check_accepts_missing_notes_and_current_version() {
+        let (mut source, head, release) = signed_check_fixture(
+            |release| {
+                release.as_object_mut().unwrap().remove("changes");
+            },
+            |_| {},
+        );
+        source.installed_version = "0.7.2".into();
+        let check = verified_update_check(&source, &head, &release).unwrap();
+        assert!(!check.update_available);
+        assert!(check.changes.is_empty());
+        let legacy: OperatorUpdateCheck = serde_json::from_value(serde_json::json!({
+            "source_name": "fixture", "channel": "stable", "current_version": "0.7.1",
+            "latest_version": "0.7.1", "update_available": false, "discovery": "Carrier"
+        }))
+        .unwrap();
+        assert!(legacy.publisher_did.is_empty() && legacy.changes.is_empty());
+    }
+
+    #[test]
+    fn signed_update_check_refuses_unbound_or_mismatched_metadata() {
+        for field in ["schema", "version", "channel", "release_sha256", "source"] {
+            let (source, head, release) = signed_check_fixture(
+                |_| {},
+                |head| {
+                    head[field] = if field == "source" {
+                        serde_json::json!({"commit": "c".repeat(40), "tree": "b".repeat(40)})
+                    } else {
+                        serde_json::json!("invalid")
+                    };
+                },
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        let (source, head, mut release) = signed_check_fixture(|_| {}, |_| {});
+        release.push(b' ');
+        assert!(verified_update_check(&source, &head, &release).is_err());
+        let mut source = source;
+        source.channel = "jetson-test".into();
+        assert!(verified_update_check(&source, &head, &release[..release.len() - 1]).is_err());
+        source.channel = "canary".into();
+        let release = &release[..release.len() - 1];
+        let offered = verified_update_check(&source, &head, release).unwrap();
+        assert_eq!(
+            (offered.channel.as_str(), offered.update_available),
+            ("stable", true)
+        );
+        // System never offers a canary Home an unsigned or wrong-signer stable head.
+        let mut unsigned: serde_json::Value = serde_json::from_slice(&head.bytes).unwrap();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let unsigned = crate::update::DiscoveredHead {
+            head_cid: None,
+            bytes: serde_json::to_vec(&unsigned).unwrap(),
+        };
+        assert!(verified_update_check(&source, &unsigned, release).is_err());
+        let mut canary = source.clone();
+        canary.publisher_dids = vec![crate::crypto::encode_signing_key_did(
+            &ed25519_dalek::SigningKey::from_bytes(&[8; 32]),
+        )];
+        assert!(verified_update_check(&canary, &head, release).is_err());
+        source.channel = "stable".into();
+        source.publisher_dids = vec![crate::crypto::encode_signing_key_did(
+            &ed25519_dalek::SigningKey::from_bytes(&[8; 32]),
+        )];
+        assert!(verified_update_check(&source, &head, release).is_err());
+    }
+
+    #[test]
+    fn signed_update_check_refuses_invalid_source_platform_or_change_fields() {
+        for field in ["source", "platforms", "changes"] {
+            let (source, head, release) = signed_check_fixture(
+                |release| release[field] = serde_json::json!("invalid"),
+                |_| {},
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        for value in [
+            serde_json::json!(["x".repeat(501)]),
+            serde_json::json!(["line\nbreak"]),
+            serde_json::json!([1]),
+            serde_json::json!([" "]),
+            serde_json::json!(vec!["change"; 33]),
+            serde_json::json!(vec!["x".repeat(500); 17]),
+        ] {
+            let (source, head, release) =
+                signed_check_fixture(|release| release["changes"] = value, |_| {});
+            assert!(verified_update_check(&source, &head, &release).is_err());
+        }
+        for field in ["cid", "sha256", "size"] {
+            let (source, head, release) = signed_check_fixture(
+                |release| {
+                    release["platforms"][crate::update::detect_release_platform()]["binary"]
+                        [field] = serde_json::json!("invalid");
+                },
+                |_| {},
+            );
+            assert!(
+                verified_update_check(&source, &head, &release).is_err(),
+                "{field}"
+            );
+        }
+        let (source, head, release) = signed_check_fixture(
+            |release| {
+                release["platforms"][crate::update::detect_release_platform()]["binary"]
+                    ["sha256"] = serde_json::json!("0".repeat(64));
+            },
+            |_| {},
+        );
+        assert!(verified_update_check(&source, &head, &release).is_err());
+        assert!(
+            verified_update_check(&source, &head, &vec![b' '; MAX_UPDATE_METADATA_BYTES + 1])
+                .is_err()
+        );
+    }
+
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");
         std::fs::create_dir_all(&identity_dir).unwrap();
-        std::fs::write(identity_dir.join("device.key"), key).unwrap();
+        let path = identity_dir.join("device.key");
+        std::fs::write(&path, key).unwrap();
+        // The identity store refuses a device key that others can read, and
+        // the operator handler loads it to sign every answer.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     async fn start_ticket_provider(
@@ -1759,8 +2315,9 @@ mod tests {
     }
 
     #[test]
-    fn supported_actions_include_update_apply() {
+    fn supported_actions_include_update_apply_and_content_replica() {
         assert!(supported_actions().contains(&OPERATOR_ACTION_UPDATE_APPLY));
+        assert!(supported_actions().contains(&"content.replica"));
     }
 
     #[test]
@@ -1906,6 +2463,186 @@ mod tests {
         let data = std::fs::read_to_string(log_path).unwrap();
         assert!(data.contains(REQUEST_STATE_RESERVED));
         assert!(data.contains(REQUEST_STATE_COMPLETED));
+    }
+
+    #[tokio::test]
+    async fn operator_stream_drops_oversized_and_stalled_requests_before_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [13u8; 32];
+        write_test_device_key(dir.path(), &key);
+        let (sk, did) = elastos_identity::derive_did(&key);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
+        let addr = decode_ticket_endpoints(&ticket).remove(0);
+        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+            .await
+            .unwrap();
+
+        // An endless line is cut at the cap: the handler answers nothing and
+        // the stream closes long before the client stops writing.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![b'a'; 16 * 1024];
+            for _ in 0..1024 {
+                if send.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            panic!("handler kept reading an oversized operator request");
+        });
+        let answer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1024))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(answer.is_empty());
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .unwrap();
+
+        // A stalled request is dropped after the request wait.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(b"{\"payload\":").await.unwrap();
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1024))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(answer.is_empty());
+        assert!(started.elapsed() >= OPERATOR_REQUEST_WAIT - Duration::from_millis(100));
+        drop(send);
+    }
+
+    #[tokio::test]
+    async fn operator_stream_audits_verified_requests_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [14u8; 32];
+        write_test_device_key(dir.path(), &key);
+        let (sk, did) = elastos_identity::derive_did(&key);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
+        let addr = decode_ticket_endpoints(&ticket).remove(0);
+        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+            .await
+            .unwrap();
+        let audit_path = dir.path().join(OPERATOR_AUDIT_FILE);
+
+        let (requester_sk, requester_did) = elastos_identity::derive_did(&[15u8; 32]);
+
+        // With no operator peers configured (the default), a request signed
+        // by any key is denied and leaves no audit entry.
+        let unconfigured = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-unconfigured-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unconfigured).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert_eq!(
+            denied.error.as_deref(),
+            Some("requester DID is not configured for operator control")
+        );
+        assert!(!audit_path.exists());
+
+        upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: requester_did.clone(),
+                label: "requester".to_string(),
+                connect_ticket: String::new(),
+                allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+            },
+        )
+        .unwrap();
+
+        // An unsigned request is denied and leaves no audit entry.
+        let unsigned = serde_json::json!({
+            "payload": {
+                "version": 1,
+                "request_id": "r".repeat(32 * 1024),
+                "requester_did": requester_did,
+                "target_did": did,
+                "ts": now_ts(),
+                "action": OPERATOR_ACTION_STATUS_READ,
+                "args": null,
+            },
+            "signature": "",
+            "signer_did": requester_did,
+        });
+        let answer = client.send_request(&unsigned).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert!(!audit_path.exists());
+
+        // A signed request is audited, and repeating it is refused as a replay.
+        let request = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-status-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &request).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let accepted = verify_response_envelope(&answer, &did).unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.error);
+        assert!(audit_contains_request_id(
+            dir.path(),
+            &requester_did,
+            &request.request_id
+        ));
+
+        let answer = client.send_request(&signed).await.unwrap();
+        let replayed = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!replayed.accepted);
+        assert_eq!(
+            replayed.error.as_deref(),
+            Some("operator request replay detected")
+        );
+
+        // A verified request for an action the peer may not run is denied
+        // and still audited, as is the refused repeat above.
+        let unallowed = OperatorRequestPayload {
+            request_id: "req-check-1".to_string(),
+            action: OPERATOR_ACTION_UPDATE_CHECK.to_string(),
+            ts: now_ts(),
+            ..request.clone()
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unallowed).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let refused = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!refused.accepted);
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let entries: Vec<(String, bool)> = audit
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    entry["request_id"].as_str().unwrap().to_string(),
+                    entry["accepted"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("req-status-1".to_string(), true),
+                ("req-status-1".to_string(), false),
+                ("req-check-1".to_string(), false),
+            ]
+        );
     }
 
     #[tokio::test]

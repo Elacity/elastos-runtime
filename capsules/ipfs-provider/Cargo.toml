@@ -6,13 +6,18 @@ description = "ElastOS ipfs-provider - IPFS operations via managed Kubo daemon"
 license = "MIT"
 
 [dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 tempfile = "3"
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common", features = ["test-fixtures"] }
 
 [workspace]

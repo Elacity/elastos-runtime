@@ -458,7 +458,7 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
         )
         .await
         .unwrap();
-    assert_eq!(denied_library.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(denied_library.status(), StatusCode::FORBIDDEN);
 
     let library = app
         .clone()
@@ -600,7 +600,7 @@ async fn test_viewer_gateway_storage_routes_require_home_token_and_round_trip_by
         )
         .await
         .unwrap();
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 
     let put = app
         .clone()

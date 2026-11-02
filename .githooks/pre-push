@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Git has already resolved the pushed object. A merge here would check a
+# different object from the one Git is about to publish.
+exec "$(dirname "$0")/../scripts/ci-local-prepush.sh" "$@"

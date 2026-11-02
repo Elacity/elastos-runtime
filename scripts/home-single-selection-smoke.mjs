@@ -116,7 +116,7 @@ test("People ordinary single reuse leaves the current profile draft alone", asyn
 });
 
 function receiver(target) {
-  const source = read(target === "inbox" ? "capsules/inbox/browser/index.html" : "capsules/wallet/browser/wallet.js");
+  const source = read(target === "inbox" ? "capsules/inbox/browser/inbox.js" : "capsules/wallet/browser/wallet.js");
   const listeners = new Map(), messages = [], calls = [], renders = [], statuses = [];
   let release, fail, clockOffset = 0;
   const summary = { notifications: { entries: [{ id: "notification-one" }, { id: "notification-two" }] },
@@ -142,7 +142,9 @@ function receiver(target) {
       addEventListener(type, listener) { listeners.set(type, listener); } },
   });
   const name = target === "inbox" ? "configureInboxWindowSelection" : "configureWalletWindowSelection";
-  const dependencies = target === "inbox" ? fn(source, "hasExactKeys") : fn(source, "walletSelectionBlocked");
+  const dependencies = target === "inbox"
+    ? fn(source, "hasExactKeys") + "\n" + fn(source, "inboxEntries")
+    : fn(source, "walletSelectionBlocked");
   vm.runInContext(dependencies + "\n" + fn(source, name), c); c[name]();
   const data = { type: `elastos:${target}-chrome-command`, cmd: target === "inbox" ? "select-notification" : "review-request",
     homeToken: "token", requestId: "request-1", documentNonce: "document-one", sequence: 1,

@@ -227,6 +227,7 @@ cmd_up() {
     log "== per-node ready receipt, ticket export, and node peer add commands =="
     local svc did carrier_bound ready_json state ticket node_info_json
     local peer_add_lines=()
+    local replica_grant_lines=()
     local descriptor_paths=()
     for svc in "${SERVICES[@]}"; do
         state="$(compose ps --format '{{.State}}' "${svc}" 2>/dev/null || true)"
@@ -286,6 +287,9 @@ cmd_up() {
         log "${svc}: wrote shared/${did}.ticket (host route 127.0.0.1:${HOST_PORT[${svc}]}/udp, docker-simulation glue -- see build_ticket())"
 
         peer_add_lines+=("elastos node peer add --did ${did} --label ${svc} --ticket \"\$(cat '${SCRIPT_DIR}/shared/${did}.ticket')\"")
+        # The node keeps the client's replicas only with this grant; the
+        # client DID is the `did` of `elastos node info --json` on the host.
+        replica_grant_lines+=("docker compose -f '${SCRIPT_DIR}/docker-compose.yml' exec -T ${svc} ${CONTAINER_ELASTOS_BIN} node peer add --did <client-did> --allow content.replica")
         descriptor_paths+=("${SCRIPT_DIR}/shared/${did}.descriptor.json")
     done
 
@@ -293,6 +297,9 @@ cmd_up() {
     log "== next: register the 3 nodes and assemble the pool from the host client =="
     local line
     for line in "${peer_add_lines[@]}"; do
+        log "${line}"
+    done
+    for line in "${replica_grant_lines[@]}"; do
         log "${line}"
     done
     log ""

@@ -6,7 +6,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("./home-passkey-virtual-auth-smoke.mjs", import.meta.url), "utf8");
 const start = source.indexOf("async function observeControlledBrowserInput(");
-const end = source.indexOf("\nasync function runControlledBrowserJourney(", start);
+const end = source.indexOf("\nasync function ", start + 1);
 assert.ok(start >= 0 && end > start);
 const declaration = source.slice(start, end);
 const plain = value => JSON.parse(JSON.stringify(value));

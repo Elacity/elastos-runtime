@@ -34,6 +34,7 @@ export async function exerciseNavigationConsumers(makeClient) {
     homeNavigation: client("library"),
     providerApi: async (_op, { uri }) => ({ object: { uri, kind: "directory" }, objects: [] }),
     cacheFolderListing: () => ({}), setObjects() {}, setStatus() {}, setFolderStatus() {}, renderAll() {}, runInitialObjectAction() {},
+    rootStateStale: false,
     isDirectory: object => object?.kind === "directory",
   });
   vm.runInContext(selectionFunction(read("capsules/library/browser/src/app.js"), "loadCurrentFolder"), library);
@@ -66,7 +67,7 @@ export async function exerciseNavigationConsumers(makeClient) {
     document: { querySelector: () => ({}) }, parentUri: () => "localhost://Users/fixture",
     showWorkspace() {}, async hydrateDestinationRoots() {}, announceHomeChrome() {},
   });
-  const archiveSource = read("capsules/archive-manager/browser/index.html");
+  const archiveSource = read("capsules/archive-manager/browser/archive-manager.js");
   vm.runInContext(["openLibraryObject", "hydrateStatOnly", "hydrateArchiveEntries"].map(name => selectionFunction(archiveSource, name)).join("\n"), archive);
   await archive.openLibraryObject({ uri: archive.objectUri });
   assert.deepEqual(reports["archive-manager"], { objectUri: archive.objectUri });
@@ -145,13 +146,14 @@ export async function exerciseNavigationConsumers(makeClient) {
 
   // Rust owns the guarded Chat selection. This exact bridge consumes its JSON;
   // the native regression covers the producer with current/stale guards.
-  const chatSource = read("capsules/chat-room/browser/index.html");
-  const chat = vm.createContext({ globalThis: {}, homeNavigation: client("chat-room") });
-  const bridge = chatSource.match(/globalThis\.elastosChatNavigation =[^;]+;/);
+  const chatSource = read("capsules/chat-room/browser/chat-room.js");
+  const chat = vm.createContext({ globalThis: {}, currentQuery: {}, homeNavigation: client("chat-room") });
+  const bridge = chatSource.match(/globalThis\.elastosChatNavigation = \(query\) => \{[\s\S]*?\n\s*\};/);
   assert.ok(bridge, "Chat must connect the actual Rust selector to Home navigation");
   vm.runInContext(bridge[0], chat);
   chat.globalThis.elastosChatNavigation({ conversation_id: "direct:sha256:conversation-b" });
   assert.deepEqual(reports["chat-room"], { conversation_id: "direct:sha256:conversation-b" });
+  assert.equal(chat.currentQuery.conversation_id, "direct:sha256:conversation-b", "Reconnect must use the settled Chat selection");
   chat.globalThis.elastosChatNavigation({});
   assert.deepEqual(reports["chat-room"], {}, "explicit default retained direct selection");
   chat.globalThis.elastosChatNavigation({ conversation_id: "direct:sha256:conversation-b" });

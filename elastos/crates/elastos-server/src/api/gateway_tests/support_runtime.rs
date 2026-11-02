@@ -492,6 +492,37 @@ fn passkey_authority_with_name_role(
     passkey_authority_with_name_role_credential(data_dir, display_name, role, credential_id)
 }
 
+/// Adds a second active passkey record for an existing principal, shaped like
+/// `complete_passkey_add`: same principal ID and role, new credential.
+fn add_second_active_passkey(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    role: crate::auth::RuntimePrincipalRole,
+) {
+    let mut auth = crate::auth::load_auth_state(data_dir).unwrap();
+    let mut second = auth
+        .principals
+        .iter()
+        .find(|principal| principal.principal_id == principal_id)
+        .unwrap()
+        .clone();
+    let mut passkey = second.proof_binding.passkey.clone().unwrap();
+    passkey.credential_id = format!("{}-second", passkey.credential_id);
+    second.proof_binding = ProofBinding::passkey_webauthn(passkey);
+    second.proof_binding_id = second.proof_binding.id();
+    second.role = role;
+    auth.principals.push(second);
+    crate::auth::save_auth_state(data_dir, &auth, None).unwrap();
+    assert_eq!(
+        crate::auth::active_passkey_principals(data_dir)
+            .unwrap()
+            .iter()
+            .filter(|principal| principal.principal_id == principal_id)
+            .count(),
+        2
+    );
+}
+
 fn passkey_authority_with_profile_role_credential(
     data_dir: &std::path::Path,
     display_name: &str,

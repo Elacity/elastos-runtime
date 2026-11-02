@@ -274,8 +274,7 @@ async fn concurrent_load_with_real_kernel() {
         None => {
             eprintln!(
                 "concurrent_load_with_real_kernel: skipping — no kernel found at \
-                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux. \
-                 Run `elastos setup --profile minimal` first."
+                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux."
             );
             return;
         }
@@ -285,8 +284,7 @@ async fn concurrent_load_with_real_kernel() {
         None => {
             eprintln!(
                 "concurrent_load_with_real_kernel: skipping — no rootfs found at \
-                 $ELASTOS_VZ_TEST_ROOTFS or <data_dir>/capsules/*/rootfs.ext4. \
-                 Run `elastos setup --profile minimal` first."
+                 $ELASTOS_VZ_TEST_ROOTFS or <data_dir>/capsules/*/rootfs.ext4."
             );
             return;
         }
@@ -513,8 +511,7 @@ async fn single_vm_boots_to_userspace() {
         None => {
             eprintln!(
                 "single_vm_boots_to_userspace: skipping — no kernel at \
-                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux. \
-                 Run `elastos setup --profile minimal` first."
+                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux."
             );
             return;
         }
@@ -525,7 +522,7 @@ async fn single_vm_boots_to_userspace() {
             eprintln!(
                 "single_vm_boots_to_userspace: skipping — no initramfs at \
                  $ELASTOS_VZ_TEST_INITRD or <data_dir>/bin/initrd (or the \
-                 bin/initrd-generic compatibility fallback). Run `elastos setup --profile minimal` first."
+                 bin/initrd-generic compatibility fallback)."
             );
             return;
         }

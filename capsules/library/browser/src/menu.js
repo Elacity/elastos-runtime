@@ -1,4 +1,7 @@
-export function createLibraryMenu({ contextMenu, perf, showError }) {
+export function createLibraryMenu({ allVisible, contextMenu, perf, showError }) {
+  // Item URIs the rendered menu acts on; its actions never run once any is hidden (#441).
+  let targetUris = [];
+
   function menuAction(label, action, options = {}) {
     const children = Array.isArray(options.children)
       ? normalizedMenuActions(options.children)
@@ -32,9 +35,10 @@ export function createLibraryMenu({ contextMenu, perf, showError }) {
     return normalized;
   }
 
-  function renderMenu(actions, x, y) {
+  function renderMenu(actions, x, y, targets = []) {
     const startedAt = performance.now();
     contextMenu.innerHTML = "";
+    targetUris = targets;
     const menuActions = normalizedMenuActions(actions);
     if (!menuActions.length) {
       hideMenu();
@@ -108,7 +112,9 @@ export function createLibraryMenu({ contextMenu, perf, showError }) {
           return;
         }
         if (button.disabled || !runnable) return;
+        const targetsVisible = allVisible(targetUris);
         hideMenu();
+        if (!targetsVisible) return;
         Promise.resolve(action()).catch(showError);
       });
       wrapper.appendChild(button);
@@ -150,8 +156,13 @@ export function createLibraryMenu({ contextMenu, perf, showError }) {
     contextMenu.classList.add("hidden");
   }
 
+  function hideMenuIfTargetsHidden() {
+    if (!contextMenu.classList.contains("hidden") && !allVisible(targetUris)) hideMenu();
+  }
+
   return {
     hideMenu,
+    hideMenuIfTargetsHidden,
     menuAction,
     renderMenu,
   };

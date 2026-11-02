@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import { createBrowserFrameFence } from '../capsules/browser/browser/browser-resize.js';
 import { runtimePageOwner, sameRuntimePageOwner } from '../capsules/browser/browser/browser-page-cleanup.js';
 const source = readFileSync(new URL('../capsules/browser/browser/browser.js', import.meta.url), 'utf8');
 function declaration(name) {
@@ -31,6 +32,8 @@ function harness() {
     runtimeOwnershipTerminallyAbsent: true, selectedBrowserEngineId: '', currentBrowserEngineId: '',
     selectedRemoteExitId: '', currentRemoteExitId: '', currentDisplayMode: '', currentView: null, lastPageStatus: null,
     runtimePageOwner, sameRuntimePageOwner,
+    lastDatachannelInputAt: 0, datachannelDrainedAt: 0, datachannelSendDisplay: null, datachannelSendGeneration: 0,
+    resizeFrameFence: createBrowserFrameFence({}),
     publishRuntimePageForHost: page => calls.push(['publish', page.page_id]),
     syncEngineSelect: () => calls.push(['engine', state.selectedBrowserEngineId]),
     syncExitSelect: () => calls.push(['exit', state.selectedRemoteExitId]),
@@ -54,7 +57,7 @@ function harness() {
       display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'diagnostic-status', ice_servers: [{ credential_present: true }] } }; },
   });
   state.globalThis = state;
-  for (const name of ['displayAttachRequestId', 'viewerDisplayAttachTimeoutMs', 'reuseDisplayAttachment', 'terminalDisplayAttachment', 'allocateDisplayAttachRetryId', 'markDisplayAttachRetryNeeded', 'displayAttachRequestForRecovery', 'currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
+  for (const name of ['resetPageInputDelivery', 'displayAttachRequestId', 'viewerDisplayAttachTimeoutMs', 'reuseDisplayAttachment', 'terminalDisplayAttachment', 'allocateDisplayAttachRetryId', 'markDisplayAttachRetryNeeded', 'displayAttachRequestForRecovery', 'currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
     vm.runInContext(declaration(name), state);
   }
   return { state, calls, failures, requests, restore: value => state.restoreRuntimePageViewer(value) };
@@ -311,14 +314,42 @@ test('a restore callback cannot change a later owner failure policy', async () =
   await h.state.settleRemoteDisplayFailure('new acquisition failure'); assert.equal(h.failures.length, 1);
 });
 
-for (const owned of [true, false]) test(`actual startup selects ${owned ? 'restore' : 'fresh open'} from Runtime ownership`, async () => {
+for (const owned of [true, false]) for (const requestedUrl of ['', 'https://requested.invalid/']) test(
+  `actual startup selects ${owned ? 'restore' : 'fresh open'} from Runtime ownership with ${requestedUrl ? 'a launch URL' : 'an empty route'}`, async () => {
   const h = harness(), value = summary(), opens = [];
   if (!owned) value.sessions.recoverable_page = null;
-  Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+  Object.assign(h.state, { params: new URLSearchParams(requestedUrl ? { url: requestedUrl } : {}), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
     fetchBrowserSummary: async () => value, requestRuntimeOpen: async url => opens.push(url),
     isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
-  assert.deepEqual(opens, owned ? [] : ['https://default.invalid/']);
+  assert.deepEqual(opens, owned ? [] : [requestedUrl || 'https://default.invalid/']);
+});
+
+test('fresh Dock startup shows a persistent status while Engine checks are pending', async () => {
+  const h = harness(), pending = deferred(), opens = [], value = summary();
+  value.sessions.recoverable_page = null;
+  Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+    fetchBrowserSummary: () => pending.promise, requestRuntimeOpen: async url => opens.push(url),
+    isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
+  const startup = vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
+  assert.deepEqual(opens, []);
+  assert.ok(h.calls.some(row => row[0] === 'status-message' && /checking its Engine.*retry/.test(row[1])));
+  pending.resolve(value);
+  await startup;
+  assert.deepEqual(opens, ['https://default.invalid/']);
+});
+
+test('fresh Dock startup keeps preparation failures visible and enables retry controls', async () => {
+  for (const message of ['Engine files need repair. Prepare this Engine.', 'Virtualization is unavailable. Choose another Engine.']) {
+    const h = harness(), value = summary();
+    value.sessions.recoverable_page = null;
+    Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+      fetchBrowserSummary: async () => value, requestRuntimeOpen: async () => { throw new Error(message); },
+      isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
+    await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
+    assert.deepEqual(h.calls.at(-2), ['loading', false]);
+    assert.deepEqual(h.calls.at(-1), ['status-message', message]);
+  }
 });
 
 test('summary authority failure reaches startup renewal without a replacement open', async () => {
@@ -329,7 +360,8 @@ test('summary authority failure reaches startup renewal without a replacement op
     requestRuntimeOpen: async value => opens.push(value),
     isAuthoritySessionError: value => value.status === 401,
     friendlyOpenError: value => value.message,
-    requestHomeRelaunch: value => { renewals.push(value); return true; } });
+    requestHomeRelaunch: value => { renewals.push(value); return true; }, resumeDeferredHomeBrowserWindowClose() {},
+    AbortController, windowCloseAbortControllers: new Set() });
   vm.runInContext(declaration('fetchBrowserSummary'), h.state);
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
   assert.deepEqual(renewals, ['Browser authority expired']);

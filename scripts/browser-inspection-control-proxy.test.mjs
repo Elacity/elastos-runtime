@@ -31,7 +31,7 @@ async function proxyHarness(t) {
   const context = vm.createContext({ http, Buffer, Error, AbortController, setTimeout, clearTimeout,
     activePages, activeVms: new Map() });
   vm.runInContext(["safeId", "validateAbsolutePath", "readJsonBody", "requestJsonOverUnix",
-    "browserDisplayControlError", "browserInspectionControlError", "activePageGuestControl", "proxyGuestPageInspect"]
+    "browserDisplayControlError", "browserInspectionControlError", "vmOwnsExactPage", "ownedVmRecord", "activePageGuestControl", "proxyGuestPageInspect"]
     .map(declaration).join("\n"), context);
   const handler = vm.runInContext(`(async function(req, url, sendJson) { ${source.slice(start, end)} })`, context);
   const proxy = http.createServer((req, res) => {

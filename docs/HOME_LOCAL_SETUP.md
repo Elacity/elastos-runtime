@@ -93,6 +93,8 @@ export USER_HOME="$HOME"
 export LOCAL_HOME_ROOT="$HOME/elastos-local-home"
 export GATEWAY_ADDR="localhost:61180"
 export HOME_URL="http://localhost:61180/apps/home/"
+export ELASTOS_NODE_BIN="$(command -v node)"
+export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$(command -v turnserver)"
 
 HOME="$LOCAL_HOME_ROOT" \
 CARGO_HOME="$USER_HOME/.cargo" \

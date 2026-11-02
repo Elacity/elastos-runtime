@@ -25,7 +25,7 @@ export function candidateFingerprint(plan, inputs) {
   requireEvidence(inputs.some(f => f.role === "operator_coordinates" && f.path === plan.runtime.operator_coords) &&
     ["scripts/browser-qualification-runner.mjs", "scripts/browser-qualification-audit.mjs",
       "scripts/lib/browser-qualification-observer.mjs", "scripts/lib/browser-journey-target.mjs",
-      "scripts/home-passkey-virtual-auth-smoke.mjs"].every(role =>
+      "scripts/home-passkey-virtual-auth-smoke.mjs", "capsules/browser/browser/browser-service-selection.js"].every(role =>
       inputs.some(f => f.role === role && hash(f.sha256))), "frozen_harness_inputs_required");
   return sha256(JSON.stringify({ plan, inputs }));
 }
@@ -342,6 +342,15 @@ export function cleanControl(value, warm = false) {
     value.warm_vms === 0 && value.active_vms === 0 && value.lifecycle?.sessions?.length === 0,
   warm ? "warm_condition_unavailable" : "control_vm_residue");
 }
+// Settings hides the selector for a lone local engine, so a plan naming that
+// engine runs on Automatic (""). Accept that only when Runtime's route proves
+// the page ran on exactly the planned adapter.
+export function observedEngineSelection(journey, pageId, planned) {
+  const route = journey?.engine_route;
+  if (!planned || route?.engine_id !== "") return planned;
+  requireEvidence(route.page_id === pageId && route.adapter_id === planned, "automatic_engine_adapter_mismatch");
+  return "";
+}
 export function validateAttempt(attempt, plan) {
   requireEvidence(plan.mode !== "warm", "warm_conditioning_unsupported");
   requireEvidence(attempt?.schema === "elastos.browser.qualification-attempt/v1" &&
@@ -360,7 +369,8 @@ export function validateAttempt(attempt, plan) {
   if (["cold", "warm"].includes(plan.mode)) requireEvidence(q.launch?.page_id === attempt.journey.page_id &&
     q.launch.clock === "host_monotonic" && finite(q.launch.usable_frame_ms) && q.launch.usable_frame_ms > 0,
   "monotonic_launch_witness_required");
-  requireEvidence(q.services?.engine_id === plan.runtime.engine_id && q.services?.exit_id === plan.runtime.exit_id &&
+  const engineSelection = observedEngineSelection(j, attempt.journey.page_id, plan.runtime.engine_id);
+  requireEvidence(q.services?.engine_id === engineSelection && q.services?.exit_id === plan.runtime.exit_id &&
     attempt.observed_page_ids?.includes(attempt.journey.page_id), "selected_service_or_local_vm_witness_missing");
   requireEvidence(isDeepStrictEqual(qualificationVmIdentity(q.vm_identity, attempt.journey.page_id),
     qualificationVmIdentity(j.close.receipt.transport_proof, attempt.journey.page_id)), "launch_close_vm_identity_mismatch");
@@ -452,7 +462,7 @@ export function auditQualification(receiptPath) {
       "journey_log_hash_mismatch");
     if (["media", "mixed"].includes(plan.mode)) {
       const derived = deriveMedia(rows.media, { page_id: a.journey.page_id, run: j.run,
-        engine_id: plan.runtime.engine_id, exit_id: plan.runtime.exit_id, mode: plan.mode, parent_times: rows.parent_times });
+        engine_id: observedEngineSelection(j, a.journey.page_id, plan.runtime.engine_id), exit_id: plan.runtime.exit_id, mode: plan.mode, parent_times: rows.parent_times });
       const reported = Object.fromEntries(Object.keys(derived).map(k => [k, j.qualification.observation[k]]));
       requireEvidence(isDeepStrictEqual(derived, reported), "media_summary_trace_mismatch");
       if (plan.mode === "mixed") requireEvidence(derived.duration_ms - derived.active_ms >= plan.duration_ms / 15 &&

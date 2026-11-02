@@ -157,6 +157,38 @@ class WriterTests(unittest.TestCase):
         self.assertIsNone(self.gate.lease)
         self.assertEqual(self.events, [])
 
+    def test_1000_resize_transactions_then_operator_acquire(self):
+        for number in range(1000):
+            lease = f"{number:032x}"
+            effect = f"{number + 1000:032x}"
+            self.assertTrue(self.command("acquire", lease=lease, duration_ms=30000).get("active", False), f"transaction {number + 1}")
+            self.command("begin", lease=lease, effect_id=effect)
+            self.command("settle", lease=lease, effect_id=effect)
+            self.assertFalse(self.command("release", lease=lease)["held"])
+        self.assertIn("error", self.command("acquire", lease=lease, duration_ms=30000))
+        self.assertTrue(self.command("acquire", duration_ms=30000)["active"])
+        self.assertLessEqual(len(self.gate.retired), 128)
+
+    def test_lost_begin_receipt_settles_before_release_and_native_input_resumes(self):
+        effect = "c" * 32
+        self.command("acquire", duration_ms=30000)
+        self.gate.command({"command": "begin", "admission_id": self.lease, "effect_id": effect})
+        # The begin effect happened but its receipt was lost. Cleanup owns the
+        # exact effect id even when the caller did not receive the begin ACK.
+        self.command("release")
+        self.assertTrue(self.command("check")["held"])
+        self.command("settle", effect_id=effect)
+        self.assertFalse(self.command("release")["held"])
+        self.gate.on_message("kd,97")
+        self.assertEqual(self.events[-1], "kd,97")
+
+    def test_selkies_geometry_messages_have_one_control_writer(self):
+        for message in ["r,1920x1080", "_arg_resize,true", "s,1920,1080"]:
+            self.gate.on_message(message)
+        self.assertEqual(self.events, [])
+        self.gate.on_message("pong")
+        self.assertEqual(self.events, ["pong"])
+
     def test_bounds_and_socket_permissions(self):
         self.assertEqual(Path(self.gate.path).stat().st_mode & 0o777,0o600)
         for duration in [True,0,1999,30001]:
@@ -164,7 +196,7 @@ class WriterTests(unittest.TestCase):
         for number in range(256):
             self.command("release",lease=f"{number:032x}")
         self.assertLessEqual(len(self.gate.retired),128)
-        self.assertIn("error",self.command("acquire",duration_ms=30000))
+        self.assertTrue(self.command("acquire",duration_ms=30000)["active"])
 
 class StagePatchTests(unittest.TestCase):
     def test_stage_wires_real_native_input_and_cleanup_once_or_fails_closed(self):

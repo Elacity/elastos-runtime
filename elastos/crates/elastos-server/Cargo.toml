@@ -47,6 +47,7 @@ tokio = { version = "1.0", features = ["full"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+semver = "1.0"
 wasmparser = "=0.236.1"
 
 # Async trait support
@@ -64,7 +65,9 @@ sha2 = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
 hex = "0.4"
+memchr = "2"
 rand = "0.8"
+subtle = "2.6"
 aes-gcm = "0.10"
 zeroize = "1"
 hkdf = "0.12"
@@ -103,7 +106,7 @@ tempfile = "3.10"
 # Archive extraction (for capsule artifacts)
 flate2 = "1.0"
 tar = "0.4"
-zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"] }
 libc = "0.2"
 
 # Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery).
@@ -123,8 +126,12 @@ tempfile = "3.10"
 tower = { version = "0.5", features = ["util"] }
 wasm-encoder = "=0.236.1"
 elastos-auth = { path = "../elastos-auth" }
+elastos-common = { path = "../elastos-common", features = ["test-fixtures"] }
 elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
 x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
+# The rand generation iroh-gossip's membership state machine takes; the
+# Community hub test drives that state machine directly.
+gossip-rand = { package = "rand", version = "0.10", default-features = false, features = ["std_rng"] }
 
 [features]
 default = []

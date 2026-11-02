@@ -1,6 +1,7 @@
 pub(super) use super::gateway_home_system_ai_provider::{
-    clear_hosted_ai_validate_doubles, install_openrouter_models_double,
-    install_venice_validate_double, OpenRouterModelsDouble, VeniceAuthDouble,
+    clear_hosted_ai_validate_doubles, install_openrouter_key_response,
+    install_openrouter_models_double, install_venice_validate_double, OpenRouterModelsDouble,
+    VeniceAuthDouble,
 };
 use super::*;
 use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
@@ -37,6 +38,23 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as TokioMutex;
 use tower::ServiceExt;
 
+// One-shot fixtures simulate the Host header supplied by their loopback HTTP
+// transport. Boundary tests use the router directly to test missing headers.
+fn gateway_router(state: GatewayState) -> Router {
+    gateway_router_with_api_url(state, "http://localhost:61180".to_string()).layer(
+        axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                if !request.headers().contains_key(HOST) {
+                    request
+                        .headers_mut()
+                        .insert(HOST, HeaderValue::from_static("localhost:61180"));
+                }
+                next.run(request).await
+            },
+        ),
+    )
+}
+
 // Real CIDs that pass cid crate validation
 const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
@@ -51,6 +69,53 @@ fn test_browser_request(host: &'static str, origin: &'static str) -> axum::http:
     } else {
         request.header("sec-fetch-site", "same-origin")
     }
+}
+
+/// Reads Home events once from `cursor` and reports whether Inbox changed.
+async fn home_inbox_changed(app: &Router, home_token: &str, cursor: &mut String) -> bool {
+    let request = test_browser_request("localhost:61180", "http://localhost:61180")
+        .uri(format!("/api/apps/home/events?wait_ms=0&cursor={cursor}"))
+        .header("x-elastos-home-token", home_token)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    *cursor = body["cursor"].as_str().unwrap().to_string();
+    body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "inbox.changed" && event["scope"] == "inbox")
+}
+
+/// The notifications Home's badge counts and its notification reads.
+async fn home_summary_notifications(app: &Router, home_token: &str) -> Value {
+    let request = test_browser_request("localhost:61180", "http://localhost:61180")
+        .uri("/api/apps/home/summary")
+        .header("x-elastos-home-token", home_token)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&bytes).unwrap()["notifications"].clone()
+}
+
+/// Home notification entries of `kind`.
+fn home_entries_of_kind(notifications: &Value, kind: &str) -> Vec<Value> {
+    notifications["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == kind)
+        .cloned()
+        .collect()
 }
 
 fn test_launch_token_from_route(route: &str) -> String {
@@ -81,6 +146,130 @@ fn test_state(cache_dir: &std::path::Path) -> GatewayState {
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
+}
+
+/// The local content backend: it answers only the (CID, exact path) pairs it
+/// holds and, like ipfs-provider, refuses a whole read past its request's
+/// `whole_max_bytes`. It records each whole read's requested limit.
+#[derive(Default)]
+struct LocalStoreFixture {
+    files: HashMap<(String, String), Vec<u8>>,
+    whole_limits: std::sync::Mutex<Vec<Option<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for LocalStoreFixture {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw requests only".into()))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    fn name(&self) -> &'static str {
+        "local-store-fixture"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let cid = request.get("cid").and_then(Value::as_str).unwrap_or("");
+        let path = request.get("path").and_then(Value::as_str).unwrap_or("");
+        if request["op"] != "cat" {
+            return Ok(json!({"status": "error", "code": "unsupported", "message": "cat only"}));
+        }
+        let limit = request.get("whole_max_bytes").and_then(Value::as_u64);
+        self.whole_limits.lock().unwrap().push(limit);
+        Ok(match self.files.get(&(cid.to_string(), path.to_string())) {
+            Some(bytes) if limit.is_some_and(|limit| bytes.len() as u64 > limit) => json!({
+                "status": "error", "code": "cat_failed",
+                "message": format!("content exceeds the whole-content limit of {} bytes", limit.unwrap()),
+            }),
+            Some(bytes) => json!({"status": "ok", "data": {
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }}),
+            None => {
+                json!({"status": "error", "code": "not_found", "message": "not in local store"})
+            }
+        })
+    }
+}
+
+/// An availability holder that answers every read with its own bytes.
+#[derive(Default)]
+struct HolderFixture {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+const HOLDER_BYTES: &[u8] = b"holder bytes";
+
+#[async_trait::async_trait]
+impl Provider for HolderFixture {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw requests only".into()))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["availability"]
+    }
+
+    fn name(&self) -> &'static str {
+        "holder-fixture"
+    }
+
+    async fn send_raw(&self, _request: &Value) -> Result<Value, ProviderError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"status": "ok", "data": {
+            "data": base64::engine::general_purpose::STANDARD.encode(HOLDER_BYTES),
+        }}))
+    }
+}
+
+/// Makes the gateway at `dir` a node that serves publisher content (a seed):
+/// only a seed answers the raw CID routes to callers without a session.
+fn serve_as_seed(dir: &std::path::Path) {
+    std::fs::create_dir_all(elastos_common::localhost::publisher_artifacts_path(dir)).unwrap();
+}
+
+/// Gateway state over the real Content provider, a local store holding
+/// `local_files` (CID, exact path, bytes), and a holder that answers every read.
+async fn verified_store_state(
+    dir: &std::path::Path,
+    local_files: &[(&str, &str, &[u8])],
+) -> (GatewayState, Arc<HolderFixture>) {
+    let (state, holder, _store) = local_store_state(dir, local_files).await;
+    (state, holder)
+}
+
+async fn local_store_state(
+    dir: &std::path::Path,
+    local_files: &[(&str, &str, &[u8])],
+) -> (GatewayState, Arc<HolderFixture>, Arc<LocalStoreFixture>) {
+    let registry = Arc::new(ProviderRegistry::new());
+    let store = Arc::new(LocalStoreFixture {
+        files: local_files
+            .iter()
+            .map(|(cid, path, bytes)| ((cid.to_string(), path.to_string()), bytes.to_vec()))
+            .collect(),
+        ..Default::default()
+    });
+    registry
+        .register_sub_provider("ipfs", store.clone())
+        .await
+        .unwrap();
+    let holder = Arc::new(HolderFixture::default());
+    registry.register(holder.clone()).await;
+    let content = Arc::new(crate::content::ContentProvider::new(
+        dir.join("content-data"),
+        Arc::downgrade(&registry),
+    ));
+    registry.register(content.clone()).await;
+    registry
+        .register_sub_provider("content", content)
+        .await
+        .unwrap();
+    let mut state = test_state(dir);
+    state.provider_registry = Some(registry);
+    (state, holder, store)
 }
 
 #[tokio::test]
@@ -860,8 +1049,10 @@ mod assistant_workspace_v2;
 mod browser_profile;
 mod browser_reconciliation;
 mod collaboration_presence;
+mod content_sandbox;
 mod documents;
 mod esp;
+mod frontdoor;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod gba;
@@ -880,3 +1071,6 @@ mod remote_model;
 mod room;
 mod site_publication;
 mod wallet;
+
+#[path = "../gateway_home_update/tests.rs"]
+mod home_update;

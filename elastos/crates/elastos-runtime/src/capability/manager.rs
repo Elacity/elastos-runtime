@@ -357,6 +357,33 @@ impl CapabilityManager {
         requested_resource: &ResourceId,
         resource_classification: Option<u8>,
     ) -> Result<(), ValidationError> {
+        self.validate_recurring(
+            token,
+            caller_capsule_id,
+            requested_action,
+            requested_resource,
+            resource_classification,
+            true,
+        )
+        .await
+    }
+
+    /// Validate a token that a Runtime-owned worker presents on a fixed cadence.
+    ///
+    /// Runs the same 12 checks as [`Self::validate`] against the live store on
+    /// every call; nothing is remembered between calls. Failures are always
+    /// audited. A success emits `CapabilityUse` only when `audit_success` is
+    /// true, so the caller can coalesce repeated successes (for example one
+    /// per token per hour) without hiding any refusal.
+    pub async fn validate_recurring(
+        &self,
+        token: &CapabilityToken,
+        caller_capsule_id: &str,
+        requested_action: Action,
+        requested_resource: &ResourceId,
+        resource_classification: Option<u8>,
+        audit_success: bool,
+    ) -> Result<(), ValidationError> {
         // 1. Version verification
         if token.version != CapabilityToken::CURRENT_VERSION {
             self.audit_validation_failure(token, caller_capsule_id, "invalid_version");
@@ -466,14 +493,16 @@ impl CapabilityManager {
             }
         }
 
-        // SUCCESS - emit audit event
-        self.audit_log.capability_use(
-            &token.id,
-            caller_capsule_id,
-            requested_resource,
-            requested_action,
-            true,
-        );
+        // SUCCESS - emit audit event (recurring callers coalesce successes)
+        if audit_success {
+            self.audit_log.capability_use(
+                &token.id,
+                caller_capsule_id,
+                requested_resource,
+                requested_action,
+                true,
+            );
+        }
 
         // Record metrics
         self.metrics.record_capability_use(caller_capsule_id);
@@ -774,6 +803,73 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ValidationError::TokenRevoked)));
+    }
+
+    fn capability_use_count(manager: &CapabilityManager, success: bool) -> usize {
+        manager
+            .audit_log()
+            .recent_events(10_000)
+            .into_iter()
+            .filter(|event| {
+                matches!(event, crate::primitives::audit::AuditEvent::CapabilityUse { success: s, .. } if *s == success)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_validate_recurring_fails_on_the_next_call_after_revoke_and_epoch() {
+        let manager = create_test_manager();
+        let resource = ResourceId::new("elastos://chat/presence/n/c/always");
+        let token = manager.grant(
+            "principal",
+            resource.clone(),
+            Action::Message,
+            TokenConstraints::default(),
+            None,
+        );
+        let tick = |audit| {
+            manager.validate_recurring(&token, "principal", Action::Message, &resource, None, audit)
+        };
+        assert!(tick(true).await.is_ok());
+        assert!(tick(false).await.is_ok());
+        // Silent success: only the audited tick emitted CapabilityUse.
+        assert_eq!(capability_use_count(&manager, true), 1);
+
+        // Wrong resource is refused and audited even when success is coalesced.
+        let open = ResourceId::new("elastos://chat/presence/n/c/while-open");
+        assert!(matches!(
+            manager
+                .validate_recurring(&token, "principal", Action::Message, &open, None, false)
+                .await,
+            Err(ValidationError::WrongResource { .. })
+        ));
+        assert_eq!(capability_use_count(&manager, false), 1);
+
+        manager.revoke(token.id, "hidden").await;
+        assert!(matches!(
+            tick(false).await,
+            Err(ValidationError::TokenRevoked)
+        ));
+        assert_eq!(capability_use_count(&manager, false), 2);
+
+        let fresh = manager.grant(
+            "principal",
+            resource.clone(),
+            Action::Message,
+            TokenConstraints::default(),
+            None,
+        );
+        assert!(manager
+            .validate_recurring(&fresh, "principal", Action::Message, &resource, None, false)
+            .await
+            .is_ok());
+        manager.revoke_all("epoch");
+        assert!(matches!(
+            manager
+                .validate_recurring(&fresh, "principal", Action::Message, &resource, None, false)
+                .await,
+            Err(ValidationError::TokenRevoked)
+        ));
     }
 
     #[tokio::test]

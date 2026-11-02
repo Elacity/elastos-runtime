@@ -42,10 +42,10 @@ pub struct RuntimeConfig {
     pub version: String,
     /// Shell configuration
     pub shell: ShellConfig,
-    /// Trusted publisher public keys (hex-encoded Ed25519).
-    /// Capsules signed by these keys skip the trust prompt.
+    /// Trusted publisher public keys (hex-encoded Ed25519) for signed capsules.
     pub trusted_keys: Vec<String>,
-    /// Dev mode: skip trusted-root verification.
+    /// Allow unsigned local capsules. Source and CI Homes set this explicitly;
+    /// an installed signed release ignores it.
     pub dev_mode: bool,
 }
 
@@ -61,7 +61,7 @@ impl Default for RuntimeConfig {
             version: RUNTIME_VERSION.to_string(),
             shell: ShellConfig::default(),
             trusted_keys: Vec::new(),
-            dev_mode: true,
+            dev_mode: false,
         }
     }
 }
@@ -69,7 +69,7 @@ impl Default for RuntimeConfig {
 /// On-disk config file representation (`config.toml`).
 ///
 /// All fields are optional — absent fields fall back to [`RuntimeConfig`] defaults.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
     pub data_dir: Option<String>,
@@ -87,21 +87,6 @@ pub struct ConfigFile {
     pub trusted_keys: Option<Vec<String>>,
     #[serde(default)]
     pub dev_mode: Option<bool>,
-}
-
-impl Default for ConfigFile {
-    fn default() -> Self {
-        Self {
-            data_dir: None,
-            enable_audit: None,
-            audit_log_path: None,
-            ipfs_gateways: None,
-            enable_cache: None,
-            max_content_size_mb: None,
-            trusted_keys: Some(Vec::new()),
-            dev_mode: Some(true),
-        }
-    }
 }
 
 impl RuntimeConfig {
@@ -139,22 +124,6 @@ impl RuntimeConfig {
             let _ = std::fs::write(&config_path, default_toml);
             (base, true)
         }
-    }
-
-    /// Return the set of trusted publisher keys: config-file keys plus built-in roots.
-    ///
-    /// Built-in roots are the ElastOS project's signing keys for core capsules
-    /// (shell, localhost-provider, did-provider, etc.). They are skipped
-    /// when `dev_mode` is true.
-    pub fn effective_trusted_keys(&self) -> Vec<String> {
-        let keys = self.trusted_keys.clone();
-        if !self.dev_mode {
-            // Built-in trusted root keys for core capsules.
-            // Add hex-encoded Ed25519 public keys here once the project has
-            // stable release keys. Example:
-            //   keys.push("abcdef0123456789...".to_string());
-        }
-        keys
     }
 
     /// Overlay values from a parsed config file onto this config.
@@ -637,13 +606,10 @@ mod tests {
         assert_eq!(config.data_dir, dir.path());
         assert!(config.ipfs_gateways.is_empty());
         assert!(
-            config.dev_mode,
-            "first-run source runtime config must make unsigned dev mode explicit"
+            !config.dev_mode,
+            "only an explicit setting allows unsigned local capsules"
         );
-        // Config file should have been created
-        let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
-        assert!(config_toml.contains("dev_mode = true"));
-        assert!(config_toml.contains("trusted_keys = []"));
+        assert!(dir.path().join("config.toml").is_file());
     }
 
     #[test]

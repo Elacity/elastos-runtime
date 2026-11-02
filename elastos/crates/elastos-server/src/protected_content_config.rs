@@ -1161,13 +1161,10 @@ mod tests {
 
     #[cfg(unix)]
     fn install_verified_custody_provider(data_dir: &Path, script: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let bin_dir = data_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let binary = bin_dir.join("custody-provider");
-        std::fs::write(&binary, script).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         let checksum = format!("sha256:{}", hex::encode(Sha256::digest(script)));
         std::fs::write(
             data_dir.join("components.json"),

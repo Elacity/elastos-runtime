@@ -163,18 +163,13 @@ test('missing device fails without mount or formatting', () => {
   assert.deepEqual(result.bytes, bytes);
 });
 
-test('Linux crosvm directory profile first-run keeps its existing guest path', () => {
-  const root = mkdtempSync(join(tmpdir(), 'b12-crosvm-profile-'));
-  try {
-    const stop = source.indexOf('\nselkies_checkpoint "profile initialized"', end);
-    assert.ok(stop > end);
-    const dispatch = source.slice(end, stop).replace('"/var/lib/elastos/browser-profiles/$profile_key"', '"$B12_PROFILES/$profile_key"');
-    const result = spawnSync('bash', ['-c', `set -eu\nprofile_key=principal-fixture\nprofile_disk_policy=\nmount_browser_profile_disk() { echo unexpected-disk-mount >&2; exit 91; }\n${dispatch}\nprintf '%s' "$ELASTOS_BROWSER_VM_PROFILE_DIR"`],
-      { encoding: 'utf8', timeout: 1000, env: { ...process.env, B12_PROFILES: root } });
-    assert.ifError(result.error);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, join(root, 'principal-fixture'));
-  } finally { rmSync(root, { recursive: true, force: true }); }
+test('Linux crosvm dispatch mounts the required persistent disk', () => {
+  const stop = source.indexOf('\nselkies_checkpoint "profile initialized"', end);
+  const dispatch = source.slice(end, stop);
+  const result = spawnSync('bash', ['-c', `set -eu\nprofile_key=principal-fixture\nprofile_disk_policy=required\nmount_browser_profile_disk() { export ELASTOS_BROWSER_VM_PROFILE_DIR=/profile/chromium; }\n${dispatch}\nprintf '%s' "$ELASTOS_BROWSER_VM_PROFILE_DIR"`],
+    { encoding: 'utf8', timeout: 1000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '/profile/chromium');
 });
 
 

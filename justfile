@@ -76,9 +76,22 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
-# Collect local source, lint, and test results before a CI-fix push.
+# Capsule units and script behavior fixtures, as CI and the pre-push gate run
+# them; offline, after `just test-behaviour-inputs` installed the pinned
+# Playwright/Chromium inputs once.
+test-behaviour:
+    ./scripts/test-behaviour.sh
+
+test-behaviour-inputs:
+    ./scripts/test-behaviour.sh inputs
+
+# Check a clean candidate against current develop before each push.
 ci-local-prepush:
     scripts/ci-local-prepush.sh
+
+# Small Git/Cargo decision fixtures; Cargo is simulated.
+test-ci-local-prepush:
+    python3 scripts/ci-local-prepush-test.py
 
 # Cold Debian container check for test-elastos when Docker is available.
 # It copies the working tree and installs Node for integration tests.
@@ -125,6 +138,7 @@ ci-source-home-linux arch='arm64':
         export PATH=/usr/local/cargo/bin:\$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/ci/.cargo && \
         cd /w && git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm ci-replica && \
         export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
+        export ELASTOS_NODE_BIN=/usr/bin/node ELASTOS_BROWSER_VM_TURNSERVER_BIN=/usr/bin/turnserver && \
         SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
         export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
         SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR=/usr/bin scripts/setup-source-home.sh && \
@@ -148,27 +162,31 @@ vendor-ui:
 fmt:
     cd elastos && cargo fmt --all
 
-# Pre-commit gate: alignment, entropy, smoke tests, fmt/lint/test
+# Pre-commit gate: data contracts, behavior tests, smoke tests, fmt/lint/test
 verify:
     git --no-pager diff --check
-    just alignment-check
+    ./scripts/test-source-gate.sh
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
     ./scripts/vendor-ui-tokens.sh --check
-    node scripts/home-entropy-check.mjs
-    python3 scripts/components-release-integrity-check.py --self-test
-    python3 scripts/publish-platform-artifacts-test.py
-    python3 scripts/release-platform-input-test.py
-    python3 scripts/prepare-release-platform-test.py
-    python3 scripts/media-tools-build-test.py
-    node scripts/home-agent-shell-smoke.mjs
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
-    node scripts/home-clipboard-source-gate.mjs
-    node scripts/browser-entropy-check.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
+    node --test scripts/home-assistant-mark.test.mjs
+    node --test scripts/assistant-markdown.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
+    node --test scripts/home-form-factor.test.mjs
+    node --test scripts/home-keyboard-inset.test.mjs
+    node --test scripts/home-capsule-layout.test.mjs
+    node --test scripts/home-phone-dock.test.mjs
+    node --test scripts/home-phone-stage.test.mjs
+    node --test scripts/home-sheet-handle.test.mjs
+    node --test scripts/home-link-status.test.mjs
+    node --test scripts/home-touch-long-press.test.mjs
+    node --test scripts/home-fullscreen-toggle.test.mjs
+    node --test scripts/home-phone-home.test.mjs
+    node --test scripts/chat-room-enter.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     ./scripts/browser-local-exit-orphan-cleanup-smoke.sh
@@ -188,22 +206,33 @@ verify-ci: ci-test-capsules ci-test-elastos
 
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs
+    node scripts/home-shell-bridge-smoke.mjs
+    node scripts/home-shell-recovery-smoke.mjs
     node scripts/people-discovery-smoke.mjs
     node scripts/inbox-product-behavior-smoke.mjs
     node scripts/archive-product-behavior-smoke.mjs
     node scripts/marketplace-product-behavior-smoke.mjs
-    node scripts/documents-product-behavior-smoke.mjs
+    node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
+    node --test scripts/chat-room-reconnect.test.mjs
 
 product-ui-browser:
     node scripts/people-product-layout-smoke.mjs
     node scripts/inbox-product-layout-smoke.mjs
     node scripts/archive-product-layout-smoke.mjs
     node scripts/marketplace-product-layout-smoke.mjs
+    node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
+    node scripts/library-menu-smoke.mjs
+    node scripts/library-shared-cid-smoke.mjs
+    node scripts/home-library-open-headless-smoke.mjs
+    node scripts/browser-product-layout-smoke.mjs
+    node scripts/system-uiux-layout-smoke.mjs
+    node scripts/system-window-policy-browser-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
+    node scripts/home-phone-layout-smoke.mjs
 
 product-ui-virtual-auth:
     HOME_VIRTUAL_AUTH_APP_MATRIX=1 node scripts/home-passkey-virtual-auth-smoke.mjs
@@ -215,9 +244,9 @@ verify-release:
     just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
-# Fail-closed check for rooted-localhost and Home-first contract drift
-alignment-check:
-    ./scripts/check-wci-alignment.sh
+# Validate capsule metadata, component profiles and signed catalog bindings.
+product-data:
+    node scripts/check-product-data.mjs
 
 # Verify the checked-in ElastOS Bus contract and real Component fixture
 bus-conformance:
@@ -283,18 +312,6 @@ rootfs-all:
         ./scripts/build/build-rootfs.sh "$c" --output artifacts/
     done
     echo "All rootfs builds complete."
-
-# Full publish: build + rootfs + sign + upload
-publish version key:
-    ./scripts/publish-release.sh --version {{version}} --key {{key}}
-
-# Quick re-publish: skip build + rootfs (re-sign and re-upload only)
-publish-quick version key:
-    ./scripts/publish-release.sh --version {{version}} --key {{key}} --skip-build --skip-rootfs
-
-# Local publish: skip build + rootfs + no public URL (fastest)
-publish-local version key:
-    ./scripts/publish-release.sh --version {{version}} --key {{key}} --skip-build --skip-rootfs --no-public-url
 
 # Run GBA emulator demo
 gba *args:

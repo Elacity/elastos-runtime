@@ -30,13 +30,17 @@ button {
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 button:hover:not(:disabled),
 button:focus-visible:not(:disabled) {
-  border-color: var(--el-hairline-strong);
   background: var(--el-inset);
-  outline: none;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--el-accent-faint);
+  outline-offset: 1px;
 }
 
 button:disabled {
@@ -86,13 +90,15 @@ button:disabled {
 /* Apps-level blend: split shell; sidebar owns lights safe-top. */
 .people-shell {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: 200px minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-height: 0;
   background: var(--el-bg);
 }
 
+/* The three pages: a sidebar column on a wide window, a segmented row on a
+   narrow one and on a phone. */
 .people-sidebar {
   display: flex;
   min-width: 0;
@@ -113,8 +119,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: calc(100% - 8px);
-  margin: 0 4px;
+  width: 100%;
   border: 0;
   border-radius: 999px;
   padding: 7px 12px;
@@ -125,7 +130,7 @@ button:disabled {
   text-align: left;
 }
 
-.people-sidebar-item:hover {
+.people-sidebar-item:hover:not(:disabled) {
   background: var(--el-lift);
   color: var(--el-text);
 }
@@ -152,7 +157,7 @@ button:disabled {
 
 .people-sidebar-icon-people::before {
   top: 3px;
-  left: 7px;
+  left: 5px;
   width: 8px;
   height: 8px;
   border: 1.7px solid currentColor;
@@ -160,25 +165,43 @@ button:disabled {
 }
 
 .people-sidebar-icon-people::after {
-  right: 4px;
-  bottom: 4px;
-  left: 4px;
-  height: 8px;
+  right: 2px;
+  bottom: 2px;
+  left: 2px;
+  height: 6px;
   border: 1.7px solid currentColor;
-  border-radius: 9px 9px 4px 4px;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
 }
 
-.people-sidebar-icon-discovery::before {
-  inset: 5px;
+.people-sidebar-icon-profile::before {
+  inset: 3px 1px;
+  border: 1.7px solid currentColor;
+  border-radius: 3px;
+}
+
+.people-sidebar-icon-profile::after {
+  top: 7px;
+  left: 4px;
+  width: 4px;
+  height: 4px;
   border: 1.7px solid currentColor;
   border-radius: 50%;
 }
 
-.people-sidebar-icon-discovery::after {
-  top: 10px;
-  right: 2px;
-  width: 8px;
-  border-top: 1.7px solid currentColor;
+.people-sidebar-icon-public::before {
+  inset: 2px;
+  border: 1.7px solid currentColor;
+  border-radius: 50%;
+}
+
+.people-sidebar-icon-public::after {
+  top: 2px;
+  bottom: 2px;
+  left: 6px;
+  width: 6px;
+  border: 1.7px solid currentColor;
+  border-radius: 50%;
 }
 
 .people-main {
@@ -190,24 +213,34 @@ button:disabled {
   background: var(--el-bg);
 }
 
+.people-content {
+  min-height: 0;
+  overflow: auto;
+  padding: 28px 32px 48px;
+}
+
+.people-content-inner {
+  width: 100%;
+  max-width: 720px;
+}
+
 .people-page-title {
-  margin: 0 0 16px;
+  margin: 0 0 18px;
   color: var(--el-text);
-  font-size: 34px;
+  font-size: 28px;
   font-weight: 700;
-  letter-spacing: 0;
   line-height: 1.15;
 }
 
 .people-status {
   margin: 0 0 14px;
-  min-height: 0;
   padding: 10px 12px;
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
   color: var(--el-muted);
   font-size: 13px;
   background: var(--el-surface-raised);
+  overflow-wrap: anywhere;
 }
 
 .people-status[data-tone="error"] {
@@ -220,120 +253,141 @@ button:disabled {
   border-color: color-mix(in srgb, var(--el-ok) 30%, transparent);
 }
 
-.people-content {
-  min-height: 0;
-  overflow: auto;
-  padding: 28px 32px 48px;
-}
-
-.people-content-inner {
-  width: 100%;
-  max-width: min(1100px, 100%);
-}
-
 .people-section {
   display: grid;
-  gap: 14px;
-  margin-bottom: 0;
-  scroll-margin-top: 12px;
-}
-
-.people-section[hidden] {
-  display: none !important;
+  gap: 20px;
 }
 
 .people-section h2,
-.people-section h3,
 .people-section p {
   margin: 0;
 }
 
 .people-section h2 {
   color: var(--el-text);
-  font-size: 22px;
+  font-size: 15px;
   font-weight: 700;
-  letter-spacing: 0;
-}
-
-.people-section h3 {
-  margin-bottom: 8px;
-  color: var(--el-muted);
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0;
 }
 
 .people-section p {
-  margin-top: 4px;
   color: var(--el-muted);
   font-size: 13px;
-  letter-spacing: 0;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
-.profile-card {
+/* One form row: a label, then a field and its button side by side. */
+.people-form {
   display: grid;
-  gap: 12px;
-  border: 1px solid var(--el-hairline);
-  border-radius: 8px;
-  padding: 16px;
-}
-
-.profile-form {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
-  align-items: end;
-  max-width: 460px;
+  min-width: 0;
 }
 
-.profile-form label {
-  grid-column: 1 / -1;
+.people-form label,
+.people-label {
   color: var(--el-muted);
   font-size: 12px;
   font-weight: 600;
 }
 
-.profile-form input {
-  width: 100%;
+.people-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.people-field-row input,
+.people-field-row code {
+  flex: 1 1 220px;
+  min-width: 0;
   min-height: 36px;
   border: 1px solid var(--el-hairline-strong);
   border-radius: 6px;
   padding: 7px 10px;
+  background: var(--el-surface-raised);
   color: var(--el-text);
 }
 
-.profile-form input:focus {
-  border-color: var(--el-hairline-strong);
+.people-field-row input:focus {
   outline: 2px solid var(--el-accent-faint);
   outline-offset: 1px;
 }
 
-.people-section-head {
+.people-field-row code {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
+  background: var(--el-inset);
+  font-family: var(--el-font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  user-select: text;
+}
+
+.people-form > button {
+  justify-self: start;
+}
+
+#add-contact-result:empty {
+  display: none;
+}
+
+.people-requests,
+.public-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px 12px;
+}
+
+.people-requests {
+  border: 1px solid var(--el-hairline);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--el-surface-raised);
+}
+
+.people-requests p,
+.public-state {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.people-section .people-requests p,
+.people-section #discovery-status {
+  color: var(--el-text);
+}
+
+.people-section #discovery-note {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.public-actions,
+.person-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .people-list-section {
   display: grid;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
 }
 
+.people-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
 .people-section-count {
-  flex: 0 0 auto;
-  align-self: center;
-  border: 1px solid var(--el-hairline);
-  border-radius: 999px;
-  padding: 6px 10px;
-  background: var(--el-surface-raised);
   color: var(--el-muted);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0;
-  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .people-list {
@@ -349,7 +403,7 @@ button:disabled {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
-  padding: 14px 16px;
+  padding: 12px 14px;
   border-bottom: 1px solid var(--el-hairline);
 }
 
@@ -368,6 +422,7 @@ button:disabled {
 .person-confirm {
   grid-column: 1 / -1;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -375,25 +430,22 @@ button:disabled {
   border-radius: 7px;
   padding: 10px 12px;
   background: color-mix(in srgb, var(--el-danger) 9%, transparent);
-  color: var(--el-danger);
-  font-size: 13px;
 }
 
-.person-confirm p {
-  margin: 0;
+.people-section .person-confirm p {
+  color: var(--el-danger);
 }
 
 .person-confirm-actions {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
   gap: 8px;
 }
 
 .person-avatar {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 36px;
+  height: 36px;
   place-items: center;
   border-radius: 50%;
   background: var(--el-inset);
@@ -409,116 +461,59 @@ button:disabled {
 .person-copy h4 {
   margin: 0;
   color: var(--el-text);
-  font-size: 15px;
-  letter-spacing: 0;
+  font-size: 14px;
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
-.person-details {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  overflow-wrap: anywhere;
-}
-
-.person-details span {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-  border: 1px solid var(--el-hairline);
-  border-radius: 999px;
-  padding: 4px 8px;
-  background: var(--el-inset);
-}
-
-.person-actions,
-.discovery-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 7px;
+.people-section .person-details {
+  margin-top: 2px;
+  font-size: 12px;
 }
 
 .danger {
   color: var(--el-danger);
 }
 
-.requested,
-.discovery-countdown {
-  align-self: center;
-  border: 1px solid color-mix(in srgb, var(--el-ok) 35%, transparent);
-  border-radius: 999px;
-  padding: 7px 11px;
-  background: color-mix(in srgb, var(--el-ok) 12%, var(--el-surface-raised));
-  color: var(--el-ok);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.empty-state {
-  display: grid;
-  min-height: 120px;
-  place-items: center;
-  padding: 20px;
+.people-section .empty-state {
+  padding: 16px 14px;
   text-align: center;
 }
 
-.empty-state h4,
-.empty-state p {
-  margin: 0;
-}
-
-.empty-state p {
-  margin-top: 4px;
-}
-
-.discovery-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.discovery-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
+/* Narrow window: the pages become a segmented row, content goes one column. */
 @media (max-width: 760px) {
-  /* Narrow stopgap — full mobile campaign later. */
   .people-shell {
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-direction: column;
   }
 
   .people-sidebar {
     flex-direction: row;
-    padding: 12px;
+    gap: 4px;
+    padding: var(--window-chrome-safe-top, 52px) 14px 10px;
     border-right: 0;
     border-bottom: 1px solid color-mix(in srgb, var(--el-hairline) 70%, transparent);
   }
 
+  .people-sidebar-item {
+    flex: 1 1 0;
+    justify-content: center;
+    min-width: 0;
+    padding: 7px 8px;
+    text-align: center;
+  }
+
+  .people-sidebar-icon,
   .people-page-title {
-    font-size: 28px;
+    display: none;
+  }
+
+  .people-main {
+    flex: 1 1 auto;
   }
 
   .people-content {
     padding: 16px 14px 24px;
-  }
-
-  .people-section-head,
-  .discovery-header {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .profile-form,
-  .discovery-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .discovery-actions {
-    justify-content: flex-start;
   }
 
   .person-card {
@@ -526,7 +521,62 @@ button:disabled {
   }
 
   .person-actions {
-    grid-column: 1 / -1;
-    justify-self: start;
+    grid-column: 2 / -1;
   }
+}
+
+/* Phone stage: the same segmented row at every phone width, and every
+   control is a full touch target. Person rows already stand above 48 px. */
+:root[data-el-form-factor="phone"] .people-shell {
+  display: flex;
+  flex-direction: column;
+}
+
+:root[data-el-form-factor="phone"] .people-sidebar {
+  flex-direction: row;
+  gap: 4px;
+  padding: 10px 12px;
+  border-right: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--el-hairline) 70%, transparent);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+:root[data-el-form-factor="phone"] .people-sidebar-item {
+  flex: 1 1 0;
+  justify-content: center;
+  min-width: 0;
+  font-size: 15px;
+  text-align: center;
+}
+
+:root[data-el-form-factor="phone"] .people-sidebar-icon,
+:root[data-el-form-factor="phone"] .people-page-title {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .people-main {
+  flex: 1 1 auto;
+}
+
+:root[data-el-form-factor="phone"] .people-content {
+  padding: 16px 14px 24px;
+}
+
+:root[data-el-form-factor="phone"] .person-card {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+:root[data-el-form-factor="phone"] .person-actions {
+  grid-column: 2 / -1;
+}
+
+:root[data-el-form-factor="phone"] button,
+:root[data-el-form-factor="phone"] .people-field-row input,
+:root[data-el-form-factor="phone"] .people-field-row code {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .people-field-row input {
+  font-size: 16px; /* below 16 px iOS Safari zooms the page on focus */
 }

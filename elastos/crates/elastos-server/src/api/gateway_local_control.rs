@@ -28,10 +28,21 @@ pub(crate) struct GatewayLocalControl {
     _browser_operators: Arc<super::gateway::BrowserOperatorService>,
 }
 
+#[cfg(test)]
 pub(crate) async fn start_gateway_local_control(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
 ) -> anyhow::Result<GatewayLocalControl> {
+    start_gateway_local_control_with_home_url(data_dir, registry, String::new()).await
+}
+
+pub(crate) async fn start_gateway_local_control_with_home_url(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    home_url: String,
+) -> anyhow::Result<GatewayLocalControl> {
+    // Resolve fallible release identity before opening listeners or spawning tasks.
+    let binary_sha256 = crate::runtime_control::sha256_file(&std::env::current_exe()?)?;
     let mut secret = [0u8; 32];
     getrandom::getrandom(&mut secret)
         .map_err(|error| anyhow::anyhow!("OS randomness unavailable: {error}"))?;
@@ -69,9 +80,11 @@ pub(crate) async fn start_gateway_local_control(
         attach_secret,
         pid: std::process::id(),
         runtime_kind: crate::runtime_control::RUNTIME_KIND_GATEWAY.to_string(),
-        binary_sha256: String::new(),
+        binary_sha256,
         policy_sha256: String::new(),
         dependency_sha256: String::new(),
+        generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
+        home_url,
     };
     let coords_guard =
         match crate::runtime_control::publish_gateway_runtime_coords(data_dir, coords) {
@@ -232,6 +245,11 @@ mod tests {
         assert_eq!(coords.pid, std::process::id());
         assert!(coords.api_url.starts_with("http://127.0.0.1:"));
         assert!(!coords.attach_secret.is_empty());
+        assert_eq!(
+            coords.binary_sha256,
+            crate::runtime_control::sha256_file(&std::env::current_exe().unwrap()).unwrap()
+        );
+        assert!(coords.home_url.is_empty());
         assert!(crate::runtime_control::read_attachable_runtime_coords(
             temp.path(),
             crate::runtime_control::AttachableRuntimeKind::Operator,
@@ -299,6 +317,8 @@ mod tests {
             .await
             .unwrap();
         let token = attach["token"].as_str().unwrap();
+        assert!(!token.is_empty());
+        assert_eq!(attach["session_type"], "shell");
         let response = client
             .post(format!("{}/api/provider/peer/list_peers", coords.api_url))
             .bearer_auth(token)

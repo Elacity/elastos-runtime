@@ -1,6 +1,7 @@
 use crate::adapters::{
-    is_http_job_creating_backend_state, is_local_text_backend_state, AdapterExecutor, CancelResult,
-    DispatchResult, ReconcileResult, WorkerApplyGuard,
+    is_http_job_creating_backend_state, is_local_text_backend_state, local_text_cancel_requested,
+    pure_local_stop_result, AdapterExecutor, CancelResult, DispatchResult, ReconcileResult,
+    WorkerApplyGuard,
 };
 use crate::config::{
     journal_root, AdapterConfig, BridgeProviderConfig, ConfiguredOffer, ProviderInitExtra,
@@ -29,6 +30,8 @@ pub(crate) struct ConfigRefresh {
     pub(crate) config: BridgeProviderConfig,
     offers: BTreeMap<String, ConfiguredOffer>,
     pub(crate) retire_offer: Option<String>,
+    pub(crate) activation_close_offers: Vec<String>,
+    reclaim_history: bool,
 }
 
 const HOME_OWNED_HOSTED_CHAT_URLS: &[&str] = &[
@@ -134,16 +137,19 @@ fn offer_has_unresolved_activity<A: AdapterExecutor>(
     extra: &ProviderInitExtra,
     retained_workers: &[String],
 ) -> Result<bool, ProviderFault> {
-    let runs = state.journal.scan_runs()?;
-    Ok(runs.iter().any(|(_, run)| {
-        run.offer.id == offer_id
+    let mut unresolved = false;
+    let mut run_offers = BTreeMap::new();
+    state.journal.visit_runs(|_, run, _| {
+        unresolved |= run.offer.id == offer_id
             && (!run.status.is_terminal()
-                || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
-    }) || retained_workers.iter().any(|worker| {
-        runs.iter()
-            .find(|(_, run)| run.run_id == *worker)
-            .is_none_or(|(_, run)| run.offer.id == offer_id)
-    }))
+                || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown));
+        run_offers.insert(run.run_id.clone(), run.offer.id.clone());
+        Ok(())
+    })?;
+    Ok(unresolved
+        || retained_workers
+            .iter()
+            .any(|worker| run_offers.get(worker).is_none_or(|id| id == offer_id)))
 }
 
 impl<A: AdapterExecutor> ModelProviderState<A> {
@@ -180,17 +186,26 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 ));
             }
         }
-        require_retained_run_bindings(&journal, &offers)?;
-        Ok(Self {
+        let replaced_local_runs = require_retained_run_bindings(&journal, &offers)?;
+        let mut state = Self {
             config,
             journal,
             offers,
             adapters,
-        })
+        };
+        for run_id in replaced_local_runs {
+            state.settle_local_text_run_unknown(&run_id)?;
+        }
+        Ok(state)
     }
 
     pub fn ready_offer_count(&self) -> usize {
         self.offers.values().filter(|offer| offer.enabled).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_run_for_test(&self, run_id: &str) -> Result<StoredRun, ProviderFault> {
+        self.journal.load_run(run_id)
     }
 
     /// Validate the complete proposal before the serialized coordinator closes
@@ -201,6 +216,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         execution_owned: bool,
         retained_workers: &[String],
     ) -> Result<ConfigRefresh, ProviderFault> {
+        self.journal.prune_expired_terminal_runs()?;
         if self.config.base_path != config.base_path
             || self.config.allowed_paths != config.allowed_paths
             || self.config.read_only != config.read_only
@@ -309,7 +325,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         let addition = offers.keys().any(|id| !self.offers.contains_key(id));
         // A warm local engine owns its artifacts, but an independent hosted
         // connection does not replace or consume them. Active workers and
-        // unresolved runs still keep every addition behind the activation gate.
+        // nonterminal runs still keep every addition behind the activation gate.
         let hosted_additions_only = offers
             .values()
             .filter(|offer| !self.offers.contains_key(&offer.id))
@@ -324,33 +340,56 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             ));
         }
         let retire_offer = retired.pop();
+        let mut activation_close_offers = Vec::new();
         if let Some(id) = &retire_offer {
-            let runs = self.journal.scan_runs()?;
-            if runs.iter().any(|(_, run)| {
-                run.offer.id == *id
-                    && (!run.status.is_terminal()
-                        || (!extra.owner_reclaim && run.status == RunStatus::SettlementUnknown))
-            }) || retained_workers.iter().any(|worker| {
-                runs.iter()
-                    .find(|(_, run)| run.run_id == *worker)
-                    .is_none_or(|(_, run)| run.offer.id == *id)
-            }) {
+            if offer_has_unresolved_activity(self, id, &extra, retained_workers)? {
                 return Err(ProviderFault::selection_unavailable(
                     "model retirement pending",
                 ));
             }
-        } else if addition
-            && ((execution_owned && !hosted_additions_only)
+        } else if addition {
+            require_retained_run_bindings(&self.journal, &offers)?;
+            let local_additions_only = offers
+                .values()
+                .filter(|offer| !self.offers.contains_key(&offer.id))
+                .all(|offer| matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. }));
+            let mut unresolved = false;
+            self.journal.visit_runs(|_, run, _| {
+                unresolved |= !run.status.is_terminal();
+                if run.status == RunStatus::SettlementUnknown {
+                    if let Some(offer) = self.offers.get(&run.offer.id) {
+                        if retained_local_llama_run(run)
+                            && matches!(offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+                        {
+                            // Outcome uncertainty belongs to this retained run.
+                            // The serialized owner must close its exact engine
+                            // before activating an independent model.
+                            activation_close_offers.push(offer.id.clone());
+                        } else if !local_additions_only
+                            || run.offer.hosted.is_none()
+                            || !matches!(
+                                &offer.adapter,
+                                AdapterConfig::OpenAiCompatibleText { .. }
+                                    | AdapterConfig::OpenAiResponsesText { .. }
+                                    | AdapterConfig::OpenRouterDecisions { .. }
+                            )
+                        {
+                            unresolved = true;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            activation_close_offers.sort();
+            activation_close_offers.dedup();
+            if (execution_owned && !hosted_additions_only && activation_close_offers.is_empty())
                 || !retained_workers.is_empty()
-                || self.journal.scan_runs()?.iter().any(|(_, r)| {
-                    !r.status.is_terminal()
-                        || (r.status == RunStatus::SettlementUnknown
-                            && self.offers.contains_key(&r.offer.id))
-                }))
-        {
-            return Err(ProviderFault::selection_unavailable(
-                "model activation pending",
-            ));
+                || unresolved
+            {
+                return Err(ProviderFault::selection_unavailable(
+                    "model activation pending",
+                ));
+            }
         }
         if extra.owner_reclaim {
             if let Some(value) = config.extra.as_object_mut() {
@@ -361,6 +400,8 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             config,
             offers,
             retire_offer,
+            activation_close_offers,
+            reclaim_history: extra.owner_reclaim,
         })
     }
 
@@ -377,6 +418,48 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
     pub(crate) fn apply_refresh(&mut self, refresh: ConfigRefresh) {
         self.offers = refresh.offers;
         self.config = refresh.config;
+    }
+
+    // Called by the serialized coordinator after checking its owned execution
+    // and workers are absent. A partial Reclaim keeps history recovery pending.
+    pub(crate) fn confirm_history_recovery(
+        &self,
+        refresh: &ConfigRefresh,
+        execution_owned: bool,
+        retained_workers: &[String],
+    ) -> Result<(), ProviderFault> {
+        if refresh.reclaim_history && !execution_owned && retained_workers.is_empty() {
+            self.journal.acknowledge_archive_recovery()?;
+        }
+        Ok(())
+    }
+
+    fn project_archived_run(&self, run: &mut StoredRun) -> Result<(), ProviderFault> {
+        if !self.journal.is_archived_run(&run.run_id)? || run.status.is_terminal() {
+            return Ok(());
+        }
+        // Recovery supplies a bounded terminal projection, not a backend
+        // settlement receipt. Original events and execution facts stay in the
+        // protected archive, even when a legacy record filled its event cap.
+        run.status = RunStatus::SettlementUnknown;
+        run.output = None;
+        run.backend_state = None;
+        run.error = Some(RunError {
+            class: ErrorClass::SettlementUnknown,
+            code: "settlement_unknown".into(),
+            message: "Model history was recovered. The previous outcome is unknown.".into(),
+        });
+        let sequence = run.next_sequence.min(MAX_EVENT_SEQUENCE);
+        run.events = vec![RunEvent {
+            schema: RUN_EVENT_SCHEMA.into(),
+            sequence,
+            kind: "settlement_unknown".into(),
+            data: json!({"code":"settlement_unknown","class":"settlement_unknown"}),
+            backend_report: run.offer.hosted.as_ref().map(|_| BackendReport::unknown()),
+            terminal: true,
+        }];
+        run.next_sequence = sequence + 1;
+        Ok(())
     }
 
     pub(crate) fn adapters(&self) -> &A {
@@ -421,6 +504,43 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             ));
         }
         reject_untrusted_binding_fields(&request.input)?;
+        request
+            .runtime_binding
+            .validate(&request.offer_id, &request.operation, &request.input)
+            .map_err(|_| ProviderFault::invalid_request("invalid runtime binding"))?;
+        let fingerprint = request_fingerprint(
+            &request.runtime_binding,
+            &request.runtime_binding.input_hash,
+        )?;
+        let run_id = deterministic_run_id(&request.runtime_binding);
+        // A retained request owns its original result, including legacy IDs and
+        // results whose offer has since changed or retired.
+        if let Some(mut existing) = self.journal.load_run_if_present(&run_id)? {
+            if request_fingerprint(&existing.runtime_binding, &existing.input_hash)? != fingerprint
+            {
+                return Err(ProviderFault::invalid_request(
+                    "request_id conflicts with an existing model run",
+                ));
+            }
+            self.project_archived_run(&mut existing)?;
+            if !existing.status.is_terminal() {
+                let current_offer = self.current_execution_offer_for_run(&existing)?;
+                self.refresh_run_if_needed(current_offer.as_ref(), &mut existing)?;
+            }
+            return serialize_run_view(&existing);
+        }
+        elastos_model_contract::validate_new_model_request_id(
+            &request.runtime_binding.request_id,
+            now_ms(),
+            self.journal.pruned_issued_floor_ms()?,
+        )
+        .map_err(|_| ProviderFault::request_expired())?;
+        if self.journal.archive_recovery_pending()? {
+            return Err(ProviderFault::policy_limit(
+                "Model history needs recovery. Reclaim the active models in System, then use them again. Unconfirmed outcomes stay unknown.",
+                "legacy model history awaits owner Reclaim and confirmed execution closure",
+            ));
+        }
         let offer = self
             .offers
             .get(&request.offer_id)
@@ -444,10 +564,6 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
                 "requested operation does not match configured offer",
             ));
         }
-        request
-            .runtime_binding
-            .validate(&request.offer_id, &request.operation, &request.input)
-            .map_err(|_| ProviderFault::invalid_request("invalid runtime binding"))?;
         let input_bytes = serde_json::to_vec(&request.input)
             .map_err(|err| ProviderFault::internal(format!("failed to encode input: {err}")))?
             .len() as u64;
@@ -461,24 +577,6 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             ));
         }
         self.journal.prune_expired_terminal_runs()?;
-        let fingerprint = request_fingerprint(
-            &request.runtime_binding,
-            &request.runtime_binding.input_hash,
-        )?;
-        let run_id = deterministic_run_id(&request.runtime_binding);
-        if let Some(mut existing) = self.journal.load_run_if_present(&run_id)? {
-            if request_fingerprint(&existing.runtime_binding, &existing.input_hash)? != fingerprint
-            {
-                return Err(ProviderFault::invalid_request(
-                    "request_id conflicts with an existing model run",
-                ));
-            }
-            if !existing.status.is_terminal() {
-                let current_offer = self.current_execution_offer_for_run(&existing)?;
-                self.refresh_run_if_needed(current_offer.as_ref(), &mut existing)?;
-            }
-            return serialize_run_view(&existing);
-        }
 
         let created_at_ms = now_ms();
         let offer_summary = offer.summary();
@@ -552,6 +650,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         validate_run_lookup_request(&request.run_id, None, &request.runtime_binding)?;
         let mut run = self.journal.load_run(&request.run_id)?;
         assert_run_owner(&request.runtime_binding, &run)?;
+        self.project_archived_run(&mut run)?;
         if self.journal.prune_expired_loaded_run(&run)? {
             return Err(ProviderFault::unauthorized_run_access());
         }
@@ -578,6 +677,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         )?;
         let mut run = self.journal.load_run(&request.run_id)?;
         assert_run_owner(&request.runtime_binding, &run)?;
+        self.project_archived_run(&mut run)?;
         if self.journal.prune_expired_loaded_run(&run)? {
             return Err(ProviderFault::unauthorized_run_access());
         }
@@ -605,6 +705,7 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         validate_run_lookup_request(&request.run_id, None, &request.runtime_binding)?;
         let mut run = self.journal.load_run(&request.run_id)?;
         assert_run_owner(&request.runtime_binding, &run)?;
+        self.project_archived_run(&mut run)?;
         if self.journal.prune_expired_loaded_run(&run)? {
             return Err(ProviderFault::unauthorized_run_access());
         }
@@ -674,6 +775,11 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         if run.status.is_terminal() {
             return Ok(());
         }
+        if matches!(&guard, WorkerApplyGuard::LocalStopSettlement)
+            && !self.local_stop_matches(&run, &result)?
+        {
+            return Ok(());
+        }
         let Some(result) = normalize_worker_result(&run, guard, result)? else {
             return Ok(());
         };
@@ -681,6 +787,38 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
         apply_reconcile_result(&stored_offer, &mut run, result)?;
         self.journal.store_run(&run)?;
         Ok(())
+    }
+
+    pub(crate) fn owned_local_stop_matches(
+        &self,
+        run_id: &str,
+        result: &ReconcileResult,
+    ) -> Result<bool, ProviderFault> {
+        let Some(run) = self.journal.load_run_if_present(run_id)? else {
+            return Ok(false);
+        };
+        self.local_stop_matches(&run, result)
+    }
+
+    fn local_stop_matches(
+        &self,
+        run: &StoredRun,
+        result: &ReconcileResult,
+    ) -> Result<bool, ProviderFault> {
+        let Some(offer) = self.offers.get(&run.offer.id) else {
+            return Ok(false);
+        };
+        Ok(!run.status.is_terminal()
+            && matches!(&offer.adapter, AdapterConfig::LocalLlamaCppText { .. })
+            && offer
+                .execution_binding_hash()
+                .map_err(|_| ProviderFault::internal("invalid local execution binding"))?
+                == run.execution_binding_hash
+            && run
+                .backend_state
+                .as_ref()
+                .is_some_and(local_text_cancel_requested)
+            && pure_local_stop_result(result))
     }
 
     pub(crate) fn run_deadline_expired(&self, run_id: &str) -> Result<bool, ProviderFault> {
@@ -719,7 +857,8 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
             .backend_state
             .as_ref()
             .map(is_local_text_backend_state)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || (!self.offers.contains_key(&run.offer.id) && retained_local_llama_run(&run));
         if !is_local {
             return Ok(());
         }
@@ -740,20 +879,18 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
     }
 
     pub(crate) fn settle_active_local_text_runs_unknown(&mut self) -> Result<(), ProviderFault> {
-        let run_ids = self
-            .journal
-            .scan_runs()?
-            .into_iter()
-            .filter_map(|(_, run)| {
-                if run.status.is_terminal() {
-                    return None;
-                }
-                run.backend_state
+        let mut run_ids = Vec::new();
+        self.journal.visit_runs(|_, run, _| {
+            if !run.status.is_terminal()
+                && run
+                    .backend_state
                     .as_ref()
-                    .filter(|backend_state| is_local_text_backend_state(backend_state))
-                    .map(|_| run.run_id)
-            })
-            .collect::<Vec<_>>();
+                    .is_some_and(is_local_text_backend_state)
+            {
+                run_ids.push(run.run_id.clone());
+            }
+            Ok(())
+        })?;
         for run_id in run_ids {
             self.settle_local_text_run_unknown(&run_id)?;
         }
@@ -795,20 +932,18 @@ impl<A: AdapterExecutor> ModelProviderState<A> {
     }
 
     pub(crate) fn settle_active_http_job_creates_unknown(&mut self) -> Result<(), ProviderFault> {
-        let run_ids = self
-            .journal
-            .scan_runs()?
-            .into_iter()
-            .filter_map(|(_, run)| {
-                if run.status.is_terminal() {
-                    return None;
-                }
-                run.backend_state
+        let mut run_ids = Vec::new();
+        self.journal.visit_runs(|_, run, _| {
+            if !run.status.is_terminal()
+                && run
+                    .backend_state
                     .as_ref()
-                    .filter(|backend_state| is_http_job_creating_backend_state(backend_state))
-                    .map(|_| run.run_id)
-            })
-            .collect::<Vec<_>>();
+                    .is_some_and(is_http_job_creating_backend_state)
+            {
+                run_ids.push(run.run_id.clone());
+            }
+            Ok(())
+        })?;
         for run_id in run_ids {
             self.settle_http_job_create_run_unknown(&run_id)?;
         }
@@ -926,7 +1061,7 @@ fn normalize_worker_result(
     result: ReconcileResult,
 ) -> Result<Option<ReconcileResult>, ProviderFault> {
     match guard {
-        WorkerApplyGuard::None => Ok(Some(result)),
+        WorkerApplyGuard::None | WorkerApplyGuard::LocalStopSettlement => Ok(Some(result)),
         WorkerApplyGuard::HttpArtifactBackendState { backend_state } => {
             if run.backend_state.as_ref() != Some(&backend_state) {
                 return Ok(None);
@@ -943,12 +1078,19 @@ fn reject_untrusted_binding_fields(input: &Value) -> Result<(), ProviderFault> {
 fn require_retained_run_bindings(
     journal: &RunJournal,
     offers: &BTreeMap<String, ConfiguredOffer>,
-) -> Result<(), ProviderFault> {
-    for (_, run) in journal.scan_runs()? {
+) -> Result<Vec<String>, ProviderFault> {
+    let mut replaced_local_runs = Vec::new();
+    journal.visit_runs(|_, run, _| {
         if !run.status.is_terminal() {
-            let offer = offers.get(&run.offer.id).ok_or_else(|| {
-                ProviderFault::selection_unavailable("retained model binding unavailable")
-            })?;
+            let Some(offer) = offers.get(&run.offer.id) else {
+                if retained_local_llama_run(run) {
+                    replaced_local_runs.push(run.run_id.clone());
+                    return Ok(());
+                }
+                return Err(ProviderFault::selection_unavailable(
+                    "retained model binding unavailable",
+                ));
+            };
             if offer
                 .execution_binding_hash()
                 .map_err(|_| ProviderFault::invalid_request("invalid model binding"))?
@@ -971,8 +1113,26 @@ fn require_retained_run_bindings(
                 }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })?;
+    Ok(replaced_local_runs)
+}
+
+// The protected run summary records local context limits only for llama.
+// Hosted workers share the text state schema and retain their own disclosure.
+fn retained_local_llama_run(run: &StoredRun) -> bool {
+    run.offer.operation == "text.generate"
+        && run.offer.context.is_some()
+        && run.offer.hosted.is_none()
+        && run.backend_state.as_ref().is_none_or(|state| {
+            is_local_text_backend_state(state)
+                && state.as_object().is_some_and(|fields| {
+                    fields.len() == 2
+                        && fields
+                            .get("cancel_requested")
+                            .is_some_and(Value::is_boolean)
+                })
+        })
 }
 
 fn assert_run_owner(binding: &RuntimeAccessBinding, run: &StoredRun) -> Result<(), ProviderFault> {
@@ -1731,7 +1891,7 @@ mod tests {
             session_id: "session:test".to_string(),
             capsule_id: "assistant".to_string(),
             grant_id: "grant:test".to_string(),
-            request_id: request_id.to_string(),
+            request_id: crate::test_support::fixture_model_request_id(request_id),
             offer_id: offer_id.to_string(),
             operation: "text.generate".to_string(),
             input_hash: model_input_hash(input).unwrap(),
@@ -1749,6 +1909,19 @@ mod tests {
             request_id: binding.request_id.clone(),
             run_id,
         }
+    }
+
+    fn expired_create_binding(label: &str, offer_id: &str, input: &Value) -> RuntimeCreateBinding {
+        let mut binding = create_binding(label, offer_id, input);
+        binding.request_id = crate::test_support::fixture_model_request_id_at(
+            label,
+            now_ms().saturating_sub(
+                elastos_model_contract::MODEL_REQUEST_MAX_AGE_MS
+                    + elastos_model_contract::MODEL_REQUEST_FUTURE_SKEW_MS
+                    + 1,
+            ),
+        );
+        binding
     }
 
     fn rotate_create_audit(
@@ -2260,6 +2433,156 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn engine_replacement_keeps_hosted_and_configured_run_bindings_strict() {
+        for case in ["hosted", "changed", "invalid-state"] {
+            let state = retirement_state();
+            let original = state.offers[if case == "hosted" {
+                "operator"
+            } else {
+                "admitted"
+            }]
+            .clone();
+            let input = json!({"schema": "elastos.model.input.text/v1", "prompt":"retained"});
+            let binding = create_binding(&format!("request:strict-{case}"), &original.id, &input);
+            let mut run = prepared_run_for_offer(binding, &original, now_ms());
+            run.status = RunStatus::Running;
+            run.backend_state = Some(serialize_local_text_backend_state(false).unwrap());
+            if case == "invalid-state" {
+                run.backend_state.as_mut().unwrap()["extra"] = json!(true);
+            }
+            state.journal.store_run(&run).unwrap();
+            let before =
+                serde_json::to_value(state.journal.load_run(&run.run_id).unwrap()).unwrap();
+            let missing_local = if case == "hosted" {
+                let local = &state.offers["admitted"];
+                let binding =
+                    create_binding("request:missing-local-before-hosted", &local.id, &input);
+                let prepared = prepared_run_for_offer(binding, local, now_ms());
+                state.journal.store_run(&prepared).unwrap();
+                Some(prepared)
+            } else {
+                None
+            };
+            let mut config = state.config.clone();
+            config.extra["offers"] = if case == "changed" {
+                let mut changed = original.clone();
+                changed.policy.runtime_ms_limit += 1;
+                json!([changed])
+            } else {
+                json!([])
+            };
+            config.extra["runtime_admitted_offers"] = json!([]);
+            assert!(
+                ModelProviderState::from_init(config, FakeAdapters::default()).is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                serde_json::to_value(state.journal.load_run(&run.run_id).unwrap()).unwrap(),
+                before
+            );
+            if let Some(prepared) = missing_local {
+                assert_eq!(
+                    serde_json::to_value(state.journal.load_run(&prepared.run_id).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(prepared).unwrap(),
+                    "validation failure settles no earlier missing local run"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_local_stop_rejects_hosted_unbound_or_impure_facts() {
+        let mut state = retirement_state();
+        for case in [
+            "local",
+            "hosted",
+            "unrequested",
+            "hash",
+            "output",
+            "events",
+            "report",
+            "error",
+        ] {
+            let configured = state.offers[if case == "hosted" {
+                "operator"
+            } else {
+                "admitted"
+            }]
+            .clone();
+            let binding = create_binding(
+                &format!("request:stop-fact-{case}"),
+                &configured.id,
+                &json!({"prompt":"x"}),
+            );
+            let mut run = prepared_run_for_offer(binding, &configured, now_ms());
+            run.status = RunStatus::Reconciling;
+            run.backend_state = Some(
+                crate::adapters::serialize_local_text_backend_state(case != "unrequested").unwrap(),
+            );
+            if case == "hash" {
+                run.execution_binding_hash = format!("sha256:{}", "f".repeat(64));
+            }
+            state.journal.store_run(&run).unwrap();
+            let mut result = ReconcileResult::Terminal {
+                events: Vec::new(),
+                status: RunStatus::Cancelled,
+                output: None,
+                error: Some(RunError {
+                    class: ErrorClass::Cancelled,
+                    code: "cancelled".into(),
+                    message: "Model run was cancelled.".into(),
+                }),
+                backend_report: None,
+            };
+            if let ReconcileResult::Terminal {
+                events,
+                output,
+                error,
+                backend_report,
+                ..
+            } = &mut result
+            {
+                match case {
+                    "output" => *output = Some(json!({"text":"late"})),
+                    "events" => events.push(crate::adapters::EventSeed {
+                        kind: "text_delta",
+                        data: json!({"text":"late"}),
+                    }),
+                    "report" => *backend_report = Some(Box::new(BackendReport::unknown())),
+                    "error" => error.as_mut().unwrap().message = "private provider detail".into(),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                state
+                    .owned_local_stop_matches(&run.run_id, &result)
+                    .unwrap(),
+                case == "local",
+                "case {case}"
+            );
+            state
+                .apply_worker_reconcile_result(
+                    &run.run_id,
+                    WorkerApplyGuard::LocalStopSettlement,
+                    result,
+                )
+                .unwrap();
+            assert_eq!(
+                state.journal.load_run(&run.run_id).unwrap().status,
+                if case == "local" {
+                    RunStatus::Cancelled
+                } else {
+                    RunStatus::Reconciling
+                },
+                "case {case}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn warm_local_engine_allows_only_idle_hosted_additions() {
         let mut state = retirement_state();
         let local = state.offers["admitted"].clone();
@@ -2315,7 +2638,7 @@ mod tests {
                 transition_terminal(
                     &local,
                     &mut unresolved,
-                    status,
+                    status.clone(),
                     None,
                     Some(RunError {
                         class: ErrorClass::SettlementUnknown,
@@ -2325,11 +2648,16 @@ mod tests {
                 )
                 .unwrap();
             } else {
-                unresolved.status = status;
+                unresolved.status = status.clone();
                 unresolved.backend_state = Some(running_backend_state());
             }
             state.journal.store_run(&unresolved).unwrap();
-            assert!(state.plan_refresh(proposed.clone(), true, &[]).is_err());
+            if status == RunStatus::Running {
+                assert!(state.plan_refresh(proposed.clone(), true, &[]).is_err());
+            } else {
+                let refresh = state.plan_refresh(proposed.clone(), true, &[]).unwrap();
+                assert_eq!(refresh.activation_close_offers, vec![local.id.clone()]);
+            }
         }
         state.journal.store_run(&run).unwrap();
         let mut new_local = local.clone();
@@ -2406,7 +2734,15 @@ mod tests {
             .is_err());
         assert!(state.offers["admitted"].enabled);
         assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
-        assert!(state.journal.scan_runs().unwrap().is_empty());
+        let mut retained = 0;
+        state
+            .journal
+            .visit_runs(|_, _, _| {
+                retained += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(retained, 0);
     }
 
     #[cfg(unix)]
@@ -2452,7 +2788,7 @@ mod tests {
         let mut state = retirement_state();
         let desired = withdrawal(&state);
         let local = state.offers["admitted"].clone();
-        let binding = create_binding(
+        let binding = expired_create_binding(
             "request:retained-retirement",
             &local.id,
             &json!({"prompt":"x"}),
@@ -2476,15 +2812,16 @@ mod tests {
         )
         .unwrap();
         expire_terminal_run(&mut run);
-        state.journal.store_run(&run).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        // Age this retained fixture on disk; production writes preserve its original time binding.
+        std::fs::write(&path, serde_json::to_vec(&run).unwrap()).unwrap();
         state.journal.prune_expired_terminal_runs().unwrap();
-        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        assert!(!path.exists());
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_ok());
         ModelProviderState::from_init(desired.clone(), FakeAdapters::default()).unwrap();
         state =
             ModelProviderState::from_init(state.config.clone(), FakeAdapters::default()).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+        assert!(!path.exists());
+        assert!(state.plan_refresh(desired.clone(), false, &[]).is_ok());
         // A retained worker blocks even after its journal has a known terminal result.
         run.status = RunStatus::Failed;
         run.error = Some(RunError {
@@ -2550,6 +2887,9 @@ mod tests {
         let mut restored = state.config.clone();
         restored.extra["offers"] = json!([local.clone(), state.offers["operator"].clone()]);
         restored.extra["runtime_admitted_offers"] = json!([{"offer_id": local.id}]);
+        let mut changed_binding = restored.clone();
+        changed_binding.extra["offers"][0]["adapter"]["settings"]["threads"] = json!(2);
+        assert!(state.plan_refresh(changed_binding, false, &[]).is_err());
         let restored_refresh = state.plan_refresh(restored, false, &[]).unwrap();
         assert!(restored_refresh.retire_offer.is_none());
         assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
@@ -2779,9 +3119,20 @@ mod tests {
         let mut oversized = input;
         oversized["messages"][3]["content"] =
             json!("x".repeat(current.policy.input_bytes_limit as usize));
+        // A changed input under a retained identity conflicts before new admission.
         assert_eq!(
             state
-                .handle_runs_create(request(oversized))
+                .handle_runs_create(request(oversized.clone()))
+                .unwrap_err()
+                .code(),
+            "invalid_request"
+        );
+        let mut fresh_oversized = request(oversized);
+        fresh_oversized.runtime_binding.request_id =
+            crate::test_support::fixture_model_request_id("request:v2-new-oversized");
+        assert_eq!(
+            state
+                .handle_runs_create(fresh_oversized)
                 .unwrap_err()
                 .code(),
             "policy_limit"
@@ -4246,7 +4597,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(settled["data"]["status"], "completed");
-        remote.request_id = "request:remote-after-settlement".to_string();
+        remote.request_id =
+            crate::test_support::fixture_model_request_id("request:remote-after-settlement");
         let resumed = state.handle_runs_create(request(remote)).unwrap();
         assert_eq!(resumed["data"]["status"], "running");
         assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 2);
@@ -4258,7 +4610,7 @@ mod tests {
         let adapters = FakeAdapters::default();
         let mut state = init_state(&root, vec![offer("local-text")], adapters);
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"hello"});
-        let binding = create_binding("request:retention", "local-text", &input);
+        let binding = expired_create_binding("request:retention", "local-text", &input);
         let mut run = StoredRun::new_prepared(
             deterministic_run_id(&binding),
             binding.clone(),
@@ -4305,7 +4657,7 @@ mod tests {
         let mut state = init_state(&root, vec![offer("local-text")], adapters);
 
         let old_input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"old"});
-        let old_binding = create_binding("request:old-expired", "local-text", &old_input);
+        let old_binding = expired_create_binding("request:old-expired", "local-text", &old_input);
         let mut old_run = StoredRun::new_prepared(
             deterministic_run_id(&old_binding),
             old_binding,
@@ -4351,7 +4703,8 @@ mod tests {
         let mut state = init_state(&root, vec![offer("local-text")], adapters);
 
         let old_input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"old"});
-        let old_binding = create_binding("request:old-invalid-create", "local-text", &old_input);
+        let old_binding =
+            expired_create_binding("request:old-invalid-create", "local-text", &old_input);
         let mut old_run = StoredRun::new_prepared(
             deterministic_run_id(&old_binding),
             old_binding,
@@ -4400,7 +4753,7 @@ mod tests {
         let adapters = FakeAdapters::default();
         let mut state = init_state(&root, vec![offer("local-text")], adapters.clone());
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"hello"});
-        let binding = create_binding("request:owner-prune", "local-text", &input);
+        let binding = expired_create_binding("request:owner-prune", "local-text", &input);
         let mut run = StoredRun::new_prepared(
             deterministic_run_id(&binding),
             binding.clone(),
@@ -4472,7 +4825,7 @@ mod tests {
         let adapters = FakeAdapters::default();
         let mut state = init_state(&root, vec![offer("local-text")], adapters);
         let input = serde_json::json!({"schema":"elastos.model.input.text/v1","prompt":"hello"});
-        let binding = create_binding("request:wrong-owner-prune", "local-text", &input);
+        let binding = expired_create_binding("request:wrong-owner-prune", "local-text", &input);
         let mut run = StoredRun::new_prepared(
             deterministic_run_id(&binding),
             binding.clone(),
@@ -5542,5 +5895,928 @@ mod tests {
 
         assert_eq!(error.code(), "internal_error");
         assert_eq!(serde_json::to_vec(&run).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_admission_refuses_before_prepared_and_backend_effects() {
+        use std::os::unix::fs::OpenOptionsExt;
+        for exhausted_count in [false, true] {
+            let root = temp_root("bounded-journal-admission");
+            let model = offer("local-text");
+            let adapters = FakeAdapters::default();
+            let mut state = init_state(&root, vec![model.clone()], adapters.clone());
+            if exhausted_count {
+                let runs = journal_root(&root, None).unwrap().join("runs");
+                for index in 0..crate::journal::MAX_NEW_JOURNAL_ENTRIES {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(runs.join(format!(".sha256-{index:064x}.json.tmp-crash")))
+                        .unwrap();
+                }
+            } else {
+                for index in 0..64 {
+                    let input = json!({"schema":"elastos.model.input.text/v1","prompt":"retained"});
+                    let binding = create_binding(&format!("retained-{index}"), &model.id, &input);
+                    let run = prepared_run_for_offer(binding, &model, now_ms());
+                    state.journal.store_run(&run).unwrap();
+                }
+            }
+            let input = json!({"schema":"elastos.model.input.text/v1","prompt":"fresh"});
+            let binding = create_binding("new-at-capacity", &model.id, &input);
+            let run_id = deterministic_run_id(&binding);
+            let error = state
+                .handle_runs_create(RunsCreateRequest {
+                    op: "runs_create".into(),
+                    offer_id: model.id.clone(),
+                    operation: model.operation.clone(),
+                    input,
+                    runtime_binding: binding,
+                    expected_execution_binding_hash: None,
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), "policy_limit");
+            assert!(!run_path(&root, &run_id).exists());
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_unknown_charges_actual_bytes_and_keeps_exact_recovery_at_count_cap() {
+        let root = temp_root("unknown-actual-charge");
+        let model = offer("local-text");
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::SettlementUnknown,
+                output: None,
+                error: Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            })])),
+            ..Default::default()
+        };
+        let mut state = init_state(&root, vec![model.clone()], adapters.clone());
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"retained"});
+        let mut retained = Vec::new();
+        for index in 0..64 {
+            let binding = create_binding(&format!("unknown-{index}"), &model.id, &input);
+            let mut run = prepared_run_for_offer(binding.clone(), &model, now_ms());
+            transition_terminal(
+                &model,
+                &mut run,
+                RunStatus::SettlementUnknown,
+                None,
+                Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            )
+            .unwrap();
+            state.journal.store_run(&run).unwrap();
+            retained.push((binding, run));
+        }
+        let fresh = create_binding("fresh-after-64-unknown", &model.id, &input);
+        let admitted = state
+            .handle_runs_create(RunsCreateRequest {
+                op: "runs_create".into(),
+                offer_id: model.id.clone(),
+                operation: model.operation.clone(),
+                input: input.clone(),
+                runtime_binding: fresh,
+                expected_execution_binding_hash: None,
+            })
+            .unwrap();
+        assert_eq!(admitted["data"]["status"], "settlement_unknown");
+        let dispatched = *adapters.dispatch_calls.lock().unwrap();
+        assert_eq!(dispatched, 1);
+        let config = state.config.clone();
+        drop(state);
+        let mut state = ModelProviderState::from_init(config, adapters.clone()).unwrap();
+        for (binding, run) in &retained {
+            let before = std::fs::read(run_path(&root, &run.run_id)).unwrap();
+            let response = state
+                .handle_runs_create(RunsCreateRequest {
+                    op: "runs_create".into(),
+                    offer_id: model.id.clone(),
+                    operation: model.operation.clone(),
+                    input: input.clone(),
+                    runtime_binding: binding.clone(),
+                    expected_execution_binding_hash: None,
+                })
+                .unwrap();
+            assert_eq!(response["data"]["run_id"], run.run_id);
+            assert_eq!(response["data"]["status"], "settlement_unknown");
+            assert_eq!(std::fs::read(run_path(&root, &run.run_id)).unwrap(), before);
+        }
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), dispatched);
+        // Frozen Unknown records still count: capacity never grows without a bound.
+        for index in 64..crate::journal::MAX_NEW_JOURNAL_ENTRIES - 1 {
+            let binding = create_binding(&format!("unknown-{index}"), &model.id, &input);
+            let mut run = prepared_run_for_offer(binding, &model, now_ms());
+            transition_terminal(
+                &model,
+                &mut run,
+                RunStatus::SettlementUnknown,
+                None,
+                Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            )
+            .unwrap();
+            state.journal.store_run(&run).unwrap();
+        }
+        let binding = create_binding("fresh-at-unknown-cap", &model.id, &input);
+        let run_id = deterministic_run_id(&binding);
+        let error = state
+            .handle_runs_create(RunsCreateRequest {
+                op: "runs_create".into(),
+                offer_id: model.id.clone(),
+                operation: model.operation.clone(),
+                input,
+                runtime_binding: binding,
+                expected_execution_binding_hash: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "policy_limit");
+        assert!(error.message().contains("history window"));
+        assert!(!run_path(&root, &run_id).exists());
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), dispatched);
+    }
+
+    #[test]
+    fn expired_full_unknown_history_allows_fresh_reply_and_blocks_replay_after_restart() {
+        let root = temp_root("unknown-full-expiry-recovery");
+        let model = offer("local-text");
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::Completed,
+                output: Some(json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text":"fresh reply"})),
+                error: None,
+            })])),
+            ..Default::default()
+        };
+        let mut state = init_state(&root, vec![model.clone()], adapters.clone());
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"reply"});
+        let mut retained = Vec::new();
+        for index in 0..crate::journal::MAX_NEW_JOURNAL_ENTRIES {
+            let binding =
+                expired_create_binding(&format!("unknown-expiry-{index}"), &model.id, &input);
+            let mut run = prepared_run_for_offer(binding.clone(), &model, now_ms());
+            transition_terminal(
+                &model,
+                &mut run,
+                RunStatus::SettlementUnknown,
+                None,
+                Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            )
+            .unwrap();
+            expire_terminal_run(&mut run);
+            state.journal.store_run(&run).unwrap();
+            retained.push(binding);
+        }
+        assert_eq!(
+            state
+                .journal
+                .store_run(&prepared_run_for_offer(
+                    create_binding("blocked-at-256", &model.id, &input),
+                    &model,
+                    now_ms()
+                ))
+                .unwrap_err()
+                .code(),
+            "policy_limit"
+        );
+        let response = state
+            .handle_runs_create(RunsCreateRequest {
+                op: "runs_create".into(),
+                offer_id: model.id.clone(),
+                operation: model.operation.clone(),
+                input: input.clone(),
+                runtime_binding: create_binding("fresh-after-expiry", &model.id, &input),
+                expected_execution_binding_hash: None,
+            })
+            .unwrap();
+        assert_eq!(response["data"]["status"], "completed");
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        let floor = state.journal.pruned_issued_floor_ms().unwrap();
+        let mut state =
+            ModelProviderState::from_init(state.config.clone(), adapters.clone()).unwrap();
+        assert_eq!(state.journal.pruned_issued_floor_ms().unwrap(), floor);
+        for binding in retained {
+            let issued =
+                elastos_model_contract::model_request_issued_ms(&binding.request_id).unwrap();
+            assert!(
+                elastos_model_contract::validate_new_model_request_id(
+                    &binding.request_id,
+                    issued,
+                    floor
+                )
+                .is_err(),
+                "clock rollback preserves the replay barrier"
+            );
+            assert_eq!(
+                state
+                    .handle_runs_create(RunsCreateRequest {
+                        op: "runs_create".into(),
+                        offer_id: model.id.clone(),
+                        operation: model.operation.clone(),
+                        input: input.clone(),
+                        runtime_binding: binding,
+                        expected_execution_binding_hash: None,
+                    })
+                    .unwrap_err()
+                    .code(),
+                "request_expired"
+            );
+        }
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn expired_unknown_history_allows_model_activation_without_another_create() {
+        let root = temp_root("unknown-expiry-activation");
+        let model = offer("local-text");
+        let state = init_state(&root, vec![model.clone()], FakeAdapters::default());
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"old"});
+        let mut run = prepared_run_for_offer(
+            expired_create_binding("expired-before-activation", &model.id, &input),
+            &model,
+            now_ms(),
+        );
+        transition_terminal(
+            &model,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "Unknown".into(),
+            }),
+        )
+        .unwrap();
+        expire_terminal_run(&mut run);
+        state.journal.store_run(&run).unwrap();
+        let mut desired = state.config.clone();
+        desired.extra["offers"] = json!([model, offer("another-model")]);
+        state.plan_refresh(desired, false, &[]).unwrap();
+        assert!(!run_path(&root, &run.run_id).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_unknown_activation_requires_exact_owner_close_and_keeps_history() {
+        let state = retirement_state();
+        let model = state.offers["admitted"].clone();
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"old"});
+        let binding = create_binding("unknown-before-other-activation", &model.id, &input);
+        let mut run = prepared_run_for_offer(binding, &model, now_ms());
+        transition_terminal(
+            &model,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "Unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&state.config.base_path, &run.run_id);
+        let saved = std::fs::read(&path).unwrap();
+        let mut different = model.clone();
+        different.id = "different-model".into();
+        let mut desired = state.config.clone();
+        desired.extra["offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(different.clone()));
+        desired.extra["runtime_admitted_offers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"offer_id":different.id}));
+        for execution_owned in [false, true] {
+            let refresh = state
+                .plan_refresh(desired.clone(), execution_owned, &[])
+                .unwrap();
+            assert_eq!(refresh.activation_close_offers, vec![model.id.clone()]);
+            assert!(state
+                .plan_refresh(desired.clone(), execution_owned, &[run.run_id.clone()])
+                .is_err());
+            assert!(state
+                .plan_refresh(desired.clone(), execution_owned, &["unbound-worker".into()])
+                .is_err());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(
+            state.journal.load_run(&run.run_id).unwrap().status,
+            RunStatus::SettlementUnknown
+        );
+        let mut active = prepared_run_for_offer(
+            create_binding("live-before-other-activation", &model.id, &input),
+            &model,
+            now_ms(),
+        );
+        active.status = RunStatus::Running;
+        active.backend_state = Some(serialize_local_text_backend_state(false).unwrap());
+        state.journal.store_run(&active).unwrap();
+        assert!(state.plan_refresh(desired, false, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hosted_unknown_allows_local_activation_but_protects_its_own_retirement() {
+        let fixture = retirement_state();
+        let local = fixture.offers["admitted"].clone();
+        let hosted = home_owned_hosted_offer(
+            "model:hosted",
+            "https://openrouter.ai/api/v1/chat/completions",
+            "fixture-key",
+        );
+        let mut initial = fixture.config.clone();
+        initial.extra["offers"] = json!([hosted.clone()]);
+        initial.extra["runtime_admitted_offers"] = json!([]);
+        drop(fixture);
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(
+                (0..2)
+                    .map(|_| {
+                        Ok(DispatchResult::Terminal {
+                            events: vec![],
+                            status: RunStatus::Completed,
+                            output: Some(json!({
+                                "schema": RUN_OUTPUT_TEXT_SCHEMA,
+                                "text": "local reply after hosted unknown",
+                            })),
+                            error: None,
+                        })
+                    })
+                    .collect(),
+            )),
+            ..FakeAdapters::default()
+        };
+        let mut state = ModelProviderState::from_init(initial.clone(), adapters.clone()).unwrap();
+        let input = json!({"schema": "elastos.model.input.text/v1", "prompt": "fixture"});
+        let binding = create_binding("hosted-unknown-before-local", &hosted.id, &input);
+        let mut unknown = prepared_run_for_offer(binding.clone(), &hosted, now_ms());
+        transition_terminal(
+            &hosted,
+            &mut unknown,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "Hosted settlement remains unknown.".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&unknown).unwrap();
+        let path = run_path(&initial.base_path, &unknown.run_id);
+        let saved = std::fs::read(&path).unwrap();
+        for attempt in 0..2 {
+            if attempt != 0 {
+                state = ModelProviderState::from_init(initial.clone(), adapters.clone()).unwrap();
+            }
+            let mut desired = state.config.clone();
+            desired.extra["offers"] = json!([hosted.clone(), local.clone()]);
+            desired.extra["runtime_admitted_offers"] = json!([{"offer_id": local.id}]);
+            let other_hosted = home_owned_hosted_offer(
+                "model:other-hosted",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "fixture-key",
+            );
+            let mut hosted_addition = state.config.clone();
+            hosted_addition.extra["offers"] = json!([hosted.clone(), other_hosted.clone()]);
+            let mut mixed_addition = desired.clone();
+            mixed_addition.extra["offers"] = json!([hosted.clone(), local.clone(), other_hosted]);
+            for addition in [hosted_addition, mixed_addition] {
+                assert_eq!(
+                    state
+                        .plan_refresh(addition, false, &[])
+                        .err()
+                        .unwrap()
+                        .code(),
+                    "selection_unavailable"
+                );
+            }
+            for worker in [unknown.run_id.clone(), "unbound-worker".into()] {
+                assert!(state
+                    .plan_refresh(desired.clone(), false, &[worker])
+                    .is_err());
+            }
+            let mut retirement = state.config.clone();
+            retirement.extra["offers"] = json!([]);
+            assert_eq!(
+                state
+                    .plan_refresh(retirement, false, &[])
+                    .err()
+                    .unwrap()
+                    .code(),
+                "selection_unavailable"
+            );
+            let mut drift = desired.clone();
+            drift.extra["offers"][0]["adapter"]["model"] = json!("changed-model");
+            assert!(state.plan_refresh(drift, false, &[]).is_err());
+            let mut active = prepared_run_for_offer(
+                create_binding(&format!("hosted-prepared-{attempt}"), &hosted.id, &input),
+                &hosted,
+                now_ms(),
+            );
+            state.journal.store_run(&active).unwrap();
+            assert!(state.plan_refresh(desired.clone(), false, &[]).is_err());
+            transition_terminal(
+                &hosted,
+                &mut active,
+                RunStatus::Completed,
+                Some(json!({"schema": RUN_OUTPUT_TEXT_SCHEMA, "text": "hosted finished"})),
+                None,
+            )
+            .unwrap();
+            state.journal.store_run(&active).unwrap();
+            let refresh = state.plan_refresh(desired, false, &[]).unwrap();
+            assert!(refresh.activation_close_offers.is_empty());
+            state.apply_refresh(refresh);
+            let response = state
+                .handle_runs_create(RunsCreateRequest {
+                    op: "runs_create".into(),
+                    offer_id: local.id.clone(),
+                    operation: local.operation.clone(),
+                    input: input.clone(),
+                    runtime_binding: create_binding(
+                        &format!("local-after-hosted-unknown-{attempt}"),
+                        &local.id,
+                        &input,
+                    ),
+                    expected_execution_binding_hash: None,
+                })
+                .unwrap();
+            assert_eq!(response["data"]["status"], "completed");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert_eq!(
+                state
+                    .journal
+                    .load_run(&unknown.run_id)
+                    .unwrap()
+                    .runtime_binding,
+                binding
+            );
+            assert_eq!(
+                state.journal.load_run(&unknown.run_id).unwrap().status,
+                RunStatus::SettlementUnknown
+            );
+        }
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 2);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_archive_owner_access_projects_unknown_and_reclaim_requires_all_execution_closed() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut state = retirement_state();
+        let model = state.offers["admitted"].clone();
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"archived"});
+        let mut binding = create_binding("archived-future-request", &model.id, &input);
+        binding.request_id = crate::test_support::fixture_model_request_id_at(
+            "archived-future-request",
+            now_ms() + 60_000,
+        );
+        let mut run = prepared_run_for_offer(binding.clone(), &model, now_ms());
+        state.journal.store_run(&run).unwrap();
+        run.events = (1..MAX_RUN_EVENT_COUNT_LIMIT)
+            .map(|sequence| RunEvent {
+                schema: RUN_EVENT_SCHEMA.into(),
+                sequence: sequence as u64,
+                kind: "progress".into(),
+                data: json!({"step":1}),
+                backend_report: None,
+                terminal: false,
+            })
+            .collect();
+        run.next_sequence = MAX_RUN_EVENT_COUNT_LIMIT as u64;
+        let path = run_path(&state.config.base_path, &run.run_id);
+        std::fs::write(&path, serde_json::to_vec(&run).unwrap()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for index in 0..crate::journal::MAX_RECOVERY_JOURNAL_ENTRIES {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    path.parent()
+                        .unwrap()
+                        .join(format!(".sha256-{index:064x}.json.tmp-crash")),
+                )
+                .unwrap();
+        }
+        state =
+            ModelProviderState::from_init(state.config.clone(), state.adapters.clone()).unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        let archive = journal_root(&state.config.base_path, None)
+            .unwrap()
+            .join("recovery-runs");
+        let archived_path = crate::journal::hashed_path(&archive, &run.run_id);
+        let request = |binding: RuntimeCreateBinding| RunsCreateRequest {
+            op: "runs_create".into(),
+            offer_id: model.id.clone(),
+            operation: model.operation.clone(),
+            input: input.clone(),
+            runtime_binding: binding,
+            expected_execution_binding_hash: None,
+        };
+        assert_eq!(
+            state.handle_runs_create(request(binding.clone())).unwrap()["data"]["status"],
+            "settlement_unknown"
+        );
+        assert_eq!(
+            state
+                .handle_runs_get(RunsGetRequest {
+                    op: "runs_get".into(),
+                    run_id: run.run_id.clone(),
+                    runtime_binding: access_binding(&binding)
+                })
+                .unwrap()["data"]["status"],
+            "settlement_unknown"
+        );
+        let page = state
+            .handle_runs_events(RunsEventsRequest {
+                op: "runs_events".into(),
+                run_id: run.run_id.clone(),
+                after_sequence: Some(0),
+                runtime_binding: access_binding(&binding),
+            })
+            .unwrap();
+        assert_eq!(page["data"]["events"][0]["kind"], "settlement_unknown");
+        assert_eq!(
+            state
+                .handle_runs_cancel(RunsCancelRequest {
+                    op: "runs_cancel".into(),
+                    run_id: run.run_id.clone(),
+                    runtime_binding: access_binding(&binding)
+                })
+                .unwrap()["data"]["status"],
+            "settlement_unknown"
+        );
+        let mut foreign = access_binding(&binding);
+        foreign.principal_id = "person:another-owner".into();
+        assert_eq!(
+            state
+                .handle_runs_get(RunsGetRequest {
+                    op: "runs_get".into(),
+                    run_id: run.run_id.clone(),
+                    runtime_binding: foreign,
+                })
+                .unwrap_err()
+                .code(),
+            "run_not_found"
+        );
+        let mut conflict = binding.clone();
+        conflict.input_hash =
+            model_input_hash(&json!({"schema":"elastos.model.input.text/v1","prompt":"changed"}))
+                .unwrap();
+        let mut conflict_request = request(conflict);
+        conflict_request.input = json!({"schema":"elastos.model.input.text/v1","prompt":"changed"});
+        assert_eq!(
+            state
+                .handle_runs_create(conflict_request)
+                .unwrap_err()
+                .code(),
+            "invalid_request"
+        );
+        let fresh = create_binding("fresh-while-recovery-pending", &model.id, &input);
+        assert_eq!(
+            state.handle_runs_create(request(fresh)).unwrap_err().code(),
+            "policy_limit"
+        );
+        assert_eq!(std::fs::read(&archived_path).unwrap(), original);
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 0);
+        assert_eq!(*state.adapters.reconcile_calls.lock().unwrap(), 0);
+        let mut desired = withdrawal(&state);
+        desired.extra["owner_reclaim"] = json!(true);
+        let refresh = state.plan_refresh(desired, false, &[]).unwrap();
+        state.confirm_history_recovery(&refresh, true, &[]).unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        state
+            .confirm_history_recovery(&refresh, false, &["another-worker".into()])
+            .unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        state
+            .confirm_history_recovery(&refresh, false, &[])
+            .unwrap();
+        assert!(!state.journal.archive_recovery_pending().unwrap());
+        state.apply_refresh(refresh);
+        let mut state =
+            ModelProviderState::from_init(state.config.clone(), state.adapters.clone()).unwrap();
+        assert!(!state.journal.archive_recovery_pending().unwrap());
+        assert_eq!(
+            state.handle_runs_create(request(binding)).unwrap()["data"]["status"],
+            "settlement_unknown"
+        );
+        assert_eq!(std::fs::read(archived_path).unwrap(), original);
+        let mut restored = state.config.clone();
+        restored.extra["offers"] = json!([model.clone(), state.offers["operator"].clone()]);
+        restored.extra["runtime_admitted_offers"] = json!([{"offer_id":model.id}]);
+        let refresh = state.plan_refresh(restored, false, &[]).unwrap();
+        state.apply_refresh(refresh);
+        state
+            .adapters
+            .dispatch_results
+            .lock()
+            .unwrap()
+            .push(Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::Completed,
+                output: Some(
+                    json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"fresh after recovery"}),
+                ),
+                error: None,
+            }));
+        let fresh = create_binding("fresh-after-owner-recovery", &model.id, &input);
+        assert_eq!(
+            state.handle_runs_create(request(fresh)).unwrap()["data"]["status"],
+            "completed"
+        );
+        assert_eq!(*state.adapters.dispatch_calls.lock().unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_hosted_archive_recovers_by_owner_init_without_removing_operator_offer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = temp_root("hosted-only-history-recovery");
+        let model = offer("operator-hosted");
+        let adapters = FakeAdapters {
+            dispatch_results: Arc::new(Mutex::new(vec![Ok(DispatchResult::Terminal {
+                events: vec![],
+                status: RunStatus::Completed,
+                output: Some(
+                    json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"recovered hosted reply"}),
+                ),
+                error: None,
+            })])),
+            ..Default::default()
+        };
+        let state = init_state(&root, vec![model.clone()], adapters.clone());
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"reply"});
+        let mut retained = create_binding("legacy-hosted-recovery", &model.id, &input);
+        retained.request_id = "legacy-hosted-recovery".into();
+        let mut run = prepared_run_for_offer(retained.clone(), &model, now_ms());
+        transition_terminal(
+            &model,
+            &mut run,
+            RunStatus::SettlementUnknown,
+            None,
+            Some(RunError {
+                class: ErrorClass::SettlementUnknown,
+                code: "settlement_unknown".into(),
+                message: "Unknown".into(),
+            }),
+        )
+        .unwrap();
+        state.journal.store_run(&run).unwrap();
+        let path = run_path(&root, &run.run_id);
+        for index in 0..crate::journal::MAX_RECOVERY_JOURNAL_ENTRIES {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    path.parent()
+                        .unwrap()
+                        .join(format!(".sha256-{index:064x}.json.tmp-crash")),
+                )
+                .unwrap();
+        }
+        let mut state =
+            ModelProviderState::from_init(state.config.clone(), adapters.clone()).unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        let mut owner_init = state.config.clone();
+        owner_init.extra["owner_reclaim"] = json!(true);
+        let refresh = state.plan_refresh(owner_init, false, &[]).unwrap();
+        assert!(refresh.retire_offer.is_none());
+        state.confirm_history_recovery(&refresh, true, &[]).unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        state
+            .confirm_history_recovery(&refresh, false, &["held-hosted-worker".into()])
+            .unwrap();
+        assert!(state.journal.archive_recovery_pending().unwrap());
+        state
+            .confirm_history_recovery(&refresh, false, &[])
+            .unwrap();
+        state.apply_refresh(refresh);
+        assert_eq!(state.offers[&model.id], model);
+        let request = |binding| RunsCreateRequest {
+            op: "runs_create".into(),
+            offer_id: model.id.clone(),
+            operation: model.operation.clone(),
+            input: input.clone(),
+            runtime_binding: binding,
+            expected_execution_binding_hash: None,
+        };
+        assert_eq!(
+            state
+                .handle_runs_create(request(create_binding(
+                    "fresh-after-hosted-history-recovery",
+                    &model.id,
+                    &input
+                )))
+                .unwrap()["data"]["status"],
+            "completed"
+        );
+        let mut restarted =
+            ModelProviderState::from_init(state.config.clone(), adapters.clone()).unwrap();
+        assert!(!restarted.journal.archive_recovery_pending().unwrap());
+        assert_eq!(
+            restarted.handle_runs_create(request(retained)).unwrap()["data"]["status"],
+            "settlement_unknown"
+        );
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 1);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn bounded_settlement_visitor_validates_all_records_before_mutation() {
+        let root = temp_root("visitor-full-validation");
+        let model = offer("local-text");
+        let adapters = FakeAdapters::default();
+        let mut state = init_state(&root, vec![model.clone()], adapters.clone());
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let input = json!({"schema":"elastos.model.input.text/v1","prompt":"x"});
+            let binding = create_binding(&format!("worker-{index}"), &model.id, &input);
+            let mut run = prepared_run_for_offer(binding, &model, now_ms());
+            run.status = RunStatus::Running;
+            run.backend_state = Some(serialize_local_text_backend_state(false).unwrap());
+            state.journal.store_run(&run).unwrap();
+            paths.push((run_path(&root, &run.run_id), run));
+        }
+        let mut malformed = paths[1].1.clone();
+        malformed.execution_binding_hash = "invalid".into();
+        std::fs::write(&paths[1].0, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let before = paths
+            .iter()
+            .map(|(path, _)| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state
+                .settle_active_local_text_runs_unknown()
+                .unwrap_err()
+                .code(),
+            "journal_corrupt"
+        );
+        for ((path, _), bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+        // Restore the exact original fixture and prove normal bounded settlement.
+        std::fs::write(&paths[1].0, serde_json::to_vec(&paths[1].1).unwrap()).unwrap();
+        state.settle_active_local_text_runs_unknown().unwrap();
+        for (_, run) in paths {
+            assert_eq!(
+                state.journal.load_run(&run.run_id).unwrap().status,
+                RunStatus::SettlementUnknown
+            );
+        }
+    }
+
+    #[test]
+    fn unseen_expired_requests_leave_journal_and_backend_unchanged() {
+        let root = temp_root("expired-create-no-effects");
+        let adapters = FakeAdapters::default();
+        let current = offer("local-text");
+        let mut state = init_state(&root, vec![current.clone()], adapters.clone());
+        let input = json!({"schema":"elastos.model.input.text/v1","prompt":"old"});
+        let old_binding = expired_create_binding("request:unrelated-expired", &current.id, &input);
+        let mut old = prepared_run_for_offer(old_binding, &current, now_ms());
+        transition_terminal(
+            &current,
+            &mut old,
+            RunStatus::Completed,
+            Some(json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"old"})),
+            None,
+        )
+        .unwrap();
+        expire_terminal_run(&mut old);
+        state.journal.store_run(&old).unwrap();
+        let old_path = run_path(&root, &old.run_id);
+        let before = std::fs::read(&old_path).unwrap();
+        for id in [
+            "legacy-unseen".to_string(),
+            "model-v1:0:invalid".to_string(),
+            crate::test_support::fixture_model_request_id_at("expired-unseen", now_ms() - 300_001),
+            crate::test_support::fixture_model_request_id_at("future-unseen", now_ms() + 120_000),
+        ] {
+            let fresh_input = json!({"schema":"elastos.model.input.text/v1","prompt":"fresh"});
+            let mut binding = create_binding("request:unseen", &current.id, &fresh_input);
+            binding.request_id = id;
+            let path = run_path(&root, &deterministic_run_id(&binding));
+            assert_eq!(
+                state
+                    .handle_runs_create(RunsCreateRequest {
+                        op: "runs_create".into(),
+                        offer_id: current.id.clone(),
+                        operation: current.operation.clone(),
+                        input: fresh_input,
+                        runtime_binding: binding,
+                        expected_execution_binding_hash: None,
+                    })
+                    .unwrap_err()
+                    .code(),
+                "request_expired"
+            );
+            assert!(!path.exists());
+            assert_eq!(std::fs::read(&old_path).unwrap(), before);
+            assert_eq!(state.journal.pruned_issued_floor_ms().unwrap(), 0);
+        }
+        assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+        assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn retained_request_precedes_freshness_floor_policy_and_unrelated_pruning() {
+        for legacy in [false, true] {
+            let root = temp_root("retained-first");
+            let adapters = FakeAdapters::default();
+            let current = offer("local-text");
+            let mut state = init_state(&root, vec![current.clone()], adapters.clone());
+            let input = json!({"schema":"elastos.model.input.text/v1","prompt":"kept"});
+            let mut binding = expired_create_binding("request:kept-old", &current.id, &input);
+            if legacy {
+                binding.request_id = "legacy-retained-exact".into();
+            }
+            let mut retained = prepared_run_for_offer(binding.clone(), &current, now_ms());
+            transition_terminal(
+                &current,
+                &mut retained,
+                RunStatus::SettlementUnknown,
+                None,
+                Some(RunError {
+                    class: ErrorClass::SettlementUnknown,
+                    code: "settlement_unknown".into(),
+                    message: "Unknown".into(),
+                }),
+            )
+            .unwrap();
+            state.journal.store_run(&retained).unwrap();
+            // A different old request raises the durable floor without pruning Unknown.
+            let mut expired_binding =
+                expired_create_binding("request:raise-floor", &current.id, &input);
+            expired_binding.request_id = crate::test_support::fixture_model_request_id_at(
+                "higher-floor",
+                now_ms() - 360_000 - 1,
+            );
+            let mut expired = prepared_run_for_offer(expired_binding, &current, now_ms());
+            transition_terminal(
+                &current,
+                &mut expired,
+                RunStatus::Completed,
+                Some(json!({"schema":RUN_OUTPUT_TEXT_SCHEMA,"text":"old"})),
+                None,
+            )
+            .unwrap();
+            expire_terminal_run(&mut expired);
+            state.journal.store_run(&expired).unwrap();
+            state.journal.prune_expired_terminal_runs().unwrap();
+            assert!(state.journal.pruned_issued_floor_ms().unwrap() > 0);
+            let bytes = std::fs::read(run_path(&root, &retained.run_id)).unwrap();
+            state.offers.get_mut(&current.id).unwrap().enabled = false;
+            let response = state
+                .handle_runs_create(RunsCreateRequest {
+                    op: "runs_create".into(),
+                    offer_id: current.id.clone(),
+                    operation: current.operation.clone(),
+                    input,
+                    runtime_binding: binding,
+                    expected_execution_binding_hash: Some("sha256:".to_string() + &"0".repeat(64)),
+                })
+                .unwrap();
+            assert_eq!(response["data"]["run_id"], retained.run_id);
+            assert_eq!(response["data"]["status"], "settlement_unknown");
+            assert_eq!(
+                std::fs::read(run_path(&root, &retained.run_id)).unwrap(),
+                bytes
+            );
+            assert_eq!(*adapters.dispatch_calls.lock().unwrap(), 0);
+            assert_eq!(*adapters.reconcile_calls.lock().unwrap(), 0);
+        }
     }
 }

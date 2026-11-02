@@ -143,7 +143,11 @@ impl Provider for FakeModelProvider {
                 { "id": "qwen-local", "title": "Qwen", "operation": "text.generate", "hosted": null },
                 { "id": "model:openrouter", "title": "GPT", "operation": "text.generate",
                   "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" } },
-            ], "offer_revisions": {"qwen-local": revision, "model:openrouter": revision} } }));
+                // Hosted by its listing, though its id is not a hosted-instance id.
+                { "id": "model:custom", "title": "Custom", "operation": "text.generate",
+                  "hosted": { "placement": "hosted", "backend_provider_label": "OpenRouter" } },
+            ], "offer_revisions": {"qwen-local": revision, "model:openrouter": revision,
+                "model:custom": revision} } }));
         }
         if op == "runs_create" {
             let revision = self
@@ -1266,7 +1270,7 @@ mod consumer_path {
             .await
             .unwrap_err();
         assert!(
-            !matches!(error, RemoteRouteError::PreDispatchRefused { .. }),
+            !matches!(error, RemoteRouteError::InvocationRefused { .. }),
             "{error}"
         );
         assert_eq!(
@@ -1274,13 +1278,40 @@ mod consumer_path {
             1,
             "a second ticket entry would create again"
         );
+        *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+            "status":"error", "code":elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+            "message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+        }));
+        let expired_request = request("expired-on-provider");
+        match fx
+            .route(&[grant.clone()], "runs_create", expired_request.clone())
+            .await
+            .unwrap_err()
+        {
+            RemoteRouteError::InvocationRefused { binding, reason } => {
+                assert_eq!(reason, "request_expired");
+                assert_eq!(binding["dispatch"], "provider_refused");
+                assert_eq!(binding["offer_id"], offer_id);
+                assert_eq!(binding["request_id"], "expired-on-provider");
+                assert_eq!(
+                    binding["input_hash"],
+                    model_input_hash(&expired_request["input"]).unwrap()
+                );
+            }
+            other => panic!("expected provider expiry refusal, got {other}"),
+        }
+        assert_eq!(
+            fx.create_count().await,
+            2,
+            "expiry does not try a second ticket entry"
+        );
         fx.write_request_record("denied");
         let refused = fx
             .route(&[grant], "runs_create", request("fresh-revoked"))
             .await
             .unwrap_err();
         match refused {
-            RemoteRouteError::PreDispatchRefused { binding, reason } => {
+            RemoteRouteError::InvocationRefused { binding, reason } => {
                 assert_eq!(reason, "denied");
                 assert_eq!(binding["offer_id"], offer_id);
                 assert_eq!(binding["request_id"], "fresh-revoked");
@@ -1288,7 +1319,7 @@ mod consumer_path {
             }
             other => panic!("expected bound refusal, got {other}"),
         }
-        assert_eq!(fx.create_count().await, 1);
+        assert_eq!(fx.create_count().await, 2);
         fx.shutdown().await;
     }
 
@@ -2274,6 +2305,293 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
     assert_eq!(fx.create_count().await, baseline + 1);
     let old = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
     assert_eq!(old["ok"], true, "{old}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hosted_grant_serves_only_while_its_provider_is_an_admin() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    let named = "model:openrouter";
+    let custom = "model:custom";
+    assert!(!crate::api::model_provider_config::is_hosted_offer_id(
+        custom
+    ));
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(named),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        named,
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    // No fixture saves a hosted offer under a custom id, so copy the shared
+    // operator entry under one, as an operator-written config would hold it.
+    let mut offers =
+        crate::api::model_provider_config::load_model_provider_operator_offers(fx.owner.path())
+            .unwrap();
+    let mut operator_custom = offers
+        .iter()
+        .find(|offer| offer["id"] == named)
+        .unwrap()
+        .clone();
+    operator_custom["id"] = json!(custom);
+    offers.push(operator_custom);
+    std::fs::write(
+        fx.owner.path().join("providers/model-provider/config.json"),
+        serde_json::to_vec(&json!({ "offers": offers })).unwrap(),
+    )
+    .unwrap();
+    let list =
+        || json!({ "op": "offers_list", "remote_model": fx.remote(SEED_PRINCIPAL, "assistant") });
+    for id in [named, custom] {
+        fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[id]);
+        let listed = fx.call("offers_list", list()).await;
+        assert_eq!(listed["result"]["data"]["offers"][0]["id"], id, "{listed}");
+        let served = fx.create_run(&format!("{}-from-admin", &id[6..]), id).await;
+        assert_eq!(served["ok"], true, "{served}");
+    }
+    let baseline = fx.create_count().await;
+
+    // Demotion needs another admin to remain.
+    passkey_authority_with_profile_role_credential(
+        fx.owner.path(),
+        "Other admin",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-other-admin-passkey",
+    );
+    crate::auth::demote_passkey_to_guest(fx.owner.path(), &fx.authority.proof_binding_id, now_ts())
+        .unwrap();
+    for (id, code) in [(named, "denied"), (custom, "offer_unavailable")] {
+        fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[id]);
+        let listed = fx.call("offers_list", list()).await;
+        assert!(!listed.to_string().contains(id), "{listed}");
+        let refused = fx
+            .create_run(&format!("{}-after-demotion", &id[6..]), id)
+            .await;
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], code, "{refused}");
+    }
+    assert_eq!(
+        fx.create_count().await,
+        baseline,
+        "demoted grant dispatched"
+    );
+
+    // The same principal's grant for its local model is unaffected.
+    fx.write_request_record("approved");
+    let local = fx.create_run("local-after-demotion", "qwen-local").await;
+    assert_eq!(local["ok"], true, "{local}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_admin_with_two_passkeys_serves_local_and_hosted_model_grants() {
+    use crate::api::model_provider_config::{HostedAiProvider, HostedOfferSave};
+    let fx = TwoRuntimes::start().await;
+    let hosted = "model:openrouter";
+    crate::api::model_provider_config::save_hosted_offer(
+        fx.owner.path(),
+        None,
+        HostedOfferSave {
+            provider: HostedAiProvider::OpenRouter,
+            api_key: "fixture-key",
+            model: "fixture/model",
+            expected_response_model: None,
+            privacy: None,
+            name: "Hosted fixture",
+            instance_id: Some(hosted),
+        },
+    )
+    .await
+    .unwrap();
+    crate::api::model_provider_config::set_hosted_offer_share(
+        fx.owner.path(),
+        hosted,
+        true,
+        Some(HostedAiProvider::OpenRouter.share_terms_ack()),
+    )
+    .unwrap();
+    add_second_active_passkey(
+        fx.owner.path(),
+        &fx.authority.principal_id,
+        crate::auth::RuntimePrincipalRole::Admin,
+    );
+    fx.write_request_record("approved");
+    let local = fx.create_run("local-two-passkeys", "qwen-local").await;
+    assert_eq!(local["ok"], true, "{local}");
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[hosted]);
+    let served = fx.create_run("hosted-two-passkeys", hosted).await;
+    assert_eq!(served["ok"], true, "{served}");
+    let baseline = fx.create_count().await;
+
+    // Records for one principal that disagree on role fail closed: not admin.
+    let mut auth = crate::auth::load_auth_state(fx.owner.path()).unwrap();
+    auth.principals
+        .iter_mut()
+        .find(|principal| {
+            principal.proof_binding_id != fx.authority.proof_binding_id
+                && principal.principal_id == fx.authority.principal_id
+        })
+        .unwrap()
+        .role = crate::auth::RuntimePrincipalRole::Guest;
+    crate::auth::save_auth_state(fx.owner.path(), &auth, None).unwrap();
+    fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[hosted]);
+    let refused = fx.create_run("hosted-mixed-roles", hosted).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "denied", "{refused}");
+    assert_eq!(
+        fx.create_count().await,
+        baseline,
+        "mixed-role grant dispatched"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_principals_holding_one_model_grant_are_refused_as_ambiguous() {
+    let fx = TwoRuntimes::start().await;
+    let served = fx.create_run("one-owner", "qwen-local").await;
+    assert_eq!(served["ok"], true, "{served}");
+    let baseline = fx.create_count().await;
+
+    // A second admin principal that passes every other check and holds a
+    // copy of the same approved request, so only ownership can refuse it.
+    let carol = passkey_authority_with_profile_role_credential(
+        fx.owner.path(),
+        "Carol",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-carol-passkey",
+    );
+    let (owner_key, owner_did) = elastos_identity::load_or_create_did(fx.owner.path()).unwrap();
+    let (seed_key, _) = elastos_identity::load_or_create_did(fx.seed.path()).unwrap();
+    let (trusted_key, _) = generate_keypair();
+    let carol_profile = load_profile_for_authority(fx.owner.path(), &carol);
+    let carol_root = crate::auth::principal_localhost_root(&carol.principal_id);
+    let store = CollaborationContactStore::new(
+        fx.owner.path(),
+        &carol.principal_id,
+        &carol_root,
+        configured_discovery_network_profile_for_test(&trusted_key, NETWORK),
+        &carol_profile,
+        &owner_did,
+    )
+    .unwrap();
+    accept_seed_contact(&store, &owner_key, &carol_profile, &seed_key, &fx.seed_did);
+    let now = now_ts();
+    write_home_principal_object_json_for_authority(
+        fx.owner.path(),
+        &carol,
+        "services-state.json",
+        json!({
+            "schema": "elastos.services.state/v1",
+            "principal_id": carol.principal_id,
+            "localhost_root": carol_root,
+            "updated_at": now,
+            "local_offer_ids": ["local:provider:model"],
+        }),
+    );
+    write_home_principal_object_json_for_authority(
+        fx.owner.path(),
+        &carol,
+        "services-requests.json",
+        json!({
+            "schema": "elastos.services.requests/v1",
+            "principal_id": carol.principal_id,
+            "localhost_root": carol_root,
+            "updated_at": now,
+            "requests": { REQUEST_ID: {
+                "request_id": REQUEST_ID,
+                "offer_id": "local:provider:model",
+                "service_uri": "elastos://peer/model",
+                "service_kind": "remote_model",
+                "service_display_name": "Carol model",
+                "requester_peer_id": fx.seed_node.endpoint.id().to_string(),
+                "requester_did": fx.seed_did,
+                "requester_principal_id": SEED_PRINCIPAL,
+                "requester_display_name": "Seed",
+                "created_at": now,
+                "updated_at": now,
+                "status": "approved",
+                "authenticated_request": true,
+                "grant_expires_at": now + 3600,
+                "approved_offer_ids": ["qwen-local"],
+                "approved_offer_revision": format!("sha256:{}", "a".repeat(64)),
+            } },
+        }),
+    );
+    let refused = fx.create_run("two-owners", "qwen-local").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "denied", "{refused}");
+    assert_eq!(
+        fx.create_count().await,
+        baseline,
+        "ambiguous grant dispatched"
+    );
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_model_expired_request_records_the_provider_refusal_phase() {
+    let fx = TwoRuntimes::start().await;
+    let mut remote = fx.remote(SEED_PRINCIPAL, "assistant");
+    remote["refusal_scope"] = json!("invocation");
+    let request = json!({
+        "op":"runs_create", "request_id":"request-pruned", "offer_id":"qwen-local",
+        "operation":"text.generate", "input":{"prompt":"kept draft"}, "remote_model":remote,
+    });
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+        "message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+    }));
+    let baseline = fx.create_count().await;
+    let refused = fx.call("runs_create", request.clone()).await;
+    assert_eq!(refused["ok"], true, "{refused}");
+    assert_eq!(refused["result"]["code"], "remote_model_invocation_refused");
+    assert_eq!(refused["result"]["reason"], "request_expired");
+    let mut expected =
+        crate::api::gateway::gateway_model_service::invocation_refusal_binding(&request).unwrap();
+    expected["dispatch"] = json!("provider_refused");
+    assert_eq!(refused["result"]["refusal"], expected);
+    assert_eq!(
+        fx.create_count().await,
+        baseline + 1,
+        "provider was called once"
+    );
+    // Only this invocation is refused. Its reservation was released, so a
+    // later explicit submission follows the normal provider path.
+    let mut fresh_request = request.clone();
+    fresh_request["request_id"] = json!(format!(
+        "model-v1:{}:fresh-submission",
+        crate::auth::now_ts().saturating_mul(1000)
+    ));
+    let accepted = fx.call("runs_create", fresh_request).await;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert_eq!(accepted["result"]["status"], "ok");
+    let runs = fx.provider.run_owners.lock().unwrap().len();
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":"request_expired", "message":"different",
+    }));
+    let mut new_request = request.clone();
+    new_request["request_id"] = json!("another-request");
+    let ambiguous = fx.call("runs_create", new_request).await;
+    assert_eq!(ambiguous["ok"], false, "{ambiguous}");
+    assert!(ambiguous.get("result").is_none());
+    assert_eq!(fx.provider.run_owners.lock().unwrap().len(), runs);
     fx.shutdown().await;
 }
 

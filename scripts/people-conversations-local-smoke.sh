@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "[people-conversations-local-smoke] home entropy guard"
-node "$ROOT/scripts/home-entropy-check.mjs"
+node "$ROOT/scripts/check-product-data.mjs"
 
 echo "[people-conversations-local-smoke] People ignores stale summary responses"
 node "$ROOT/scripts/people-refresh-generation.test.mjs"

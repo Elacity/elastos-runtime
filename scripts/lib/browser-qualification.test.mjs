@@ -9,7 +9,7 @@ import { writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validatePlan, validateJourney, validateAttempt, auditQualification, sha256,
-  TERMINAL_EFFECTS, percentile, cleanControl, candidateFingerprint, validateInstallation, validateLiveIdentity, deriveMedia, qualificationTarget, qualificationVmIdentity, validateLocalLaunchSample } from "../browser-qualification-audit.mjs";
+  TERMINAL_EFFECTS, percentile, cleanControl, candidateFingerprint, validateInstallation, validateLiveIdentity, deriveMedia, qualificationTarget, qualificationVmIdentity, validateLocalLaunchSample, observedEngineSelection } from "../browser-qualification-audit.mjs";
 import { freezeArtifacts, checkArtifacts, journeyEnvironment, parseProcesses, ownedProcesses, runJourneyChild, executableInode, qualificationFixtureHealth } from "../browser-qualification-runner.mjs";
 import { qualificationOptions, installQualificationReceiver, observationCall, createQualificationHarness, createQualificationCancellation, qualificationInteraction, cleanupQualificationOpens } from "./browser-qualification-observer.mjs";
 import { readBrowserJourneyReceipt } from "./browser-journey-target.mjs";
@@ -51,7 +51,8 @@ function installation(p) {
 function frozenInputs(p) {
   return [...p.candidate.artifacts, { role: "operator_coordinates", path: p.runtime.operator_coords, sha256: "e".repeat(64) },
     ...["scripts/browser-qualification-runner.mjs", "scripts/browser-qualification-audit.mjs",
-      "scripts/lib/browser-qualification-observer.mjs", "scripts/lib/browser-journey-target.mjs", "scripts/home-passkey-virtual-auth-smoke.mjs"].map(role =>
+      "scripts/lib/browser-qualification-observer.mjs", "scripts/lib/browser-journey-target.mjs", "scripts/home-passkey-virtual-auth-smoke.mjs",
+      "capsules/browser/browser/browser-service-selection.js"].map(role =>
       ({ role, path: "/fixture/" + role, sha256: "e".repeat(64) }))].map(a => ({ ...a, identity: "1:2:3:4:5" }));
 }
 function liveIdentity(p) {
@@ -1053,4 +1054,15 @@ test("raw thirty-minute media and interaction trace drives its summary and retai
     Object.assign(moved.scroll, { started_ms: 319901, receipt_ms: 319902 });
     assert.throws(() => deriveMedia(lateResume, { ...binding, mode: "mixed" }), /sustained_interaction_cadence/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Automatic stands for a planned lone engine only when Runtime routed the page to that exact adapter", () => {
+  const route = adapter_id => ({ engine_route: { page_id: "page-one", engine_id: "", adapter_id, provider: "browser-engine" } });
+  assert.equal(observedEngineSelection(route("browser-vm-product"), "page-one", "browser-vm-product"), "");
+  assert.throws(() => observedEngineSelection(route("other-engine"), "page-one", "browser-vm-product"), /automatic_engine_adapter_mismatch/);
+  assert.throws(() => observedEngineSelection(route("browser-vm-product"), "page-two", "browser-vm-product"), /automatic_engine_adapter_mismatch/);
+  assert.equal(observedEngineSelection({}, "page-one", "browser-vm-product"), "browser-vm-product",
+    "without an Automatic route the named selection is still required");
+  assert.equal(observedEngineSelection({ engine_route: { engine_id: "browser-vm-product" } }, "page-one", "browser-vm-product"), "browser-vm-product");
+  assert.equal(observedEngineSelection(route("x"), "page-one", ""), "");
 });

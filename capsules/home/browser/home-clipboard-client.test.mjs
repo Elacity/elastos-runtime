@@ -194,6 +194,8 @@ test("only Browser can read and exact matching text/plain result settles it", as
 
 test("client accepts the closed first-party write purposes", async () => {
   const cases = [
+    ["people", "profile.id", "did:key:zProfile"],
+    ["chat-room", "profile.id", "did:key:zProfile"],
     ["wallet", "wallet.address", "0x1234"],
     ["wallet", "wallet.recovery-key", '{"secret":"bounded"}'],
     ["wallet-metamask", "wallet.address", "0x2345"],
@@ -201,8 +203,8 @@ test("client accepts the closed first-party write purposes", async () => {
     ["wallet-walletconnect", "wallet.address", "0x3456"],
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
-    ["documents", "resource.uri", "elastos://bafy-document"],
     ["assistant", "transcript.markdown", "# Assistant transcript\n\n## User\n\nHello"],
+    ["assistant", "message.text", "**Reply** with `code`"],
   ];
   for (const [targetId, purpose, text] of cases) {
     const f = fixture(targetId);
@@ -246,6 +248,28 @@ test("wrong source, origin, token, target, generation, or shape fails closed", a
       f.event({ ...f.result("request-1", "write", "browser.text"), ...fields }),
     );
     await assert.rejects(write, /invalid Clipboard result/);
+  }
+});
+
+test("a Home page that does not know the purpose is told apart from other refusals", async () => {
+  // An older Home page answers an unknown purpose this way (replyRequestError).
+  const f = fixture("assistant");
+  const write = f.client.writeText("**Reply**", { purpose: "message.text" });
+  f.client.handleMessage(f.event(f.result("request-1", "write", "invalid", { ok: false, error: "malformed" })));
+  await assert.rejects(write, (error) => error.code === "unknown_purpose");
+
+  const malformed = fixture("assistant");
+  const refused = malformed.client.writeText("**Reply**", { purpose: "message.text" });
+  malformed.client.handleMessage(
+    malformed.event(malformed.result("request-1", "write", "message.text", { ok: false, error: "malformed" })),
+  );
+  await assert.rejects(refused, (error) => error.code === "malformed");
+
+  for (const fields of [{ ok: false, error: "busy" }, { ok: true }, { ok: false, error: "malformed", extra: true }]) {
+    const other = fixture("assistant");
+    const otherWrite = other.client.writeText("**Reply**", { purpose: "message.text" });
+    other.client.handleMessage(other.event(other.result("request-1", "write", "invalid", fields)));
+    await assert.rejects(otherWrite, /invalid Clipboard result/);
   }
 });
 

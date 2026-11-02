@@ -137,6 +137,29 @@ test("lost Studio create response preserves its request across reload without re
   assert.equal(restored.app.snapshot().studioDraft, prompt);
 });
 
+test("Studio accepts an exact expired fresh refusal and preserves deliberate retry", async t => {
+  for (const exact of [true, false]) {
+    let requests = 0;
+    const f = await fixture(t, { studioState: { studioDraft: "Keep this deliberate draft" }, create: async body => {
+      requests++;
+      if (requests > 1) return completed();
+      return { ok: false, status: 409, json: async () => ({ status: "error", code: "model_invocation_refused", reason: "request_expired",
+        message: "This request is no longer valid. Check your device's clock, then try again.", refusal: { schema: "elastos.model.invocation-refusal/v1", scope: "invocation", dispatch: "provider_refused",
+          request_id: exact ? body.request_id : "other", offer_id: body.offer_id, operation: body.operation, input_hash: `sha256:${"a".repeat(64)}` } }) };
+    } });
+    assert.equal(await f.app.sendDraft(), false);
+    const first = f.operations()[0].body.request_id;
+    assert.match(first, /^model-v1:1000:/);
+    assert.equal(f.app.snapshot().studioDraft, "Keep this deliberate draft");
+    assert.equal(f.app.snapshot().activeRun.status, exact ? "not_sent" : "settlement_unknown");
+    assert.equal(f.app.snapshot().activeRun.terminal, exact);
+    assert.equal(await f.app.sendDraft(), exact);
+    assert.equal(requests, exact ? 2 : 1);
+    if (exact) assert.notEqual(f.operations()[1].body.request_id, first);
+    else assert.equal(f.app.snapshot().activeRun.createRequestId, first);
+  }
+});
+
 const restoredRun = {
   runId, createRequestId: "original-request", sessionId: "studio-session", actorCapsule: "assistant",
   mode: "studio", offerId: offer.id, operation: offer.operation, afterSequence: 7,

@@ -12,7 +12,7 @@ bootstrap configuration, while Profile and Runtime checks own person, contact
 and message authority.
 
 Current implementation and installed acceptance are recorded in
-[state.md](../state.md). Current J6 work belongs in [TASKS.md](../TASKS.md);
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues), with current J6 work;
 later collaboration work belongs in [deferred work](DEFERRED_WORK.md).
 
 ## Goal
@@ -37,7 +37,7 @@ object model and UX are proven.
 
 For the near term:
 
-- `Profile` is a compact People "My Profile" surface backed by Runtime-owned
+- `Profile` is the People app's Profile page backed by Runtime-owned
   ProfileAuthority.
 - `People` is a Home section backed by contact objects.
 - `Conversations` is a Chat Room module/view backed by conversation objects.
@@ -68,8 +68,10 @@ Use these concepts consistently:
   second concurrent device.
 - `DiscoveryAdvertisement`: a short-lived signed publication of the current
   signed Profile document while discovery is on and this Home is online.
-- `ContactRequest`: an Inbox-reviewed request bound to one exact signed
-  discovery advertisement.
+- `ContactRequest`: an Inbox-reviewed request addressed to a Profile DID. A
+  request sent from Public's `Public now` list is instead bound to one
+  exact signed discovery advertisement, so a Home on 0.8.0-alpha.25 can still
+  receive it.
 - `Contact`: a mutual relationship derived from a verified request plus the
   exact signed acceptance receipt.
 - `Conversation`: a direct, group, or public thread between profile identities.
@@ -93,38 +95,48 @@ sync are later work; normal UI shows neither device labels nor device DIDs.
 
 ## UX Model
 
-### People / My Profile
+The People app has three pages: People, Profile and Public. Public is the
+word people read; code, APIs and schemas keep the name Discovery.
+
+### People / Profile
 
 User-facing actions:
 
-- Edit my profile card.
-- Turn Discovery on or off.
+- Edit my name.
+- Show `Your DID` and copy it, so people can add you.
 
 Copy rules:
 
 - Say "device", "profile", "people", "conversation".
 - Do not say "runtime DID" in ordinary UI.
-- If a DID is shown in advanced details, label it as technical proof material.
+- Show a Profile DID only where a person copies or pastes it: `Your DID` on
+  Profile, the Add field, and `Copy DID` on a Chat profile card. Device DIDs
+  stay hidden.
 
-### People / Contacts
+### People / People
 
 User-facing actions:
 
-- See accepted contacts.
-- Choose whether other people can find this Home.
-- See the bounded `Visible now` list of people who have opted in, with optional
-  local filtering.
-- Send contact request.
+- See contacts and requests you sent; requests to you point to Inbox.
+- Add someone by the DID they shared, with or without Public.
 - Start chat.
 - Remove contact.
+
+### People / Public
+
+User-facing actions:
+
+- Turn Public on or off.
+- See the bounded list of people who are public now, and send one a contact
+  request.
 
 Discovery must be opt-in, bounded, and honest:
 
 - off by default;
-- advertisements renew only while the user has turned Discovery on and this
+- advertisements renew only while the user has turned Public on and this
   Home is online; after a disconnect or failed withdrawal, the last
   advertisement can remain visible for at most its existing TTL;
-- `Visible now` is bounded and never implies a global roster or directory;
+- `Public now` is bounded and never implies a global roster or directory;
 - turning Discovery off stops new advertisement refresh and withdraws the
   current advertisement when transport is available.
 
@@ -166,18 +178,17 @@ Use one compact card everywhere:
 - relationship state: `You`, `Contact`, `Requested`, or `Pending`
 - primary action: `Message`, `Add contact`, `Accept`, `Decline`, or `Remove`
 
-Do not show raw DID text on the card. Put technical identifiers behind
-`Details`.
+Do not show raw DID text on the card. `Copy DID` copies the person's Profile
+DID; the card itself carries only an opaque reference.
 
-### Discovery Panel
+### Public Page
 
-Discovery should feel simple and intentional:
+Public should feel simple and intentional:
 
-- big toggle: `Turn Discovery On`
-- clear `Turn Off` action
-- bounded `Visible now` list with optional local filtering
-- discovered profile cards in a simple grid/list
-- empty state: `No one is visible right now`
+- one status line, with `Turn On` or `Turn Off` and `Refresh`
+- bounded `Public now` list, shown only while you are public
+- person rows in a simple list
+- empty state: `No one else is public right now.`
 
 The panel should never imply background permanent visibility, a universal
 directory, or unique global names.
@@ -226,10 +237,10 @@ The primary action should remain reachable without exposing advanced controls.
 
 Discovery is convenience, not the only path.
 
-1. User saves a real display name and turns Discovery on.
+1. User saves a real display name and turns Public on.
 2. Runtime publishes a short-lived signed `DiscoveryAdvertisement` derived from
    the current signed Profile document.
-3. Other opt-in Homes can show the bounded `Visible now` list, with optional
+3. Other opt-in Homes can show the bounded `Public now` list, with optional
    local filtering.
 4. User clicks `Add contact`.
 5. Recipient receives an Inbox `ContactRequest`.
@@ -240,7 +251,7 @@ Privacy constraints:
 
 - Off by default.
 - User can stop immediately.
-- `Visible now` is bounded.
+- `Public now` is bounded.
 - The signed public Profile document is deliberately minimal.
 - Use opaque advertisement ids in UI; avoid stable tracking identifiers beyond
   the signed Profile DID already needed for contact authority.
@@ -248,10 +259,50 @@ Privacy constraints:
   or failed withdrawal, the last advertisement can remain visible only until
   its existing TTL expires.
 
+## Adding by DID
+
+Discovery off means "not listed", not "unreachable". Anyone who has your
+Profile DID can send you one contact request, from People's Add form or a
+Chat profile card:
+
+1. The requester's Home signs a request addressed to your Profile DID (scope
+   `elastos.people.contact.profile`, 24 hour lifetime) that carries their
+   signed Profile, and queues it.
+2. The Community node holds it in a mailbox keyed by your Profile DID. Your
+   Home reads that mailbox on every pass while it is in Community, whatever
+   the Discovery setting.
+3. You Accept or Decline in Inbox. The answer travels back with your current
+   signed Profile, and the requester's Home checks that this Profile is the
+   DID it asked and authorizes the device that signed the answer.
+
+What each side learns:
+
+- The requester learns nothing about you until you answer: not whether the
+  DID exists, nor your name, nor whether you are online. People shows a name
+  only when this Home already holds that person's signed Profile; otherwise
+  the row says only `Request sent`.
+- The Community node learns which Profile asked which, as it already does for
+  Discovery requests, and holds the requester's signed Profile.
+- A Decline sends your signed Profile to the requester, as Discovery's Decline
+  does.
+
+Leave Community stops all requests. There is no separate setting, because
+every requester is by definition not yet a contact.
+
+Compatibility: requests by DID use their own relay operations and mailboxes,
+so a Home on 0.8.0-alpha.25 never meets one and never receives one; adds from
+the `Public now` list keep the advertisement-bound request it can receive.
+The Community node must run 0.8.0 first; until it does, People says
+`Contact requests can't be delivered right now.` on each waiting request.
+Contacts added by DID live in their own file beside the Discovery contact
+store, so Undo to 0.8.0-alpha.25 keeps People and direct messages for
+Discovery contacts but does not show contacts added by DID.
+
 ## QR, Code, and Link Flow
 
-QR/code/link remains an explicit alternate onboarding and invite path and
-should ship first.
+QR/code/link is an alternate onboarding and invite path. The current Chat
+journey uses Community Profiles, a contact request and recipient Inbox approval.
+The owning GitHub invite issue records when the alternate path is implemented.
 
 Use it for:
 
@@ -366,8 +417,8 @@ Scope:
 
 User test:
 
-- Turn Discovery on from one runtime.
-- Refresh `Visible now` from the other runtime.
+- Turn Public on from one runtime.
+- Refresh `Public now` from the other runtime.
 - Send request, accept in Inbox, and see the accepted contact authority land on
   both sides with no second user click after relay loss/restart.
 
@@ -400,7 +451,10 @@ User test:
 Status: implemented. Direct conversations are Profile-scoped, Runtime-authorized
 on every read and send, and routed over the Runtime-mediated peer path. Shared
 group Chat is unchanged. Bilateral removal, shared-room Profile attribution,
-and incoming-message notifications have landed with it. Direct conversations
+and incoming-message notifications have landed with it. A message alert and its
+unread dot belong to the account that received the message: many accounts can
+share one Home, so Home, Inbox and Chat show each account only its own alerts,
+and only that account can read, dismiss or clear them. Direct conversations
 are text-only for now: attachments need object handling and a delivery path of
 their own, designed on the unified delivery layer, and until then the attach
 control is visibly unavailable in direct mode rather than silently missing.
@@ -417,11 +471,11 @@ Scope:
   - device signature proves the sending endpoint;
   - the retained signed Profile document proves that device is currently
     authorized for the participant Profile DID.
-- The selected Carrier session already provides encrypted peer confidentiality:
-  the current `PeerDid` path uses Iroh QUIC/TLS, relays forward encrypted bytes
-  only, and Runtime binds delivery to the accepted Profile's current authorized
-  endpoint before admitting the message. The seed/bootstrap path receives no
-  direct-message plaintext and no direct-message authority.
+- Carrier connects the two Homes over encrypted Iroh QUIC/TLS under the
+  [release connection contract](COLLABORATION_NETWORK_PROFILE.md#availability).
+  Runtime binds delivery to the accepted Profile's current authorized endpoint
+  before admitting the message. The sender and recipient own Direct plaintext
+  and authority; the Community bootstrap node supplies network discovery.
 - Plaintext direct-message content exists only in the sender's and recipient's
   protected principal-root direct-message store under
   `.AppData/ElastOS/Chat/direct-messages.json`.
@@ -461,6 +515,42 @@ offline, and neither invents a third party to hide it:
   [COLLABORATION_HANDOFF.md](COLLABORATION_HANDOFF.md) §1. The window is a
   deliberate bound, not a shared constant with the 64-head contact store: the
   ring bounds announcement payloads, the head store bounds relationships.
+
+## Spam Limits
+
+Each limit is a constant in the Runtime and refuses only the extra item:
+
+- Community messages: a Home sends at most 5 messages per Profile in any
+  10 seconds. The sixth gets HTTP 429 with `Retry-After`, Chat shows "Slow
+  down", and the draft stays in the composer. A retry of an already accepted
+  message is free; the count comes from saved messages, so a send that fails
+  to save does not count. Every receiving Home also accepts at most 5
+  messages per sender Profile in 10 seconds, and keeps at most 8 per sender
+  waiting for Chat. Past either limit it holds that sender's message and
+  retries it itself, since the sender stops resending once any other Home
+  accepts it; other senders' messages in the same batch keep flowing. Network
+  delay can bunch an honest sender's messages into one window; the Home holds
+  them and lets them in as the window slides. A Home holds at most 5 messages
+  per sender, and drops a sender's flood beyond that. When its 64 held
+  messages are full, the sender holding the most gives up its newest one first; if every sender holds as few, the Home waits and
+  retries the batch instead of dropping a message. Receive windows and held
+  messages live in memory and reset on restart.
+- Discovery relay: a Home's Carrier endpoint is its signing device, and the
+  relay accepts a listing or contact request only from the device that signed
+  it, so another Home cannot replay it. One Home lists at most 4 people in
+  `Public now`; renewing a stored listing is free. The relay stores at most 8
+  contact requests per sender Profile and 16 per Home, and refuses a call
+  without an authenticated Carrier endpoint.
+- Requests by DID: the relay accepts one new request per device every 5
+  seconds, at most 8 per sender Profile, 16 per device, 16 per recipient and
+  512 in total; a newer request to the same person replaces the older one,
+  and an answer removes the request at once. Only the signing device may
+  submit a request, answer or mailbox read. Your Home keeps one waiting request
+  per person and 32 in total, and drops requests from someone you declined
+  for 7 days; you can still ask them. You can have 16 requests waiting for an
+  answer. Profiles are free to create, so these limits bound one identity:
+  many new identities can fill one person's 16 relay slots until the requests
+  expire.
 
 ## Near-Term Non-Goals
 

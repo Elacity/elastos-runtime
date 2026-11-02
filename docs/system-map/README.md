@@ -12,10 +12,8 @@ Read these in order when a statement matters:
    constraints.
 2. [`ARCHITECTURE.md`](../ARCHITECTURE.md) defines responsibility and trust
    boundaries.
-3. [`state.md`](../../state.md) records verified current behavior and known
-   limitations.
-4. [`TASKS.md`](../../TASKS.md) records open work.
-5. [`AGENTS.md`](../../AGENTS.md) defines the operator and agent process.
+3. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record verified behavior, known limitations and open work.
+4. [`AGENTS.md`](../../AGENTS.md) defines the operator and agent process.
 6. The contract for the touched surface defines its exact interface.
 
 If this map disagrees with one of those files, the source of truth wins and

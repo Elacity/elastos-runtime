@@ -17,8 +17,6 @@ pub struct DocsState {
 /// Allowed doc files and their repo-relative paths (prevents path traversal)
 const ALLOWED_DOCS: &[(&str, &str)] = &[
     ("ROADMAP.md", "ROADMAP.md"),
-    ("TASKS.md", "TASKS.md"),
-    ("state.md", "state.md"),
     ("ARCHITECTURE.md", "docs/ARCHITECTURE.md"),
     ("OVERVIEW.md", "docs/OVERVIEW.md"),
     ("GETTING_STARTED.md", "docs/GETTING_STARTED.md"),

@@ -253,6 +253,17 @@ pub async fn run_capsule(
         .cloned()
         .ok_or_else(|| anyhow!("ensure-capsule response missing path for '{}'", name))?;
     let manifest = load_capsule_manifest(&capsule_dir, &name)?;
+    if matches!(
+        manifest.execution_type(),
+        elastos_common::CapsuleType::WebProjection
+            | elastos_common::CapsuleType::NativeProvider
+            | elastos_common::CapsuleType::NativeHost
+    ) {
+        anyhow::bail!(
+            "Web projections and native helpers use their existing Runtime-owned host paths"
+        );
+    }
+
     if manifest.capsule_type == elastos_common::CapsuleType::Wasm {
         if !manifest.is_component_capsule() {
             bail!(

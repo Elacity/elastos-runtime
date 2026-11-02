@@ -9,26 +9,17 @@ import tempfile
 from pathlib import Path
 
 
+# Setup platform -> release platform; Runtime's setup.rs embeds the same file.
+RELEASE_PLATFORMS = json.loads(Path(__file__).with_name("release-platforms.json").read_text())
 ALIASES = {
-    "linux-amd64": ("x86_64-linux",),
-    "x86_64-linux": ("linux-amd64",),
-    "linux-arm64": ("aarch64-linux",),
-    "aarch64-linux": ("linux-arm64",),
-    "darwin-arm64": ("macos-arm64",),
-    "macos-arm64": ("darwin-arm64",),
+    **{setup: (release,) for setup, release in RELEASE_PLATFORMS.items()},
+    **{release: (setup,) for setup, release in RELEASE_PLATFORMS.items()},
 }
 
 CHECKSUM_RE = re.compile(r"^(sha256:[0-9a-fA-F]{64}|sha512:[0-9a-fA-F]{128})$")
 DEV_STRATEGIES = {"source-build", "local-copy"}
 FETCH_FIELDS = ("release_path", "cid", "url")
 PROVIDER_ICON_SIZES = (32, 64, 128, 256)
-RELEASE_PLATFORMS = {
-    "linux-amd64": "x86_64-linux",
-    "linux-arm64": "aarch64-linux",
-    "darwin-arm64": "aarch64-darwin",
-    "macos-arm64": "aarch64-darwin",
-    "darwin-amd64": "x86_64-darwin",
-}
 
 
 def non_empty(value):
@@ -43,8 +34,11 @@ def requires_checksum(info):
     return any(non_empty(info.get(field)) for field in FETCH_FIELDS)
 
 
-def checksum_error(name, platform, info):
-    if not requires_checksum(info):
+def checksum_error(name, platform, info, release=False):
+    image_strategy = name == "browser-vm-image" and info.get("strategy") == "browser-vm-image"
+    if release and info.get("strategy") not in (None, "prebuilt") and not image_strategy:
+        return f"{name} {platform}: development or unsupported release strategy {info.get('strategy')!r}"
+    if not release and not requires_checksum(info):
         return None
     checksum = info.get("checksum")
     artifact = next(
@@ -53,7 +47,7 @@ def checksum_error(name, platform, info):
     )
     if not non_empty(checksum):
         return f"{name} {platform} {artifact}: missing checksum"
-    if not CHECKSUM_RE.match(checksum):
+    if not CHECKSUM_RE.fullmatch(checksum):
         return f"{name} {platform} {artifact}: unsupported checksum format {checksum!r}"
     return None
 
@@ -150,7 +144,7 @@ def audit_manifest(data, platforms, selected_components=None, source_home_capsul
 
 
 def audit_release_artifacts(data, platforms, artifact_root):
-    """Verify locally advertised files; external URL-only downloads stay external."""
+    """Verify that release dependencies have locally admitted artifact bytes."""
     root = Path(artifact_root)
     errors = []
     if not platforms:
@@ -200,8 +194,14 @@ def audit_release_artifacts(data, platforms, artifact_root):
                 entries.append((f"{name} capsule_metadata", component["capsule_metadata"]))
             for label, entry in entries:
                 _, info = resolve_platform_info(entry, platform)
-                if info is not None and "release_path" in info:
-                    verify(f"{label} {platform}", info)
+                if info is not None:
+                    error = checksum_error(label, platform, info, release=True)
+                    if error:
+                        errors.append(error)
+                    if non_empty(info.get("url")) and not non_empty(info.get("release_path")):
+                        errors.append(f"{label} {platform}: URL-only dependency requires a release artifact")
+                    elif "release_path" in info:
+                        verify(f"{label} {platform}", info)
         release_platform = RELEASE_PLATFORMS.get(platform, platform)
         for name, entry in sorted((data.get("capsules") or {}).items()):
             capsule_platforms = entry.get("platforms")
@@ -243,6 +243,22 @@ def audit_provider_capsule_metadata(data, platforms, selected_components=None, s
         if metadata.get("install_path") != expected_install_path:
             errors.append(f"{name}: capsule_metadata install_path mismatch")
 
+        if metadata.get("role") == "content" and metadata.get("type") == "data":
+            if isinstance(component.get("provider_runtime"), dict):
+                errors.append(f"{name}: native provider requires provider capsule metadata")
+                continue
+            for platform, info in sorted((metadata.get("platforms") or {}).items()):
+                if not isinstance(info, dict) or info.get("install_path") != expected_install_path:
+                    errors.append(f"{name}: content capsule_metadata {platform} install_path mismatch")
+                    continue
+                root = info.get("extract_path")
+                if (not non_empty(root) or "\\" in root
+                        or any(part in {"", ".", ".."} for part in root.split("/"))):
+                    errors.append(f"{name}: content capsule_metadata {platform} extract_path is unsafe")
+            continue
+        if "role" in metadata or "type" in metadata:
+            errors.append(f"{name}: capsule_metadata content role/type mismatch")
+            continue
         capsule_root = source_capsule_root(source_root, name) if source_root else None
         if capsule_root is None:
             if source_root is not None:
@@ -472,6 +488,23 @@ def run_self_test():
         }
     }
 
+    for info, accepted in [
+        ({"checksum": f"sha256:{good_hash}"}, True),
+        ({"checksum": f"sha512:{good_hash_512}", "strategy": "prebuilt"}, True),
+        ({}, False),
+        ({"checksum": "sha256:bad"}, False),
+        ({"checksum": f"sha256:{good_hash}\n"}, False),
+        ({"checksum": f"sha256:{good_hash}", "strategy": "source-build"}, False),
+        ({"checksum": f"sha256:{good_hash}", "strategy": "local-copy"}, False),
+    ]:
+        if (checksum_error("fixture", "*", info, release=True) is None) != accepted:
+            raise AssertionError(info)
+
+    image = {"strategy": "browser-vm-image", "checksum": f"sha256:{good_hash}"}
+    assert checksum_error("browser-vm-image", "darwin-arm64", image, release=True) is None
+    assert checksum_error("another-component", "darwin-arm64", image, release=True) is not None
+    assert checksum_error("browser-vm-image", "darwin-arm64", {"strategy": "browser-vm-image"}, release=True) is not None
+
     current_platform_errors = audit_manifest(manifest, ["linux-amd64"])
     if current_platform_errors != [
         "bad-format linux-amd64 via * bad.tar.gz: unsupported checksum format 'sha256:not-a-real-hash'"
@@ -500,6 +533,15 @@ def run_self_test():
     }
     if audit_manifest(clean_manifest, ["linux-amd64"]):
         raise AssertionError("alias-resolved stamped manifest should pass")
+    mac_manifest = {
+        "external": {
+            "mac": {"platforms": {"aarch64-darwin": {"cid": "bafy-mac"}}},
+        }
+    }
+    if audit_manifest(mac_manifest, ["darwin-arm64"]) != [
+        "mac darwin-arm64 via aarch64-darwin bafy-mac: missing checksum",
+    ]:
+        raise AssertionError("darwin-arm64 must resolve Runtime's aarch64-darwin entry")
 
     profiled_manifest = {
         "external": {

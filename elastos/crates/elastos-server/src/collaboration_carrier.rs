@@ -1,14 +1,21 @@
 //! Internal Carrier transport for one verified collaboration network.
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use elastos_runtime::provider::Provider;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 
-use crate::collaboration_network::VerifiedCollaborationNetworkProfile;
+use crate::collaboration_network::{
+    validate_collaboration_bootstrap_peer, CollaborationBootstrapPeer,
+    VerifiedCollaborationNetworkProfile,
+};
 use crate::collaboration_protocol::{
     verify_collaboration_transport_frame, MAX_COLLABORATION_TRANSPORT_FRAME_BYTES,
 };
@@ -18,6 +25,87 @@ const COLLABORATION_TOPIC_PREFIX: &str = "__elastos_internal/collaboration-v1/";
 const COLLABORATION_RECEIVE_BATCH_SIZE: usize = 32;
 const MAX_RECEIVE_RESPONSE_BYTES: usize =
     MAX_COLLABORATION_TRANSPORT_FRAME_BYTES * COLLABORATION_RECEIVE_BATCH_SIZE + 64 * 1024;
+/// How long a joined Home may have no Community peer before it repairs the
+/// link. Gossip neighbours come back within seconds of a working dial, and
+/// the missing-peer rejoin retries every second, so a minute is a dead link.
+pub(crate) const COMMUNITY_LINK_SILENCE: Duration = Duration::from_secs(60);
+/// Longest early wait while a Home stays without a Community peer.
+const MAX_COMMUNITY_LINK_RETRY: Duration = Duration::from_secs(300);
+/// Most rebuild requests one watchdog admits for its Runtime lifetime. A
+/// request keeps its slot when its caller times out: Carrier can finish it
+/// later. Each rebuild retains one endpoint lookup and eviction task, so this
+/// policy bounds requests rather than promising a byte or wakeup budget.
+pub(crate) const MAX_COMMUNITY_GOSSIP_REBUILDS: u32 = 120;
+const COMMUNITY_OUTAGE_FAST_REBUILDS: u32 = 6;
+const COMMUNITY_LONG_OUTAGE_RETRY: Duration = Duration::from_secs(900);
+const COMMUNITY_ADDRESS_STABILITY: Duration = Duration::from_secs(10);
+
+pub(crate) type CommunityHostAddresses = BTreeSet<IpAddr>;
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn is_community_host_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local(),
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified() && !ip.is_unicast_link_local(),
+    }
+}
+
+/// Runtime samples host interfaces as a repair hint, not as connectivity proof.
+/// Unsupported hosts and enumeration failures keep the scheduled repair path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn community_host_addresses() -> Option<CommunityHostAddresses> {
+    struct InterfaceList(*mut libc::ifaddrs);
+    impl Drop for InterfaceList {
+        fn drop(&mut self) {
+            // SAFETY: this is the list returned by a successful getifaddrs call,
+            // and this guard owns its one matching free.
+            if !self.0.is_null() {
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+
+    let mut head = std::ptr::null_mut();
+    // SAFETY: head is a valid output pointer. On success the guard owns the
+    // allocated list until every address has been copied into Rust values.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+    let list = InterfaceList(head);
+    let mut current = list.0;
+    let mut addresses = CommunityHostAddresses::new();
+    while !current.is_null() {
+        // SAFETY: getifaddrs owns a linked list of valid ifaddrs records until
+        // the guard frees it. Family checks precede the sockaddr casts.
+        let interface = unsafe { &*current };
+        if !interface.ifa_addr.is_null() {
+            let family = unsafe { (*interface.ifa_addr).sa_family } as i32;
+            let ip = match family {
+                libc::AF_INET => {
+                    let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+                    Some(IpAddr::V4(std::net::Ipv4Addr::from(
+                        addr.sin_addr.s_addr.to_ne_bytes(),
+                    )))
+                }
+                libc::AF_INET6 => {
+                    let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in6>() };
+                    Some(IpAddr::V6(std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr)))
+                }
+                _ => None,
+            };
+            if let Some(ip) = ip.filter(is_community_host_address) {
+                addresses.insert(ip);
+            }
+        }
+        current = interface.ifa_next;
+    }
+    Some(addresses)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn community_host_addresses() -> Option<CommunityHostAddresses> {
+    None
+}
 
 /// An exact collaboration-network Carrier subscription.
 ///
@@ -27,6 +115,7 @@ pub struct JoinedCollaborationNetwork {
     carrier: Arc<dyn Provider>,
     topic: String,
     consumer_id: String,
+    bootstrap_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +171,42 @@ struct RememberPeerData {
 #[serde(deny_unknown_fields)]
 struct JoinExactData {
     topic: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalTicketData {
+    node_id: String,
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicPeersData {
+    topic: String,
+    peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicHealthData {
+    topic: String,
+    peer_count: usize,
+    received_frames: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebuildData {
+    topics: usize,
+}
+
+/// One reading of the Community topic in Carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommunityLinkHealth {
+    pub(crate) peer_count: usize,
+    /// Frames received from peers since the topic was joined.
+    pub(crate) received_frames: u64,
 }
 
 #[derive(Deserialize)]
@@ -182,11 +307,98 @@ pub async fn join_collaboration_network(
         carrier,
         topic,
         consumer_id,
+        bootstrap_node_ids: peers,
     })
 }
 
 impl JoinedCollaborationNetwork {
-    pub async fn send(&self, frame: &[u8]) -> anyhow::Result<CollaborationCarrierSendOutcome> {
+    async fn topic_peers(&self) -> anyhow::Result<TopicPeersData> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "list_topic_peers",
+                "topic": self.topic,
+            }))
+            .await
+            .context("Carrier peer lookup failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let connected: TopicPeersData = require_ok_response(response, "list_topic_peers")?;
+        if connected.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration topic");
+        }
+        Ok(connected)
+    }
+
+    pub(crate) async fn has_remote_peers(&self) -> anyhow::Result<bool> {
+        Ok(!self.topic_peers().await?.peers.is_empty())
+    }
+
+    async fn local_node_id(&self) -> anyhow::Result<String> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "get_ticket" }))
+            .await
+            .context("Carrier local endpoint lookup failed for collaboration recovery")?;
+        require_bounded_response(&response)?;
+        let local: LocalTicketData = require_ok_response(response, "get_ticket")?;
+        validate_collaboration_bootstrap_peer(&CollaborationBootstrapPeer {
+            node_id: local.node_id.clone(),
+            connect_ticket: local.ticket,
+        })
+        .context("Carrier local endpoint identity is inconsistent")?;
+        Ok(local.node_id)
+    }
+
+    /// Repair only missing peers from the verified profile. The Runtime owns
+    /// the retry cadence; a healthy mesh never receives another Join here.
+    pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
+        if self.bootstrap_node_ids.is_empty() {
+            return Ok(());
+        }
+        let local_node_id = self.local_node_id().await?;
+        let connected = self.topic_peers().await?;
+        let missing = self
+            .bootstrap_node_ids
+            .iter()
+            .filter(|node_id| *node_id != &local_node_id && !connected.peers.contains(node_id))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join_peers",
+                "topic": self.topic,
+                "peers": missing,
+            }))
+            .await
+            .context("Carrier missing bootstrap join failed for collaboration recovery")?;
+        require_bounded_response(&response)?;
+        let joined: JoinExactData = require_ok_response(response, "gossip_join_peers")?;
+        if joined.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration recovery join");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn send_gossip(
+        &self,
+        core: &crate::collaboration_core::CollaborationCore,
+        frame: &[u8],
+        original: Option<&[u8]>,
+    ) -> anyhow::Result<CollaborationCarrierSendOutcome> {
+        let allowed = match original {
+            Some(original) => core.allows_gossip_receipt(frame, original)?,
+            None => core.allows_gossip_frame(frame)?,
+        };
+        if !allowed {
+            anyhow::bail!("this collaboration frame does not travel over gossip");
+        }
+        self.send_frame(frame).await
+    }
+
+    async fn send_frame(&self, frame: &[u8]) -> anyhow::Result<CollaborationCarrierSendOutcome> {
         let message =
             std::str::from_utf8(frame).context("collaboration Carrier frame is not UTF-8")?;
         if frame.len() > MAX_COLLABORATION_TRANSPORT_FRAME_BYTES {
@@ -285,6 +497,251 @@ impl JoinedCollaborationNetwork {
     }
 }
 
+/// What the Community link watchdog needs from Carrier.
+pub(crate) trait CommunityLink {
+    /// Only a Home repairs its own link. A bootstrap node (the seed's
+    /// Community node) has nobody to rejoin, and its rebuild would cut every
+    /// Home at once.
+    async fn recovers_its_link(&self) -> anyhow::Result<bool>;
+    async fn link_health(&self) -> anyhow::Result<CommunityLinkHealth>;
+    fn host_addresses(&self) -> Option<CommunityHostAddresses>;
+    /// Leaves the Community topic and joins it again with its bootstrap peers.
+    async fn rejoin(&self) -> anyhow::Result<()>;
+    /// Replaces Carrier's gossip actor; returns how many topics joined again.
+    async fn rebuild_gossip(&self) -> anyhow::Result<usize>;
+}
+
+impl CommunityLink for JoinedCollaborationNetwork {
+    async fn recovers_its_link(&self) -> anyhow::Result<bool> {
+        if self.bootstrap_node_ids.is_empty() {
+            return Ok(false);
+        }
+        let local_node_id = self.local_node_id().await?;
+        Ok(!self.bootstrap_node_ids.contains(&local_node_id))
+    }
+
+    async fn link_health(&self) -> anyhow::Result<CommunityLinkHealth> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "gossip_topic_health",
+                "topic": self.topic,
+            }))
+            .await
+            .context("Carrier topic health failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let health: TopicHealthData = require_ok_response(response, "gossip_topic_health")?;
+        if health.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration topic health");
+        }
+        Ok(CommunityLinkHealth {
+            peer_count: health.peer_count,
+            received_frames: health.received_frames,
+        })
+    }
+
+    fn host_addresses(&self) -> Option<CommunityHostAddresses> {
+        community_host_addresses()
+    }
+
+    async fn rejoin(&self) -> anyhow::Result<()> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "gossip_rejoin", "topic": self.topic }))
+            .await
+            .context("Carrier gossip_rejoin failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let joined: JoinExactData = require_ok_response(response, "gossip_rejoin")?;
+        if joined.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration rejoin");
+        }
+        Ok(())
+    }
+
+    async fn rebuild_gossip(&self) -> anyhow::Result<usize> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "gossip_rebuild" }))
+            .await
+            .context("Carrier gossip_rebuild failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let rebuilt: RebuildData = require_ok_response(response, "gossip_rebuild")?;
+        Ok(rebuilt.topics)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommunityLinkStep {
+    Rejoin,
+    Rebuild,
+}
+
+/// Repairs a joined Home whose Community link has had no peer for a while,
+/// whatever stalled it: first a topic rejoin, then a new gossip actor.
+///
+/// Only a missing peer counts: a quiet Community is normal (Discovery off
+/// means a Home announces nothing). Frames that still trickle in do not prove
+/// the link: a Home the hub evicted from its active view lists no neighbour
+/// yet can still get a frame now and then, and it stays cut off until it
+/// rejoins. While no peer returns it keeps
+/// repairing with a doubling wait up to `MAX_COMMUNITY_LINK_RETRY`, then a
+/// fifteen-minute wait after six rebuild requests in one outage. A changed
+/// nonempty host address set stable for ten seconds can bring a rebuild
+/// forward. Every repair shares the same rest, counted from the last finish,
+/// and lifetime request limit. A peer return resets only the outage counter.
+pub(crate) struct CommunityLinkWatchdog {
+    silence: Duration,
+    observed_at: Option<Instant>,
+    no_peers_since: Option<Instant>,
+    last_step_at: Option<Instant>,
+    steps: u32,
+    rebuilds: u32,
+    outage_rebuilds: u32,
+    cap_reported: bool,
+    addresses: Option<CommunityHostAddresses>,
+    address_change: Option<(CommunityHostAddresses, Instant)>,
+}
+
+impl CommunityLinkWatchdog {
+    pub(crate) fn new(silence: Duration) -> Self {
+        Self {
+            silence,
+            observed_at: None,
+            no_peers_since: None,
+            last_step_at: None,
+            steps: 0,
+            rebuilds: 0,
+            outage_rebuilds: 0,
+            cap_reported: false,
+            addresses: None,
+            address_change: None,
+        }
+    }
+
+    pub(crate) fn recovery_exhausted(&self) -> bool {
+        self.no_peers_since.is_some() && self.rebuilds >= MAX_COMMUNITY_GOSSIP_REBUILDS
+    }
+
+    /// `health` is `None` when Carrier did not answer, which counts as no peer.
+    pub(crate) fn observe(
+        &mut self,
+        health: Option<CommunityLinkHealth>,
+        addresses: Option<CommunityHostAddresses>,
+        now: Instant,
+    ) -> Option<CommunityLinkStep> {
+        // A gap (Community left, or a long cycle) starts the window again;
+        // repair rest and both request counters remain until a peer returns.
+        if self
+            .observed_at
+            .is_some_and(|at| now.duration_since(at) > self.silence / 2)
+        {
+            *self = Self {
+                last_step_at: self.last_step_at,
+                rebuilds: self.rebuilds,
+                outage_rebuilds: self.outage_rebuilds,
+                cap_reported: self.cap_reported,
+                ..Self::new(self.silence)
+            };
+        }
+        self.observed_at = Some(now);
+        let healthy = health.is_some_and(|health| health.peer_count > 0);
+        let address_changed = self.observe_addresses(addresses, healthy, now);
+        if healthy {
+            if self.steps > 0 {
+                tracing::info!(steps = self.steps, "Community link recovered");
+            }
+            self.steps = 0;
+            self.outage_rebuilds = 0;
+            self.no_peers_since = None;
+            return None;
+        }
+        let since = *self.no_peers_since.get_or_insert(now);
+        let wait = if self.outage_rebuilds >= COMMUNITY_OUTAGE_FAST_REBUILDS {
+            COMMUNITY_LONG_OUTAGE_RETRY
+        } else {
+            // Rejoin-only repairs after the lifetime cap keep backing off.
+            let doublings = self.outage_rebuilds.max(self.steps.saturating_sub(1));
+            self.silence
+                .saturating_mul(1 << doublings.min(8))
+                .min(MAX_COMMUNITY_LINK_RETRY)
+        };
+        let anchor = match (self.steps, self.last_step_at) {
+            (0, _) | (_, None) => since,
+            (_, Some(at)) => at,
+        };
+        let rested = self
+            .last_step_at
+            .is_none_or(|at| now.duration_since(at) >= self.silence);
+        let network_rebuild = address_changed && self.rebuilds < MAX_COMMUNITY_GOSSIP_REBUILDS;
+        if (!network_rebuild && now.duration_since(anchor) < wait) || !rested {
+            return None;
+        }
+        let step = if (address_changed || self.steps > 0)
+            && self.rebuilds < MAX_COMMUNITY_GOSSIP_REBUILDS
+        {
+            // Reserve before dispatch. A detached Carrier job keeps its slot.
+            self.rebuilds += 1;
+            self.outage_rebuilds = self.outage_rebuilds.saturating_add(1);
+            if let Some((addresses, _)) = self.address_change.take() {
+                self.addresses = Some(addresses);
+            }
+            CommunityLinkStep::Rebuild
+        } else {
+            if self.rebuilds == MAX_COMMUNITY_GOSSIP_REBUILDS && !self.cap_reported {
+                self.cap_reported = true;
+                tracing::info!(
+                    max_rebuilds = MAX_COMMUNITY_GOSSIP_REBUILDS,
+                    "Carrier gossip rebuilds are capped until this Home restarts; \
+                     the Community link watchdog only rejoins from now on"
+                );
+            }
+            CommunityLinkStep::Rejoin
+        };
+        self.steps = self.steps.saturating_add(1);
+        self.last_step_at = Some(now);
+        Some(step)
+    }
+
+    fn observe_addresses(
+        &mut self,
+        addresses: Option<CommunityHostAddresses>,
+        healthy: bool,
+        now: Instant,
+    ) -> bool {
+        let Some(addresses) = addresses else {
+            self.address_change = None;
+            return false;
+        };
+        if healthy || addresses.is_empty() || self.addresses.is_none() {
+            self.addresses = Some(addresses);
+            self.address_change = None;
+            return false;
+        }
+        if self.addresses.as_ref() == Some(&addresses) {
+            self.address_change = None;
+            return false;
+        }
+        let (candidate, since) = self
+            .address_change
+            .get_or_insert_with(|| (addresses.clone(), now));
+        if *candidate != addresses {
+            *candidate = addresses;
+            *since = now;
+        }
+        now.duration_since(*since) >= COMMUNITY_ADDRESS_STABILITY
+    }
+
+    /// Counts the rest before the next step from when this one finished.
+    pub(crate) fn step_finished(&mut self, now: Instant) {
+        if self.last_step_at.is_some() {
+            self.last_step_at = Some(now);
+            // A slow repair belongs to this observation window. Its own wait
+            // does not mean the Home left Community.
+            self.observed_at = Some(now);
+        }
+    }
+}
+
 fn random_collaboration_consumer_id() -> anyhow::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|error| {
@@ -362,6 +819,314 @@ fn decode_frame(frame: &serde_json::Value) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_addresses(addresses: &[&str]) -> Option<CommunityHostAddresses> {
+        Some(
+            addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect(),
+        )
+    }
+
+    fn healthy_link() -> Option<CommunityLinkHealth> {
+        Some(CommunityLinkHealth {
+            peer_count: 1,
+            received_frames: 0,
+        })
+    }
+
+    #[test]
+    fn community_link_host_addresses_exclude_link_local_offline_samples() {
+        let filtered = |addresses: &[&str]| {
+            Some(
+                addresses
+                    .iter()
+                    .map(|address| address.parse::<IpAddr>().unwrap())
+                    .filter(is_community_host_address)
+                    .collect::<CommunityHostAddresses>(),
+            )
+        };
+        let offline = [
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.1.2",
+            "::1",
+            "::",
+            "fe80::1",
+            "febf::1",
+        ];
+        assert_eq!(filtered(&offline), host_addresses(&[]));
+        let online = ["10.0.0.1", "192.0.2.1", "2001:db8::1", "fd00::1"];
+        assert_eq!(filtered(&online), host_addresses(&online));
+
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        assert_eq!(
+            watchdog.observe(healthy_link(), filtered(&online), start),
+            None
+        );
+        for second in (5..=20).step_by(5) {
+            assert_eq!(
+                watchdog.observe(
+                    None,
+                    filtered(&offline),
+                    start + Duration::from_secs(second)
+                ),
+                None
+            );
+        }
+        for second in [25, 30] {
+            assert_eq!(
+                watchdog.observe(None, filtered(&online), start + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert_eq!(
+            watchdog.observe(None, filtered(&online), start + Duration::from_secs(35)),
+            Some(CommunityLinkStep::Rebuild)
+        );
+        assert_eq!(
+            watchdog.rebuilds, 1,
+            "only stable network restoration spends a request"
+        );
+    }
+
+    #[test]
+    fn community_link_watchdog_rejoin_only_after_cap_backs_off_in_each_new_outage() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        watchdog.rebuilds = MAX_COMMUNITY_GOSSIP_REBUILDS;
+        let start = Instant::now();
+        for outage_start in [0, 1200] {
+            let mut steps = Vec::new();
+            for second in (0..=1080).step_by(5) {
+                let now = start + Duration::from_secs(outage_start + second);
+                if let Some(step) = watchdog.observe(None, None, now) {
+                    steps.push((step, second));
+                    watchdog.step_finished(now);
+                }
+            }
+            assert_eq!(
+                steps,
+                [60, 120, 240, 480, 780, 1080].map(|second| (CommunityLinkStep::Rejoin, second))
+            );
+            assert_eq!(watchdog.rebuilds, MAX_COMMUNITY_GOSSIP_REBUILDS);
+            assert!(watchdog.recovery_exhausted());
+            watchdog.observe(
+                healthy_link(),
+                None,
+                start + Duration::from_secs(outage_start + 1085),
+            );
+            assert!(!watchdog.recovery_exhausted());
+        }
+    }
+
+    #[test]
+    fn community_link_watchdog_address_hint_needs_ten_stable_seconds_and_shared_rest() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        let observe = |watchdog: &mut CommunityLinkWatchdog, second, addresses| {
+            watchdog.observe(None, addresses, start + Duration::from_secs(second))
+        };
+        assert_eq!(
+            watchdog.observe(healthy_link(), host_addresses(&["192.0.2.1"]), start),
+            None
+        );
+        for (second, addresses) in [
+            (5, host_addresses(&["192.0.2.2", "2001:db8::1"])),
+            (10, host_addresses(&["2001:db8::1", "192.0.2.2"])),
+        ] {
+            assert_eq!(observe(&mut watchdog, second, addresses), None);
+        }
+        assert_eq!(
+            observe(
+                &mut watchdog,
+                15,
+                host_addresses(&["192.0.2.2", "2001:db8::1"])
+            ),
+            Some(CommunityLinkStep::Rebuild)
+        );
+        // A second stable change cannot bypass the rest after this repair.
+        watchdog.step_finished(start + Duration::from_secs(20));
+        for second in (20..80).step_by(5) {
+            assert_eq!(
+                observe(&mut watchdog, second, host_addresses(&["192.0.2.3"])),
+                None
+            );
+        }
+        assert_eq!(
+            observe(&mut watchdog, 80, host_addresses(&["192.0.2.3"])),
+            Some(CommunityLinkStep::Rebuild)
+        );
+        assert_eq!(watchdog.rebuilds, 2);
+        assert_eq!(watchdog.outage_rebuilds, 2);
+        assert!(watchdog.address_change.is_none());
+    }
+
+    #[test]
+    fn community_link_watchdog_healthy_churn_seeds_without_a_repair() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        for second in (0..120).step_by(5) {
+            let addresses = host_addresses(&[&format!("192.0.2.{}", second + 1)]);
+            assert_eq!(
+                watchdog.observe(
+                    healthy_link(),
+                    addresses,
+                    start + Duration::from_secs(second)
+                ),
+                None
+            );
+        }
+        assert_eq!(watchdog.rebuilds, 0);
+        assert!(watchdog.address_change.is_none());
+        assert!(!watchdog.recovery_exhausted());
+    }
+
+    #[test]
+    fn community_link_watchdog_empty_and_unknown_samples_disarm_stability() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        let samples = [
+            (0, host_addresses(&["192.0.2.1"])), // first sample seeds
+            (5, host_addresses(&["192.0.2.2"])),
+            (10, None), // unknown clears the pending stability window
+            (15, host_addresses(&["192.0.2.2"])),
+            (20, host_addresses(&[])), // known offline state becomes baseline
+            (25, host_addresses(&[])),
+            (30, None), // unknown is not an empty-to-nonempty change
+            (35, host_addresses(&["192.0.2.1"])),
+            (40, host_addresses(&["192.0.2.1"])),
+        ];
+        for (second, addresses) in samples {
+            assert_eq!(
+                watchdog.observe(None, addresses, start + Duration::from_secs(second)),
+                None
+            );
+        }
+        assert_eq!(
+            watchdog.observe(
+                None,
+                host_addresses(&["192.0.2.1"]),
+                start + Duration::from_secs(45)
+            ),
+            Some(CommunityLinkStep::Rebuild)
+        );
+        assert_eq!(
+            watchdog.rebuilds, 1,
+            "only stable restoration consumes a request"
+        );
+    }
+
+    #[test]
+    fn community_link_watchdog_same_ip_and_unknown_hosts_keep_the_timer_fallback() {
+        for addresses in [None, host_addresses(&["192.0.2.1"])] {
+            let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+            let start = Instant::now();
+            let mut steps = Vec::new();
+            for second in (0..=240).step_by(5) {
+                let now = start + Duration::from_secs(second);
+                if let Some(step) = watchdog.observe(None, addresses.clone(), now) {
+                    steps.push((step, second));
+                    watchdog.step_finished(now);
+                }
+            }
+            assert_eq!(
+                steps,
+                [
+                    (CommunityLinkStep::Rejoin, 60),
+                    (CommunityLinkStep::Rebuild, 120),
+                    (CommunityLinkStep::Rebuild, 240)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn community_link_watchdog_unstable_address_churn_keeps_the_timer_fallback() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        let mut steps = Vec::new();
+        for second in (0..=240).step_by(5) {
+            let now = start + Duration::from_secs(second);
+            let addresses = host_addresses(&[&format!("2001:db8::{}", second + 1)]);
+            if let Some(step) = watchdog.observe(None, addresses, now) {
+                steps.push((step, second));
+                watchdog.step_finished(now);
+            }
+        }
+        assert_eq!(
+            steps,
+            [
+                (CommunityLinkStep::Rejoin, 60),
+                (CommunityLinkStep::Rebuild, 120),
+                (CommunityLinkStep::Rebuild, 240)
+            ]
+        );
+    }
+
+    #[test]
+    fn community_link_watchdog_caps_address_and_timer_requests_without_refunds() {
+        assert_eq!(
+            MAX_COMMUNITY_GOSSIP_REBUILDS, 120,
+            "the lifetime request policy is explicit"
+        );
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        let mut count = 0;
+        for second in (0..=10_000).step_by(5) {
+            let now = start + Duration::from_secs(second);
+            // Churn has a stable sample for fifteen seconds each minute.
+            let addresses = host_addresses(&[&format!("2001:db8::{}", second / 60 + 1)]);
+            if watchdog.observe(None, addresses, now) == Some(CommunityLinkStep::Rebuild) {
+                count += 1;
+                watchdog.step_finished(now);
+            }
+        }
+        assert_eq!(count, MAX_COMMUNITY_GOSSIP_REBUILDS);
+        assert_eq!(watchdog.rebuilds, MAX_COMMUNITY_GOSSIP_REBUILDS);
+        assert!(watchdog.recovery_exhausted());
+        let healthy_at = start + Duration::from_secs(10_005);
+        assert_eq!(watchdog.observe(healthy_link(), None, healthy_at), None);
+        assert_eq!(watchdog.outage_rebuilds, 0);
+        assert!(!watchdog.recovery_exhausted());
+        // A leave gap preserves every reserved request, even after recovery.
+        for second in (10_600..11_600).step_by(5) {
+            assert_ne!(
+                watchdog.observe(
+                    None,
+                    host_addresses(&["192.0.2.9"]),
+                    start + Duration::from_secs(second)
+                ),
+                Some(CommunityLinkStep::Rebuild)
+            );
+        }
+        assert_eq!(watchdog.rebuilds, MAX_COMMUNITY_GOSSIP_REBUILDS);
+        assert!(watchdog.recovery_exhausted());
+    }
+
+    #[test]
+    fn community_link_watchdog_pacing_counts_address_attempts_and_saturates() {
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = Instant::now();
+        watchdog.observe(None, host_addresses(&[]), start);
+        for second in (5..=70).step_by(5) {
+            let now = start + Duration::from_secs(second);
+            let addresses = host_addresses(&[&format!("192.0.2.{}", second / 15 + 1)]);
+            if let Some(step) = watchdog.observe(None, addresses, now) {
+                assert_eq!(step, CommunityLinkStep::Rebuild);
+                watchdog.step_finished(now);
+            }
+        }
+        assert_eq!(watchdog.outage_rebuilds, 1);
+        // Counter saturation keeps a bounded shift and the long-outage wait.
+        watchdog.steps = u32::MAX;
+        watchdog.outage_rebuilds = u32::MAX;
+        let now = start + Duration::from_secs(75);
+        assert_eq!(watchdog.observe(None, None, now), None);
+        assert_eq!(watchdog.steps, u32::MAX);
+    }
+
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -509,6 +1274,20 @@ mod tests {
         }))
     }
 
+    fn local_ticket(peer: &CollaborationBootstrapPeer) -> FakeReply {
+        FakeReply::Value(serde_json::json!({
+            "status": "ok",
+            "data": {"node_id": peer.node_id, "ticket": peer.connect_ticket},
+        }))
+    }
+
+    fn topic_peers(topic: &str, peers: &[&str]) -> FakeReply {
+        FakeReply::Value(serde_json::json!({
+            "status": "ok",
+            "data": {"topic": topic, "peers": peers},
+        }))
+    }
+
     fn signed_frame(envelope: &[u8]) -> Vec<u8> {
         let signing_key = SigningKey::from_bytes(&[0x42; 32]);
         sign_collaboration_transport_frame(&signing_key, envelope).unwrap()
@@ -621,6 +1400,187 @@ mod tests {
                 "peers": [],
             })]
         );
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_availability_uses_any_current_topic_peer() {
+        let (signer, _) = generate_keypair();
+        let bootstrap = ticket_for(20);
+        let remaining_peer = ticket_for(21);
+        let profile = verified_profile(
+            &signer,
+            "community-availability",
+            1,
+            None,
+            vec![bootstrap.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            topic_peers(&topic, &[]),
+            topic_peers(&topic, &[&remaining_peer.node_id]),
+            topic_peers(&topic, &[]),
+            topic_peers("foreign-topic", &[&remaining_peer.node_id]),
+            FakeReply::Error("unavailable"),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(!joined.has_remote_peers().await.unwrap());
+        assert!(joined.has_remote_peers().await.unwrap());
+        assert!(!joined.has_remote_peers().await.unwrap());
+        assert!(joined.has_remote_peers().await.is_err());
+        assert!(joined.has_remote_peers().await.is_err());
+        assert_eq!(
+            carrier
+                .requests()
+                .iter()
+                .filter(|request| request["op"] == "gossip_join_exact")
+                .count(),
+            1
+        );
+        assert!(!carrier
+            .requests()
+            .iter()
+            .any(|request| request["op"] == "gossip_join_peers"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_repairs_only_missing_verified_bootstraps() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(20);
+        let connected = ticket_for(21);
+        let missing = ticket_for(22);
+        let unrelated = ticket_for(23);
+        let profile = verified_profile(
+            &signer,
+            "bootstrap-recovery",
+            1,
+            None,
+            vec![own.clone(), connected.clone(), missing.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&own.node_id),
+            remember_ok(&connected.node_id),
+            remember_ok(&missing.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&connected.node_id, &unrelated.node_id]),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&connected.node_id, &missing.node_id]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        let repair = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] == "gossip_join_peers")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repair,
+            [serde_json::json!({
+                "op": "gossip_join_peers", "topic": topic, "peers": [missing.node_id],
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_retries_missing_bootstrap_after_a_failed_join() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(24);
+        let bootstrap = ticket_for(25);
+        let profile = verified_profile(&signer, "late-bootstrap", 1, None, vec![bootstrap.clone()]);
+        let topic = collaboration_topic(&profile);
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            FakeReply::Error("offline"),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[&bootstrap.node_id]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        joined.restore_missing_bootstrap_peers().await.unwrap();
+        let repairs = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] == "gossip_join_peers")
+            .collect::<Vec<_>>();
+        assert_eq!(repairs.len(), 2);
+        assert!(repairs.iter().all(|request| request["topic"] == topic
+            && request["peers"] == serde_json::json!([bootstrap.node_id])));
+    }
+
+    #[tokio::test]
+    async fn collaboration_carrier_recovery_refuses_mismatched_local_identity_or_topic() {
+        let (signer, _) = generate_keypair();
+        let own = ticket_for(26);
+        let other = ticket_for(27);
+        let bootstrap = ticket_for(28);
+        let profile = verified_profile(
+            &signer,
+            "bootstrap-refusal",
+            1,
+            None,
+            vec![bootstrap.clone()],
+        );
+        let topic = collaboration_topic(&profile);
+        for reply in [
+            FakeReply::Value(serde_json::json!({"status": "ok", "data": {
+                "node_id": other.node_id, "ticket": own.connect_ticket,
+            }})),
+            FakeReply::Value(serde_json::json!({"status": "ok", "data": {
+                "node_id": crate::crypto::encode_signing_key_did(&signer), "ticket": own.connect_ticket,
+            }})),
+        ] {
+            let carrier =
+                FakeCarrier::new([remember_ok(&bootstrap.node_id), join_ok(&topic), reply]);
+            let joined = join_collaboration_network(carrier.clone(), &profile)
+                .await
+                .unwrap();
+            assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+            assert!(!carrier
+                .requests()
+                .iter()
+                .any(|request| request["op"] == "gossip_join_peers"));
+        }
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers("other-topic", &[]),
+        ]);
+        let joined = join_collaboration_network(carrier.clone(), &profile)
+            .await
+            .unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
+        assert!(!carrier
+            .requests()
+            .iter()
+            .any(|request| request["op"] == "gossip_join_peers"));
+        let carrier = FakeCarrier::new([
+            remember_ok(&bootstrap.node_id),
+            join_ok(&topic),
+            local_ticket(&own),
+            topic_peers(&topic, &[]),
+            join_ok("other-topic"),
+        ]);
+        let joined = join_collaboration_network(carrier, &profile).await.unwrap();
+        assert!(joined.restore_missing_bootstrap_peers().await.is_err());
     }
 
     #[test]
@@ -758,20 +1718,20 @@ mod tests {
         let envelope = br#"{"frame":"ok"}"#;
 
         assert_eq!(
-            joined.send(envelope).await.unwrap(),
+            joined.send_frame(envelope).await.unwrap(),
             CollaborationCarrierSendOutcome::RemoteBroadcast { peer_count: 2 }
         );
         assert_eq!(
-            joined.send(envelope).await.unwrap(),
+            joined.send_frame(envelope).await.unwrap(),
             CollaborationCarrierSendOutcome::LocalOnlyBuffered
         );
         let request_count = carrier.requests().len();
         assert!(joined
-            .send(&vec![b'x'; MAX_COLLABORATION_TRANSPORT_FRAME_BYTES + 1])
+            .send_frame(&vec![b'x'; MAX_COLLABORATION_TRANSPORT_FRAME_BYTES + 1])
             .await
             .is_err());
         assert_eq!(carrier.requests().len(), request_count);
-        assert!(joined.send(envelope).await.is_err());
+        assert!(joined.send_frame(envelope).await.is_err());
 
         for request in &carrier.requests()[1..3] {
             assert_eq!(request["op"], "gossip_send");

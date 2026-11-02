@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,9 +18,9 @@ use elastos_common::protected_content::{
     validate_protected_content_key_envelope_algorithms, SealedObjectV1, SEALED_OBJECT_SCHEMA,
 };
 use elastos_runtime::provider::{
-    Provider, ProviderByteRange, ProviderError, ProviderInvocation, ProviderInvocationTransport,
-    ProviderProgress, ProviderRegistry, ProviderStreamOptions, ProviderTransfer, ResourceRequest,
-    ResourceResponse,
+    Provider, ProviderByteRange, ProviderCarrierRoute, ProviderError, ProviderInvocation,
+    ProviderInvocationTransport, ProviderProgress, ProviderRegistry, ProviderStreamOptions,
+    ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -93,7 +93,8 @@ const REPAIR_WORKER_MAX_ATTEMPTS_LIMIT: u32 = 25;
 const REPAIR_WORKER_DEFAULT_FAILURE_BUDGET: u32 = 10;
 const REPAIR_WORKER_MAX_FAILURE_BUDGET: u32 = 100;
 const IMPORT_EXACT_MAX_BYTES: usize = 64 * 1024 * 1024;
-const IMPORT_OBJECT_MAX_FILES: usize = 512;
+/// Publish policy that pins on this node only and never asks availability to replicate.
+pub(crate) const LOCAL_PIN_AVAILABILITY_POLICY: &str = "local_pin";
 const AVAILABILITY_DASHBOARD_REMOTE_ROW_LIMIT: usize = 10;
 const OBJECT_MANIFEST_SCHEMA: &str = "elastos.content.object.manifest/v1";
 const OBJECT_MANIFEST_PATH: &str = "_elastos_object.json";
@@ -102,11 +103,17 @@ const SEALED_OBJECT_PATH: &str = "sealed.json";
 pub const CONTENT_OBJECT_MANIFEST_PATH: &str = OBJECT_MANIFEST_PATH;
 const MAX_LOCAL_OBJECT_DIRS: usize = 16;
 const MAX_LOCAL_OBJECT_WALK_DEPTH: usize = 8;
+// Bounds the one local object file Runtime reads whole: 4096 manifest entries.
+const MAX_LOCAL_OBJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const LOCAL_OBJECT_WALK_SKIP: &[&str] = &[
     "ipfs-repo",
     "logs",
     "bin",
     "managed-runtimes",
+    // Runtime-private model inventory. Admitted models are verified at
+    // admission and this Home's Kubo does not hold them in 0.8.0; serving
+    // them to peers is the holder role of #324.
+    "model-preparation",
     "target",
     ".git",
 ];
@@ -220,6 +227,8 @@ struct ContentFetchTransfer {
     progress: Option<ProviderProgress>,
     bounded_read: bool,
     max_bytes: Option<u64>,
+    /// A local whole read's own limit, applied by the local backend.
+    whole_max_bytes: Option<u64>,
 }
 
 impl ContentFetchTransfer {
@@ -310,11 +319,31 @@ impl ContentFetchTransfer {
                 "complete metadata requires a local bounded whole index".into(),
             ));
         }
+        let whole_max_bytes = request
+            .get("whole_max_bytes")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|n| (1..=elastos_common::MAX_WHOLE_CONTENT_BYTES as u64).contains(n))
+                    .ok_or_else(|| ProviderError::Provider("invalid whole read bound".into()))
+            })
+            .transpose()?;
+        if whole_max_bytes.is_some()
+            && (request.get("local_only") != Some(&Value::Bool(true))
+                || request.get("bounded_read").is_some()
+                || max_bytes.is_some()
+                || range.is_some())
+        {
+            return Err(ProviderError::Provider(
+                "a whole read bound requires a local whole read".into(),
+            ));
+        }
         Ok(Self {
             transfer,
             range,
             progress,
             max_bytes,
+            whole_max_bytes,
             bounded_read: match request.get("bounded_read") {
                 None | Some(Value::Bool(false)) => false,
                 Some(Value::Bool(true)) => true,
@@ -2680,34 +2709,106 @@ pub async fn publish_bytes_via_provider(
     content_response_cid(&response)
 }
 
-/// Complete one bounded model read through the existing local Content path.
-/// Preparation owns aggregate accounting, ordering, integrity and settlement.
-pub(crate) async fn fetch_model_part(
+const MODEL_PREPARATION_SOURCE: &str = "runtime-model-preparation";
+
+/// One preparation's read route for its package parts. Parts come from the
+/// local backend until it misses once; every later part of that package goes
+/// straight to Carrier holders, so a package this Home lacks pays one local
+/// miss instead of one per 64 KiB part. Reads take `&self` so preparation can
+/// keep several parts in flight. Preparation still checks each file's SHA-256
+/// and the package CID, whichever route served the bytes.
+#[derive(Debug, Default)]
+pub(crate) struct ModelPartReads {
+    holders_only: std::sync::atomic::AtomicBool,
+}
+
+impl ModelPartReads {
+    /// Complete one bounded model read. Preparation owns aggregate accounting,
+    /// ordering, integrity and settlement.
+    pub(crate) async fn fetch(
+        &self,
+        registry: &ProviderRegistry,
+        cid: &str,
+        path: &str,
+        range: Option<(u64, u64)>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut request = json!({"op":"fetch", "cid":cid, "path":path, "bounded_read":true,
+            "transfer":"stream", "local_only":true});
+        let (limit, byte_range) = if let Some((offset, length)) = range {
+            anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
+            let end = offset
+                .checked_add(length - 1)
+                .ok_or_else(|| anyhow::anyhow!("model range overflow"))?;
+            request["range"] = json!({"start":offset,"end":end});
+            (
+                length,
+                Some(ProviderByteRange {
+                    start: offset,
+                    end: Some(end),
+                }),
+            )
+        } else {
+            anyhow::ensure!(
+                path == CONTENT_OBJECT_MANIFEST_PATH,
+                "complete model index required"
+            );
+            request["max_bytes"] = json!(65536);
+            (65536, None)
+        };
+        let index_read = range.is_none();
+        if !self.holders_only.load(std::sync::atomic::Ordering::Acquire) {
+            match read_local_model_part(registry, request).await {
+                Ok(bytes) => return checked_model_part(bytes, limit, range.is_some(), index_read),
+                Err(_) => self
+                    .holders_only
+                    .store(true, std::sync::atomic::Ordering::Release),
+            }
+        }
+        let transfer = ContentFetchTransfer {
+            transfer: ProviderTransfer::Bytes,
+            range: byte_range,
+            progress: None,
+            bounded_read: true,
+            max_bytes: index_read.then_some(limit),
+            whole_max_bytes: None,
+        };
+        let fetched = ContentProvider::fetch_from_availability_provider(
+            registry,
+            MODEL_PREPARATION_SOURCE,
+            cid,
+            path,
+            &transfer,
+        )
+        .await;
+        if index_read {
+            let outcome = match &fetched {
+                Ok(Some(_)) => "completed",
+                Ok(None) => "unavailable",
+                Err(_) => "failed",
+            };
+            tracing::warn!(target: "elastos::model_index_read", stage = "availability_fallback",
+                outcome, "model index read fallback settled");
+        }
+        let ContentFetchPayload::Bytes(data) = fetched?
+            .ok_or_else(|| anyhow::anyhow!("Carrier availability is unavailable"))?
+            .payload
+        else {
+            anyhow::bail!("availability returned a stream for a bytes read");
+        };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+        checked_model_part(bytes, limit, range.is_some(), index_read)
+    }
+}
+
+/// One part through the local Content path only; a miss never reaches Carrier.
+async fn read_local_model_part(
     registry: &ProviderRegistry,
-    cid: &str,
-    path: &str,
-    range: Option<(u64, u64)>,
+    request: Value,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut request = json!({"op":"fetch", "cid":cid, "path":path,
-        "bounded_read":true, "transfer":"stream"});
-    let limit = if let Some((offset, length)) = range {
-        anyhow::ensure!((1..=65536).contains(&length), "invalid model read bound");
-        request["range"] = json!({"start":offset,"end":offset.checked_add(length - 1)
-            .ok_or_else(|| anyhow::anyhow!("model range overflow"))?});
-        length
-    } else {
-        anyhow::ensure!(
-            path == CONTENT_OBJECT_MANIFEST_PATH,
-            "complete model index required"
-        );
-        request["max_bytes"] = json!(65536);
-        65536
-    };
-    let index_read = path == CONTENT_OBJECT_MANIFEST_PATH && range.is_none();
-    let opened = registry
+    let mut stream = registry
         .open_provider_stream(
             ProviderInvocation {
-                source: "runtime-model-preparation".into(),
+                source: MODEL_PREPARATION_SOURCE.into(),
                 target: "content".into(),
                 op: "fetch".into(),
                 request,
@@ -2718,18 +2819,16 @@ pub(crate) async fn fetch_model_part(
             },
             ProviderStreamOptions::default(),
         )
-        .await;
-    if index_read && opened.is_err() {
-        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_open",
-            "model index read substage failed");
-    }
-    let mut stream = opened?;
-    let drained = stream.drain_to_vec();
-    if index_read && drained.is_err() {
-        tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_drain",
-            "model index read substage failed");
-    }
-    let bytes = drained?;
+        .await?;
+    Ok(stream.drain_to_vec()?)
+}
+
+fn checked_model_part(
+    bytes: Vec<u8>,
+    limit: u64,
+    exact: bool,
+    index_read: bool,
+) -> anyhow::Result<Vec<u8>> {
     if bytes.len() as u64 > limit {
         if index_read {
             tracing::warn!(target: "elastos::model_index_read", stage = "runtime_stream_validation",
@@ -2737,16 +2836,51 @@ pub(crate) async fn fetch_model_part(
         }
         anyhow::bail!("model read exceeds bound");
     }
-    if range.is_some() {
+    if exact {
         anyhow::ensure!(bytes.len() as u64 == limit, "incomplete model range");
     }
     Ok(bytes)
+}
+
+/// One part with a fresh route: local first, then Carrier holders.
+#[cfg(test)]
+pub(crate) async fn fetch_model_part(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: &str,
+    range: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<u8>> {
+    ModelPartReads::default()
+        .fetch(registry, cid, path, range)
+        .await
 }
 
 pub async fn fetch_bytes_via_provider(
     registry: &ProviderRegistry,
     cid: &str,
     path: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    fetch_bytes_via_content(registry, cid, path, None).await
+}
+
+/// Read from this node's IPFS repo only, refused once the file passes
+/// `max_bytes`; a local miss never searches the network or reaches
+/// availability holders.
+pub(crate) async fn fetch_verified_local_bytes_via_provider(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    fetch_bytes_via_content(registry, cid, path, Some(max_bytes)).await
+}
+
+/// `local_max_bytes` makes the read local-only and bounds it at the backend.
+async fn fetch_bytes_via_content(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    local_max_bytes: Option<usize>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "op": "fetch",
@@ -2757,6 +2891,10 @@ pub async fn fetch_bytes_via_provider(
             "expected_bytes": Value::Null,
         },
     });
+    if let Some(max_bytes) = local_max_bytes {
+        request["local_only"] = Value::Bool(true);
+        request["whole_max_bytes"] = json!(max_bytes);
+    }
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         request["path"] = Value::String(path.to_string());
     }
@@ -2783,6 +2921,149 @@ pub async fn fetch_bytes_via_provider(
     session
         .drain_to_vec()
         .map_err(|err| anyhow::anyhow!("content provider stream read failed: {err}"))
+}
+
+/// Runtime provider source for Home getting a file a contact shared in Chat.
+pub(crate) const HOME_SHARED_CONTENT_SOURCE: &str = "home-shared-content";
+/// Largest file Home gets from a contact: `import_exact`'s own bound.
+pub(crate) const HOME_SHARED_CONTENT_MAX_BYTES: usize = IMPORT_EXACT_MAX_BYTES;
+/// How long Home connects to the sender's Home before calling it offline.
+const HOME_SHARED_CONTENT_CONNECT_MS: u64 = 5_000;
+
+/// The outcome of getting a shared file from its sender's Home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedContentGet {
+    /// The exact bytes are pinned here now.
+    Local,
+    SenderOffline,
+    /// The sender's Home refused or no longer pins the CID.
+    NotShared,
+    TooLarge,
+    /// The bytes did not hash to the link's CID; nothing was pinned.
+    Mismatch,
+    Timeout,
+}
+
+impl SharedContentGet {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::SenderOffline => "sender_offline",
+            Self::NotShared => "not_shared",
+            Self::TooLarge => "too_large",
+            Self::Mismatch => "mismatch",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Whether `cid` is pinned on this Home's backend now. A receipt alone is not
+/// enough: a failed pin can leave a `repair_needed` receipt with no bytes here.
+pub(crate) async fn content_pinned_here(registry: &ProviderRegistry, cid: &str) -> bool {
+    crate::carrier::local_cid_pinned(registry, cid).await == Some(true)
+}
+
+/// Gets `cid` from the Home at `peer_did` with its existing local-only
+/// `content/fetch`, waiting at most `reply_wait` for the answer, then imports
+/// it with `import_exact`: added unpinned, compared with `cid`, pinned only on
+/// a match. The holder reads at most [`HOME_SHARED_CONTENT_MAX_BYTES`], and the
+/// answer this Home accepts is bounded to match.
+pub(crate) async fn get_shared_content_from_peer(
+    registry: &ProviderRegistry,
+    peer_did: &str,
+    cid: &str,
+    filename: &str,
+    reply_wait: Duration,
+) -> anyhow::Result<SharedContentGet> {
+    anyhow::ensure!(is_valid_cid(cid), "shared content requires a valid CID");
+    let reply_wait_ms = u64::try_from(reply_wait.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let fetched = registry
+        .invoke_provider(ProviderInvocation {
+            source: HOME_SHARED_CONTENT_SOURCE.to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: json!({
+                "op": "fetch",
+                "cid": cid,
+                "local_only": true,
+                "transfer": "stream",
+                "whole_max_bytes": HOME_SHARED_CONTENT_MAX_BYTES,
+            }),
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did.to_string(),
+                timeout_ms: Some(HOME_SHARED_CONTENT_CONNECT_MS),
+                reply_wait_ms: Some(reply_wait_ms),
+            }),
+        })
+        .await;
+    let mut response = match fetched {
+        Ok(response) => response,
+        Err(ProviderError::Unavailable(_)) => return Ok(SharedContentGet::SenderOffline),
+        Err(ProviderError::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
+            return Ok(SharedContentGet::Timeout)
+        }
+        Err(err) => {
+            let text = err.to_string();
+            return Ok(
+                if text.ends_with(crate::carrier::CARRIER_CONTENT_TOO_LARGE) {
+                    SharedContentGet::TooLarge
+                } else if text.ends_with(crate::carrier::PEER_ROUTE_IN_TRANSIT) {
+                    SharedContentGet::SenderOffline
+                } else {
+                    SharedContentGet::NotShared
+                },
+            );
+        }
+    };
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        return Ok(SharedContentGet::NotShared);
+    }
+    // Move the payload out so only one copy of the bytes is held at a time.
+    let mut import = json!({ "op": "import_exact", "cid": cid, "filename": filename });
+    match response.get_mut("data") {
+        Some(data) if data.get("stream").is_some() => import["stream"] = data["stream"].take(),
+        Some(data) if data.get("data").is_some_and(Value::is_string) => {
+            import["data"] = data["data"].take()
+        }
+        _ => return Ok(SharedContentGet::NotShared),
+    }
+    drop(response);
+    let imported = registry
+        .invoke_provider(ProviderInvocation {
+            source: HOME_SHARED_CONTENT_SOURCE.to_string(),
+            target: "content".to_string(),
+            op: "import_exact".to_string(),
+            request: import,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await;
+    match imported {
+        Ok(response) if response.get("status").and_then(Value::as_str) == Some("ok") => {
+            Ok(SharedContentGet::Local)
+        }
+        Ok(response) if response.get("code").and_then(Value::as_str) == Some("cid_mismatch") => {
+            Ok(SharedContentGet::Mismatch)
+        }
+        Err(err) if err.to_string().contains("import_exact payload exceeds") => {
+            Ok(SharedContentGet::TooLarge)
+        }
+        Ok(response) => anyhow::bail!(
+            "shared content import failed: {}",
+            response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ),
+        Err(err) => anyhow::bail!("shared content import failed: {err}"),
+    }
 }
 
 /// Validate signed catalog metadata using the existing content closure list.
@@ -2928,6 +3209,11 @@ pub fn parse_content_object_manifest(
     Ok(manifest)
 }
 
+/// What `elastos run/serve --cid` say for a CID this Home's store lacks. The
+/// CLI has no Carrier node and Kubo is offline, so only Home can fetch it.
+pub const CID_NOT_ON_THIS_HOME: &str =
+    "This content isn't on this Home. Open it from Home, which can fetch it from a contact.";
+
 /// Materialize a published capsule through the content availability contract.
 ///
 /// Data capsules must carry `_elastos_object.json`; that manifest is the file
@@ -2939,13 +3225,16 @@ pub async fn prepare_capsule_from_content_provider(
     let manifest_bytes = match fetch_bytes_via_provider(registry, cid, Some("capsule.json")).await {
         Ok(bytes) => bytes,
         Err(capsule_err) => {
-            if let Ok(object_manifest) = fetch_content_object_manifest(registry, cid).await {
-                anyhow::bail!(
+            match fetch_content_object_manifest(registry, cid).await {
+                Ok(object_manifest) => anyhow::bail!(
                     "content object {cid} has kind '{}' and is not a launchable capsule; use `elastos open elastos://{cid}` to inspect release objects or open it with a matching viewer once one is installed",
                     object_manifest.kind
-                );
+                ),
+                Err(_) => {
+                    tracing::debug!(%cid, error = %capsule_err, "capsule CID not in this Home's store");
+                    anyhow::bail!(CID_NOT_ON_THIS_HOME);
+                }
             }
-            return Err(capsule_err);
         }
     };
     let manifest_data = String::from_utf8(manifest_bytes.clone())
@@ -3008,7 +3297,6 @@ impl Provider for ContentProvider {
             Some("publish") => self.publish(request).await,
             Some("fetch") => self.fetch(request).await,
             Some("import_exact") => self.import_exact(request).await,
-            Some("import_object") => self.import_object(request).await,
             Some("admission") => self.admission(request).await,
             Some("ensure") => self.ensure(request).await,
             Some("repair") => self.repair(request).await,
@@ -3129,9 +3417,14 @@ impl ContentProvider {
                 }
             }
             Err(local_err) => {
-                let fallback = self
-                    .fetch_from_availability_provider(&registry, cid, path, &transfer)
-                    .await;
+                let fallback = Self::fetch_from_availability_provider(
+                    &registry,
+                    self.name(),
+                    cid,
+                    path,
+                    &transfer,
+                )
+                .await;
                 if model_index {
                     let outcome = match &fallback {
                         Ok(Some(_)) => "completed",
@@ -3209,6 +3502,9 @@ impl ContentProvider {
         if let Some(max_bytes) = transfer.max_bytes {
             ipfs_request["max_bytes"] = json!(max_bytes);
         }
+        if let Some(whole_max_bytes) = transfer.whole_max_bytes {
+            ipfs_request["whole_max_bytes"] = json!(whole_max_bytes);
+        }
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
         }
@@ -3224,9 +3520,11 @@ impl ContentProvider {
         })
     }
 
+    /// Read through the availability plane only. Content uses this after a
+    /// local miss; model preparation uses it for a package its backend lacks.
     async fn fetch_from_availability_provider(
-        &self,
         registry: &ProviderRegistry,
+        source: &str,
         cid: &str,
         path: &str,
         transfer: &ContentFetchTransfer,
@@ -3255,8 +3553,17 @@ impl ContentProvider {
             hop.progress = None;
         }
 
-        let response = match self
-            .invoke_provider_with_fetch_transfer(registry, "availability", "fetch", request, &hop)
+        let response = match registry
+            .invoke_provider(ProviderInvocation {
+                source: source.to_string(),
+                target: "availability".to_string(),
+                op: "fetch".to_string(),
+                request,
+                transfer: hop.transfer,
+                range: hop.range,
+                progress: hop.progress.clone(),
+                transport: ProviderInvocationTransport::Local,
+            })
             .await
         {
             Ok(response) => response,
@@ -3272,9 +3579,14 @@ impl ContentProvider {
                 .get("message")
                 .and_then(|value| value.as_str())
                 .unwrap_or("Carrier availability fetch failed");
-            return Err(ProviderError::Provider(format!(
-                "availability fetch failed ({code}): {message}"
-            )));
+            let message = format!("availability fetch failed ({code}): {message}");
+            // Only failures in transit stay typed as I/O, so a bounded reader
+            // can repeat them; refusals and bad answers stay provider errors.
+            return Err(if code == crate::carrier::CARRIER_FETCH_IN_TRANSIT_CODE {
+                ProviderError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+            } else {
+                ProviderError::Provider(message)
+            });
         }
         if transfer.bounded_read {
             check_bounded_availability_payload(&response, transfer)?;
@@ -3396,7 +3708,12 @@ impl ContentProvider {
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
         let local_outcome = AvailabilityOutcome::local_publish(pin);
-        let outcome = if pin {
+        // `local_pin` keeps the object on this node only; no network replication is attempted.
+        let local_only_policy = request
+            .get("availability_policy")
+            .and_then(|value| value.as_str())
+            == Some(LOCAL_PIN_AVAILABILITY_POLICY);
+        let outcome = if pin && !local_only_policy {
             self.ensure_network_availability(
                 &registry,
                 &cid,
@@ -3666,7 +3983,9 @@ impl ContentProvider {
                     "op": "add_bytes",
                     "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
                     "filename": filename,
-                    "pin": true,
+                    // Pin only after the CID is checked, so a wrong
+                    // expected CID never changes an existing pin.
+                    "pin": false,
                 }),
                 ProviderTransfer::Bytes,
             )
@@ -3676,23 +3995,13 @@ impl ContentProvider {
             ProviderError::Provider(format!("content import_exact missing imported CID: {err}"))
         })?;
         if imported_cid != cid {
-            let _ = self
-                .invoke_provider(
-                    &registry,
-                    "ipfs",
-                    "unpin",
-                    json!({
-                        "op": "unpin",
-                        "cid": imported_cid,
-                    }),
-                    ProviderTransfer::Json,
-                )
-                .await;
             return Ok(provider_error(
                 "cid_mismatch",
                 "content import_exact produced a different CID; exact-CID import requires block-level compatible bytes",
             ));
         }
+        self.pin_imported_cid(&registry, cid, "content import_exact")
+            .await?;
 
         let outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
@@ -3752,167 +4061,24 @@ impl ContentProvider {
         })))
     }
 
-    async fn import_object(&self, request: &Value) -> Result<Value, ProviderError> {
-        validate_import_object_invocation(request)?;
-        let cid = request
-            .get("cid")
-            .and_then(|cid| cid.as_str())
-            .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content import_object requires cid".into()))?;
-        if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content import_object requires a valid CID",
-            ));
-        }
-        let files = request
-            .get("files")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let (file_count, total_bytes) = validate_import_object_payload_bounds(&files)?;
-        let requirements = AvailabilityRequirements::from_request(request);
-        let publisher_did = request
-            .get("publisher_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let publisher_did = Some(self.effective_publisher_did(publisher_did.as_deref())?);
-        let storage_quota = self.principal_storage_quota_for_request(
-            publisher_did.as_deref().unwrap_or_default(),
-            &requirements,
-            Some(total_bytes as u64),
-            Some(cid),
-        )?;
-        if storage_quota.get("status").and_then(|value| value.as_str()) == Some("quota_exceeded") {
-            return Ok(provider_error(
-                "storage_quota_exceeded",
-                "content import_object exceeds the principal storage quota",
-            ));
-        }
-        let object_kind = request
-            .get("object_kind")
-            .or_else(|| request.get("kind"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("directory");
-        let files = with_directory_object_manifest(
-            files,
-            object_kind,
-            request.get("object_did").and_then(|value| value.as_str()),
-            request
-                .get("publisher_did")
-                .and_then(|value| value.as_str()),
-            request.get("links"),
-        )?;
-        let registry = self.registry()?;
-        let ipfs_response = self
+    /// Pins `cid` once an import has added its blocks unpinned and produced
+    /// exactly that CID.
+    async fn pin_imported_cid(
+        &self,
+        registry: &ProviderRegistry,
+        cid: &str,
+        label: &str,
+    ) -> Result<(), ProviderError> {
+        let response = self
             .invoke_provider(
-                &registry,
+                registry,
                 "ipfs",
-                "add_directory",
-                json!({
-                    "op": "add_directory",
-                    "files": files,
-                    "pin": true,
-                }),
+                "pin",
+                json!({ "op": "pin", "cid": cid }),
                 ProviderTransfer::Json,
             )
             .await?;
-        provider_response_ok(&ipfs_response, "content import_object")?;
-        let imported_cid = provider_response_cid(&ipfs_response).map_err(|err| {
-            ProviderError::Provider(format!("content import_object missing imported CID: {err}"))
-        })?;
-        if imported_cid != cid {
-            let _ = self
-                .invoke_provider(
-                    &registry,
-                    "ipfs",
-                    "unpin",
-                    json!({
-                        "op": "unpin",
-                        "cid": imported_cid,
-                    }),
-                    ProviderTransfer::Json,
-                )
-                .await;
-            return Ok(provider_error(
-                "cid_mismatch",
-                "content import_object produced a different CID; exact object import requires matching manifest and bytes",
-            ));
-        }
-
-        let local_outcome = AvailabilityOutcome {
-            provider: "ipfs-provider".to_string(),
-            policy: "carrier_object_import".to_string(),
-            status: "local_pinned".to_string(),
-            replicas: 1,
-            reason: None,
-            peer_selection: local_peer_selection_json(),
-            quota: local_quota_json(),
-            repair_worker: repair_worker_json(false),
-            storage_market: local_storage_market_json(),
-            repair_graph: local_repair_graph_json(),
-            abuse_controls: local_abuse_controls_json(),
-        };
-        let outcome = self
-            .ensure_network_availability(
-                &registry,
-                cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: request.get("object_did").and_then(|value| value.as_str()),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation: ContentAccountingObservation {
-                        files: Some(file_count as u64),
-                        bytes: Some(total_bytes as u64),
-                    },
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome);
-        let object_did = request
-            .get("object_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let receipt = self.write_receipt(ReceiptInput {
-            cid: cid.to_string(),
-            object_did,
-            publisher_did,
-            provider: outcome.provider.clone(),
-            policy: outcome.policy.clone(),
-            status: outcome.status.clone(),
-            replicas: outcome.replicas,
-            peer_selection: outcome.peer_selection.clone(),
-            quota: outcome.quota.clone(),
-            repair_worker: outcome.repair_worker.clone(),
-            storage_market: outcome.storage_market.clone(),
-            repair_graph: outcome.repair_graph.clone(),
-            abuse_controls: outcome.abuse_controls.clone(),
-            accounting: content_accounting_json_with_storage_quota(
-                "carrier_object_import",
-                ContentAccountingObservation {
-                    files: Some(file_count as u64),
-                    bytes: Some(total_bytes as u64),
-                },
-                outcome.replicas,
-                storage_quota,
-            ),
-        })?;
-        let repair_task = self.record_repair_task(&receipt, &outcome, requirements, false)?;
-
-        Ok(provider_ok(json!({
-            "cid": cid,
-            "uri": format!("elastos://{cid}"),
-            "availability": outcome.to_json(),
-            "repair_task": repair_task,
-            "receipt": receipt,
-            "import": {
-                "schema": "elastos.content.import-object/v1",
-                "method": "carrier_provider_object_manifest",
-                "files": file_count,
-                "bytes": total_bytes,
-                "verified_cid": true,
-            }
-        })))
+        provider_response_ok(&response, label)
     }
 
     async fn unpublish(&self, request: &Value) -> Result<Value, ProviderError> {
@@ -3941,7 +4107,25 @@ impl ContentProvider {
                 ProviderTransfer::Json,
             )
             .await?;
-        provider_response_ok(&ipfs_response, "content unpublish")?;
+        if ipfs_response.get("status").and_then(Value::as_str) == Some("error") {
+            // An unpin that fails because the CID is no longer pinned (an
+            // earlier unpublish got this far before it was interrupted)
+            // completes the unpublish: verified absence, not a guess.
+            let status = self
+                .invoke_provider(
+                    &registry,
+                    "ipfs",
+                    "pin_status",
+                    json!({ "op": "pin_status", "cid": cid }),
+                    ProviderTransfer::Json,
+                )
+                .await?;
+            if !(status.get("status").and_then(Value::as_str) == Some("ok")
+                && status["data"]["pinned"] == false)
+            {
+                provider_response_ok(&ipfs_response, "content unpublish")?;
+            }
+        }
         let previous_receipt = self.latest_receipt_for_cid(cid).transpose()?;
         let outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
@@ -4103,7 +4287,12 @@ impl ContentProvider {
             .transpose()?
             .map(|receipt| content_accounting_observation_from_value(&receipt.payload.accounting))
             .unwrap_or_default();
-        let outcome = if local_outcome.status == "local_pinned" {
+        // `local_pin` keeps the object on this node only, for repair as for publish.
+        let local_only_policy = request
+            .get("availability_policy")
+            .and_then(|value| value.as_str())
+            == Some(LOCAL_PIN_AVAILABILITY_POLICY);
+        let outcome = if local_outcome.status == "local_pinned" && !local_only_policy {
             self.ensure_network_availability(
                 &registry,
                 cid,
@@ -4168,21 +4357,20 @@ impl ContentProvider {
     ) -> Result<bool, ProviderError> {
         for dir in complete_local_object_dirs(&self.data_dir) {
             match self.import_local_object_dir(registry, &dir).await {
-                Ok(imported_cid) if imported_cid == cid => return Ok(true),
-                Ok(imported_cid) => {
-                    let _ = self
+                // The import is unpinned; only the requested CID is pinned.
+                Ok(imported_cid) if imported_cid == cid => {
+                    let pinned = self
                         .invoke_provider(
                             registry,
                             "ipfs",
-                            "unpin",
-                            json!({
-                                "op": "unpin",
-                                "cid": imported_cid,
-                            }),
+                            "pin",
+                            json!({ "op": "pin", "cid": cid }),
                             ProviderTransfer::Json,
                         )
-                        .await;
+                        .await?;
+                    return Ok(pinned["status"] == "ok");
                 }
+                Ok(_) => {}
                 Err(err) => {
                     tracing::debug!(
                         dir = %dir.display(),
@@ -4200,32 +4388,38 @@ impl ContentProvider {
         registry: &ProviderRegistry,
         dir: &Path,
     ) -> Result<String, ProviderError> {
-        let files = local_object_dir_files(dir)?;
-        let ipfs_response = self
-            .invoke_provider(
-                registry,
-                "ipfs",
-                "add_directory",
-                json!({
-                    "op": "add_directory",
-                    "files": files,
-                    "pin": true,
-                }),
-                ProviderTransfer::Json,
-            )
-            .await?;
-        provider_response_ok(&ipfs_response, "content local object import")?;
-        provider_response_cid(&ipfs_response).map_err(|err| {
-            ProviderError::Provider(format!("content local object import missing CID: {err}"))
-        })
+        // The provider streams the files from disk into Kubo; Runtime sends
+        // only their paths and recorded sizes, whatever the object's size.
+        registry
+            .add_local_ipfs_object(dir, &local_object_dir_files(dir)?)
+            .await
     }
 
+    /// Restores the replicas this Content plane recorded: a complete local
+    /// object is pinned and announced only when its imported CID has a Content
+    /// receipt that was not withdrawn by unpublish.
     pub async fn restore_complete_local_objects(&self) {
         let Ok(registry) = self.registry() else {
             return;
         };
+        let held: BTreeSet<String> = match self.latest_receipts() {
+            Ok(receipts) => receipts
+                .into_iter()
+                .filter(|receipt| receipt.payload.status != "local_unpinned")
+                .map(|receipt| receipt.payload.cid)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "content: local object restore skipped");
+                return;
+            }
+        };
         for dir in complete_local_object_dirs(&self.data_dir) {
             match self.import_local_object_dir(&registry, &dir).await {
+                Ok(cid) if !held.contains(&cid) => tracing::warn!(
+                    dir = %dir.display(),
+                    cid = %cid,
+                    "content: local object CID has no Content receipt; not restored"
+                ),
                 Ok(cid) => match self
                     .ensure(&json!({
                         "cid": cid,
@@ -4591,6 +4785,10 @@ impl ContentProvider {
                     "receipt": receipt,
                 })));
             }
+            return Ok(provider_error(
+                "missing",
+                "content status has no availability receipt for this CID",
+            ));
         }
 
         let emit_operator_alert = request
@@ -5974,7 +6172,7 @@ impl AvailabilityOutcome {
         if pin {
             Self {
                 provider: "ipfs-provider".to_string(),
-                policy: "local_pin".to_string(),
+                policy: LOCAL_PIN_AVAILABILITY_POLICY.to_string(),
                 status: "local_pinned".to_string(),
                 replicas: 1,
                 reason: None,
@@ -8047,15 +8245,23 @@ fn validate_import_exact_invocation(request: &Value) -> Result<(), ProviderError
         request,
         "content import_exact requires Runtime provider invocation metadata",
     )?;
+    // A peer's replica push arrives over Carrier; Home's own `get` of a file a
+    // contact shared imports locally. No other caller may import.
+    let (source, transport) = match runtime.get("source").and_then(|value| value.as_str()) {
+        Some(HOME_SHARED_CONTENT_SOURCE) => {
+            (HOME_SHARED_CONTENT_SOURCE, "runtime-local-provider-plane")
+        }
+        _ => ("carrier-availability", "carrier-provider-plane"),
+    };
     validate_runtime_invocation_fields(
         runtime,
         "content import_exact",
         &[
             ("schema", "elastos.provider.invocation/v1"),
-            ("source", "carrier-availability"),
+            ("source", source),
             ("target", "content"),
             ("op", "import_exact"),
-            ("transport", "carrier-provider-plane"),
+            ("transport", transport),
         ],
     )?;
     if !matches!(
@@ -8067,25 +8273,6 @@ fn validate_import_exact_invocation(request: &Value) -> Result<(), ProviderError
         ));
     }
     Ok(())
-}
-
-fn validate_import_object_invocation(request: &Value) -> Result<(), ProviderError> {
-    let runtime = runtime_invocation_object(
-        request,
-        "content import_object requires Runtime provider invocation metadata",
-    )?;
-    validate_runtime_invocation_fields(
-        runtime,
-        "content import_object",
-        &[
-            ("schema", "elastos.provider.invocation/v1"),
-            ("source", "carrier-availability"),
-            ("target", "content"),
-            ("op", "import_object"),
-            ("transport", "carrier-provider-plane"),
-            ("transfer", "json"),
-        ],
-    )
 }
 
 fn validate_repair_worker_invocation(request: &Value) -> Result<(), ProviderError> {
@@ -8159,146 +8346,17 @@ fn import_exact_payload_bytes(request: &Value) -> Result<Vec<u8>, ProviderError>
     Ok(bytes)
 }
 
-fn validate_import_object_payload_bounds(files: &Value) -> Result<(usize, usize), ProviderError> {
-    let files = files.as_array().ok_or_else(|| {
-        ProviderError::Provider("content import_object files must be an array".into())
-    })?;
-    if files.is_empty() {
-        return Err(ProviderError::Provider(
-            "content import_object requires at least one file".into(),
-        ));
-    }
-    if files.len() > IMPORT_OBJECT_MAX_FILES {
-        return Err(ProviderError::Provider(format!(
-            "content import_object file count exceeds {IMPORT_OBJECT_MAX_FILES}"
-        )));
-    }
-    let mut total_bytes = 0_usize;
-    for file in files {
-        let path = file
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let data = file
-            .get("data")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "content import_object file {path} is missing base64 data"
-                ))
-            })?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|err| {
-                ProviderError::Provider(format!(
-                    "content import_object file {path} has invalid base64 data: {err}"
-                ))
-            })?;
-        total_bytes = total_bytes.saturating_add(decoded.len());
-        if total_bytes > IMPORT_EXACT_MAX_BYTES {
-            return Err(ProviderError::Provider(format!(
-                "content import_object payload exceeds {} bytes",
-                IMPORT_EXACT_MAX_BYTES
-            )));
-        }
-    }
-    Ok((files.len(), total_bytes))
-}
-
 fn provider_stream_payload_bytes(stream: &Value) -> Result<Vec<u8>, ProviderError> {
-    let object = stream.as_object().ok_or_else(|| {
-        ProviderError::Provider("content import_exact stream must be an object".into())
-    })?;
-    let schema = object
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if schema != "elastos.provider.stream/v1" {
-        return Err(ProviderError::Provider(format!(
-            "content import_exact stream schema mismatch: expected elastos.provider.stream/v1, got {schema}"
-        )));
-    }
-    let encoding = object
-        .get("encoding")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if encoding != "base64-chunks" {
-        return Err(ProviderError::Provider(format!(
-            "content import_exact stream encoding mismatch: expected base64-chunks, got {encoding}"
-        )));
-    }
-    let chunks = object
-        .get("chunks")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| {
-            ProviderError::Provider("content import_exact stream missing chunks".into())
-        })?;
-    let mut bytes = Vec::new();
-    for (expected_index, chunk) in chunks.iter().enumerate() {
-        let chunk = chunk.as_object().ok_or_else(|| {
-            ProviderError::Provider("content import_exact stream chunk must be an object".into())
-        })?;
-        let index = chunk
-            .get("index")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing index".into())
-            })?;
-        if index != expected_index as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream chunk index mismatch: expected {expected_index}, got {index}"
-            )));
-        }
-        let offset = chunk
-            .get("offset")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing offset".into())
-            })?;
-        if offset != bytes.len() as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream chunk {index} offset mismatch: expected {}, got {offset}",
-                bytes.len()
-            )));
-        }
-        let encoded = chunk
-            .get("data")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing data".into())
-            })?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|err| {
+    elastos_runtime::provider::decode_provider_stream_payload(stream, IMPORT_EXACT_MAX_BYTES)
+        .map_err(|err| {
+            if err.to_string().contains("payload exceeds") {
                 ProviderError::Provider(format!(
-                    "content import_exact stream chunk has invalid base64: {err}"
+                    "content import_exact payload exceeds {IMPORT_EXACT_MAX_BYTES} bytes"
                 ))
-            })?;
-        if bytes.len().saturating_add(decoded.len()) > IMPORT_EXACT_MAX_BYTES {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact payload exceeds {} bytes",
-                IMPORT_EXACT_MAX_BYTES
-            )));
-        }
-        if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
-            if length != decoded.len() as u64 {
-                return Err(ProviderError::Provider(format!(
-                    "content import_exact stream chunk {index} length {length} does not match decoded length {}",
-                    decoded.len()
-                )));
+            } else {
+                ProviderError::Provider(format!("content import_exact stream: {err}"))
             }
-        }
-        bytes.extend_from_slice(&decoded);
-    }
-    if let Some(total_bytes) = object.get("total_bytes").and_then(|value| value.as_u64()) {
-        if total_bytes != bytes.len() as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream total_bytes {total_bytes} does not match decoded length {}",
-                bytes.len()
-            )));
-        }
-    }
-    Ok(bytes)
+        })
 }
 
 fn parse_availability_provider_response(
@@ -8751,55 +8809,55 @@ fn walk_local_object_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 }
 
 fn local_object_dir_is_complete(dir: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(dir.join(OBJECT_MANIFEST_PATH)) else {
+    let Some((_, manifest)) = local_object_manifest(dir) else {
         return false;
     };
-    let Ok(manifest) = serde_json::from_slice::<ContentObjectManifest>(&bytes) else {
-        return false;
-    };
-    if manifest.schema != OBJECT_MANIFEST_SCHEMA || manifest.files.is_empty() {
-        return false;
-    }
     manifest.files.iter().all(|file| {
-        if validate_content_path(&file.path).is_err() {
-            return false;
-        }
-        let path = dir.join(&file.path);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
-        };
-        bytes.len() as u64 == file.size
-            && format!("{:x}", sha2::Sha256::digest(&bytes)) == file.sha256
+        validate_content_path(&file.path).is_ok()
+            && local_object_file_sha256(&dir.join(&file.path), file.size).as_deref()
+                == Some(file.sha256.as_str())
     })
 }
 
-fn local_object_dir_files(dir: &Path) -> Result<Vec<Value>, ProviderError> {
-    let manifest_path = dir.join(OBJECT_MANIFEST_PATH);
-    let manifest_bytes = std::fs::read(&manifest_path)?;
-    let manifest: ContentObjectManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|err| {
-            ProviderError::Provider(format!(
-                "content local object manifest decode failed: {err}"
-            ))
-        })?;
+fn local_object_manifest(dir: &Path) -> Option<(u64, ContentObjectManifest)> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(dir.join(OBJECT_MANIFEST_PATH))
+        .ok()?
+        .take(MAX_LOCAL_OBJECT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let manifest: ContentObjectManifest = serde_json::from_slice(&bytes).ok()?;
+    (bytes.len() as u64 <= MAX_LOCAL_OBJECT_MANIFEST_BYTES
+        && manifest.schema == OBJECT_MANIFEST_SCHEMA
+        && !manifest.files.is_empty())
+    .then_some((bytes.len() as u64, manifest))
+}
+
+/// Streams a file that must be exactly `size` bytes through SHA-256.
+fn local_object_file_sha256(path: &Path, size: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?.take(size + 1);
+    let mut digest = sha2::Sha256::new();
+    let read = std::io::copy(&mut file, &mut digest).ok()?;
+    (read == size).then(|| format!("{:x}", digest.finalize()))
+}
+
+/// Paths and recorded sizes of a local object, manifest last, as the original
+/// directory import sent them.
+fn local_object_dir_files(dir: &Path) -> Result<Vec<(String, u64)>, ProviderError> {
+    let (manifest_bytes, manifest) = local_object_manifest(dir).ok_or_else(|| {
+        ProviderError::Provider("content local object manifest is invalid".into())
+    })?;
     let mut files = Vec::with_capacity(manifest.files.len().saturating_add(1));
-    for file in &manifest.files {
+    for file in manifest.files {
         if validate_content_path(&file.path).is_err() {
             return Err(ProviderError::Provider(format!(
                 "content local object path {} is invalid",
                 file.path
             )));
         }
-        let bytes = std::fs::read(dir.join(&file.path))?;
-        files.push(json!({
-            "path": file.path,
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }));
+        files.push((file.path, file.size));
     }
-    files.push(json!({
-        "path": OBJECT_MANIFEST_PATH,
-        "data": base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
-    }));
+    files.push((OBJECT_MANIFEST_PATH.to_string(), manifest_bytes));
     Ok(files)
 }
 
@@ -9162,14 +9220,22 @@ async fn write_materialized_file(base: &Path, rel_path: &str, bytes: &[u8]) -> a
     Ok(())
 }
 
+/// One lock for every ledger append in this process, and one write per line,
+/// so concurrent appends never interleave inside a JSON line.
+static JSONL_APPEND: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn append_jsonl<T: Serialize>(path: &Path, entry: &T) -> Result<(), ProviderError> {
+    let mut line = serde_json::to_vec(entry)
+        .map_err(|err| ProviderError::Provider(format!("content receipt write failed: {err}")))?;
+    line.push(b'\n');
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _append = JSONL_APPEND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut file, entry)
-        .map_err(|err| ProviderError::Provider(format!("content receipt write failed: {err}")))?;
-    file.write_all(b"\n")?;
+    file.write_all(&line)?;
     Ok(())
 }
 
@@ -9297,6 +9363,8 @@ mod tests {
         pinned: Mutex<Vec<String>>,
         pin_error: Mutex<Option<String>>,
         unpinned: Mutex<Vec<String>>,
+        unpin_error: Mutex<Option<String>>,
+        pin_status: Mutex<Option<bool>>,
         bounded_read_not_ready: Mutex<bool>,
     }
 
@@ -9327,12 +9395,19 @@ mod tests {
         async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
             self.requests.lock().await.push(request.clone());
             match request.get("op").and_then(|op| op.as_str()) {
-                Some("add_directory") => {
+                Some(op @ ("add_directory" | "runtime_add_local_object")) => {
                     *self.add_count.lock().await += 1;
+                    let files = if op == "add_directory" {
+                        &request["files"]
+                    } else {
+                        // The blocks are now local, so a later pin succeeds.
+                        *self.pin_error.lock().await = None;
+                        &request["object"]["files"]
+                    };
                     self.added_directories
                         .lock()
                         .await
-                        .push(request["files"].as_array().cloned().unwrap_or_default());
+                        .push(files.as_array().cloned().unwrap_or_default());
                     Ok(provider_ok(json!({ "cid": TEST_CID })))
                 }
                 Some("add_bytes") => {
@@ -9394,6 +9469,9 @@ mod tests {
                     Ok(provider_ok(json!({})))
                 }
                 Some("unpin") => {
+                    if let Some(message) = self.unpin_error.lock().await.clone() {
+                        return Ok(provider_error("unpin_failed", &message));
+                    }
                     let cid = request
                         .get("cid")
                         .and_then(|cid| cid.as_str())
@@ -9402,6 +9480,13 @@ mod tests {
                     self.unpinned.lock().await.push(cid);
                     Ok(provider_ok(json!({})))
                 }
+                Some("pin_status") => match *self.pin_status.lock().await {
+                    Some(pinned) => Ok(provider_ok(json!({ "pinned": pinned }))),
+                    None => Ok(provider_error(
+                        "pin_status_failed",
+                        "mock pin set unreadable",
+                    )),
+                },
                 _ => Ok(provider_error("unsupported", "unsupported mock ipfs op")),
             }
         }
@@ -9478,25 +9563,6 @@ mod tests {
                 "encoding": "base64-chunks",
                 "chunk_size": 65536
             },
-            "range": null,
-            "progress": null
-        })
-    }
-
-    fn carrier_import_object_invocation() -> Value {
-        json!({
-            "schema": "elastos.provider.invocation/v1",
-            "source": "carrier-availability",
-            "target": "content",
-            "op": "import_object",
-            "capability": "provider:carrier-availability->content:import_object",
-            "transport": "carrier-provider-plane",
-            "carrier": {
-                "route": "connect_ticket",
-                "peer_did": "did:key:zRemote",
-                "timeout_ms": 5000
-            },
-            "transfer": "json",
             "range": null,
             "progress": null
         })
@@ -9625,6 +9691,8 @@ mod tests {
             pinned: Mutex::new(Vec::new()),
             pin_error: Mutex::new(None),
             unpinned: Mutex::new(Vec::new()),
+            unpin_error: Mutex::new(None),
+            pin_status: Mutex::new(None),
             bounded_read_not_ready: Mutex::new(false),
         });
         registry
@@ -10079,103 +10147,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_import_exact_rejects_cid_mismatch_and_unpins_import() {
+    async fn content_import_with_a_wrong_expected_cid_leaves_existing_pins_untouched() {
         let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        // The bytes hash to TEST_CID, which this node already pins; the peer
+        // names a different CID.
+        let other_cid = "QmRSEtAyq7Xgr5YCFVWuYsBdqbR5X9fJDsdpNQuvm9yaic";
         let response = content
             .send_raw(&json!({
                 "op": "import_exact",
-                "cid": "QmRSEtAyq7Xgr5YCFVWuYsBdqbR5X9fJDsdpNQuvm9yaic",
+                "cid": other_cid,
                 "stream": test_stream_payload(b"hello content"),
                 "_runtime_invocation": carrier_import_exact_invocation(),
             }))
             .await
             .unwrap();
-
-        assert_eq!(response["status"], "error");
+        assert_eq!(response["status"], "error", "{response}");
         assert_eq!(response["code"], "cid_mismatch");
-        assert_eq!(
-            ipfs.unpinned.lock().await.as_slice(),
-            [TEST_CID.to_string()]
-        );
+        assert!(ipfs.unpinned.lock().await.is_empty(), "no pin is removed");
+        assert!(ipfs.pinned.lock().await.is_empty(), "nothing is pinned");
+        for request in ipfs.requests.lock().await.iter() {
+            if matches!(request["op"].as_str(), Some("add_bytes" | "add_directory")) {
+                assert_eq!(request["pin"], false, "an import adds unpinned first");
+            }
+        }
+    }
+
+    #[test]
+    fn content_ledger_appends_stay_parseable_under_concurrency() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let path = data_dir.path().join("ledger.jsonl");
+        let threads = (0..16)
+            .map(|thread| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for index in 0..64 {
+                        let entry = json!({
+                            "thread": thread,
+                            "index": index,
+                            "padding": "x".repeat(16 * 1024),
+                        });
+                        append_jsonl(&path, &entry).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let ledger = std::fs::read_to_string(&path).unwrap();
+        let lines = ledger.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 16 * 64);
+        for line in lines {
+            serde_json::from_str::<Value>(line).expect("every ledger line is one JSON entry");
+        }
     }
 
     #[tokio::test]
-    async fn content_import_object_requires_runtime_provider_invocation() {
+    async fn content_status_of_an_unknown_cid_is_missing_not_the_dashboard() {
         let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
-        let err = content
-            .send_raw(&json!({
-                "op": "import_object",
-                "cid": TEST_CID,
-                "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
-            }))
+        let status = content
+            .send_raw(&json!({ "op": "status", "cid": TEST_CID }))
             .await
-            .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("requires Runtime provider invocation metadata"));
+            .unwrap();
+        assert_eq!(status["status"], "error", "{status}");
+        assert_eq!(status["code"], "missing");
+        assert!(status.get("data").is_none());
     }
 
     #[tokio::test]
-    async fn content_import_object_reconstructs_manifest_directory() {
+    async fn content_refuses_an_older_peers_replica_object_import() {
         let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let response = content
+        let refused = content
             .send_raw(&json!({
                 "op": "import_object",
                 "cid": TEST_CID,
-                "object_kind": "document",
-                "object_did": "did:key:zObject",
-                "publisher_did": "did:key:zPublisher",
-                "links": [{"rel": "provenance", "cid": TEST_CID}],
                 "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
-                "_runtime_invocation": carrier_import_object_invocation(),
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "import_object",
+                    "transport": "carrier-provider-plane",
+                    "transfer": "json",
+                },
             }))
-            .await
-            .unwrap();
-
-        assert_eq!(response["status"], "ok");
-        assert_eq!(response["data"]["cid"], TEST_CID);
-        assert_eq!(
-            response["data"]["availability"]["policy"],
-            "carrier_object_import"
+            .await;
+        assert!(
+            !matches!(&refused, Ok(response) if response["status"] == "ok"),
+            "{refused:?}"
         );
-        assert_eq!(
-            response["data"]["import"]["schema"],
-            "elastos.content.import-object/v1"
-        );
-        assert_eq!(response["data"]["import"]["files"], 1);
-        assert_eq!(response["data"]["import"]["verified_cid"], true);
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["source"],
-            "carrier_object_import"
-        );
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["files"],
-            1
-        );
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["content_bytes"],
-            7
-        );
-
-        let directories = ipfs.added_directories.lock().await;
-        assert_eq!(directories.len(), 1);
-        let manifest_entry = directories[0]
-            .iter()
-            .find(|entry| entry["path"].as_str() == Some(OBJECT_MANIFEST_PATH))
-            .expect("object manifest should be injected");
-        let manifest_bytes = base64::engine::general_purpose::STANDARD
-            .decode(manifest_entry["data"].as_str().unwrap())
-            .unwrap();
-        let manifest: ContentObjectManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert_eq!(manifest.kind, "document");
-        assert_eq!(manifest.object_did.as_deref(), Some("did:key:zObject"));
-        assert_eq!(
-            manifest.publisher_did.as_deref(),
-            Some("did:key:zPublisher")
-        );
-        assert_eq!(manifest.files.len(), 1);
-        assert_eq!(manifest.links[0].rel, "provenance");
+        assert!(ipfs.added_directories.lock().await.is_empty());
+        assert!(ipfs.pinned.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -10407,6 +10469,94 @@ mod tests {
             1
         );
         assert!(!dashboard.to_string().contains("connect_ticket"));
+    }
+
+    #[tokio::test]
+    async fn content_publish_local_pin_policy_never_calls_availability() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+
+        let response = content
+            .send_raw(&json!({
+                "op": "publish",
+                "kind": "file",
+                "filename": "notes.txt",
+                "data": "aGVsbG8K",
+                "pin": true,
+                "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(
+            response["data"]["receipt"]["payload"]["policy"],
+            LOCAL_PIN_AVAILABILITY_POLICY
+        );
+        assert_eq!(response["data"]["repair_task"]["status"], "local_only");
+        assert!(availability.requests.lock().await.is_empty());
+        assert_eq!(
+            *ipfs.added_files.lock().await,
+            vec!["notes.txt".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn content_repair_and_ensure_with_local_pin_policy_never_call_availability() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+
+        for op in ["repair", "ensure"] {
+            let response = content
+                .send_raw(&json!({
+                    "op": op,
+                    "cid": TEST_CID,
+                    "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["status"], "ok", "{response}");
+            assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        }
+        assert!(availability.requests.lock().await.is_empty());
+        assert_eq!(ipfs.pinned.lock().await.len(), 2);
+
+        // Without the policy, repair still asks availability as before.
+        content
+            .send_raw(&json!({ "op": "repair", "cid": TEST_CID }))
+            .await
+            .unwrap();
+        assert_eq!(availability.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn content_unpublish_completes_when_the_cid_is_verified_no_longer_pinned() {
+        let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let unpublish = json!({ "op": "unpublish", "cid": TEST_CID });
+        *ipfs.unpin_error.lock().await = Some("not pinned or pinned indirectly".to_string());
+
+        // The pin set can't be read: the failure stands, so Unpublish is retried.
+        assert!(content.send_raw(&unpublish).await.is_err());
+        // Still pinned: the failure stands.
+        *ipfs.pin_status.lock().await = Some(true);
+        assert!(content.send_raw(&unpublish).await.is_err());
+        // Verified not pinned (an earlier unpin got through): done.
+        *ipfs.pin_status.lock().await = Some(false);
+        let response = content.send_raw(&unpublish).await.unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(
+            response["data"]["receipt"]["payload"]["status"],
+            "local_unpinned"
+        );
     }
 
     #[tokio::test]
@@ -11764,7 +11914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_restore_imports_complete_local_objects() {
+    async fn content_restore_pins_only_local_objects_with_a_content_receipt() {
         let (data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
         let body = b"hello object";
         let digest = format!("{:x}", sha2::Sha256::digest(body));
@@ -11787,10 +11937,24 @@ mod tests {
         )
         .unwrap();
 
+        // No Content receipt names the imported CID: it is never pinned.
         content.restore_complete_local_objects().await;
-
         assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        assert!(ipfs.pinned.lock().await.is_empty());
+
+        // A recorded replica is pinned again on restore.
+        let ensure = json!({"op": "ensure", "cid": TEST_CID});
+        assert_eq!(content.send_raw(&ensure).await.unwrap()["status"], "ok");
+        ipfs.pinned.lock().await.clear();
+        content.restore_complete_local_objects().await;
         assert_eq!(ipfs.pinned.lock().await.as_slice(), [TEST_CID.to_string()]);
+
+        // Unpublish withdraws the replica; restore does not pin it again.
+        let unpublish = json!({"op": "unpublish", "cid": TEST_CID});
+        assert_eq!(content.send_raw(&unpublish).await.unwrap()["status"], "ok");
+        ipfs.pinned.lock().await.clear();
+        content.restore_complete_local_objects().await;
+        assert!(ipfs.pinned.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -12522,11 +12686,11 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("outcome=\"failed\""), "{output}");
-        assert!(output.contains("stage=\"runtime_stream_open\""), "{output}");
         assert!(!output.contains("stage=\"runtime_stream_validation\""));
         assert!(!output.contains(TEST_CID));
         assert!(!output.contains("private-fixture-marker"));
-        assert_eq!(ipfs.requests.lock().await.len(), 1);
+        // One local-only read and its single not-ready retry, then one holder read.
+        assert_eq!(ipfs.requests.lock().await.len(), 2);
         assert_eq!(availability.requests.lock().await.len(), 1);
     }
 
@@ -12981,6 +13145,20 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("kind 'release'"));
         assert!(err.to_string().contains("not a launchable capsule"));
+    }
+
+    #[tokio::test]
+    async fn content_prepare_capsule_says_a_missing_cid_is_not_on_this_home() {
+        let (_data_dir, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        {
+            let mut missing = ipfs.missing_paths.lock().await;
+            missing.push("capsule.json".to_string());
+            missing.push(OBJECT_MANIFEST_PATH.to_string());
+        }
+        let err = prepare_capsule_from_content_provider(&registry, TEST_CID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), CID_NOT_ON_THIS_HOME);
     }
 
     #[tokio::test]

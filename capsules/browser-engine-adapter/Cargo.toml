@@ -5,6 +5,10 @@ edition = "2021"
 description = "ElastOS Browser Engine Adapter provider capsule"
 license = "MIT"
 
+[features]
+default = []
+test-engine = []
+
 [[bin]]
 name = "browser-engine-adapter"
 path = "src/main.rs"

@@ -55,13 +55,14 @@ async fn gba_viewer_storage_requires_exact_preconditions_and_preserves_the_winne
         .await
         .unwrap();
     assert_eq!(saved.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        saved
-            .headers()
-            .get("access-control-expose-headers")
-            .unwrap(),
-        "ETag"
-    );
+    assert!(saved
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(|header| header.trim().eq_ignore_ascii_case("etag")));
     let revision = saved
         .headers()
         .get("etag")
@@ -97,13 +98,14 @@ async fn gba_viewer_storage_requires_exact_preconditions_and_preserves_the_winne
         .await
         .unwrap();
     assert_eq!(restored.headers().get("etag").unwrap(), revision.as_str());
-    assert_eq!(
-        restored
-            .headers()
-            .get("access-control-expose-headers")
-            .unwrap(),
-        "ETag"
-    );
+    assert!(restored
+        .headers()
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(',')
+        .any(|header| header.trim().eq_ignore_ascii_case("etag")));
     assert_eq!(
         axum::body::to_bytes(restored.into_body(), usize::MAX)
             .await
@@ -375,17 +377,27 @@ async fn old_install_upgrade_encrypts_ucity_save_and_state_before_normal_round_t
     );
     assert!(backup_dir.join("upgrade-receipt.json").is_file());
     assert!(backup_dir.join("root-000/receipt.json").is_file());
-    let plaintext_backups = std::fs::read_dir(backup_dir.join("root-000"))
+    let encrypted_backups = std::fs::read_dir(backup_dir.join("root-000"))
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
                 .file_name()
                 .to_string_lossy()
-                .ends_with(".plaintext.backup")
+                .ends_with(".encrypted.backup")
         })
         .collect::<Vec<_>>();
-    assert_eq!(plaintext_backups.len(), 2);
+    assert_eq!(encrypted_backups.len(), 2);
+    for entry in &encrypted_backups {
+        let bytes = std::fs::read(entry.path()).unwrap();
+        assert!(!bytes
+            .windows(b"old-install uCity".len())
+            .any(|window| window == b"old-install uCity"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["schema"],
+            "elastos.principal-root.object/v1"
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -518,6 +530,22 @@ async fn old_install_upgrade_encrypts_ucity_save_and_state_before_normal_round_t
             .unwrap();
         assert_eq!(&bytes[..], after);
     }
+    // The router journey has passed with changed current content. At the
+    // accepted-Home boundary cleanup retains proof and removes rollback payload.
+    let binary = dir.path().join("elastos");
+    let writer = crate::install_transaction::InstallationGuard::acquire(dir.path()).unwrap();
+    assert_eq!(
+        crate::api::auth_gateway::finalize_configured_principal_root_migrations_with_writer(
+            dir.path(),
+            &binary,
+            &writer,
+        )
+        .unwrap(),
+        2
+    );
+    assert!(encrypted_backups.iter().all(|entry| !entry.path().exists()));
+    assert!(backup_dir.join("upgrade-receipt.json").is_file());
+    assert!(backup_dir.join("root-000/receipt.json").is_file());
 }
 
 #[tokio::test]

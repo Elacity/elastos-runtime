@@ -1695,8 +1695,8 @@ if (display.display_backend !== "selkies_gstreamer_webrtc") throw new Error("wro
 if (display.media_transport !== "runtime_relay") throw new Error("Selkies display must report runtime_relay media transport");
 if (display.offerer !== "engine") throw new Error("Selkies display must be engine-offer");
 if (display.input !== "datachannel" || display.input_protocol !== "selkies_v1") throw new Error("Selkies display must declare datachannel selkies_v1 input");
-if (display.width !== 1920 || display.height !== 1080) throw new Error("Selkies display must expose the fixed stream/input coordinate space");
-if (response.view?.schema !== "elastos.browser.view/v1" || response.view.width !== 1920 || response.view.height !== 1080) throw new Error("Selkies result must expose the fixed product raster as its Browser view");
+if (display.width !== 1920 || display.height !== 1080) throw new Error("Selkies display must expose the configured initial stream/input coordinate space");
+if (response.view?.schema !== "elastos.browser.view/v1" || response.view.width !== 1920 || response.view.height !== 1080) throw new Error("Selkies result must expose the configured initial raster as its Browser view");
 if (display.initial_offer?.schema !== "elastos.browser.webrtc-offer/v1") throw new Error("missing initial offer");
 if (!display.initial_offer.sdp.includes("m=video")) throw new Error("initial offer must include video");
 if (display.audio_offer?.schema !== "elastos.browser.webrtc-offer/v1" || !display.audio_offer.sdp.includes("m=audio")) throw new Error("audio offer must include audio");
@@ -1798,8 +1798,8 @@ if (seen.get("/api/apps/browser/wallet/broadcast-transaction").body?.request_id 
 ' "$tmp_dir/fake-runtime-proxy-requests.jsonl" "$tmp_dir/fake-cdp-ready.json.wallet-pre-grant-denied"
 "$node_bin" -e '
 const viewport = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-if (viewport.width !== 1920 || viewport.height !== 1080) throw new Error("initial CDP page raster must fill the fixed 1080p compositor");
-if (viewport.screenWidth !== 1920 || viewport.screenHeight !== 1080) throw new Error("initial CDP screen must match the fixed 1080p compositor");
+if (viewport.width !== 1920 || viewport.height !== 1080) throw new Error("initial CDP page raster must fill the configured initial compositor");
+if (viewport.screenWidth !== 1920 || viewport.screenHeight !== 1080) throw new Error("initial CDP screen must match the configured initial compositor");
 if (viewport.deviceScaleFactor !== 1) throw new Error("initial CDP page raster must use DPR 1");
 ' "$tmp_dir/fake-cdp-ready.json.viewport"
 
@@ -2085,16 +2085,15 @@ curl --silent --show-error \
 {
   "event": {
     "type": "resize",
-    "viewport": {
-      "width": 1000,
-      "height": 700
-    }
+    "width": 319,
+    "height": 700,
+    "sequence": 1
   }
 }
 JSON
 )"
-if [[ "$resize_status" != "400" ]] || ! grep -q "guest raster is fixed at 1920x1080" "$resize_response"; then
-  echo "dynamic guest viewport resize must be retired, status=$resize_status" >&2
+if [[ "$resize_status" != "400" ]] || ! grep -q "Invalid Browser geometry" "$resize_response"; then
+  echo "out-of-bounds guest viewport resize must be refused, status=$resize_status" >&2
   cat "$resize_response" >&2 || true
   exit 1
 fi

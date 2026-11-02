@@ -14,9 +14,8 @@ from pathlib import Path
 import tempfile
 
 
-# gstwebrtc_app.py from installed image 76967c5b, which already has the
-# audio-queue diagnostic.
-BASE_SHA256 = "d1813fc03015077d0c96e697123c53115220d870d44616431594bbc77fda9168"
+# Prepared vendored gstwebrtc_app.py with the audio-queue diagnostic applied.
+BASE_SHA256 = "8dfe87c499cc890e03f7c963cbff8fa65bd6ed0e1d9f425e94fcd459d6f38689"
 MARKER = "# ElastOS bounded webrtc send diagnostic v1"
 OBSERVER = r'''
 # ElastOS bounded webrtc send diagnostic v1

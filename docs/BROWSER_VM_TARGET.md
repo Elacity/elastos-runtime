@@ -125,7 +125,7 @@ scripts/build/stage-browser-vm-target.sh \
   --control-service /path/to/browser-selkies-control-service.mjs \
   --node-bin /path/to/node \
   --chromium-bin /path/to/chromium \
-  --target-platform linux-amd64
+  --target-platform linux-arm64
 ```
 
 The staging script intentionally does not install Chromium or claim a bootable
@@ -163,8 +163,8 @@ scripts/build/build-browser-vm-rootfs.sh \
   --target-platform linux-arm64
 ```
 
-This script builds the Linux guest binaries for the requested architecture,
-assembles a Debian Browser filesystem with arm64/amd64 Chromium, Node, Xvfb,
+This script builds the locked Linux ARM64 guest binaries and assembles a Debian
+Browser filesystem with ARM64 Chromium, Node, Xvfb,
 Python, GStreamer, PipeWire, WirePlumber, and Selkies through `debootstrap`,
 overlays the ElastOS Browser VM contract, preserves Chromium launcher arguments,
 patches the Selkies caps/relay policy needed by the Runtime-owned WebRTC path,
@@ -388,10 +388,141 @@ The control-service readiness cache watches those same files.
 
 ## Source-Home Install Truth
 
-`components.json` currently owns the packaged provider binaries such as
-`browser-engine-adapter`, `browser-engine-supervisor`, `browser-stream-bridge`,
-and `browser-local-exit`. It does not currently own the source-home Browser VM
-helper script wrappers or VM guest artifacts.
+### Linux host network setup
+
+The Home user runs Runtime, crosvm and Browser launch/cleanup as ordinary
+processes. Root owns a pool of four persistent TAP devices for that Linux
+account. Each slot has a private `/30`, a relay listener on TCP `19091`, and
+local TURN on TCP/UDP `41000` with relay ports `49152:49215`. Session ICE
+configuration uses `turn:{host_ip}:{turn_port}` with a username and credential.
+The launcher refuses a different local media port or relay range.
+
+After staging and reviewing the helpers, install the setup helper in its
+root-owned location. Run these commands in a root shell. Replace
+`<reviewed-checkout>` and `<home-user>` with the reviewed source directory and
+the ordinary Linux Home account:
+
+```sh
+install -D -o root -g root -m 755 <reviewed-checkout>/scripts/browser-vm-linux-network.py /usr/local/lib/elastos/browser-vm-linux-network.py
+python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user <home-user>
+```
+
+The script lists the devices, addresses and policy, then asks for `y` before
+it changes the host. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
+tools (`setfacl`, `getfacl`), systemd and udev, plus `/dev/kvm` and `/dev/net/tun`.
+It creates TAPs owned by the numeric UID, adds their host addresses and
+confinement rules, grants that user read/write KVM access through a named ACL,
+and installs a KVM udev rule. An existing named KVM ACL is saved for removal.
+This gives `elastos-agent` KVM access without changing its groups.
+
+Root stores ACL state in `/var/lib/elastos-browser/<uid>.json`, copies the
+setup helper to `/usr/local/lib/elastos/browser-vm-linux-network.py`, and
+enables `elastos-browser-network-<uid>.service`. This oneshot service restores
+the devices and rules after each boot, following host firewall services. The
+unit shares stop/restart and reload events with `nftables`, `firewalld`, `ufw`
+and `netfilter-persistent`. Before stopping or repairing the network, it
+removes the receipt and brings every TAP down, including active guests. A
+failed repair leaves the TAPs down and Browser unavailable. Active session
+locks can hold repair until the user closes those sessions.
+It writes a root-owned, boot-bound receipt under `/run/elastos-browser` only
+after all changes succeed. The Runtime does read-only checks of that receipt,
+its policy, active unit state, TAP identity/owner/persistence/address, and
+device access on each readiness request and launch. Root owns firewall state:
+direct rule edits or flush commands outside these service events require the
+operator to close Browser sessions and rerun setup. An ordinary process cannot
+inspect the privileged rule set. Repair messages name the root-owned helper;
+if that copy is absent or unsafe, they first require a reviewed installation.
+
+The launcher leases a slot with an ordinary file lock. It releases that lock
+after the VM and media children stop. A TAP with an active carrier remains
+busy if its VM outlives the launcher. A fifth concurrent session reports that
+the user must close a session. Close all sessions before setup or removal.
+Setup refuses a subnet that overlaps an existing host route.
+
+The filter policy for each TAP is:
+
+| Traffic | Host action |
+| --- | --- |
+| Guest to its host, established/related | Accept |
+| Guest to its host, TCP `19091` | Accept for Runtime Exit relay |
+| Guest to its host, TCP/UDP `41000`, `49152:49215` | Accept for session-local TURN |
+| Other input from that TAP | Drop |
+| Forwarded IPv4/IPv6 from that TAP | Drop |
+| IPv6 input from that TAP | Drop; interface IPv6 is also disabled |
+| Host output from slot IP, UDP source `49152:49215` | Accept only to the slot IP on UDP `49152:49215` or `41000`; drop all else |
+
+Root inserts per-TAP input chains and forwarding drops ahead of existing host
+filter rules. Runtime keeps its Unix relay and session-local TURN processes;
+launch creates the VM, bridges, media process, sockets and disposable rootfs.
+Guest control stays on TCP `19092` reached from the host. Guest DHCP, host
+forwarding, NAT and host default-route changes are unnecessary.
+Session TURN relays only to its own relay address (the slot host IP), where the
+guest and viewer allocations meet; loopback, private ranges and every other
+peer are denied, and TCP relays are off. coturn checks peer IPs only, so the
+relay output rule above confines relayed UDP to the TURN ports; host services
+on the slot IP stay unreachable. `check` refuses a receipt without that rule.
+`elastos setup` writes the Home's TURN credential to the
+owner-only `$DATA_DIR/runtime-turn/turn-credentials.env` and keeps an
+existing one.
+
+For removal, use the same root shell and helper:
+
+```sh
+python3 /usr/local/lib/elastos/browser-vm-linux-network.py remove --user <home-user>
+```
+
+After confirmation, removal deletes this account's TAPs, filter hooks/chains,
+boot service, udev rule, locks and receipts. It restores the prior named KVM
+ACL, or removes the grant created by setup. The shared root helper is removed
+when the last account's setup is removed. Other host firewall rules stay with
+their owner. `install.sh` integration is a separate change; the installer can
+call the exact setup command above as its approved root step.
+
+### Linux operator proof
+
+Run this proof on both a suitable Linux ARM64 host and the Jetson. Stage the
+candidate launcher, network helper, control service and preflight helper at
+their stable installed paths; record their source tree and SHA-256 parity.
+Use an isolated test Home on an unused port such as `18091`.
+
+1. Run the confirmed setup command as root. As the Home user, run
+   `python3 <data-dir>/scripts/browser-vm-linux-network.py check`. Save the
+   returned slot addresses. After reboot, repeat the check to prove restoration.
+   Restart and reload each installed firewall service. Prove restoration when
+   sessions are closed; with an active session, prove that failed repair keeps
+   the TAPs down and readiness unavailable. Close the session and rerun setup.
+2. Start the test Runtime as that user with a PATH directory containing only
+   the needed ordinary tools (including `node`, `python3`, `ip`, `cp`, `ss`
+   and `turnserver`) and its installed `bin` directory. Record
+   `command -v sudo` returning failure. Trace the Runtime and children with
+   `strace -f -e execve -o <proof-dir>/exec.log` and confirm that the log has
+   zero privilege-escalation commands. Scan the installed runtime/helper files
+   with `find <data-dir>/bin <data-dir>/scripts -type f -perm /6000 -print`
+   and `getcap -r <data-dir>/bin <data-dir>/scripts`; both scans should be empty.
+3. Sign in and open Browser with explicit Browser Engine and Exit selection.
+   Prove page load through Runtime Exit, audio/video, input, reconnect and
+   frame continuity. Open concurrent sessions and prove distinct slots and
+   the four-slot refusal. Capture desktop/phone media and manual UX evidence
+   for `scripts/browser-objective-audit.mjs`.
+4. From the guest, prove TCP `19091` and the configured TURN ports work.
+   Prove other host ports, other host addresses, LAN/internet forwarding and
+   IPv6 fail. Save root `iptables -S`/`ip6tables -S` output and packet evidence.
+5. Close Browser, then stop the test Runtime. Prove its VM, TURN process,
+   listeners and control sockets are gone; all TAP carriers should be `0`.
+   Reopen a session to prove slot reuse, then close it. Run confirmed removal
+   as root and prove the TAPs, per-account rules, service and udev rule are
+   gone and the prior KVM ACL is restored. Run `check` again as the Home user:
+   it should refuse with the single root setup command.
+
+These target steps prove installed behavior. Root-free source tests establish
+command construction and refusal, and leave target media acceptance to this
+operator journey.
+
+`components.json` owns the signed provider binaries, including
+`browser-engine-adapter` and `browser-local-exit`, the VM host helper closure,
+managed dependencies and shared ARM64 guest image. Normal Runtime setup admits
+that closure before launch. The host-native supervisor and stream bridge remain
+test tools; the guest retains its network wrapper through the image recipe.
 
 Full source-home setup installs the Runtime at the stable platform data-root
 path `bin/elastos` and writes
@@ -517,6 +648,10 @@ use their fixed vsock-to-Runtime bridges. VZ NAT, a media NIC, a default guest
 route, legacy ICE boot configuration, and VZ hibernation are not available.
 Missing, stale, disabled, partial, or mixed legacy/VZ configuration fails before
 VM dispatch.
+The VZ TURN server relays only to its relay host, with TCP relays off, and
+allows loopback peers only when that host is loopback. The media bridge then
+refuses any guest TURN peer outside the session relay port range by closing
+the stream.
 
 Source-home config also loads Runtime-owned TURN credentials from
 `$HOME/runtime-turn/turn-credentials.env` or

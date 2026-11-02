@@ -2,20 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createLibraryActions } from "./actions.js";
-import { decimalIntegerToHexQuantity } from "./model.js";
+import { decimalIntegerToHexQuantity, isSharingBroken } from "./model.js";
 
 function makeActions(overrides = {}) {
   return createLibraryActions({
     clearSelection() {},
     closeSelf() {},
     confirmDestructive: async () => true,
+    confirmPublish: async () => true,
     currentFolderReadOnly: () => false,
     deliverToTarget: () => false,
     downloadObjectRaw: async () => ({ blob: new Blob([]), filename: "item.bin" }),
     loadCurrentFolder: async () => {},
     loadRoots: async () => {},
     navigate: async () => {},
-    openPublishedUri() {},
+    offerDownload: async () => false,
     openTarget: () => false,
     previewObject: async () => {},
     providerApi: {},
@@ -27,8 +28,7 @@ function makeActions(overrides = {}) {
     showObjectStatus() {},
     showProtectAndListDialog: async () => false,
     showProperties() {},
-    showShareDialog() {},
-    showShareReceipt() {},
+    showPublishedLink() {},
     showSharedAccessReceipt() {},
     startCreateObject() {},
     state: {},
@@ -61,8 +61,8 @@ test("Library routes identifiers and resource URIs through distinct closed write
     "resource.identifier",
   );
   await actions.copyText(
-    "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-    "published link",
+    "localhost://Users/smoke/Documents/Guide.md",
+    "object URI",
     "resource.uri",
   );
 
@@ -70,11 +70,11 @@ test("Library routes identifiers and resource URIs through distinct closed write
     "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
   ]);
   assert.deepEqual(uris, [
-    "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+    "localhost://Users/smoke/Documents/Guide.md",
   ]);
   assert.deepEqual(statuses, [
     "Copied content CID.",
-    "Copied published link.",
+    "Copied object URI.",
   ]);
   await assert.rejects(
     actions.copyText("arbitrary text", "value", "browser.text"),
@@ -223,7 +223,7 @@ test("Library protect and list sends the exact runtime custody publish shape", a
     revision: "rev:movie",
     name: "movie.mp4",
     mime: "video/mp4",
-    capabilities: ["publish"],
+    capabilities: ["publish", "protect"],
   });
 
   assert.deepEqual(requests, [
@@ -247,30 +247,91 @@ test("Library protect and list sends the exact runtime custody publish shape", a
   assert.deepEqual(reloads, ["reload"]);
 });
 
-test("Library plain publish stays unchanged", async () => {
-  const requests = [];
+test("Library opens a published file from its local copy", async () => {
+  const launches = [];
   const actions = makeActions({
-    async providerApi(op, payload) {
-      requests.push({ op, payload });
-      return {};
+    openTarget(target, query) {
+      launches.push({ target, query });
+      return true;
     },
   });
 
-  await actions.publishObject({
+  await actions.openObject({
     uri: "localhost://Users/test/Documents/guide.md",
-    revision: "rev:guide",
     name: "guide.md",
+    mime: "text/markdown",
+    published: true,
+    published_cid: "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+    viewers: [{ id: "documents", label: "Documents" }],
   });
 
-  assert.deepEqual(requests, [
+  assert.deepEqual(launches, [
     {
-      op: "publish",
-      payload: {
+      target: "documents",
+      query: {
+        objectUri: "localhost://Users/test/Documents/guide.md",
         uri: "localhost://Users/test/Documents/guide.md",
-        if_revision: "rev:guide",
+        name: "guide.md",
+        mime: "text/markdown",
       },
     },
   ]);
+});
+
+test("Library offers a PDF with no viewer as a download, never as a preview or Documents", async () => {
+  const offers = [];
+  const previews = [];
+  const launches = [];
+  const downloads = [];
+  const statuses = [];
+  const clicks = [];
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    body: { appendChild() {} },
+    createElement: () => ({ click() { clicks.push(this.download); }, remove() {} }),
+  };
+  try {
+    const pdf = {
+      uri: "localhost://Users/test/Documents/letter.pdf",
+      name: "letter.pdf",
+      mime: "application/pdf",
+      capabilities: ["open", "read", "download"],
+    };
+    for (const accept of [false, true]) {
+      const actions = makeActions({
+        async downloadObjectRaw(payload) {
+          downloads.push(payload.uri);
+          return { blob: new Blob(["%PDF-1.4"]), filename: "letter.pdf" };
+        },
+        async offerDownload(object) {
+          offers.push(object.uri);
+          return accept;
+        },
+        openTarget(target) {
+          launches.push(target);
+          return true;
+        },
+        async previewObject(object) {
+          previews.push(object.uri);
+        },
+        setStatus(status) {
+          statuses.push(status);
+        },
+      });
+      await actions.openObject(pdf);
+    }
+  } finally {
+    globalThis.document = previousDocument;
+  }
+  assert.deepEqual(offers, [
+    "localhost://Users/test/Documents/letter.pdf",
+    "localhost://Users/test/Documents/letter.pdf",
+  ]);
+  assert.deepEqual(previews, []);
+  assert.deepEqual(launches, []);
+  assert.deepEqual(downloads, ["localhost://Users/test/Documents/letter.pdf"]);
+  assert.deepEqual(clicks, ["letter.pdf"]);
+  assert.deepEqual(statuses, ["Downloaded letter.pdf."]);
 });
 
 test("Library protect and list ignores ineligible objects", async () => {
@@ -346,6 +407,13 @@ test("Library protect and list ignores ineligible objects", async () => {
       name: "missing-capability.mp4",
       mime: "video/mp4",
     },
+    {
+      uri: "localhost://Users/test/Documents/protection-not-released.mp4",
+      kind: "file",
+      name: "protection-not-released.mp4",
+      mime: "video/mp4",
+      capabilities: ["publish"],
+    },
   ];
 
   for (const object of cases) {
@@ -387,7 +455,7 @@ test("Library renders pending, denied, unavailable, and failed protection states
       revision: "rev:movie",
       name: "movie.mp4",
       mime: "video/mp4",
-      capabilities: ["publish"],
+      capabilities: ["publish", "protect"],
     });
 
     assert.equal(statuses.at(-1), expected);
@@ -425,7 +493,7 @@ test("Library coalesces repeated protect and list clicks for one object", async 
     revision: "rev:movie",
     name: "movie.mp4",
     mime: "video/mp4",
-    capabilities: ["publish"],
+    capabilities: ["publish", "protect"],
   };
 
   const first = actions.protectAndListObject(object);
@@ -442,4 +510,259 @@ test("Library coalesces repeated protect and list clicks for one object", async 
   assert.equal(requests.length, 1);
   assert.deepEqual(reloads, ["reload"]);
   assert.equal(statuses.at(-1), "Protected and listed movie.mp4.");
+});
+
+const DOCS = "localhost://Users/test/Documents";
+
+function file(name, extra = {}) {
+  return {
+    uri: `${DOCS}/${name}`,
+    name,
+    kind: "file",
+    revision: `rev:${name}`,
+    capabilities: ["publish", "unpublish", "download"],
+    ...extra,
+  };
+}
+
+function publishHarness({ confirm = true, failures = {}, clipboardFails = false, selection = [] } = {}) {
+  const requests = [];
+  const statuses = [];
+  const confirmations = [];
+  const linkDialogs = [];
+  const clipboard = [];
+  const actions = makeActions({
+    async confirmPublish(request) {
+      confirmations.push(request);
+      return confirm;
+    },
+    async providerApi(op, payload) {
+      requests.push({ op, payload });
+      const failure = failures[payload.uri];
+      if (failure) {
+        const { code, reason } = typeof failure === "string" ? { code: failure } : failure;
+        throw Object.assign(new Error(`provider said ${code}`), { code, reason });
+      }
+      return { uri: "elastos://bafkreipublished" };
+    },
+    // A folder reload writes its own status, as Library's does.
+    async loadCurrentFolder() {
+      statuses.push("3 items");
+    },
+    selectedObjects: () => selection,
+    setStatus(status) {
+      statuses.push(status);
+    },
+    showPublishedLink(request) {
+      linkDialogs.push(request);
+    },
+    async writeResourceUri(value) {
+      if (clipboardFails) throw new Error("Clipboard write was denied.");
+      clipboard.push(value);
+    },
+  });
+  return { actions, clipboard, confirmations, linkDialogs, requests, statuses };
+}
+
+test("Library Publish asks once and sends nothing when cancelled", async () => {
+  const one = publishHarness({ confirm: false });
+  await one.actions.publishObject(file("Guide.md"));
+  assert.equal(one.confirmations.length, 1);
+  assert.deepEqual(one.confirmations[0].files.map((object) => object.name), ["Guide.md"]);
+  assert.deepEqual(one.requests, []);
+
+  const many = publishHarness({ confirm: false, selection: [file("A.md"), file("B.md")] });
+  await many.actions.publishSelectedObjects();
+  assert.equal(many.confirmations.length, 1);
+  assert.deepEqual(many.requests, []);
+});
+
+test("Library Publish sends the plain publish shape after one confirmation", async () => {
+  const harness = publishHarness();
+  await harness.actions.publishObject(file("Guide.md"));
+  assert.deepEqual(harness.requests, [
+    { op: "publish", payload: { uri: `${DOCS}/Guide.md`, if_revision: "rev:Guide.md" } },
+  ]);
+  assert.equal(harness.statuses.at(-1), "Shared Guide.md with your contacts.");
+});
+
+test("Library Publish Selected lists eligible files and leaves folders and published files out", async () => {
+  const folder = { uri: `${DOCS}/Projects`, name: "Projects", kind: "directory", capabilities: ["publish"] };
+  const published = file("Shared.md", { published: true, published_cid: "bafkreishared" });
+  const harness = publishHarness({ selection: [file("A.md"), folder, published, file("B.md")] });
+  await harness.actions.publishSelectedObjects();
+  assert.equal(harness.confirmations.length, 1);
+  assert.deepEqual(harness.confirmations[0].files.map((object) => object.name), ["A.md", "B.md"]);
+  assert.deepEqual(harness.confirmations[0].excluded.map((object) => object.name), ["Projects", "Shared.md"]);
+  assert.deepEqual(harness.requests.map(({ payload }) => payload.uri), [`${DOCS}/A.md`, `${DOCS}/B.md`]);
+  assert.equal(harness.statuses.at(-1), "Shared 2 files with your contacts.");
+});
+
+test("Library Publish Selected with only folders asks nothing and says why", async () => {
+  const folder = { uri: `${DOCS}/Projects`, name: "Projects", kind: "directory" };
+  const harness = publishHarness({ selection: [folder] });
+  await harness.actions.publishSelectedObjects();
+  assert.deepEqual(harness.confirmations, []);
+  assert.deepEqual(harness.requests, []);
+  assert.equal(harness.statuses.at(-1), "Select files to share. Folders can't be shared.");
+});
+
+test("Library Publish Selected reports partial success in plain words", async () => {
+  const harness = publishHarness({
+    selection: [file("A.md"), file("Empty.md"), file("C.md")],
+    failures: { [`${DOCS}/Empty.md`]: "empty_file" },
+  });
+  await harness.actions.publishSelectedObjects();
+  assert.equal(harness.requests.length, 3);
+  assert.equal(harness.statuses.at(-1), "Shared 2 of 3 files. Empty.md: Empty files can't be shared.",
+    "the result must stay visible after the folder reloads");
+
+  const two = publishHarness({
+    selection: [file("A.md"), file("Big.bin"), file("Old.md")],
+    failures: { [`${DOCS}/Big.bin`]: "too_large", [`${DOCS}/Old.md`]: "stale_revision" },
+  });
+  await two.actions.publishSelectedObjects();
+  assert.equal(
+    two.statuses.at(-1),
+    "Shared 1 of 3 files. Big.bin: This file is too large to share. Files up to 8 MiB can be shared. Old.md: This file changed. Refresh Library and try again.",
+  );
+});
+
+test("Library Publish maps each error code to plain words", async () => {
+  const expected = {
+    empty_file: "Empty files can't be shared.",
+    too_large: "This file is too large to share. Files up to 8 MiB can be shared.",
+    stale_revision: "This file changed. Refresh Library and try again.",
+    unsupported: "This file can't be shared from here.",
+    unavailable: "Sharing isn't available right now. Try again.",
+    changed_since_publish: "This file changed after you shared it. Stop sharing it first, then share it again.",
+    library_error: "Guide.md could not be shared. Try again.",
+  };
+  for (const [code, text] of Object.entries(expected)) {
+    const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: code } });
+    await harness.actions.publishObject(file("Guide.md"));
+    assert.equal(harness.statuses.at(-1), text, code);
+  }
+  for (const [reason, text] of [
+    ["folder", "Folders can't be shared."],
+    ["protected", "Protected files can't be shared."],
+    ["symlink", "This file can't be shared from here."],
+  ]) {
+    const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: { code: "unsupported", reason } } });
+    await harness.actions.publishObject(file("Guide.md"));
+    assert.equal(harness.statuses.at(-1), text, reason);
+  }
+  const ok = publishHarness();
+  await ok.actions.publishObject(file("Guide.md"));
+  assert.equal(ok.statuses.at(-1), "Shared Guide.md with your contacts.", "success must stay visible after the folder reloads");
+});
+
+test("Library Copy Link copies the recorded publication, never the current file CID", async () => {
+  const harness = publishHarness();
+  await harness.actions.copyPublishedLink(file("Guide.md", {
+    published: true,
+    published_cid: "bafkreirecorded",
+    content_cid: "bafkreicurrentbytes",
+  }));
+  assert.deepEqual(harness.clipboard, ["elastos://bafkreirecorded"]);
+  assert.deepEqual(harness.linkDialogs, []);
+  assert.equal(harness.statuses.at(-1), "Copied the link to Guide.md.");
+});
+
+test("Library Copy Link shows the link as selectable text when the clipboard fails", async () => {
+  const harness = publishHarness({ clipboardFails: true });
+  await harness.actions.copyPublishedLink(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
+  assert.deepEqual(harness.linkDialogs, [{ name: "Guide.md", link: "elastos://bafkreirecorded" }]);
+  assert.equal(harness.statuses.at(-1), "Copying didn't work. Select the link to copy it.");
+});
+
+test("Library gives Chat the file's address and revision, and Browser the file's bytes", async () => {
+  const deliveries = [];
+  const downloads = [];
+  const harness = (returnTarget) => makeActions({
+    closeSelf() {},
+    async deliverToTarget(target, payload) {
+      deliveries.push({ target, payload });
+      return true;
+    },
+    async downloadObjectRaw({ uri }) {
+      downloads.push(uri);
+      return { blob: new Blob(["hello"], { type: "text/plain" }), filename: "Note.txt" };
+    },
+    state: { mode: "attach", returnTarget },
+  });
+  const note = file("Note.txt", { mime: "text/plain", size: 5 });
+  await harness("chat-room").attachObject(note);
+  const chat = deliveries.at(-1);
+  assert.equal(chat.target, "chat-room");
+  assert.equal(chat.payload.type, "chat-room:attach-library-item");
+  assert.equal(chat.payload.objectUri, `${DOCS}/Note.txt`);
+  assert.equal(chat.payload.revision, "rev:Note.txt");
+  assert.equal(chat.payload.fileName, "Note.txt");
+  assert.equal(chat.payload.sizeBytes, 5);
+
+  const big = file("Big.bin", { size: 8 * 1024 * 1024 + 1 });
+  await harness("chat-room").attachObject(big);
+  assert.deepEqual(downloads, [`${DOCS}/Note.txt`], "Library must not read a file over Chat's limit");
+  assert.equal(deliveries.at(-1).payload.blob, undefined);
+  assert.equal(deliveries.at(-1).payload.sizeBytes, 8 * 1024 * 1024 + 1);
+
+  await harness("browser").attachObject(note);
+  const browser = deliveries.at(-1);
+  assert.equal(browser.payload.type, "browser:file-picker-selection");
+  assert.equal(await browser.payload.blob.text(), "hello");
+  assert.equal(browser.payload.revision, undefined);
+});
+
+test("Library treats only a failed last repair as broken sharing", () => {
+  const shared = (availability) => file("Guide.md", { published: true, published_cid: "bafkreirecorded", availability });
+  assert.equal(isSharingBroken(shared("local_pinned")), false);
+  assert.equal(isSharingBroken(shared("unknown")), false);
+  assert.equal(isSharingBroken(shared("repair_needed")), true);
+  assert.equal(isSharingBroken(shared({ status: "repair_needed" })), true);
+  assert.equal(isSharingBroken(file("Guide.md", { availability: "repair_needed" })), false);
+});
+
+test("Library Share again runs the repair and says whether the file is shared again", async () => {
+  for (const [repairStatus, expected] of [
+    ["local_pinned", "Guide.md is shared again."],
+    ["repair_needed", "Guide.md couldn't be shared again. Try again later."],
+  ]) {
+    const ops = [];
+    const statuses = [];
+    const actions = makeActions({
+      async providerApi(op) {
+        ops.push(op);
+        return { availability: { status: repairStatus } };
+      },
+      setStatus(status) {
+        statuses.push(status);
+      },
+    });
+    await actions.shareAgain(file("Guide.md", { published: true, published_cid: "bafkreirecorded", availability: "repair_needed" }));
+    assert.deepEqual(ops, ["repair"], repairStatus);
+    assert.equal(statuses.at(-1), expected, repairStatus);
+  }
+});
+
+test("Library reads a shared file with this Home's token", async () => {
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  const originalUrl = globalThis.URL;
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return new Response("hello");
+  };
+  globalThis.document = { createElement: () => ({ click() {}, remove() {} }), body: { appendChild() {} } };
+  globalThis.URL = Object.assign(class extends originalUrl {}, { createObjectURL: () => "blob:x", revokeObjectURL() {} });
+  try {
+    await makeActions({ state: { homeToken: "home-token" } }).downloadSharedFile("bafkreishared", "notes.txt");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+    globalThis.URL = originalUrl;
+  }
+  assert.equal(requests[0].url, "/content/bafkreishared");
+  assert.equal(requests[0].init.headers["x-elastos-home-token"], "home-token");
 });

@@ -243,7 +243,7 @@ preserved; an older implementation is not evidence that it fits current contract
 Branch assumptions: `origin/main@8ac18bec` contains the released `v0.7.0`
 source. `origin/upstream/0.7.1-dev@c511b133` is the active integration line.
 PR52 (`4d688cc5`) and PR54 (`2a49ea57`) are active review branches. Use
-[state.md](../../state.md) and fetched refs for exact checkpoints. Published source,
+[state.md](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md) and fetched refs for exact checkpoints. Published source,
 installed behavior and public-live behavior require separate evidence.
 
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
@@ -252,7 +252,7 @@ installed behavior and public-live behavior require separate evidence.
 - [ ] Do not reopen the accepted released-line reconciliation except for a newly
   proven defect with a named owner and verification command. ESP,
   Wallet, Recovery, Home authority, GBA, and the bounded Browser continuation
-  are reconciled in [state.md](../../state.md). The reviewed shell/UIUX is included;
+  are reconciled in [state.md](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md). The reviewed shell/UIUX is included;
   broader Carrier reconciliation and advanced Assistant workflows remain
   deferred. Before claiming
   completeness, run `git diff --check`, the Home and Browser entropy checks,
@@ -561,9 +561,9 @@ installed behavior and public-live behavior require separate evidence.
 
 ### Trusted content and access rights
 
-Current protected-content source status lives in [state.md](../../state.md).
+Current protected-content source status lives in [state.md](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/state.md).
 The contract is in [Protected content](../PROTECTED_CONTENT.md).
-The J5 and C6 rows in the [current execution queue](../../TASKS.md#now) own the acceptance
+The J5 and C6 rows in the [current execution queue](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/TASKS.md#now) own the acceptance
 sequence, with the detailed criteria in sections 8 and 9 of the approved plan.
 External cryptographic review remains open before public dKMS or production
 confidentiality claims.

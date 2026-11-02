@@ -10,6 +10,7 @@ function declaration(name) {
 }
 function fixture() {
   const calls = [], state = vm.createContext({ supported: true, peerConnection: {}, audioPeerConnection: null, viewerOwnerActive: () => true,
+    AbortController, connectAbortSignal: null, WEBRTC_SIGNAL_TIMEOUT_MS: 15000, window: { setTimeout, clearTimeout },
     supportsDisplayGeneration: () => state.supported,
     malformedDisplayResponse: message => new Error(message), signalingFailure: message => new Error(message),
     fetchJson: async (url, options) => { calls.push({ url, body: options.body }); return { accepted: true, display_generation: options.body.display_generation }; },
@@ -100,7 +101,7 @@ function controllerFixture({ audio = true, offerer = 'engine' } = {}) {
   }
   let timerId = 0;
   const remoteVideo = new Media();
-  const context = vm.createContext({ Audio: Media, MediaStream: Stream, RTCPeerConnection: Peer, Blob,
+  const context = vm.createContext({ Audio: Media, MediaStream: Stream, RTCPeerConnection: Peer, Blob, AbortController,
     console: { info() {} },
     window: { setTimeout(callback, delay) { timers.set(++timerId, { callback, delay }); return timerId; },
       clearTimeout(id) { timers.delete(id); } },
@@ -116,7 +117,7 @@ function controllerFixture({ audio = true, offerer = 'engine' } = {}) {
     ? { schema: 'elastos.browser.webrtc-answer/v1', type: 'answer', sdp: 'v=0\r\ns=remote\r\n', display_generation: body.display_generation }
     : { schema: 'elastos.browser.webrtc-signal-ack/v1', type: body.type, accepted: true, display_generation: body.display_generation, candidates: [] };
   const controller = context.createBrowserRemoteDisplay({ debugMetrics: false,
-    fetchJson: async (url, options) => { calls.push({ url, body: options.body }); return state.fetch ? state.fetch(options.body, ack) : ack(options.body); },
+    fetchJson: async (url, options) => { calls.push({ url, body: options.body }); return state.fetch ? state.fetch(options.body, ack, options) : ack(options.body); },
     friendlyOpenError: error => error.message, getCurrentDisplayMode: () => 'webrtc_remote_display',
     getLastPageStatus: () => ({}), supportsDisplayGeneration: () => state.supported,
     captureViewerOwnerGuard: () => { const owner = state.owner; return () => state.active && state.owner === owner; },
@@ -341,4 +342,31 @@ test('viewer activity guard is captured for the owner at connect', async () => {
   f.state.active = false; const peers = f.peers.length;
   await f.controller.connect(f.display('b'), {});
   assert.equal(f.peers.length, peers);
+});
+
+const hungSignal = (_body, _ack, options) => new Promise((_, reject) => {
+  options.signal.addEventListener('abort', () => reject(new Error('Browser connection interrupted.')), { once: true });
+});
+
+test('hung display signaling requests (video and audio answers) end at their deadlines', async () => {
+  const f = controllerFixture(); f.state.fetch = hungSignal;
+  const connecting = f.controller.connect(f.display('a'), {});
+  for (let turn = 0; turn < 4; turn += 1) await flush();
+  const deadlines = [...f.timers].filter(([, timer]) => timer.delay === 15000);
+  assert.equal(deadlines.length, f.calls.length, 'every signaling request has a deadline');
+  for (const [id, timer] of deadlines) { f.timers.delete(id); timer.callback(); }
+  await assert.rejects(connecting, /interrupted/);
+});
+
+test('the caller signal aborts a hung connect; an aborted signal never dispatches', async () => {
+  const f = controllerFixture(); f.state.fetch = hungSignal;
+  const close = new AbortController();
+  const connecting = f.controller.connect(f.display('a'), {}, { signal: close.signal });
+  for (let turn = 0; turn < 4; turn += 1) await flush();
+  const sent = f.calls.length;
+  assert.ok(sent >= 1);
+  close.abort();
+  await assert.rejects(connecting, /interrupted/);
+  await assert.rejects(f.controller.connect(f.display('b'), {}, { signal: close.signal }), /closing/);
+  assert.equal(f.calls.length, sent);
 });

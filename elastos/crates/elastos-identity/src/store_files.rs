@@ -47,7 +47,7 @@ impl IdentityFiles {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(data_dir)?;
-        validate_owner(&root.metadata()?)?;
+        validate_data_root(&root.metadata()?)?;
         if create {
             if unsafe { libc::mkdirat(root.as_raw_fd(), c"identity".as_ptr(), 0o700) } != 0 {
                 let error = std::io::Error::last_os_error();
@@ -380,6 +380,18 @@ fn validate_owner(metadata: &std::fs::Metadata) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The data root keeps its owner's group permissions (Ubuntu umask 002), as the
+/// installation writer admits it; the identity folder and files stay strict.
+#[cfg(unix)]
+fn validate_data_root(metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o002 != 0 {
+        anyhow::bail!(
+            "identity data root must be owned by the Runtime user and not world-writable"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn validate_file(file: &File) -> anyhow::Result<()> {
     let metadata = file.metadata()?;
@@ -513,6 +525,23 @@ mod tests {
         .unwrap();
         assert!(files.read(c"device.key").is_err());
         assert!(IdentityFiles::open(root.path()).is_err());
+    }
+
+    #[test]
+    fn identity_accepts_group_writable_data_root_and_keeps_identity_folder_strict() {
+        let root = tempfile::tempdir().unwrap();
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(root.path(), 0o770);
+        drop(IdentityFiles::open(root.path()).unwrap());
+        IdentityFiles::open_existing(root.path()).unwrap();
+        set(&root.path().join("identity"), 0o770);
+        assert!(IdentityFiles::open_existing(root.path()).is_err());
+        set(&root.path().join("identity"), 0o700);
+        set(root.path(), 0o777);
+        assert!(IdentityFiles::open_existing(root.path()).is_err());
+        set(root.path(), 0o700);
     }
 
     #[test]

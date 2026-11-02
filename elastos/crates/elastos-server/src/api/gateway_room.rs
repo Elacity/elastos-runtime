@@ -6,6 +6,50 @@ pub(super) struct ChatDirectMessageSendRequest {
     request_id: String,
     conversation_id: String,
     text: String,
+    #[serde(default)]
+    retry_existing: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatDirectMessageReadOptions {
+    #[serde(default)]
+    retry_details: bool,
+    #[serde(default)]
+    mark_read: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatDirectConversationReadOptions {
+    #[serde(default)]
+    community_status: bool,
+}
+
+fn direct_conversation_read_payload(
+    conversations: Vec<crate::collaboration_direct_messages::DirectConversationSummary>,
+    community_unread: Option<bool>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({"conversations": conversations});
+    if let Some(unread) = community_unread {
+        payload["community_unread"] = serde_json::json!(unread);
+    }
+    payload
+}
+
+fn direct_message_read_payload(
+    mut messages: Vec<crate::collaboration_direct_messages::DirectMessageSummary>,
+    conversation_id: &str,
+    retry_details: bool,
+) -> serde_json::Value {
+    // Older Chat bundles reject unknown message fields. Retry identity is
+    // opt-in on this same authenticated read endpoint.
+    if !retry_details {
+        for message in &mut messages {
+            message.request_id = None;
+        }
+    }
+    serde_json::json!({"conversation_id": conversation_id, "messages": messages})
 }
 
 fn direct_api_error_response(
@@ -16,14 +60,203 @@ fn direct_api_error_response(
         DirectApiError::InvalidRequest => StatusCode::BAD_REQUEST,
         DirectApiError::ForbiddenConversation => StatusCode::FORBIDDEN,
         DirectApiError::IntentConflict => StatusCode::CONFLICT,
+        DirectApiError::RetryExpired | DirectApiError::RetryUnavailable => StatusCode::GONE,
         DirectApiError::Authority => StatusCode::UNAUTHORIZED,
+        DirectApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         DirectApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (
-        status,
-        Json(serde_json::json!({"error": error.to_string()})),
-    )
-        .into_response()
+    let mut body = serde_json::json!({"error": error.to_string()});
+    match error {
+        DirectApiError::RetryExpired => body["code"] = serde_json::json!("retry_expired"),
+        DirectApiError::RetryUnavailable => body["code"] = serde_json::json!("retry_unavailable"),
+        DirectApiError::ServiceUnavailable => {
+            body["code"] = serde_json::json!("direct_service_unavailable")
+        }
+        _ => {}
+    }
+    (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod direct_retry_wire_tests {
+    use super::*;
+
+    #[test]
+    fn direct_retry_wire_modes_are_explicit_and_old_requests_keep_their_behavior() {
+        let old = serde_json::json!({"request_id":"message:one", "conversation_id":"direct:one", "text":"hello"});
+        assert!(
+            !serde_json::from_value::<ChatDirectMessageSendRequest>(old.clone())
+                .unwrap()
+                .retry_existing
+        );
+        let mut retry = old.clone();
+        retry["retry_existing"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ChatDirectMessageSendRequest>(retry.clone())
+                .unwrap()
+                .retry_existing
+        );
+        retry["retry_existing"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<ChatDirectMessageSendRequest>(retry).is_err());
+        assert!(
+            !Query::<ChatDirectMessageReadOptions>::try_from_uri(&"/messages".parse().unwrap())
+                .unwrap()
+                .0
+                .retry_details
+        );
+        assert!(
+            Query::<ChatDirectMessageReadOptions>::try_from_uri(
+                &"/messages?retry_details=true".parse().unwrap()
+            )
+            .unwrap()
+            .0
+            .retry_details
+        );
+        assert!(Query::<ChatDirectMessageReadOptions>::try_from_uri(
+            &"/messages?retry_details=yes".parse().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chat_read_intent_and_community_status_are_explicit_without_changing_old_wire_shapes() {
+        let old =
+            Query::<ChatDirectMessageReadOptions>::try_from_uri(&"/messages".parse().unwrap())
+                .unwrap()
+                .0;
+        assert!(old.mark_read.unwrap_or(true));
+        for (query, expected) in [("false", false), ("true", true)] {
+            let options = Query::<ChatDirectMessageReadOptions>::try_from_uri(
+                &format!("/messages?retry_details=true&mark_read={query}")
+                    .parse()
+                    .unwrap(),
+            )
+            .unwrap()
+            .0;
+            assert!(options.retry_details);
+            assert_eq!(options.mark_read, Some(expected));
+        }
+        assert!(Query::<ChatDirectMessageReadOptions>::try_from_uri(
+            &"/messages?mark_read=yes".parse().unwrap()
+        )
+        .is_err());
+        let old_poll: RoomPollBody =
+            serde_json::from_value(serde_json::json!({"since": 7})).unwrap();
+        assert!(!old_poll.mark_read);
+        assert!(
+            serde_json::from_value::<RoomPollBody>(serde_json::json!({"since":7,"mark_read":true}))
+                .unwrap()
+                .mark_read
+        );
+        assert!(
+            serde_json::from_value::<RoomPollBody>(serde_json::json!({"mark_read":"true"}))
+                .is_err()
+        );
+        let old_list = Query::<ChatDirectConversationReadOptions>::try_from_uri(
+            &"/conversations".parse().unwrap(),
+        )
+        .unwrap()
+        .0;
+        assert!(!old_list.community_status);
+        assert!(
+            Query::<ChatDirectConversationReadOptions>::try_from_uri(
+                &"/conversations?community_status=true".parse().unwrap()
+            )
+            .unwrap()
+            .0
+            .community_status
+        );
+        assert!(Query::<ChatDirectConversationReadOptions>::try_from_uri(
+            &"/conversations?community_status=yes".parse().unwrap()
+        )
+        .is_err());
+        assert_eq!(
+            direct_conversation_read_payload(Vec::new(), None),
+            serde_json::json!({"conversations":[]})
+        );
+        assert_eq!(
+            direct_conversation_read_payload(Vec::new(), Some(true)),
+            serde_json::json!({"conversations":[],"community_unread":true})
+        );
+    }
+
+    #[test]
+    fn old_direct_reads_omit_retry_identity_and_opt_in_reads_expose_only_outgoing_identity() {
+        use crate::collaboration_direct_messages::DirectMessageSummary;
+        let messages = vec![
+            DirectMessageSummary {
+                message_id: "message:out".into(),
+                request_id: Some("request:out".into()),
+                direction: "outgoing",
+                text: "hello".into(),
+                created_at: 10,
+                delivery_state: "pending",
+            },
+            DirectMessageSummary {
+                message_id: "message:in".into(),
+                request_id: None,
+                direction: "incoming",
+                text: "hi".into(),
+                created_at: 11,
+                delivery_state: "received",
+            },
+        ];
+        let legacy = direct_message_read_payload(messages.clone(), "direct:one", false);
+        for message in legacy["messages"].as_array().unwrap() {
+            assert_eq!(
+                message
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                [
+                    "created_at",
+                    "delivery_state",
+                    "direction",
+                    "message_id",
+                    "text"
+                ]
+            );
+        }
+        let retry = direct_message_read_payload(messages, "direct:one", true);
+        assert_eq!(retry["messages"][0]["request_id"], "request:out");
+        assert!(retry["messages"][1].get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_retry_refusals_are_typed_gone_without_changing_other_errors() {
+        use crate::collaboration_direct_messages::DirectApiError;
+        for (error, code) in [
+            (DirectApiError::RetryExpired, "retry_expired"),
+            (DirectApiError::RetryUnavailable, "retry_unavailable"),
+        ] {
+            let response = direct_api_error_response(error);
+            assert_eq!(response.status(), StatusCode::GONE);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"error":error.to_string(), "code":code})
+            );
+        }
+        assert_eq!(
+            direct_api_error_response(DirectApiError::IntentConflict).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            direct_api_error_response(DirectApiError::Authority).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            direct_api_error_response(DirectApiError::ForbiddenConversation).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 }
 
 struct DirectAuthorityContext {
@@ -48,7 +281,7 @@ fn direct_authority(
     let service = state
         .collaboration_discovery_service
         .clone()
-        .ok_or(DirectApiError::Internal)?;
+        .ok_or(DirectApiError::ServiceUnavailable)?;
     let authority = super::gateway_home_system::load_configured_contact_authority_for_context(
         &state.data_dir,
         &context,
@@ -67,6 +300,7 @@ fn direct_authority(
 pub(super) async fn chat_direct_conversations(
     State(state): State<GatewayState>,
     headers: HeaderMap,
+    Query(options): Query<ChatDirectConversationReadOptions>,
 ) -> Response {
     let DirectAuthorityContext {
         service, authority, ..
@@ -78,8 +312,33 @@ pub(super) async fn chat_direct_conversations(
         .direct_message_service()
         .conversation_summaries(authority.store.as_ref())
     {
-        Ok(conversations) => {
-            Json(serde_json::json!({"conversations": conversations})).into_response()
+        Ok(mut conversations) => {
+            let unread = crate::notifications::unread_direct_message_conversations(
+                &state.data_dir,
+                authority.store.local_profile_did(),
+            )
+            .unwrap_or_default();
+            for conversation in &mut conversations {
+                conversation.unread = unread.contains(&conversation.conversation_id);
+            }
+            let community_unread = if options.community_status {
+                match state.collaboration_chat_product_port.as_ref() {
+                    Some(port) => {
+                        match port.community_unread(&state.data_dir, &authority.profile, now_ts()) {
+                            Ok(unread) => Some(unread),
+                            Err(error) => return room_service_error_response(error),
+                        }
+                    }
+                    None => Some(false),
+                }
+            } else {
+                None
+            };
+            Json(direct_conversation_read_payload(
+                conversations,
+                community_unread,
+            ))
+            .into_response()
         }
         Err(error) => direct_api_error_response(error),
     }
@@ -89,6 +348,7 @@ pub(super) async fn chat_direct_conversation_messages(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Path(conversation_id): Path<String>,
+    Query(options): Query<ChatDirectMessageReadOptions>,
 ) -> Response {
     let DirectAuthorityContext {
         service, authority, ..
@@ -105,14 +365,18 @@ pub(super) async fn chat_direct_conversation_messages(
         Ok(messages) => {
             // Reading the conversation is what resolves its message
             // notification; the next incoming message resurfaces it.
-            let _ = crate::notifications::mark_acted_for_action(
-                &state.data_dir,
-                &crate::notifications::direct_message_notification_action_id(&conversation_id),
-            );
-            Json(serde_json::json!({
-                "conversation_id": conversation_id,
-                "messages": messages,
-            }))
+            if options.mark_read.unwrap_or(true) {
+                let _ = crate::notifications::mark_acted_for_action(
+                    &state.data_dir,
+                    Some(authority.store.local_profile_did()),
+                    &crate::notifications::direct_message_notification_action_id(&conversation_id),
+                );
+            }
+            Json(direct_message_read_payload(
+                messages,
+                &conversation_id,
+                options.retry_details,
+            ))
             .into_response()
         }
         Err(error) => direct_api_error_response(error),
@@ -157,6 +421,7 @@ pub(super) async fn chat_direct_message_send(
                 request_id: &request.request_id,
                 conversation_id: &request.conversation_id,
                 text: &request.text,
+                retry_existing: request.retry_existing,
                 now,
             },
         )
@@ -179,6 +444,8 @@ pub(super) async fn chat_direct_message_send(
 pub(super) struct RoomPollBody {
     #[serde(default)]
     since: u64,
+    #[serde(default)]
+    mark_read: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +453,15 @@ pub(super) struct RoomPollBody {
 pub(super) struct RoomSendBody {
     request_id: String,
     body: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatRoomAttachLibraryBody {
+    uri: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,12 +550,18 @@ pub(super) async fn chat_room_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
+    let chat_launch =
+        require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID);
     if state.collaboration_chat_product_port.is_none() {
+        // The legacy summary lists guest requests and sessions: Chat or Home only.
+        if let Err(err) = chat_launch {
+            if require_home_token(&state.data_dir, &headers).is_err() {
+                return room_service_error_response(err);
+            }
+        }
         return room_service_summary(State(state)).await;
     }
-    if let Err(err) =
-        require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
-    {
+    if let Err(err) = chat_launch {
         return room_service_error_response(err);
     }
     Json(serde_json::json!({
@@ -303,8 +585,19 @@ pub(super) struct CarrierBootstrapQuery {
 
 pub(super) async fn gateway_carrier_bootstrap(
     State(state): State<GatewayState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: HeaderMap,
     Query(query): Query<CarrierBootstrapQuery>,
 ) -> Response {
+    let public =
+        gateway_frontdoor::public_publisher_bootstrap(&state.data_dir, uri.path(), uri.query());
+    if !public && gateway_home_token::require_gateway_launch(&state.data_dir, &headers).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            "Carrier bootstrap requires an authorized caller",
+        )
+            .into_response();
+    }
     let publisher_bootstrap = carrier_bootstrap_query_requests_publisher(&query);
     let bootstrap = if publisher_bootstrap {
         match gateway_provider_carrier_bootstrap(&state).await {
@@ -320,25 +613,18 @@ pub(super) async fn gateway_carrier_bootstrap(
             },
         }
     };
-    let did = elastos_identity::load_or_create_did(&state.data_dir)
-        .ok()
-        .map(|(_, did)| did)
-        .unwrap_or_default();
+    let mut body = serde_json::json!({
+        "schema": "elastos.carrier.bootstrap/v1", "transport": "carrier",
+        "ticket": bootstrap.ticket, "node_id": bootstrap.node_id,
+        "role": if publisher_bootstrap { "publisher" } else { "runtime" }, "generated_at": now_ts(),
+    });
+    if !public {
+        body["did"] = serde_json::Value::String(
+            load_existing_gateway_runtime_did(&state.data_dir).unwrap_or_default(),
+        );
+    }
 
-    (
-        StatusCode::OK,
-        [(CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({
-            "schema": "elastos.carrier.bootstrap/v1",
-            "transport": "carrier",
-            "ticket": bootstrap.ticket,
-            "node_id": bootstrap.node_id,
-            "did": did,
-            "role": if publisher_bootstrap { "publisher" } else { "runtime" },
-            "generated_at": now_ts(),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, [(CACHE_CONTROL, "no-store")], Json(body)).into_response()
 }
 
 fn carrier_bootstrap_query_requests_publisher(query: &CarrierBootstrapQuery) -> bool {
@@ -360,7 +646,10 @@ async fn gateway_provider_carrier_bootstrap(
             .into_response());
     };
     let body = match registry
-        .send_raw("peer", &serde_json::json!({ "op": "get_ticket" }))
+        .send_raw(
+            "peer",
+            &serde_json::json!({ "op": "get_ticket", "exported": true }),
+        )
         .await
     {
         Ok(body) => body,
@@ -461,7 +750,7 @@ async fn managed_runtime_carrier_bootstrap_from_coords(
             &client_token,
             &peer_cap,
             "get_ticket",
-            serde_json::json!({}),
+            serde_json::json!({ "exported": true }),
         )
         .ok()?;
         carrier_bootstrap_from_body(&body)
@@ -480,11 +769,19 @@ pub(super) async fn chat_room_session_start(
             Ok(context) => context,
             Err(err) => return room_service_error_response(err),
         };
+    // Chat asks once, on Community open; a refusal or an open card is kept.
+    let _ = gateway_collaboration_presence::request_community_presence(&state, &context, false);
+    let community_presence =
+        gateway_collaboration_presence::community_presence_state(&state, &context);
     let secure = request_uses_tls(&headers);
     let data_dir = state.data_dir.clone();
     let transport = room_transport_view(&state);
     let port = state.collaboration_chat_product_port.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let presence_snapshot = match state.collaboration_presence_product_port.as_ref() {
+        Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
+        None => None,
+    };
     match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let output = if port.is_some() {
             start_configured_chat_room_session(&data_dir, &context)?
@@ -496,6 +793,7 @@ pub(super) async fn chat_room_session_start(
             Some(port) => port.conversation_poll(&data_dir, &output.token, 0)?,
             None => crate::room_service::room_poll(&data_dir, &output.token, 0)?,
         };
+        let mut cards = None;
         // The configured shared room refreshes only already-verified signed
         // Profile names here. The plain room keeps its server-stamped
         // home-session and guest names.
@@ -506,28 +804,45 @@ pub(super) async fn chat_room_session_start(
                 discovery_service.as_ref(),
             )
             .unwrap_or(None);
+            let read_snapshot = authority
+                .as_ref()
+                .and_then(|authority| authority.store.read_only_snapshot().ok());
+            let contact_snapshot = read_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.snapshot().ok());
             let summary = crate::room_service::load_summary(&data_dir).ok();
             let local_identity = room_local_profile_identity(&data_dir, &context);
-            let names = room_profile_attribution_names(
+            let names = room_profile_attribution_names_from_snapshot(
                 authority.as_ref(),
+                contact_snapshot.as_ref(),
                 summary.as_ref(),
                 local_identity
                     .as_ref()
                     .map(|(did, name)| (did.as_str(), name.as_str())),
             );
             apply_profile_attribution_to_room_poll(&mut poll, &names);
+            cards = Some(participant_card_directory(
+                read_snapshot.as_ref(),
+                presence_snapshot.as_ref(),
+                local_identity.as_ref().map(|(did, _)| did.as_str()),
+            ));
         }
         poll.transport = transport;
-        Ok((output, poll))
+        Ok((output, poll, cards))
     })
     .await
     {
-        Ok(Ok((output, poll))) => {
+        Ok(Ok((output, poll, cards))) => {
+            let mut poll = GatewayRoomPollView::from(poll);
+            if let Some(cards) = cards.as_ref() {
+                poll.apply_participant_cards(cards);
+            }
+            poll.community_presence = community_presence;
             let mut response = Json(ChatRoomSessionStartResponse {
                 status: "connected".to_string(),
                 display_name: output.display_name,
                 expires_at: output.expires_at,
-                poll: GatewayRoomPollView::from(poll),
+                poll,
             })
             .into_response();
             match set_room_session_cookie_header(&output.token, output.max_age_secs, secure) {
@@ -1161,7 +1476,9 @@ fn room_transport_view(state: &GatewayState) -> crate::room_service::RoomTranspo
         .unwrap_or_else(|| crate::room_service::RoomTransportView {
             configured: false,
             available: false,
+            community_joined: None,
             status: Some("Collaboration is isolated on this Runtime.".to_string()),
+            history: None,
         })
 }
 
@@ -1173,8 +1490,23 @@ fn room_transport_view(state: &GatewayState) -> crate::room_service::RoomTranspo
 /// cards (the signed-profile projection recorded at admission — the source a
 /// guest session can verify against). Presence heartbeats are deliberately
 /// not a name source: they prove liveness, not identity.
+#[cfg(test)]
 pub(super) fn room_profile_attribution_names(
     contact_authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
+    room_summary: Option<&crate::room_service::RoomSummary>,
+    local_identity: Option<(&str, &str)>,
+) -> std::collections::HashMap<String, String> {
+    let snapshot = contact_authority.and_then(|authority| authority.store.snapshot().ok());
+    room_profile_attribution_names_from_snapshot(
+        contact_authority,
+        snapshot.as_ref(),
+        room_summary,
+        local_identity,
+    )
+}
+fn room_profile_attribution_names_from_snapshot(
+    contact_authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
+    snapshot: Option<&crate::collaboration_contact_store::CollaborationContactStoreSnapshot>,
     room_summary: Option<&crate::room_service::RoomSummary>,
     local_identity: Option<(&str, &str)>,
 ) -> std::collections::HashMap<String, String> {
@@ -1187,7 +1519,7 @@ pub(super) fn room_profile_attribution_names(
         }
     }
     if let Some(authority) = contact_authority {
-        if let Ok(snapshot) = authority.store.snapshot() {
+        if let Some(snapshot) = snapshot {
             for removed in snapshot.removed() {
                 names.insert(
                     removed.remote_profile_did().to_string(),
@@ -1225,6 +1557,235 @@ fn room_local_profile_identity(
     let (member_did, _) = trusted_configured_chat_profile(data_dir, context).ok()?;
     let card = gateway_home_system::home_room_profile_card_projection(data_dir, context).ok()??;
     Some((member_did, card.display_name))
+}
+
+/// Collects the relationship facts behind Community profile cards from this
+/// principal's signed contact store.
+fn participant_card_directory(
+    read_snapshot: Option<
+        &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    >,
+    presence_snapshot: Option<&crate::collaboration_presence::CollaborationPresenceSnapshot>,
+    local_profile_did: Option<&str>,
+) -> ParticipantCardDirectory {
+    let mut directory = ParticipantCardDirectory {
+        local_profile_did: local_profile_did.map(str::to_string),
+        ..ParticipantCardDirectory::default()
+    };
+    // Members whose Home announced Community presence; everyone else shows
+    // their last Community message time instead.
+    let now = now_ts();
+    if let Some(snapshot) = presence_snapshot {
+        for record in snapshot
+            .records()
+            .iter()
+            .filter(|record| record.expires_at() > now)
+        {
+            directory
+                .present
+                .entry(record.sender_profile_did().to_string())
+                .and_modify(|member: &mut PresentMember| {
+                    if record.last_seen_at() > member.last_seen_at {
+                        member.display_name = record.display_name().to_string();
+                        member.last_seen_at = record.last_seen_at();
+                    }
+                })
+                .or_insert_with(|| PresentMember {
+                    display_name: record.display_name().to_string(),
+                    last_seen_at: record.last_seen_at(),
+                });
+        }
+    }
+    if let Some(store) = read_snapshot {
+        directory.relationships = gateway_home_system::contact_relationships(store, now);
+    }
+    directory
+}
+
+/// The signed Profile display names this Home holds for Community members,
+/// by Profile DID: unexpired presence first (the newest name), then verified
+/// Community posts. These are the people and names Chat profile cards show.
+pub(super) async fn community_member_names(
+    state: &GatewayState,
+    now: u64,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut names = std::collections::HashMap::new();
+    if let Some(port) = state.collaboration_chat_product_port.as_ref() {
+        let (network_id, conversation_id) = port.history_scope();
+        let (network_id, conversation_id) = (network_id.to_string(), conversation_id.to_string());
+        let data_dir = state.data_dir.clone();
+        names.extend(
+            tokio::task::spawn_blocking(move || {
+                crate::room_service::collaboration_verified_members(
+                    &data_dir,
+                    &network_id,
+                    &conversation_id,
+                )
+            })
+            .await??,
+        );
+    }
+    if let Some(port) = state.collaboration_presence_product_port.as_ref() {
+        if let Ok(snapshot) = port.authorized_snapshot(now).await {
+            for record in snapshot
+                .records()
+                .iter()
+                .filter(|record| record.expires_at() > now)
+            {
+                names.insert(
+                    record.sender_profile_did().to_string(),
+                    record.display_name().to_string(),
+                );
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The Profile DID behind a card's opaque reference, among the people the
+/// card directory lists: verified posters in this Community and members
+/// whose Home announced presence. Any other reference resolves to nothing,
+/// so Chat acts only on people it shows.
+async fn resolve_participant_ref(
+    state: &GatewayState,
+    participant_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(community_member_names(state, now_ts())
+        .await?
+        .into_keys()
+        .find(|member_did| home_people_contact_id(member_did) == participant_ref))
+}
+
+const PARTICIPANT_NOT_LISTED: &str = "This person is no longer listed in Community.";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChatRoomContactRequestBody {
+    participant_ref: String,
+}
+
+/// Sends a contact request to a Community participant chosen on their
+/// profile card, with or without Discovery, and answers like People's
+/// request by DID: `{status, message}`. They accept or decline it in
+/// Inbox. A person visible in Discovery gets the request bound to their
+/// listing, which an alpha.25 Home can still receive.
+pub(super) async fn chat_room_contact_request(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomContactRequestBody>,
+) -> Response {
+    // The Chat session comes first, so a refused caller learns nothing about
+    // this Home's contacts.
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return room_service_error_response(err),
+        };
+    let Some(service) = state.collaboration_discovery_service.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            "Contacts are unavailable on this Home.",
+        )
+            .into_response();
+    };
+    let authority = match gateway_home_system::load_configured_contact_authority_for_context(
+        &state.data_dir,
+        &context,
+        Some(&service),
+    ) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            return (
+                StatusCode::CONFLICT,
+                "Create your Profile before adding contacts.",
+            )
+                .into_response()
+        }
+        Err(err) => return room_service_error_response(err),
+    };
+    let now = now_ts();
+    let status = match service.read_only_status(authority.store.as_ref(), &authority.profile, now) {
+        Ok(status) => status,
+        Err(err) => return room_service_error_response(err),
+    };
+    if status.community_paused() {
+        return room_service_error_response(anyhow::anyhow!(
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+        ));
+    }
+    let community_names = match community_member_names(&state, now).await {
+        Ok(names) => names,
+        Err(err) => return room_service_error_response(err),
+    };
+    let Some(member_did) = community_names
+        .keys()
+        .find(|member_did| home_people_contact_id(member_did) == body.participant_ref)
+        .cloned()
+    else {
+        return (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response();
+    };
+    let addable =
+        matches!(
+        authority
+            .store
+            .read_only_snapshot()
+            .and_then(|read| read.relationship_with(&member_did, now)),
+        Ok(crate::collaboration_contact_store::CollaborationContactRelationship::None
+            | crate::collaboration_contact_store::CollaborationContactRelationship::Removed { .. }
+            | crate::collaboration_contact_store::CollaborationContactRelationship::Declined)
+    );
+    let listed = status
+        .visible_people()
+        .iter()
+        .find(|person| person.profile_did() == member_did);
+    if let (true, Some(person)) = (addable, listed) {
+        return match service
+            .send_contact_request(
+                authority.store.as_ref(),
+                person.advertisement_id(),
+                &authority.profile,
+                now,
+            )
+            .await
+        {
+            Ok(()) => gateway_home_system::contact_request_answer(
+                &crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::Requested,
+                Some(person.display_name()),
+            ),
+            Err(err) => room_service_error_response(err),
+        };
+    }
+    gateway_home_system::send_profile_contact_request_response(
+        &service,
+        &state,
+        &community_names,
+        &context,
+        &authority,
+        &member_did,
+    )
+    .await
+}
+
+/// `POST /api/apps/chat-room/contacts/profile-id {participant_ref}` →
+/// `{profile_id}`: the DID of a person Chat lists, released only when
+/// someone asks to copy it from that person's card.
+pub(super) async fn chat_room_contact_profile_id(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomContactRequestBody>,
+) -> Response {
+    if let Err(err) =
+        require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
+    {
+        return room_service_error_response(err);
+    }
+    match resolve_participant_ref(&state, &body.participant_ref).await {
+        Ok(Some(profile_id)) => {
+            Json(serde_json::json!({ "profile_id": profile_id })).into_response()
+        }
+        Ok(None) => (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response(),
+        Err(err) => room_service_error_response(err),
+    }
 }
 
 /// Binds configured shared-room attribution to signed Profile identity.
@@ -1298,7 +1859,7 @@ fn configured_attachment_unsupported_response() -> Response {
         .into_response()
 }
 
-fn configured_legacy_room_control_unsupported_response() -> Response {
+pub(super) fn configured_legacy_room_control_unsupported_response() -> Response {
     (
         StatusCode::CONFLICT,
         "Legacy room controls are unavailable in configured collaboration Chat.",
@@ -1390,7 +1951,12 @@ pub(super) async fn room_service_poll(
     let transport = room_transport_view(&state);
     let port = state.collaboration_chat_product_port.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
+    let presence_snapshot = match state.collaboration_presence_product_port.as_ref() {
+        Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
+        None => None,
+    };
     let mut launch_context = None;
+    let mut reader_profile = None;
     let token = match port.as_ref() {
         Some(_) => {
             let context = match require_home_launch_token_context(
@@ -1402,10 +1968,12 @@ pub(super) async fn room_service_poll(
                 Err(err) => return room_service_error_response(err),
             };
             launch_context = Some(context.clone());
-            let (did, _) = match trusted_configured_chat_profile(&data_dir, &context) {
-                Ok(principal) => principal,
+            let profile = match trusted_chat_room_profile_authority(&data_dir, &context) {
+                Ok(profile) => profile,
                 Err(err) => return room_service_error_response(err),
             };
+            let did = profile.document().profile_did.clone();
+            reader_profile = Some(profile);
             let session =
                 match crate::room_service::resolve_configured_collaboration_principal_session(
                     &data_dir,
@@ -1430,41 +1998,80 @@ pub(super) async fn room_service_poll(
             Err(err) => return room_service_error_response(err),
         },
     };
+    let community_presence = launch_context.as_ref().and_then(|context| {
+        gateway_collaboration_presence::community_presence_state(&state, context)
+    });
     match tokio::task::spawn_blocking(move || {
         let mut poll = match port {
-            Some(port) => port.conversation_poll(&data_dir, &token, body.since)?,
+            Some(port) => port.conversation_poll_with_read_intent(
+                &data_dir,
+                &token,
+                body.since,
+                reader_profile
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Chat reader Profile is unavailable"))?,
+                body.mark_read,
+                now_ts(),
+            )?,
             None => crate::room_service::room_poll(&data_dir, &token, body.since)?,
         };
+        let mut cards = None;
         // The configured shared room refreshes only already-verified signed
         // Profile names here: contact authority plus room membership cards
         // may refresh the display name, but they never upgrade an unverified
         // row. The plain room keeps its server-stamped home-session and
         // guest names.
         if let Some(context) = launch_context.as_ref() {
-            let authority = gateway_home_system::load_configured_contact_authority_for_context(
-                &data_dir,
-                context,
-                discovery_service.as_ref(),
-            )
-            .unwrap_or(None);
+            let profile = reader_profile
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Chat reader Profile is unavailable"))?;
+            let authority = discovery_service.as_ref().and_then(|service| {
+                gateway_home_system::configured_contact_authority_from_profile(
+                    &data_dir,
+                    context,
+                    service,
+                    profile.clone(),
+                )
+                .ok()
+            });
+            let read_snapshot = authority
+                .as_ref()
+                .and_then(|authority| authority.store.read_only_snapshot().ok());
+            let contact_snapshot = read_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.snapshot().ok());
             let summary = crate::room_service::load_summary(&data_dir).ok();
-            let local_identity = room_local_profile_identity(&data_dir, context);
-            let names = room_profile_attribution_names(
+            let local_identity = Some((
+                profile.document().profile_did.clone(),
+                profile.document().display_name.clone(),
+            ));
+            let names = room_profile_attribution_names_from_snapshot(
                 authority.as_ref(),
+                contact_snapshot.as_ref(),
                 summary.as_ref(),
                 local_identity
                     .as_ref()
                     .map(|(did, name)| (did.as_str(), name.as_str())),
             );
             apply_profile_attribution_to_room_poll(&mut poll, &names);
+            cards = Some(participant_card_directory(
+                read_snapshot.as_ref(),
+                presence_snapshot.as_ref(),
+                local_identity.as_ref().map(|(did, _)| did.as_str()),
+            ));
         }
-        Ok::<_, anyhow::Error>(poll)
+        Ok::<_, anyhow::Error>((poll, cards))
     })
     .await
     {
-        Ok(Ok(mut output)) => {
+        Ok(Ok((mut output, cards))) => {
             output.transport = transport;
-            Json(GatewayRoomPollView::from(output)).into_response()
+            let mut view = GatewayRoomPollView::from(output);
+            if let Some(cards) = cards.as_ref() {
+                view.apply_participant_cards(cards);
+            }
+            view.community_presence = community_presence;
+            Json(view).into_response()
         }
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
@@ -1621,6 +2228,231 @@ pub(super) async fn room_service_upload_finish(
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
     }
+}
+
+#[cfg(test)]
+mod community_file_post_tests {
+    #[test]
+    fn a_file_post_is_one_exact_line_within_the_body_limit() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (body, name) = super::community_file_post("a\nb\tc.txt", 30, cid);
+        assert_eq!(body, format!("a b c.txt · 30 bytes · elastos://{cid}"));
+        assert_eq!(name, "a b c.txt");
+        let long = "x".repeat(2_100);
+        let (body, name) = super::community_file_post(&long, 3_565_158, cid);
+        assert_eq!(
+            body.chars().count(),
+            crate::room_service::MAX_OBJECT_BODY_LEN
+        );
+        assert!(name.ends_with('…'));
+        assert!(body.ends_with(&format!(" · 3.4 MB · elastos://{cid}")));
+        let (body, _) = super::community_file_post(&"y".repeat(300), 1024, cid);
+        assert_eq!(
+            body,
+            format!("{} · 1.0 KB · elastos://{cid}", "y".repeat(300))
+        );
+    }
+}
+
+/// The Community post for one attached file: `<name> · <size> · elastos://<cid>`,
+/// one line, within the Chat body limit (the name gives way).
+fn community_file_post(name: &str, size_bytes: u64, cid: &str) -> (String, String) {
+    let name: String = name
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let name = if name.is_empty() {
+        "file".to_string()
+    } else {
+        name
+    };
+    let tail = format!(
+        " · {} · elastos://{cid}",
+        format_shared_file_size(size_bytes)
+    );
+    let room = crate::room_service::MAX_OBJECT_BODY_LEN.saturating_sub(tail.chars().count());
+    let name = if name.chars().count() > room {
+        let mut short: String = name.chars().take(room.saturating_sub(1)).collect();
+        short.push('…');
+        short
+    } else {
+        name
+    };
+    (format!("{name}{tail}"), name)
+}
+
+/// Community attach: the sender's own Library file goes through the one
+/// Library publish (pinned on this Home only, Published in Library, withdrawn
+/// with Unpublish), then its link is posted through the normal signed Chat
+/// send. A post that fails keeps the publication: the same `request_id` posts
+/// it again without publishing anything new.
+pub(super) async fn chat_room_attach_library(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomAttachLibraryBody>,
+) -> Response {
+    if let Err(err) = validate_room_send_request_id(&body.request_id) {
+        return attach_library_response(
+            StatusCode::BAD_REQUEST,
+            None,
+            attach_library_error_body("invalid_request", &err.to_string()),
+        );
+    }
+    let data_dir = state.data_dir.clone();
+    let (Some(port), Some(registry)) = (
+        state.collaboration_chat_product_port.clone(),
+        state.provider_registry.clone(),
+    ) else {
+        return attach_library_response(
+            StatusCode::CONFLICT,
+            None,
+            attach_library_error_body("unsupported", "Files can be posted only in Community."),
+        );
+    };
+    let context = match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
+    {
+        Ok(context) => context,
+        Err(err) => return attach_library_chat_error(err),
+    };
+    let profile = match gateway_home_system::load_profile_authority_for_context(&data_dir, &context)
+    {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return attach_library_chat_error(anyhow::anyhow!("Chat requires a signed Profile"))
+        }
+        Err(err) => return attach_library_chat_error(err),
+    };
+    let token = match start_configured_chat_room_session(&data_dir, &context) {
+        Ok(session) => session.token,
+        Err(err) => return attach_library_chat_error(err),
+    };
+    let ChatRoomAttachLibraryBody {
+        uri,
+        if_revision,
+        request_id,
+    } = body;
+    // The request_id is checked against its saved binding before anything
+    // happens: another file under the same id, or a publication withdrawn
+    // since, is refused; a saved publication is posted as it was published;
+    // a new one passes the send rate limit before it is published.
+    let publication = match crate::library::chat_attach_publication(
+        &data_dir,
+        &registry,
+        &context.principal_id,
+        &request_id,
+        &uri,
+        if_revision.as_deref(),
+        || port.check_message_allowed(&profile, now_ts()),
+    )
+    .await
+    {
+        Ok(publication) => publication,
+        Err(err)
+            if err
+                .downcast_ref::<crate::collaboration_rate_limit::CommunitySendRateLimited>()
+                .is_some() =>
+        {
+            return attach_library_chat_error(err)
+        }
+        Err(err) => return attach_library_publish_error(err),
+    };
+    let (post, name) =
+        community_file_post(&publication.name, publication.size_bytes, &publication.cid);
+    let size_bytes = publication.size_bytes;
+    let principal_id = context.principal_id;
+    let now = now_ts();
+    let posted = tokio::task::spawn_blocking(move || {
+        let operation = crate::collaboration_product::chat_message_request_binding(
+            &request_id,
+            &principal_id,
+            &post,
+            &profile,
+        )?;
+        let prepared = port.prepare_message(operation, &post, &profile, now)?;
+        port.project_prepared_message(&data_dir, &prepared, Some(&token))
+    })
+    .await;
+    let failure = match posted {
+        Ok(Ok(_)) => {
+            return Json(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "publication": publication.data,
+                    "posted": true,
+                    "name": name,
+                    "size_bytes": size_bytes,
+                },
+            }))
+            .into_response()
+        }
+        Ok(Err(err)) => err,
+        Err(err) => anyhow::anyhow!("group chat task failed: {err}"),
+    };
+    let (status, retry_after, _) = room_service_error_parts(&failure);
+    let mut body = attach_library_error_body(
+        "post_failed",
+        "Your file is published, but the post did not go through. Try again.",
+    );
+    body["data"] = serde_json::json!({
+        "publication": publication.data,
+        "posted": false,
+    });
+    attach_library_response(status, retry_after, body)
+}
+
+fn attach_library_error_body(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "code": code, "message": message })
+}
+
+fn attach_library_response(
+    status: StatusCode,
+    retry_after: Option<u64>,
+    body: serde_json::Value,
+) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    if let Some(secs) = retry_after {
+        response
+            .headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from(secs));
+    }
+    response
+}
+
+/// A Chat authority or send refusal before anything is published.
+fn attach_library_chat_error(err: anyhow::Error) -> Response {
+    let (status, retry_after, message) = room_service_error_parts(&err);
+    let code = if retry_after.is_some() {
+        "rate_limited"
+    } else {
+        "chat_error"
+    };
+    attach_library_response(
+        status,
+        retry_after,
+        attach_library_error_body(code, &message),
+    )
+}
+
+fn attach_library_publish_error(err: anyhow::Error) -> Response {
+    let refusal = crate::library::find_library_refusal(&err);
+    let code = refusal.map_or("library_error", |refusal| refusal.code);
+    let status = match code {
+        "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "stale_revision" | "changed_since_publish" | "request_id_reused" | "withdrawn" => {
+            StatusCode::CONFLICT
+        }
+        "not_found" => StatusCode::NOT_FOUND,
+        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    let mut body = attach_library_error_body(code, &err.to_string());
+    if let Some(reason) = refusal.and_then(|refusal| refusal.reason) {
+        body["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    attach_library_response(status, None, body)
 }
 
 pub(super) async fn room_service_attachment_get(
@@ -1795,7 +2627,41 @@ fn upload_offset_from_headers(headers: &HeaderMap) -> anyhow::Result<u64> {
 }
 
 pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
-    let profile_required = gateway_home_system::profile_required_message(&err);
+    match room_service_error_parts(&err) {
+        (status, Some(retry_after), text) => {
+            (status, [("retry-after", retry_after.to_string())], text).into_response()
+        }
+        (status, None, text) => (status, text).into_response(),
+    }
+}
+
+/// The HTTP status, any retry-after seconds, and the plain words for a Chat
+/// room failure.
+fn room_service_error_parts(err: &anyhow::Error) -> (StatusCode, Option<u64>, String) {
+    if let Some(limited) =
+        err.downcast_ref::<crate::collaboration_rate_limit::CommunitySendRateLimited>()
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(limited.retry_after_secs),
+            limited.to_string(),
+        );
+    }
+    if let Some(refusal) =
+        err.downcast_ref::<crate::collaboration_discovery_runtime::ProfileContactRequestRefusal>()
+    {
+        use crate::collaboration_discovery_runtime::ProfileContactRequestRefusal;
+        let status = match refusal {
+            ProfileContactRequestRefusal::InvalidProfileId
+            | ProfileContactRequestRefusal::OwnDeviceId
+            | ProfileContactRequestRefusal::OtherHomeDeviceId => StatusCode::BAD_REQUEST,
+            ProfileContactRequestRefusal::TooManyWaiting
+            | ProfileContactRequestRefusal::CommunityLeft
+            | ProfileContactRequestRefusal::Undeliverable => StatusCode::CONFLICT,
+        };
+        return (status, None, refusal.to_string());
+    }
+    let profile_required = gateway_home_system::profile_required_message(err);
     let text = profile_required
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string());
@@ -1806,7 +2672,9 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
         || text.contains("home launch token")
     {
         StatusCode::UNAUTHORIZED
-    } else if profile_required.is_some() {
+    } else if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         StatusCode::CONFLICT
     } else if text.contains("not an active member")
         || text.contains("not part of this conversation")
@@ -1814,6 +2682,7 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
     {
         StatusCode::FORBIDDEN
     } else if text.contains("must not be empty")
+        || text == crate::room_service::EMPTY_FILE_REFUSAL
         || text.contains("characters or fewer")
         || text.contains("exceeds")
         || text.contains("request_id")
@@ -1823,7 +2692,7 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (status, text).into_response()
+    (status, None, text)
 }
 
 pub(super) fn room_service_join_error_response(err: tokio::task::JoinError) -> Response {

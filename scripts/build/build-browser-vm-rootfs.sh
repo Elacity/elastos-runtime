@@ -21,12 +21,10 @@ contract, then emits plain artifacts consumed by crosvm or Apple VZ:
 
 Options:
   --out-dir PATH              Build output directory
-  --target-platform PLATFORM  linux-arm64|linux-amd64 (default: linux-arm64)
-  --rootfs-size SIZE          mke2fs image size (default: 8192M)
+  --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest)
+  --rootfs-size SIZE          mke2fs image size (default: 4096M)
   --debian-suite SUITE        Debian suite (default: bookworm)
-  --debian-mirror URL         Debian mirror (default: https://deb.debian.org/debian)
-  --selkies-version VERSION   Selkies Python/web version (default: 1.6.1)
-  --selkies-web-url URL       Override Selkies web tarball URL
+  --debian-mirror URL         Debian mirror (default: https://snapshot.debian.org/archive/debian/20261008T203843Z/)
 USAGE
 }
 
@@ -37,11 +35,9 @@ die() {
 
 out_dir=""
 target_platform="${ELASTOS_BROWSER_VM_TARGET_PLATFORM:-linux-arm64}"
-rootfs_size="${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-8192M}"
+rootfs_size="${ELASTOS_BROWSER_VM_ROOTFS_SIZE:-4096M}"
 debian_suite="${ELASTOS_BROWSER_VM_DEBIAN_SUITE:-bookworm}"
-debian_mirror="${ELASTOS_BROWSER_VM_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
-selkies_version="${ELASTOS_BROWSER_VM_SELKIES_VERSION:-1.6.1}"
-selkies_web_url="${ELASTOS_BROWSER_VM_SELKIES_WEB_URL:-}"
+debian_mirror="${ELASTOS_BROWSER_VM_DEBIAN_MIRROR:-https://snapshot.debian.org/archive/debian/20261008T203843Z/}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -65,14 +61,6 @@ while [[ $# -gt 0 ]]; do
       debian_mirror="${2:-}"
       shift 2
       ;;
-    --selkies-version)
-      selkies_version="${2:-}"
-      shift 2
-      ;;
-    --selkies-web-url)
-      selkies_web_url="${2:-}"
-      shift 2
-      ;;
     --help|-h)
       usage
       exit 0
@@ -86,10 +74,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$out_dir" ]] || { usage >&2; exit 2; }
-[[ "$selkies_version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-.][A-Za-z0-9.]+)?$ ]] || {
-  echo "--selkies-version must look like 1.6.1" >&2
-  exit 2
-}
+
+python3 "$repo_root/scripts/build/browser-vm-debian.py" validate "$debian_suite" "$debian_mirror"
+
+image_inputs_args=(--target-platform "$target_platform" --rootfs-size "$rootfs_size"
+  --debian-suite "$debian_suite" --debian-mirror "$debian_mirror" --image-dir "$out_dir")
+if image_inputs=$(python3 "$repo_root/scripts/browser-vm-image-inputs.py" "${image_inputs_args[@]}"); then
+  echo "[browser-vm-rootfs] reuse verified guest: recipe input hash matches" >&2
+  cat "$out_dir/browser-vm-rootfs-manifest.json"
+  exit 0
+else
+  input_status=$?
+  [[ "$input_status" == 2 ]] || die "Guest input or cached image verification failed"
+fi
 
 case "$target_platform" in
   linux-arm64)
@@ -135,6 +132,7 @@ as_root() {
 }
 
 require_cmd cargo
+require_cmd git
 mke2fs_bin="$(resolve_cmd mke2fs)"
 require_cmd cpio
 require_cmd gzip
@@ -146,6 +144,7 @@ fi
 debootstrap_bin="$(resolve_cmd debootstrap)"
 
 mkdir -p "$out_dir"
+printf '%s\n' "$image_inputs" > "$out_dir/browser-vm-inputs.json"
 out_dir="$(cd "$out_dir" && pwd)"
 target_dir="$out_dir/target-contract"
 rootfs_dir="$out_dir/rootfs"
@@ -184,24 +183,27 @@ require_mounts_clean() {
   done
   [[ "$dirty" == "0" ]]
 }
-trap cleanup_mounts EXIT
+selkies_source_dir="$(mktemp -d "$out_dir/selkies-source.XXXXXX")"
+trap 'cleanup_mounts; rm -rf "$selkies_source_dir"' EXIT
+python3 "$repo_root/scripts/build/prepare-browser-selkies.py" --out-dir "$selkies_source_dir/source"
+require_cmd gpgv
+debian_keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+[[ -r "$debian_keyring" && -s "$debian_keyring" ]] || \
+  die "Install the verified Debian archive keyring before building the Browser guest"
 
 echo "[browser-vm-rootfs] target: $target_platform"
 echo "[browser-vm-rootfs] output: $out_dir"
-if [[ -z "$selkies_web_url" ]]; then
-  selkies_web_url="https://github.com/selkies-project/selkies/releases/download/v${selkies_version}/selkies-gstreamer-web_v${selkies_version}.tar.gz"
-fi
-echo "[browser-vm-rootfs] selkies: $selkies_version"
+echo "[browser-vm-rootfs] selkies: vendored 1.6.1"
 
 cargo_target_dir="${ELASTOS_BROWSER_VM_CARGO_TARGET_DIR:-$out_dir/cargo-target}"
 echo "[browser-vm-rootfs] build guest binaries"
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-native-proxy-engine/Cargo.toml" \
   --target "$rust_target" --release
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-vm-runtime-relay/Cargo.toml" \
   --target "$rust_target" --release
-CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet \
+CARGO_TARGET_DIR="$cargo_target_dir" cargo build --quiet --locked \
   --manifest-path "$repo_root/elastos/tools/browser-vm-guest-control-bridge/Cargo.toml" \
   --target "$rust_target" --release
 
@@ -212,11 +214,22 @@ as_root rm -rf "$rootfs_dir" "$target_dir" "$initrd_dir" "$rootfs_image" "$kerne
   "$out_dir/browser-vm-rootfs-manifest.json" "$out_dir/node" "$out_dir/chromium"
 as_root mkdir -p "$rootfs_dir"
 as_root "$debootstrap_bin" \
+  --force-check-gpg \
+  --keyring="$debian_keyring" \
   --arch="$deb_arch" \
   --variant=minbase \
+  --include=ca-certificates,debian-archive-keyring \
   "$debian_suite" \
   "$rootfs_dir" \
   "$debian_mirror"
+
+as_root mkdir -p "$rootfs_dir/opt"
+as_root cp -a "$selkies_source_dir/source" "$rootfs_dir/opt/selkies-build"
+# APT authenticates the frozen indexes with Debian archive keys.
+python3 "$repo_root/scripts/build/browser-vm-debian.py" sources | as_root tee "$rootfs_dir/etc/apt/sources.list" > /dev/null
+as_root rm -f "$rootfs_dir/etc/apt/sources.list.d/"*
+chromium_packages=$(python3 "$repo_root/scripts/build/browser-vm-debian.py" packages)
+python3 "$repo_root/scripts/build/browser-vm-debian.py" python-requirements | as_root tee "$rootfs_dir/opt/elastos-python-requirements.txt" > /dev/null
 
 as_root mount -t proc proc "$rootfs_dir/proc"
 as_root mount -t sysfs sysfs "$rootfs_dir/sys"
@@ -244,15 +257,14 @@ echo "[browser-vm-rootfs] install Browser guest packages"
 as_root chroot "$rootfs_dir" /usr/bin/env \
   DEBIAN_FRONTEND=noninteractive \
   KERNEL_PACKAGE="$kernel_package" \
-  SELKIES_VERSION="$selkies_version" \
-  SELKIES_WEB_URL="$selkies_web_url" \
+  CHROMIUM_PACKAGES="$chromium_packages" \
   /bin/sh <<'SH'
 set -eu
 apt-get update -qq
-apt-get install --no-install-recommends -y -qq \
+set -- \
   busybox-static \
   ca-certificates \
-  chromium \
+  $CHROMIUM_PACKAGES \
   dbus \
   fontconfig \
   fonts-dejavu-core \
@@ -293,6 +305,8 @@ apt-get install --no-install-recommends -y -qq \
   python3-numpy \
   python3-dev \
   python3-pip \
+  python3-setuptools \
+  python3-wheel \
   python3-websockets \
   tini \
   xauth \
@@ -302,224 +316,27 @@ apt-get install --no-install-recommends -y -qq \
   xvfb \
   wireplumber \
   "$KERNEL_PACKAGE"
-CC=gcc python3 -m pip install --break-system-packages --no-cache-dir -q "selkies==${SELKIES_VERSION}"
-python3 - <<'PY'
-from pathlib import Path
-import re
+printf '%s\n' "$@" > /opt/elastos-apt-packages
+apt-get install --download-only --no-install-recommends -y -qq "$@"
+SH
+# Verify the exact Chromium payloads before dpkg executes their contents.
+python3 "$repo_root/scripts/build/browser-vm-debian.py" verify-cache "$rootfs_dir/var/cache/apt/archives"
+as_root chroot "$rootfs_dir" /usr/bin/env DEBIAN_FRONTEND=noninteractive /bin/sh <<'SH'
+set -eu
+xargs apt-get install --no-download --no-install-recommends -y -qq < /opt/elastos-apt-packages
+rm /opt/elastos-apt-packages
+# Source archives use the Debian-pinned compiler/setuptools; dependency resolution
+# is explicit and every accepted wheel/source archive has a committed checksum.
+CC=gcc python3 -m pip install --break-system-packages --no-cache-dir --no-build-isolation \
+  --require-hashes --no-deps -q -r /opt/elastos-python-requirements.txt
+rm /opt/elastos-python-requirements.txt
+CC=gcc python3 -m pip install --break-system-packages --no-cache-dir -q \
+  --no-index --no-deps --no-build-isolation /opt/selkies-build
+mv /opt/selkies-build/gst-web /opt/gst-web
+mkdir -p /usr/share/doc/selkies
+mv /opt/selkies-build/provenance /usr/share/doc/selkies/source
+rm -rf /opt/selkies-build
 
-path = Path("/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py")
-text = path.read_text()
-marker = '        self.webrtcbin.set_property("latency", 0)\n'
-relay_patch = '''        elastos_ice_transport_policy = os.environ.get("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY", "").strip().lower()
-        if elastos_ice_transport_policy:
-            if elastos_ice_transport_policy not in ("all", "relay"):
-                raise GSTWebRTCAppError("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY must be all or relay")
-            try:
-                policy_value = getattr(GstWebRTC.WebRTCICETransportPolicy, elastos_ice_transport_policy.upper())
-            except AttributeError:
-                policy_value = elastos_ice_transport_policy
-            self.webrtcbin.set_property("ice-transport-policy", policy_value)
-            logger.info("using ICE transport policy: %s", elastos_ice_transport_policy)
-'''
-turn_marker = '''        if self.turn_servers:
-            for i, turn_server in enumerate(self.turn_servers):
-                logger.info("updating TURN server")
-                if i == 0:
-                    self.webrtcbin.set_property("turn-server", turn_server)
-                else:
-                    self.webrtcbin.emit("add-turn-server", turn_server)
-'''
-turn_relay_patch = '''        if elastos_ice_transport_policy:
-            self.webrtcbin.set_property("ice-transport-policy", policy_value)
-            logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
-'''
-if "elastos_ice_transport_policy" not in text:
-    if marker not in text:
-        raise SystemExit("Selkies relay policy patch target not found")
-    text = text.replace(marker, marker + relay_patch, 1)
-if "confirmed ICE transport policy after TURN setup" not in text:
-    if turn_marker not in text:
-        raise SystemExit("Selkies TURN relay policy patch target not found")
-    text = text.replace(turn_marker, turn_marker + turn_relay_patch, 1)
-if "confirmed ICE transport policy after TURN setup" not in text:
-    raise SystemExit("Selkies relay policy patch incomplete")
-ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
-ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
-if ice_log_patch not in text:
-    if ice_log_marker not in text:
-        raise SystemExit("Selkies ICE candidate log patch target not found")
-    text = text.replace(ice_log_marker, ice_log_patch, 1)
-rtp_extensions_marker = '''        rtp_id_iteration = 0
-        return_result = True
-'''
-legacy_rtp_extensions_patch = '''        # Selkies 1.6.1 RTP header extensions are unstable in the ElastOS
-        # combined audio/video product session. Runtime TURN plus NACK/FIR keeps
-        # the media path reliable without mutating RTP extension caps here.
-        return True
-'''
-if legacy_rtp_extensions_patch in text:
-    text = text.replace(legacy_rtp_extensions_patch, rtp_extensions_marker, 1)
-elif rtp_extensions_marker not in text:
-    raise SystemExit("Selkies RTP extension patch removal target not found")
-opusenc_member_marker = "        self.rtpgccbwe = None\n"
-opusenc_member_patch = "        self.rtpgccbwe = None\n        self.opusenc = None\n"
-if opusenc_member_patch not in text:
-    if opusenc_member_marker not in text:
-        raise SystemExit("Selkies opusenc member patch target not found")
-    text = text.replace(opusenc_member_marker, opusenc_member_patch, 1)
-video_only_start = """        if audio_only:
-            self.build_audio_pipeline()
-        else:
-            self.build_video_pipeline()
-"""
-audio_video_start = """        if audio_only:
-            self.build_audio_pipeline()
-        else:
-            self.build_video_pipeline()
-            self.build_audio_pipeline()
-"""
-audio_video_pattern = (
-    r"        if audio_only:\n"
-    r"            self\.build_audio_pipeline\(\)\n"
-    r"        else:\n"
-    r"            self\.build_video_pipeline\(\)\n"
-    r"(?:            self\.build_audio_pipeline\(\)\n)+"
-)
-text, pipeline_replacements = re.subn(audio_video_pattern, video_only_start, text, count=1)
-if pipeline_replacements == 0 and video_only_start not in text:
-    raise SystemExit("Selkies video/audio split pipeline patch target not found")
-audio_extension_block = """        # Add WebRTC RTP extensions
-        extensions_return = self.rtp_add_extensions(rtpopuspay, audio=True)
-        if not extensions_return:
-            logger.warning("WebRTC RTP extension configuration failed with audio, this may lead to suboptimal performance")
-"""
-legacy_audio_extension_patch = """        # Selkies 1.6.1 can corrupt combined audio/video SDP when audio RTP
-        # header extensions are attached. Keep the product session audio track
-        # simple and let WebRTC/NACK handle media recovery through Runtime TURN.
-        extensions_return = True
-"""
-audio_extension_patch = """        # Selkies 1.6.1 audio RTP header extensions are fragile in the split
-        # product audio peer. Keep the audio track
-        # simple and let WebRTC/NACK handle media recovery through Runtime TURN.
-        extensions_return = True
-"""
-if audio_extension_block in text:
-    text = text.replace(audio_extension_block, audio_extension_patch, 1)
-elif legacy_audio_extension_patch in text:
-    text = text.replace(legacy_audio_extension_patch, audio_extension_patch, 1)
-elif "Selkies 1.6.1 audio RTP header extensions are fragile" not in text:
-    raise SystemExit("Selkies audio RTP extension patch target not found")
-pulsesrc_named = '        pulsesrc = Gst.ElementFactory.make("pulsesrc", "pulsesrc")\n'
-pulsesrc_unnamed = '        pulsesrc = Gst.ElementFactory.make("pulsesrc")\n'
-pulsesrc_device = '        pulsesrc.set_property("device", "auto_null.monitor")\n'
-if pulsesrc_named in text:
-    text = text.replace(pulsesrc_named, pulsesrc_unnamed, 1)
-elif pulsesrc_unnamed not in text:
-    raise SystemExit("Selkies pulsesrc patch target not found")
-text = re.sub(r'^[ \t]*pulsesrc\.set_property\("device", .*\)\n', '', text, flags=re.MULTILINE)
-text = text.replace(pulsesrc_unnamed, pulsesrc_unnamed + pulsesrc_device, 1)
-opusenc_named = '        opusenc = Gst.ElementFactory.make("opusenc", "opusenc")\n'
-opusenc_unnamed = '        opusenc = Gst.ElementFactory.make("opusenc")\n'
-if opusenc_named in text:
-    text = text.replace(opusenc_named, opusenc_unnamed, 1)
-elif opusenc_unnamed not in text:
-    raise SystemExit("Selkies opusenc patch target not found")
-opusenc_bitrate_marker = '        opusenc.set_property("bitrate", self.audio_bitrate)\n'
-opusenc_bitrate_patch = '        opusenc.set_property("bitrate", self.audio_bitrate)\n        self.opusenc = opusenc\n'
-if opusenc_bitrate_patch not in text:
-    if opusenc_bitrate_marker not in text:
-        raise SystemExit("Selkies opusenc reference patch target not found")
-    text = text.replace(opusenc_bitrate_marker, opusenc_bitrate_patch, 1)
-opusenc_update_block = """            element = Gst.Bin.get_by_name(self.pipeline, "opusenc")
-            element.set_property("bitrate", bitrate)
-"""
-opusenc_update_patch = """            element = self.opusenc or Gst.Bin.get_by_name(self.pipeline, "opusenc")
-            if element is None:
-                raise GSTWebRTCAppError("Audio encoder is unavailable")
-            element.set_property("bitrate", bitrate)
-"""
-if opusenc_update_block in text:
-    text = text.replace(opusenc_update_block, opusenc_update_patch, 1)
-elif opusenc_update_patch not in text:
-    raise SystemExit("Selkies audio bitrate update patch target not found")
-audio_queue_named = '        rtpopuspay_queue = Gst.ElementFactory.make("queue", "rtpopuspay_queue")\n'
-audio_queue_unnamed = '        rtpopuspay_queue = Gst.ElementFactory.make("queue")\n'
-if audio_queue_named in text:
-    text = text.replace(audio_queue_named, audio_queue_unnamed, 1)
-elif audio_queue_unnamed not in text:
-    raise SystemExit("Selkies audio queue patch target not found")
-audio_add_block = """        # Add all elements to the pipeline.
-        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
-
-        for pipeline_element in pipeline_elements:
-            self.pipeline.add(pipeline_element)
-"""
-audio_add_strict_block = """        # Add all elements to the pipeline.
-        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
-
-        for pipeline_element in pipeline_elements:
-            if pipeline_element is None:
-                raise GSTWebRTCAppError("Audio pipeline element is unavailable")
-            if not self.pipeline.add(pipeline_element):
-                raise GSTWebRTCAppError("Failed to add {} to pipeline".format(pipeline_element.get_name()))
-"""
-audio_add_patch = """        # Add all elements to the pipeline.
-        pipeline_elements = [pulsesrc, pulsesrc_capsfilter, opusenc, rtpopuspay, rtpopuspay_queue, rtpopuspay_capsfilter]
-
-        for pipeline_element in pipeline_elements:
-            if pipeline_element is None:
-                raise GSTWebRTCAppError("Audio pipeline element is unavailable")
-            self.pipeline.add(pipeline_element)
-"""
-if audio_add_strict_block in text:
-    text = text.replace(audio_add_strict_block, audio_add_patch, 1)
-elif audio_add_block in text:
-    text = text.replace(audio_add_block, audio_add_patch, 1)
-elif audio_add_patch not in text:
-    raise SystemExit("Selkies audio pipeline add patch target not found")
-audio_offer_marker = '        logger.info("{} pipeline started".format("audio" if audio_only else "video"))\n'
-audio_offer_patch = """        logger.info("{} pipeline started".format("audio" if audio_only else "video"))
-        if audio_only:
-            logger.info("forcing audio SDP offer for split product audio peer")
-            self.__on_negotiation_needed(self.webrtcbin)
-"""
-if audio_offer_patch not in text:
-    if audio_offer_marker not in text:
-        raise SystemExit("Selkies split audio offer patch target not found")
-    text = text.replace(audio_offer_marker, audio_offer_patch, 1)
-path.write_text(text)
-PY
-python3 - <<'PY'
-import os
-import pathlib
-import shutil
-import tarfile
-import tempfile
-import urllib.request
-
-url = os.environ["SELKIES_WEB_URL"]
-install_parent = pathlib.Path("/opt")
-install_dir = install_parent / "gst-web"
-with tempfile.NamedTemporaryFile(suffix=".tar.gz") as archive:
-    urllib.request.urlretrieve(url, archive.name)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = pathlib.Path(tmp)
-        root = tmp_path.resolve()
-        with tarfile.open(archive.name, "r:gz") as tar:
-            for member in tar.getmembers():
-                target = (tmp_path / member.name).resolve()
-                if target != root and root not in target.parents:
-                    raise SystemExit(f"unsafe path in Selkies web archive: {member.name}")
-            tar.extractall(tmp_path)
-        extracted = tmp_path / "gst-web"
-        if not (extracted / "index.html").is_file():
-            raise SystemExit("Selkies web archive must contain gst-web/index.html")
-        if install_dir.exists():
-            shutil.rmtree(install_dir)
-        shutil.move(str(extracted), str(install_dir))
-if not (install_dir / "index.html").is_file():
-    raise SystemExit("Selkies web install missing /opt/gst-web/index.html")
-PY
 apt-get clean
 rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 SH
@@ -632,6 +449,9 @@ mkdir -p "$target_dir"
   --runtime-relay-bin "$cargo_target_dir/$rust_target/release/browser-vm-runtime-relay" \
   --guest-control-bridge-bin "$cargo_target_dir/$rust_target/release/browser-vm-guest-control-bridge" \
   --control-service "$repo_root/scripts/browser-selkies-control-service.mjs" \
+  --vz-transport-bootstrap "$repo_root/scripts/browser-vm-vz-transport-bootstrap.mjs" \
+  --runtime-exit-transport vsock_relay \
+  --display-backend vm_selkies_gstreamer_webrtc \
   --node-bin "$out_dir/node" \
   --chromium-bin "$out_dir/chromium" > "$out_dir/stage-result.json"
 
@@ -827,6 +647,9 @@ rm -f "$rootfs_image"
 as_root "$mke2fs_bin" -q -t ext4 -d "$rootfs_dir" -F "$rootfs_image" "$rootfs_size"
 as_root chown "$(id -u):$(id -g)" "$rootfs_image"
 
+current_inputs=$(python3 "$repo_root/scripts/browser-vm-image-inputs.py" "${image_inputs_args[@]:0:8}")
+[[ "$current_inputs" == "$image_inputs" ]] || die "Guest inputs changed during build"
+
 python3 - "$out_dir" "$target_platform" "$rootfs_image" "$kernel_image" "$initrd_image" <<'PY'
 import hashlib
 import json
@@ -852,6 +675,8 @@ manifest = {
     "ok": bool(preflight.get("ok")),
     "builder": "debootstrap",
     "target_platform": target_platform,
+    "inputs_sha256": json.loads((out_dir / "browser-vm-inputs.json").read_text())["sha256"],
+    "recipe_options": json.loads((out_dir / "browser-vm-inputs.json").read_text())["options"],
     "rootfs_ext4": str(rootfs),
     "sha256": sha256(rootfs),
     "size": rootfs.stat().st_size,

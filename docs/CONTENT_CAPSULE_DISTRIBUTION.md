@@ -22,7 +22,7 @@ does not describe the later SmolLM2 result.
 A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
 Marketplace and Carrier, then completed a terminal Assistant reply. Its current
 installed readiness regression also passed after Runtime restart; the exact
-local receipt is recorded in [state.md](../state.md#current-model-foundation-23-september-2026-utc).
+local receipt is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Full Qwen, combined retention and failure-path acceptance, and public delivery
 remain open.
 
@@ -127,7 +127,7 @@ workflow, file picker or editable model path. It uses this sequence:
 Off-box catalog and package delivery uses the existing Content and availability
 contracts over Carrier. Runtime applies the same publisher, identity and
 authority checks. A bounded local miss can fetch from an authenticated holder;
-the installed direct-Carrier SmolLM2 result is recorded in [state.md](../state.md).
+the installed direct-Carrier SmolLM2 result is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Independent-holder and wider route acceptance remain open.
 
 The CID proves the closure bytes. The publisher signature proves who made the
@@ -242,7 +242,8 @@ operator pins one. Re-pinning `model_catalog.head_cid` binds only new
 preparation records. An admitted package keeps its bytes and its original
 receipt, while readiness follows the current head: startup composition and
 dispatch readiness cover only records bound to the current head, so the
-package reports admitted and not ready until one explicit authorized same-CID
+package reports admitted and not ready, with `dispatch_unavailable_reason`
+`catalog_updated`, until one explicit authorized same-CID
 Use under the new pin creates an alias record that reuses the admitted bytes
 without another payload fetch.
 
@@ -310,8 +311,9 @@ staging enters admission by exclusive same-filesystem rename. Exact-CID reuse
 retains one artifact charge with separate actor/request bindings.
 
 Private native/Registry capacity observation uses the ready backend's actual
-repository and same-volume datastores. It returns bounded facts and enforces the 10%
-free-space floor. Current-owner backend directories may use `0755` with no
+repository and same-volume datastores. It returns bounded facts; Runtime admits
+the work only when its bytes plus the shared 2 GiB free-space reserve fit in the
+available space. Current-owner backend directories may use `0755` with no
 special or group/world write bits; staging remains owner-only `0700`.
 This filesystem observation is separate from the inventory reservation.
 Isolated process tests exercise fresh Use through real Content, Registry,
@@ -322,7 +324,7 @@ unknown settlement when backend stop is unconfirmed. The catalog signer and
 successful revalidation callback belong to the fixture. They do not prove the
 installed Home grant/session path. The installed operator catalog and receipt
 exist. That earlier Qwen Use failed; the later SmolLM2 installed journey passed.
-Their separate evidence and limits are in [state.md](../state.md).
+Their separate evidence and limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
@@ -338,6 +340,19 @@ without reading model or engine payloads. Activation still verifies full
 hashes, and the provider verifies payloads before each new engine start.
 Dispatch readiness describes the current binding; an actual run proves
 inference.
+
+When admitted content cannot run, the same projection can report a fixed
+`dispatch_unavailable_reason`: `unsupported_host`, `source_engine_required`,
+`catalog_updated`, `cache_budget_unavailable` or `memory_budget_unavailable`.
+Runtime derives this current fact from its host profile, engine acquisition
+policy, catalogue head binding and caller budget. Preparation also reports fixed
+`download_interrupted` and `storage_service_unavailable` causes so the caller
+can resume a retained transfer or restart its storage service. A Get whose
+content reads fail in transit first resumes by itself from the kept bytes, up
+to five times over about four minutes, and reports `download_interrupted` only
+after that. The UI explains the next action while retaining the admitted content.
+Other failures keep the general service-unavailable state. The projection
+stores no failure cause and exposes no provider error text or host path.
 
 ## Content-to-consumer review
 
@@ -379,7 +394,7 @@ The following separates implemented primitives from remaining package work:
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented, including the current viewer rejection. Review handoff compatibility separately from execution authority; preparation verifies facts against the complete fetched package. |
 | `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant matches exact ready offers and preserves optional CID intent. |
-| `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
+| `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` remains capped at 64 MiB; it is a separate path. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
 | `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
@@ -395,8 +410,9 @@ payload digests before admission; a range receipt alone cannot establish them.
 Runtime owns one private staging operation for the exact package identity and
 admission record. Bound catalog/manifest bytes, file count, each file, total
 bytes and time from validated policy and exact package facts. Account for
-backend pin storage, staging and final placement, preserving at least 10% free
-space on every affected volume before and during preparation. Verify ownership,
+backend pin storage, staging and final placement, and require those bytes plus
+the shared 2 GiB free-space reserve to fit in the available space on every
+affected volume before and during preparation. Verify ownership,
 mode, symlink/hard-link refusal and containment. Atomically admit only the full
 verified closure; restart reconciles the same record and removes only its owned
 partial staging. Retry neither duplicates admission nor repeats a completed
@@ -436,7 +452,9 @@ Implemented source boundaries and remaining acceptance:
    closure succeed; uncertainty blocks replacement. Provider-source tests verify
    retirement by exact offer ID and immutable configuration through private Init,
    preserving operator offers and historical results. Runtime stores the exact
-   activation descriptor and pending retirement in the same inventory. It
+   activation descriptor and pending retirement in the same inventory. A verified
+   engine replacement can rebuild that descriptor while preserving the model,
+   settings and policy. Retained runs keep their original execution binding. It
    withdraws the offer before removing eligible unkept admission files, and
    reconciles withdrawal before startup registration. CapacityPending keeps
    pending Use identity with zero reservation; uncertain closure preserves
@@ -449,8 +467,9 @@ Implemented source boundaries and remaining acceptance:
    Visible in-flight preparation has bounded polling; request and CID ownership
    reject stale replies. An unconfirmed Use keeps its request identity until a
    successful read reconciles it. Keep is a caller retention choice, not deletion.
-   Assistant keeps exact offer/CID intent in existing workspaces and
-   use current unique ready mappings. Missing choices and failed refreshes
+   Assistant keeps the saved CID as model intent in existing workspaces and
+   refreshes its offer hint from the current unique ready mapping. Service
+   selections keep their exact offer identity. Missing choices and failed refreshes
    preserve drafts and accepted runs; new dispatch requires current readiness
    and deliberate Send. Open Models uses the Home handoff to Marketplace Models.
    A ready result can select that exact CID in Assistant;
@@ -470,7 +489,8 @@ Implemented source boundaries and remaining acceptance:
    JSON array. Large-model bootstrap must use bounded operator/provider import
    or a separately verified publisher repair. Capacity admission covers the
    complete proof layout, including an additional publisher backend copy when
-   used, while preserving the 10% free-space floor.
+   used, and requires that layout plus the shared 2 GiB reserve to fit in the
+   available space.
    Verify actual
    artifact/receipt parity and human behavior, then publish code/tests/docs/
    manifests only after explicit authorization. Passkey ceremonies require the
@@ -483,7 +503,7 @@ llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
 signed closure size. The local operator package records exact bytes,
 complete-closure CID, publisher signature/trust, licenses, provenance claims,
 resource limits and local availability. Its verified scope and upstream
-provenance limits are in [state.md](../state.md#model-and-assistant-truth).
+provenance limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 That local package proof does not establish off-box distribution. The existing
 engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing

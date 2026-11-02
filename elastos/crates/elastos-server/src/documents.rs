@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 
 const DOCUMENTS_SCHEMA: &str = "elastos.document/v2";
 const DOCUMENTS_DEFAULT_TITLE: &str = "Untitled";
+/// The most plain files the Documents list shows from the Documents folder.
+const DOCUMENTS_FOLDER_FILES_LIMIT: usize = 500;
+/// The most folder entries of any kind one summary reads while finding them.
+const DOCUMENTS_FOLDER_ENTRIES_LIMIT: usize = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsListItem {
@@ -26,6 +30,23 @@ pub struct DocumentsListItem {
     pub updated_at: u64,
     #[serde(default)]
     pub latest_published_cid: Option<String>,
+}
+
+/// A plain `.md` or `.txt` file in the user's Documents folder (or a folder in
+/// it) that has no Documents object, such as a file made in Library. Documents
+/// lists it and opens it as a Library file; listing imports nothing.
+#[derive(Debug, Clone, Serialize)]
+struct DocumentsFolderFile {
+    uri: String,
+    name: String,
+    path: String,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DocumentsSummary {
+    documents: Vec<DocumentsListItem>,
+    files: Vec<DocumentsFolderFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,9 +475,9 @@ fn handle_provider_request_inner(
     request: DocumentsProviderRequest,
 ) -> anyhow::Result<Value> {
     match request {
-        DocumentsProviderRequest::Summary { principal_id } => Ok(json!({
-            "documents": documents_load_summary(data_dir, &principal_id)?,
-        })),
+        DocumentsProviderRequest::Summary { principal_id } => Ok(serde_json::to_value(
+            documents_load_summary(data_dir, &principal_id)?,
+        )?),
         DocumentsProviderRequest::Create {
             principal_id,
             title,
@@ -684,7 +705,7 @@ fn documents_operation_error_message(err: anyhow::Error) -> String {
 
 fn documents_viewer_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
     let viewer_dir = data_dir.join("capsules").join("documents");
-    if viewer_dir.join("index.html").is_file() {
+    if crate::shares::check_viewer_entrypoint(&viewer_dir).is_ok() {
         return Ok(viewer_dir);
     }
 
@@ -1081,15 +1102,115 @@ fn documents_load_metadata_index(
     Ok(documents)
 }
 
-fn documents_load_summary(
-    data_dir: &Path,
-    principal_id: &str,
-) -> anyhow::Result<Vec<DocumentsListItem>> {
-    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
-    Ok(documents_load_metadata_index(&objects, principal_id)?
-        .into_iter()
-        .map(|metadata| documents_list_item(&metadata))
-        .collect())
+fn documents_load_summary(data_dir: &Path, principal_id: &str) -> anyhow::Result<DocumentsSummary> {
+    let metadata = {
+        let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+        documents_load_metadata_index(&objects, principal_id)?
+    };
+    // The folder scan reads names and times only, so it runs without the
+    // shared object lock; a file saved meanwhile shows on the next summary.
+    let docs_root = documents_root(data_dir, principal_id)?;
+    let mut scan = DocumentsFolderScan {
+        indexed: metadata
+            .iter()
+            .map(|metadata| metadata.file_name.as_str())
+            .collect(),
+        base_uri: documents_working_copy_uri(principal_id, "")?,
+        visited: 0,
+        files: Vec::new(),
+    };
+    // Only the principal's real Documents folder: nothing on the way to it,
+    // nor the folder itself, may be a link.
+    let real_folder = crate::auth::ensure_no_symlink_components(data_dir, &docs_root).is_ok()
+        && std::fs::symlink_metadata(&docs_root).is_ok_and(|metadata| metadata.is_dir());
+    if real_folder {
+        scan.collect(&docs_root, "", 0);
+    }
+    let mut files = scan.files;
+    files.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(DocumentsSummary {
+        documents: metadata.iter().map(documents_list_item).collect(),
+        files,
+    })
+}
+
+/// Walks the Documents folder by name to the start walk's folder depth,
+/// skipping hidden entries, links and anything unreadable. It reads at most
+/// `DOCUMENTS_FOLDER_ENTRIES_LIMIT` entries of any kind and keeps at most
+/// `DOCUMENTS_FOLDER_FILES_LIMIT` files.
+struct DocumentsFolderScan<'a> {
+    indexed: std::collections::HashSet<&'a str>,
+    base_uri: String,
+    visited: usize,
+    files: Vec<DocumentsFolderFile>,
+}
+
+impl DocumentsFolderScan<'_> {
+    fn done(&self) -> bool {
+        self.visited >= DOCUMENTS_FOLDER_ENTRIES_LIMIT
+            || self.files.len() >= DOCUMENTS_FOLDER_FILES_LIMIT
+    }
+
+    fn collect(&mut self, dir: &Path, relative: &str, depth: usize) {
+        if depth >= crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            if self.done() {
+                return;
+            }
+            self.visited += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if name.starts_with('.') || file_type.is_symlink() {
+                continue;
+            }
+            let path = if relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative}/{name}")
+            };
+            if file_type.is_dir() {
+                self.collect(&entry.path(), &path, depth + 1);
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if !file_type.is_file()
+                || !(lower.ends_with(".md") || lower.ends_with(".txt"))
+                || self.indexed.contains(path.as_str())
+            {
+                continue;
+            }
+            let updated_at = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_secs());
+            self.files.push(DocumentsFolderFile {
+                uri: format!("{}{path}", self.base_uri),
+                name,
+                path,
+                updated_at,
+            });
+        }
+    }
 }
 
 pub fn documents_load_document(
@@ -1668,6 +1789,7 @@ mod tests {
     struct MockIpfsProvider {
         cid: String,
         add_count: tokio::sync::Mutex<usize>,
+        published_paths: tokio::sync::Mutex<Vec<String>>,
         unpinned: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -1676,6 +1798,7 @@ mod tests {
             Self {
                 cid: cid.to_string(),
                 add_count: tokio::sync::Mutex::new(0),
+                published_paths: tokio::sync::Mutex::new(Vec::new()),
                 unpinned: tokio::sync::Mutex::new(Vec::new()),
             }
         }
@@ -1704,6 +1827,12 @@ mod tests {
             match request.get("op").and_then(|op| op.as_str()) {
                 Some("add_directory") => {
                     *self.add_count.lock().await += 1;
+                    *self.published_paths.lock().await = request["files"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|file| file["path"].as_str().map(str::to_string))
+                        .collect();
                     Ok(json!({
                         "status": "ok",
                         "data": {
@@ -1731,14 +1860,19 @@ mod tests {
         }
     }
 
+    /// Installs the repository's real Documents capsule (manifest plus its
+    /// `browser/` entrypoint directory), the layout setup installs.
     fn install_test_documents_viewer(data_dir: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../capsules/documents");
         let viewer_dir = data_dir.join("capsules").join("documents");
-        std::fs::create_dir_all(&viewer_dir).unwrap();
-        std::fs::write(
-            viewer_dir.join("index.html"),
-            "<!doctype html><title>Documents</title>",
-        )
-        .unwrap();
+        let mut files = Vec::new();
+        crate::ipfs::collect_files_for_ipfs(&source, &source, &mut files).unwrap();
+        for rel in files {
+            let dest = viewer_dir.join(&rel);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(source.join(&rel), dest).unwrap();
+        }
+        assert!(!viewer_dir.join("index.html").exists());
     }
 
     #[test]
@@ -1747,23 +1881,138 @@ mod tests {
 
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert!(summary.is_empty());
+        assert!(summary.documents.is_empty() && summary.files.is_empty());
         assert!(!documents_root(dir.path(), TEST_PRINCIPAL).unwrap().exists());
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
     }
 
     #[test]
-    fn documents_summary_does_not_import_orphan_markdown() {
+    fn documents_summary_lists_plain_folder_files_without_importing() {
         let dir = tempfile::tempdir().unwrap();
         let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
-        std::fs::create_dir_all(&docs_root).unwrap();
+        std::fs::create_dir_all(docs_root.join("Notes")).unwrap();
+        std::fs::create_dir_all(docs_root.join(".hidden")).unwrap();
         std::fs::write(docs_root.join("Legacy.md"), "# Legacy\n").unwrap();
+        std::fs::write(docs_root.join("New File.txt"), "plain\n").unwrap();
+        std::fs::write(docs_root.join("Notes").join("Todo.TXT"), "todo\n").unwrap();
+        std::fs::write(docs_root.join("photo.png"), [0u8; 4]).unwrap();
+        std::fs::write(docs_root.join(".hidden").join("Secret.md"), "x\n").unwrap();
 
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert!(summary.is_empty());
+        assert!(summary.documents.is_empty());
+        let mut paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["Legacy.md", "New File.txt", "Notes/Todo.TXT"]);
+        let root = crate::auth::principal_localhost_root(TEST_PRINCIPAL);
+        let todo = summary
+            .files
+            .iter()
+            .find(|file| file.path == "Notes/Todo.TXT")
+            .unwrap();
+        assert_eq!(todo.uri, format!("{root}/Documents/Notes/Todo.TXT"));
+        assert_eq!(todo.name, "Todo.TXT");
+        assert!(todo.updated_at > 0);
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
         assert!(docs_root.join("Legacy.md").is_file());
+    }
+
+    #[test]
+    fn documents_summary_folder_files_stay_within_depth_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        let mut deep = docs_root.clone();
+        for level in 0..crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Too deep.md"), "x\n").unwrap();
+        std::fs::write(deep.parent().unwrap().join("Deepest.md"), "x\n").unwrap();
+
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let names = summary
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Deepest.md"]);
+
+        for index in 0..=DOCUMENTS_FOLDER_FILES_LIMIT {
+            std::fs::write(docs_root.join(format!("n{index:03}.txt")), "x\n").unwrap();
+        }
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert_eq!(summary.files.len(), DOCUMENTS_FOLDER_FILES_LIMIT);
+    }
+
+    #[test]
+    fn documents_summary_folder_scan_reads_a_bounded_number_of_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = dir.path().join("Documents");
+        std::fs::create_dir_all(docs_root.join("folder")).unwrap();
+        // Folders and files Documents does not list count as well.
+        for index in 0..DOCUMENTS_FOLDER_ENTRIES_LIMIT {
+            std::fs::write(docs_root.join(format!("photo{index}.png")), "").unwrap();
+            std::fs::write(docs_root.join("folder").join(format!("p{index}.png")), "").unwrap();
+        }
+
+        let mut scan = DocumentsFolderScan {
+            indexed: Default::default(),
+            base_uri: String::new(),
+            visited: 0,
+            files: Vec::new(),
+        };
+        scan.collect(&docs_root, "", 0);
+
+        assert_eq!(scan.visited, DOCUMENTS_FOLDER_ENTRIES_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documents_summary_does_not_list_through_a_linked_documents_folder() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Elsewhere.txt"), "x\n").unwrap();
+
+        // The Documents folder itself is a link.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        std::fs::create_dir_all(docs_root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &docs_root).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert!(summary.files.is_empty(), "{:?}", summary.files);
+
+        // A folder on the way to it is a link.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        let principal_folder = docs_root.parent().unwrap();
+        std::fs::create_dir_all(principal_folder.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(outside.path().join("Documents")).unwrap();
+        std::fs::write(outside.path().join("Documents").join("Away.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), principal_folder).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert!(summary.files.is_empty(), "{:?}", summary.files);
+
+        // A link inside it is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        std::fs::create_dir_all(&docs_root).unwrap();
+        std::fs::write(docs_root.join("Own.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), docs_root.join("Linked")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("Elsewhere.txt"),
+            docs_root.join("Linked.txt"),
+        )
+        .unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["Own.md"]);
     }
 
     #[test]
@@ -1774,13 +2023,17 @@ mod tests {
             documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Project Plan")).unwrap();
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].doc_did, document.doc_did);
+        assert_eq!(summary.documents.len(), 1);
+        assert_eq!(summary.documents[0].doc_did, document.doc_did);
         assert_eq!(
-            summary[0].document_uri,
+            summary.documents[0].document_uri,
             documents_object_uri(&document.doc_did)
         );
-        assert_eq!(summary[0].title, "Project Plan");
+        assert_eq!(summary.documents[0].title, "Project Plan");
+        assert!(
+            summary.files.is_empty(),
+            "a Documents object is listed once"
+        );
     }
 
     #[test]
@@ -1807,8 +2060,12 @@ mod tests {
             format!("{root}/Documents/Shared Note.txt")
         );
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].doc_did, imported.doc_did);
+        assert_eq!(summary.documents.len(), 1);
+        assert_eq!(summary.documents[0].doc_did, imported.doc_did);
+        assert!(
+            summary.files.is_empty(),
+            "a Documents object is listed once"
+        );
 
         documents_save_local(
             dir.path(),
@@ -1833,7 +2090,7 @@ mod tests {
         assert_eq!(reopened.doc_did, imported.doc_did);
         assert_eq!(reopened.body, "edited locally");
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
-        assert_eq!(summary.len(), 1);
+        assert_eq!(summary.documents.len(), 1);
     }
 
     #[test]
@@ -1909,7 +2166,9 @@ mod tests {
             documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
         let loaded =
             documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
 
         assert_eq!(republish.next_version, 2);
         assert_eq!(loaded.title, newer.title);
@@ -1939,7 +2198,9 @@ mod tests {
 
         let unpublished =
             documents_unpublish_local(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
         let republish =
             documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
 
@@ -1967,10 +2228,12 @@ mod tests {
         assert!(documents_delete_local(dir.path(), OTHER_PRINCIPAL, &owned.doc_did).is_err());
         assert!(documents_load_summary(dir.path(), OTHER_PRINCIPAL)
             .unwrap()
+            .documents
             .is_empty());
         assert_eq!(
             documents_load_summary(dir.path(), TEST_PRINCIPAL)
                 .unwrap()
+                .documents
                 .len(),
             1
         );
@@ -2016,7 +2279,9 @@ mod tests {
         )
         .unwrap();
 
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
 
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].doc_did, document.doc_did);
@@ -2113,6 +2378,19 @@ mod tests {
         assert_eq!(published.uri, format!("elastos://{TEST_CID}"));
         assert_eq!(published.route, format!("/s/{TEST_CID}/"));
         assert_eq!(*ipfs_provider.add_count.lock().await, 1);
+        let paths = ipfs_provider.published_paths.lock().await.clone();
+        for expected in [
+            "index.html",
+            "documents.js",
+            "elastos-ui.css",
+            "_share.json",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == expected),
+                "{expected} missing from {paths:?}"
+            );
+        }
+        assert!(!paths.iter().any(|path| path.starts_with("browser/")));
 
         let republished = client.publish(&document.doc_did).await.unwrap();
         assert_eq!(republished.cid, TEST_CID);
@@ -2275,6 +2553,7 @@ mod tests {
         assert!(!metadata_dir.exists());
         assert!(documents_load_summary(dir.path(), TEST_PRINCIPAL)
             .unwrap()
+            .documents
             .is_empty());
         assert!(documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).is_err());
     }

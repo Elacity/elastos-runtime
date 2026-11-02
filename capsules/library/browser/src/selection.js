@@ -4,14 +4,44 @@ export function createLibrarySelection({
   state,
   visibleObjects,
 }) {
+  let visibleUriSource = null;
+  let visibleUriSet = new Set();
+
   function objectByUri(uri) {
     return state.objectsByUri.get(uri);
   }
 
+  function visibleUris() {
+    const visible = visibleObjects();
+    if (visible !== visibleUriSource) {
+      visibleUriSource = visible;
+      visibleUriSet = new Set(visible.map((object) => object.uri));
+    }
+    return visibleUriSet;
+  }
+
+  function allVisible(uris) {
+    const visible = visibleUris();
+    return uris.every((uri) => visible.has(uri));
+  }
+
+  // Only items the person can see are selected or acted on (#441).
   function selectedObjects() {
+    const visible = visibleUris();
     return Array.from(state.selectedUris)
+      .filter((uri) => visible.has(uri))
       .map((uri) => state.objectsByUri.get(uri))
       .filter(Boolean);
+  }
+
+  function pruneSelectionToVisible() {
+    const visible = visibleUris();
+    for (const uri of state.selectedUris) {
+      if (!visible.has(uri)) state.selectedUris.delete(uri);
+    }
+    if (state.selectionAnchorUri && !visible.has(state.selectionAnchorUri)) {
+      state.selectionAnchorUri = "";
+    }
   }
 
   function isSelected(uri) {
@@ -89,10 +119,12 @@ export function createLibrarySelection({
   }
 
   return {
+    allVisible,
     clearSelection,
     isSelected,
     objectByUri,
     prepareDragSelection,
+    pruneSelectionToVisible,
     selectAllVisible,
     selectedObjects,
     selectOnly,

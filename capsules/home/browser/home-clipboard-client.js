@@ -201,6 +201,12 @@ export function createHomeClipboardClient({
       return true;
     }
     const record = pending;
+    // A Home page whose code predates this purpose refuses it as malformed
+    // under the purpose "invalid" (home-clipboard-host.js replyRequestError).
+    // This client sends only purposes it allows, so that refusal means the
+    // Home page runs older code than this app and needs a reload.
+    const purposeUnknown =
+      data.ok === false && data.purpose === "invalid" && data.error === "malformed";
     const commonValid =
       data.schema === HOME_CLIPBOARD_RESULT_SCHEMA &&
       data.targetId === targetId &&
@@ -208,7 +214,7 @@ export function createHomeClipboardClient({
       data.parentOrigin === homeOrigin &&
       data.generation === generation &&
       data.operation === record.operation &&
-      data.purpose === record.purpose &&
+      (data.purpose === record.purpose || purposeUnknown) &&
       typeof data.ok === "boolean";
     if (!commonValid) {
       invalidResult(record);
@@ -235,7 +241,7 @@ export function createHomeClipboardClient({
         return true;
       }
       const error = new Error(`Home Clipboard request failed: ${data.error}.`);
-      error.code = data.error;
+      error.code = purposeUnknown ? "unknown_purpose" : data.error;
       clearPending(record, error);
       return true;
     }

@@ -439,6 +439,39 @@ pub(crate) fn require_home_token_context(
     .map(|required| required.context)
 }
 
+/// Verify a launch before body extraction. The handler retains its actor gate.
+pub(super) fn require_gateway_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<()> {
+    if require_home_token_context(data_dir, headers).is_ok() {
+        return Ok(());
+    }
+    let token = single_home_launch_token_header(headers)?
+        .ok_or_else(|| anyhow::anyhow!("missing launch token"))?;
+    if token.len() > 16 * 1024 {
+        anyhow::bail!("invalid launch token");
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&token)?;
+    let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)?;
+    let actor = &envelope.payload.launch_context.executable_actor;
+    let browser = headers.contains_key("origin")
+        || headers.contains_key("referer")
+        || headers.contains_key("sec-fetch-site");
+    require_home_launch_token_for_any_from_with_origin(
+        data_dir,
+        headers,
+        &[actor],
+        None,
+        if browser {
+            HomeLaunchOriginPolicy::Browser
+        } else {
+            HomeLaunchOriginPolicy::InternalShell
+        },
+    )
+    .map(|_| ())
+}
+
 pub(crate) fn home_launch_token_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-elastos-home-token")
@@ -771,7 +804,8 @@ fn require_capsule_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
+/// The origin a Home browser request was addressed to (scheme and Host).
+pub(in crate::api) fn home_browser_origin(headers: &HeaderMap) -> anyhow::Result<String> {
     let host = single_browser_header(headers, axum::http::header::HOST.as_str())?
         .ok_or_else(|| anyhow::anyhow!("Home browser request is missing its host"))?;
     let authority = host
@@ -782,9 +816,13 @@ fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> 
     } else {
         "http"
     };
-    let expected = url::Url::parse(&format!("{scheme}://{authority}"))?
+    Ok(url::Url::parse(&format!("{scheme}://{authority}"))?
         .origin()
-        .ascii_serialization();
+        .ascii_serialization())
+}
+
+fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
+    let expected = home_browser_origin(headers)?;
     let mut has_same_origin_provenance = false;
     if let Some(origin) = single_browser_header(headers, axum::http::header::ORIGIN.as_str())? {
         let parsed = url::Url::parse(origin)
@@ -1341,7 +1379,9 @@ mod tests {
         .contains("invalid home launch token payload"));
 
         let mut future = valid_envelope.clone();
-        future.payload.iat = now_ts().saturating_add(61);
+        // Signing and verification can cross a second under suite load.
+        // Keep this fixture well beyond the 60-second clock allowance.
+        future.payload.iat = now_ts().saturating_add(3600);
         future.payload.exp = future
             .payload
             .iat

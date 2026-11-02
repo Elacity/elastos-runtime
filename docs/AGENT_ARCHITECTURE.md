@@ -2,8 +2,7 @@
 
 This document defines how human and AI actors fit the same ElastOS authority
 model. It is an architecture contract, not a claim that the complete agent
-product is implemented. Current implementation truth and known gaps remain in
-[`state.md`](../state.md).
+product is implemented. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own implementation status and proof.
 
 The governing rule is:
 
@@ -363,14 +362,6 @@ The repository already establishes several parts of this model:
 - The architecture already separates mutable capsule state from immutable
   capsule artifacts.
 
-The complete parity path is not yet proven. In particular, `state.md` records
-that principal, proof binding, device, capsule, launch grant, and session are
-not yet independently established end to end for the Component path. The
-installed Assistant does not yet provide the general Agent Host contract with
-durable task/session recovery, persistent approvals, and arbitrary governed
-tools. End-to-end proof for a corresponding signed agent identity document,
-private persona contract, and standing mandate product remains open.
-
 No product-readiness claim should be inferred from this architecture document.
 A conforming implementation must prove the exact installed Runtime, capsule,
 provider, principal, grant, session, restart, and audit path that a user runs.
@@ -401,4 +392,3 @@ provider, principal, grant, session, restart, and audit path that a user runs.
 - [People and conversations](PEOPLE_CONVERSATIONS.md)
 - [Model provider contract](MODEL_PROVIDER.md)
 - [Private network contract](PRIVATE_NETWORK.md)
-- [Current state](../state.md)

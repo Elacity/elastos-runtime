@@ -15,10 +15,7 @@ use url::Url;
 
 const DEFAULT_REMOTE_CARRIER_EXIT_SERVICE: &str = "elastos://exit/open_stream";
 const MAX_CARRIER_CONNECT_TICKET_BYTES: usize = 8192;
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]

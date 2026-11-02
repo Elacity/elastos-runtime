@@ -15,9 +15,10 @@ import {
 import {
   shellState,
   desktopObjects,
-  postToHome,
+  openWebLink,
   openModelsFromAgent,
   openAiProviderSettingsFromAgent,
+  copyFromButton,
 } from "./harness-host.js";
 import {
   agentStageId,
@@ -66,6 +67,8 @@ import {
   startTurnForPrompt,
   canSubmitNewTurn,
   deleteMessageAt,
+  beginDeleteMessage,
+  cancelDeleteMessage,
   beginEditUserMessage,
   cancelEditUserMessage,
   submitEditUserMessage,
@@ -74,6 +77,8 @@ import {
   ensureJumpToLatest,
   setStreamStatus,
   openCodeArtifact,
+  refreshEmptyModelHint,
+  messageCopyText,
 } from "./agent-stream.js";
 import {
   getLiveInferenceState,
@@ -82,6 +87,10 @@ import {
   selectedLiveOffer,
   liveContentChoice,
   liveContentModels,
+  liveDownloadingModel,
+  liveMenuOffers,
+  liveCatalogPending,
+  watchLiveModels,
 } from "./agent-live.js";
 import {
   bindAgentSessions,
@@ -389,15 +398,22 @@ function toggleSidebarCollapsed() {
   setSidebarCollapsed(!collapsed);
 }
 
-let lastComposerGeometryKey = "";
+/* A reader this close to the transcript's end counts as at the end. */
+const READER_AT_END_PX = 8;
+let lastComposerColumnKey = "";
+let lastComposerClearance = -1;
+/* During a turn the column stays put while the stream grows. */
+let composerColumnFrozen = false;
 let composerGeometryRoRaf = 0;
 let composerGeometrySyncing = false;
 let composerGeometryBurstAt = 0;
 let composerGeometryBurst = 0;
 
 /* `tracking`: a bounded per-frame follow of a CSS ease (the rail collapse);
-   it is not a ResizeObserver feedback loop, so the burst guard stands aside. */
-function syncComposerGeometry({ tracking = false } = {}) {
+   it is not a ResizeObserver feedback loop, so the burst guard stands aside.
+   `clearanceOnly`: during a turn only the stream's bottom clearance follows
+   the composer (a follow-up being typed grows it). */
+function syncComposerGeometry({ tracking = false, clearanceOnly = false } = {}) {
   const taskbar = document.querySelector(".taskbar");
   const main = document.querySelector(".agent-harness-main");
   if (!taskbar || !main || !document.body.classList.contains("agent-harness-active")) {
@@ -432,23 +448,42 @@ function syncComposerGeometry({ tracking = false } = {}) {
     }
   }
   const dock = taskbar.getBoundingClientRect();
-  const band = main.getBoundingClientRect();
-  /* Round to device pixels so left/right edges don’t drift by a subpixel. */
-  const dpr = window.devicePixelRatio || 1;
-  const snap = (n) => Math.round(n * dpr) / dpr;
-  const width = snap(dock.width);
-  const left = snap(dock.left - band.left);
   const clearance = Math.max(96, Math.round(window.innerHeight - dock.top));
-  const key = `${width}|${left}|${clearance}`;
-  if (key === lastComposerGeometryKey) {
+  let width = 0;
+  let left = 0;
+  let columnKey = lastComposerColumnKey;
+  if (!clearanceOnly) {
+    const band = main.getBoundingClientRect();
+    /* Round to device pixels so left/right edges don’t drift by a subpixel. */
+    const dpr = window.devicePixelRatio || 1;
+    const snap = (n) => Math.round(n * dpr) / dpr;
+    width = snap(dock.width);
+    left = snap(dock.left - band.left);
+    columnKey = `${width}|${left}`;
+  }
+  if (columnKey === lastComposerColumnKey && clearance === lastComposerClearance) {
     return;
   }
-  lastComposerGeometryKey = key;
+  /* Measured before the writes: a reader at the end stays at the end, so the
+     newest message and the turn's status line stay above the composer as it
+     grows. */
+  const scroller = streamScrollEl();
+  const atEnd = Boolean(scroller) &&
+    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= READER_AT_END_PX;
   composerGeometrySyncing = true;
   const root = document.documentElement;
-  root.style.setProperty("--harness-composer-clearance", `${clearance}px`);
-  root.style.setProperty("--agent-column-width", `${width}px`);
-  root.style.setProperty("--agent-column-left", `${left}px`);
+  if (clearance !== lastComposerClearance) {
+    root.style.setProperty("--harness-composer-clearance", `${clearance}px`);
+    lastComposerClearance = clearance;
+  }
+  if (columnKey !== lastComposerColumnKey) {
+    root.style.setProperty("--agent-column-width", `${width}px`);
+    root.style.setProperty("--agent-column-left", `${left}px`);
+    lastComposerColumnKey = columnKey;
+  }
+  if (atEnd) {
+    scroller.scrollTop = scroller.scrollHeight;
+  }
   requestAnimationFrame(() => {
     composerGeometrySyncing = false;
   });
@@ -463,15 +498,12 @@ function observeDockGeometry() {
     dockResizeObserver.disconnect();
   }
   dockResizeObserver = new ResizeObserver(() => {
-    if (turnBusy) {
-      return;
-    }
     if (composerGeometryRoRaf) {
       return;
     }
     composerGeometryRoRaf = requestAnimationFrame(() => {
       composerGeometryRoRaf = 0;
-      syncComposerGeometry();
+      syncComposerGeometry({ clearanceOnly: composerColumnFrozen });
     });
   });
   /* Observe the dock only. Watching `main` re-fired on every stream height
@@ -485,14 +517,11 @@ function stopDockGeometryObserver() {
   dockResizeObserver = null;
 }
 
-/** Suspend dock geometry work for the whole turn (stream growth). */
+/** For the whole turn the column stays put while the stream grows; the
+    clearance still follows the composer. */
 function setComposerGeometrySuspended(suspended) {
+  composerColumnFrozen = suspended;
   if (suspended) {
-    if (composerGeometryRoRaf) {
-      cancelAnimationFrame(composerGeometryRoRaf);
-      composerGeometryRoRaf = 0;
-    }
-    stopDockGeometryObserver();
     return;
   }
   observeDockGeometry();
@@ -712,6 +741,15 @@ function closeModelMenu() {
   if (returnFocus) anchor?.focus({ preventScroll: true });
 }
 
+// Every published probe (boot, open, Refresh, a re-read, a send) updates the
+// chip and an open menu, so neither keeps an older read.
+window.addEventListener("assistant:live-models", () => {
+  if (!active) return;
+  syncModelTrigger();
+  refreshEmptyModelHint();
+  if (modelMenuOpen()) renderModelMenu();
+});
+
 function syncModelTrigger() {
   syncAgentSendButton();
   const btn = modelBtnEl();
@@ -723,7 +761,9 @@ function syncModelTrigger() {
   const liveInference = getLiveInferenceState();
   const offer = selectedLiveOffer();
   const content = liveContentModels().find(model => model.offerId === offer?.offerId);
-  const label = content?.title || offer?.label || liveInference.model || "No model";
+  const downloading = offer ? null : liveDownloadingModel();
+  const label = content?.title || offer?.label || liveInference.model ||
+    (downloading ? `${downloading.title} is downloading (${downloading.downloadPercent}%)` : "No model");
   if (name) {
     name.textContent = label;
   }
@@ -764,11 +804,10 @@ function buildInstalledModelRows(host, emptyText) {
     status.textContent = modelSelectionMessage || "Keeping this model on this device…";
     host.append(status);
   }
-  /* Rows are the advertised model offers — nothing else is inference. */
-  const liveInference = getLiveInferenceState();
+  /* Rows are the advertised model offers — nothing else is inference. An
+     admitted model appears only as its catalog row below, with its title. */
   const activeOffer = selectedLiveOffer();
-  for (const model of liveInference.models) {
-    if (liveContentModels().some(content => content.offerId === model.offerId)) continue;
+  for (const model of liveMenuOffers()) {
     const row = document.createElement("button");
     row.type = "button";
     row.disabled = modelSelectionPending;
@@ -821,7 +860,7 @@ function buildInstalledModelRows(host, emptyText) {
   if (!host.children.length) {
     const empty = document.createElement("p");
     empty.className = "agent-model-menu-empty";
-    empty.textContent = emptyText;
+    empty.textContent = liveCatalogPending() ? "Checking models on this Home…" : emptyText;
     host.append(empty);
   }
   for (const [action, label] of [
@@ -831,6 +870,7 @@ function buildInstalledModelRows(host, emptyText) {
   ]) {
     const button = document.createElement("button");
     button.type = "button"; button.className = "agent-model-option";
+    button.id = `agent-model-action-${action}`;
     button.dataset.modelAction = action; button.textContent = label;
     host.append(button);
   }
@@ -842,7 +882,11 @@ function renderModelMenu() {
   if (!listHost) {
     return;
   }
+  // A published probe can re-render an open menu; keyboard focus stays on its
+  // row or action, which keep their ids.
+  const focused = modelMenuEl()?.contains(document.activeElement) ? document.activeElement.id : "";
   buildInstalledModelRows(listHost, "No model offer on this Home yet.");
+  if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
   if (modelMenuOpen()) {
     const anchor = modelMenuAnchor || modelBtnEl();
     positionFloatingMenu(modelMenuEl(), anchor, {
@@ -984,6 +1028,7 @@ export function showAgentHarness({
 
   /* Already open (e.g. Agent button while harness visible) — keep room, optional send. */
   if (active && !prompt) {
+    watchLiveModels(true);
     harness.classList.add("is-visible");
     if (syncStage && !isAgentSpace(getActiveStageId())) {
       setActiveStage(agentStageId(), {
@@ -1024,6 +1069,7 @@ export function showAgentHarness({
 
   const motionGen = (harnessMotionGen += 1);
   active = true;
+  watchLiveModels(true);
   closeHarnessDrawer();
   document.body.classList.add("agent-harness-active");
   if (!prefersReducedMotion()) {
@@ -1053,11 +1099,7 @@ export function showAgentHarness({
   harness.setAttribute("aria-hidden", "false");
   syncTruthStrip();
   syncSessionModeUi();
-  void probeLiveInference({ force: true }).then(() => {
-    if (active) {
-      syncModelTrigger();
-    }
-  });
+  void probeLiveInference({ force: true });
   renderSessions();
   renderActiveSession();
 
@@ -1148,6 +1190,7 @@ export function hideAgentHarness({ syncStage = true } = {}) {
   stopAgentStream({ keepPartial: true, cancelRun: false });
   stopParticles();
   active = false;
+  watchLiveModels(false);
   closeHarnessDrawer();
   closeSessionSearch();
   closeModelMenu();
@@ -1234,7 +1277,7 @@ export function sendToAgentHarness(prompt, opts = {}) {
     renderSessions();
     setTitle(session.title);
     clearEmptyState();
-    appendMessage("user", displayText, { parts, modelText });
+    appendMessage("user", displayText, { msgIndex: session.messages.length - 1, parts, modelText });
     startTurnForPrompt(modelText);
     return true;
   }
@@ -1301,19 +1344,11 @@ export function bindAgentHarness() {
   bindAgentWorkspaceSnapshot(getAgentWorkspaceSnapshot);
   ensureAgentWorkspaceHydrated();
   window.addEventListener("online", () => {
-    void probeLiveInference({ force: true }).then(() => {
-      if (active) {
-        syncModelTrigger();
-      }
-    });
+    void probeLiveInference({ force: true });
   });
 
   /* Contract era: real probe — live flips only on offers_list truth (§AL.3). */
-  void probeLiveInference().then(() => {
-    if (active) {
-      syncModelTrigger();
-    }
-  });
+  void probeLiveInference();
 
   /* Esc: search (90) → drawer (85) → Shelf reverse dance (75). */
   registerEscapeHandler("agent-session-search", {
@@ -1341,6 +1376,11 @@ export function bindAgentHarness() {
     priority: 89,
     isActive: () => sessionActionsOpen(),
     dismiss: () => closeSessionActions(),
+  });
+  registerEscapeHandler("agent-delete-confirm", {
+    priority: 88,
+    isActive: () => Boolean(streamEl()?.querySelector("[data-delete-confirm-bar]")),
+    dismiss: () => cancelDeleteMessage(),
   });
 
   window.addEventListener("resize", () => {
@@ -1565,20 +1605,19 @@ export function bindAgentHarness() {
     const webLink = event.target.closest?.("[data-open-browser-url]");
     if (webLink) {
       event.preventDefault();
-      postToHome({
-        type: "home-agent:open-browser",
-        url: webLink.dataset.openBrowserUrl || "",
-      });
+      openWebLink(webLink.dataset.openBrowserUrl || "");
       return;
     }
     const copyCode = event.target.closest?.(".agent-md-copy");
     if (copyCode) {
       event.preventDefault();
+      void copyFromButton(copyCode, copyCode.closest(".agent-md-code")?.querySelector("code")?.textContent || "");
       return;
     }
     const copyMsg = event.target.closest?.("[data-copy-message]");
     if (copyMsg) {
       event.preventDefault();
+      void copyFromButton(copyMsg, messageCopyText(copyMsg.closest(".agent-msg")));
       return;
     }
     if (event.target.closest?.("[data-agent-jump-latest]")) {
@@ -1603,13 +1642,27 @@ export function bindAgentHarness() {
       beginEditUserMessage(editBtn.closest(".agent-msg")?.dataset.msgIndex);
       return;
     }
+    if (event.target.closest?.("[data-delete-cancel]")) {
+      event.preventDefault();
+      cancelDeleteMessage();
+      return;
+    }
+    const deleteConfirm = event.target.closest?.("[data-delete-confirm]");
+    if (deleteConfirm) {
+      event.preventDefault();
+      const idx = deleteConfirm.closest(".agent-msg")?.dataset.msgIndex;
+      cancelDeleteMessage();
+      if (!turnBusy) deleteMessageAt(idx);
+      return;
+    }
     const deleteBtn = event.target.closest?.("[data-delete-message]");
     if (deleteBtn) {
       event.preventDefault();
       if (turnBusy) {
         return;
       }
-      deleteMessageAt(deleteBtn.closest(".agent-msg")?.dataset.msgIndex);
+      cancelDeleteMessage();
+      beginDeleteMessage(deleteBtn.closest(".agent-msg")?.dataset.msgIndex);
       return;
     }
     if (event.target.closest?.("[data-retry]") || event.target.closest?.("[data-regenerate]")) {

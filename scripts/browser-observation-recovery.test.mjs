@@ -29,9 +29,9 @@ function deferred() {
 }
 
 const routes = {
-  status: { start: "startPageStatusPolling", timer: "pageStatusTimer" },
-  heartbeat: { start: "startPageHeartbeat", timer: "pageHeartbeatTimer" },
-  afterInput: { start: "schedulePageStatusRefresh", timer: "pageStatusRefreshTimers" },
+  status: { start: "startPageStatusPolling", stop: "stopPageStatusPolling", timer: "pageStatusTimer" },
+  heartbeat: { start: "startPageHeartbeat", stop: "stopPageHeartbeat", timer: "pageHeartbeatTimer" },
+  afterInput: { start: "schedulePageStatusRefresh", stop: "stopPageStatusRefresh", timer: "pageStatusRefreshTimers" },
 };
 function harness() {
   const timers = new Map(), requests = [], failures = [], renewals = [], mutations = [], messages = [];
@@ -40,6 +40,7 @@ function harness() {
     currentPage: { page_id: "page-current", actual_url: "https://fixture.invalid/nav", title: "Before",
       runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-current" } },
     unloadCleanupStarted: false, currentPageGeneration: 1, pageStatusTimer: 0, pageHeartbeatTimer: 0, pageStatusRefreshTimers: [],
+    pageStatusPollingRun: null, pageStatusRefreshRun: null, pageHeartbeatRun: null,
     relaunchRequested: false, lastPageStatus: null, homeWindowCloseInFlight: false,
     homeWindowTerminalCloseConfirmed: false, pendingHomeWindowCloseDelivery: null,
     document: { hidden: false }, isAddressEditing: () => false,
@@ -82,6 +83,7 @@ function harness() {
     mediaOpen: () => mediaOpen,
     setFetch: value => { fetch = value; },
     start: route => state[routes[route].start](),
+    stop: route => state[routes[route].stop](),
     async fire(route) {
       const id = timerFor(route), timer = timers.get(id);
       assert.ok(timer, `missing ${route} timer`);
@@ -233,6 +235,56 @@ for (const route of Object.keys(routes)) {
       assert.deepEqual(h.messages, []);
       assert.deepEqual([...h.timers.keys()], newTimers, "old completion cannot add or cancel the new owner's polling");
     });
+  }
+}
+
+for (const route of Object.keys(routes)) {
+  for (const lifecycle of ["restart", "stop"]) {
+    for (const outcome of ["success", "transport", "authority", "terminal"]) {
+      test(`${route} ${lifecycle} retires a pending ${outcome} observation for the same page owner`, async () => {
+        const h = harness(), pending = deferred(), owner = h.state.currentRuntimePageOwner();
+        const previousStatus = { ...h.healthyStatus(), actual_url: "https://fixture.invalid/previous", title: "Previous" };
+        h.setFetch(() => pending.promise);
+        h.start(route);
+        const observation = h.fire(route);
+        assert.equal(h.requests.length, 1);
+        if (lifecycle === "restart") h.start(route);
+        else h.stop(route);
+        h.state.currentPage.actual_url = "https://fixture.invalid/current";
+        const remainingTimers = [...h.timers.keys()];
+        assert.equal(remainingTimers.length, lifecycle === "stop" ? 0 : route === "afterInput" ? 4 : 1);
+
+        if (outcome === "success") pending.resolve(response(previousStatus));
+        else if (outcome === "transport") pending.reject(new TypeError("retired observation failed"));
+        else pending.resolve(response({ error: "retired observation failed" }, outcome === "authority" ? 401 : 404));
+        await observation;
+
+        assertRetained(h, owner);
+        assert.equal(h.state.currentPage.actual_url, "https://fixture.invalid/current");
+        assert.equal(h.state.lastPageStatus, null);
+        assert.deepEqual(h.mutations, []);
+        assert.deepEqual(h.messages, []);
+        assert.deepEqual([...h.timers.keys()], remainingTimers,
+          "Retired work must leave the replacement timers unchanged");
+
+        if (lifecycle === "restart") {
+          if (outcome === "authority") {
+            h.setFetch(async () => response({ error: "auth session is not active" }, 401));
+            await h.fire(route);
+            assert.equal(h.renewals.length, 1, "The active run must still request fresh authority on HTTP 401");
+            assert.equal(h.timers.size, 0);
+            assert.deepEqual(h.failures, []);
+            assert.equal(h.mediaOpen(), true);
+          } else {
+            h.setFetch(async () => response(h.healthyStatus()));
+            await h.fire(route);
+            assertRetained(h, owner);
+            assert.equal(h.requests.length, 2, "The replacement run must continue observing");
+            if (route !== "heartbeat") assert.ok(h.mutations.length > 0);
+          }
+        }
+      });
+    }
   }
 }
 

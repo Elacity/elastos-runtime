@@ -229,7 +229,7 @@ function renderServices(services) {
     available: availableRemoteOffers,
     source: "others",
     selectedTitle: "Subscribed",
-    availableTitle: "Available from People",
+    availableTitle: "Services from People",
     emptySelected: "No Services from others are subscribed.",
     emptyAvailable: `No ${SERVICE_KIND_LIST_COPY} services are available from People you are connected with.`,
   });
@@ -484,6 +484,10 @@ function serviceCopy(offer, source, selected) {
     if (selected && requestStatus === "denied") {
       return `${name} denied the request. Remove it and ask again if needed.`;
     }
+    if (readText(offer?.service_kind) === BROWSER_ENGINE_SERVICE_KIND) {
+      const sharing = "The owner must share their Browser Engine in Services and approve in Inbox before Browser can use it.";
+      return selected ? `Request sent. ${sharing}` : `Ask to use ${name}. ${sharing}`;
+    }
     return selected
       ? `${name} is waiting for approval.`
       : `Ask to use ${name}. You need to be connected in People first.`;
@@ -520,6 +524,9 @@ function serviceStatus(offer, source, selected) {
     return "Subscribed";
   }
   const status = readText(offer?.status);
+  if (status === "requestable" && readText(offer?.service_kind) === BROWSER_ENGINE_SERVICE_KIND) {
+    return "Ask owner";
+  }
   return status === "requestable" ? "Available" : status || "Available";
 }
 

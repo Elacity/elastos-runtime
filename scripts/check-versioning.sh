@@ -31,7 +31,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-meta='(\+[0-9A-Za-z.-]+)?'
+meta='(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
 preferred="^${core}(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?${meta}$"
 compact_prerelease="^${core}(-(alpha|beta|rc)(0|[1-9][0-9]*))${meta}$"
 

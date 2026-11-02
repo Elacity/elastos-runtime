@@ -9,7 +9,7 @@ const end = source.indexOf("\nasync function currentPasskey(", start);
 function harness({ reuse = true, journey = true, refresh = { ok: true, homeToken: "scoped-home" } } = {}) {
   const calls = [];
   const context = vm.createContext({ assert, REUSE_SIGNED_HOME: reuse, CHECK_BROWSER_CONTROLLED_JOURNEY: journey,
-    waitForHomeReady: async () => calls.push("ready"), homeState: async () => ({ authority: "signed" }),
+    waitForHomeEntry: async () => calls.push("ready"), homeState: async () => ({ authority: "signed" }),
     refreshCurrentHomeToken: async () => { calls.push("refresh"); return refresh; },
     waitForSignedHome: async () => calls.push("signed"), signOut: async () => calls.push("sign-out"),
     signBackIn: async () => { calls.push("sign-in"); return "new-home"; } });

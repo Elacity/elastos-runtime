@@ -2,9 +2,8 @@
 
 This is the Browser qualification matrix. A supported entry requires installed
 evidence for the exact device roles, software versions, codecs and topology.
-Current verdicts and target observations live in
-[state.md](../state.md#browser-contract-and-device-qualification).
-Open qualification work lives in [TASKS.md](../TASKS.md#browser-maturity-workstream).
+Current verdicts, target observations and open qualification work live in
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
 
 The matrix deliberately separates a viewer from the Runtime that hosts Engine
 and the Runtime that hosts Exit. A device with insufficient local Engine

@@ -17,12 +17,13 @@ import {
   abortLiveChatStream,
   detachLiveChatStream,
   selectedLiveOffer,
+  liveDownloadingModel,
   unresolvedModelTurn,
 } from "./agent-live.js";
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
 import { renderHarnessPage } from "./agent-configure.js";
-import { postToHome, openInboxFromAgent } from "./harness-host.js";
+import { postToHome, openInboxFromAgent, openModelsFromAgent } from "./harness-host.js";
 import {
   createProgressController,
   snapshotProgress,
@@ -54,7 +55,8 @@ const liveTurnCanonical = {
 const STREAM_BUDGET_MS = 8;
 const STREAM_TRACE_LIMIT = 48;
 const FOLLOW_RESUME_PX = 96;
-const RICH_FINALIZE_BUDGET_MS = 48;
+/** A scroll this soon after the reader's wheel, key, touch or pointer is theirs. */
+const READER_INPUT_MS = 1000;
 /** One-shot markdown+KaTeX above this freezes Brave. Stream freeze slices stay ~800. */
 const RICH_MARKDOWN_MAX_CHARS = 8_000;
 const LONG_TASK_TRACE_LIMIT = 24;
@@ -232,7 +234,7 @@ export function renderMarkdown(text, { streaming = false, stream, kind } = {}) {
 }
 
 /** Keep raw markdown on the node so Stop/Copy don't lose markers after HTML paint. */
-function paintAgentMessageBody(body, text, { streaming = false, allowDegrade = false } = {}) {
+function paintAgentMessageBody(body, text, { streaming = false } = {}) {
   if (!body) {
     return;
   }
@@ -246,18 +248,8 @@ function paintAgentMessageBody(body, text, { streaming = false, allowDegrade = f
     delete body.dataset.mdPainted;
     return;
   }
-  const started = performance.now();
-  const html = renderMarkdown(raw, { streaming: false });
-  if (allowDegrade && performance.now() - started > RICH_FINALIZE_BUDGET_MS) {
-    delete body.dataset.mdPainted;
-    return;
-  }
   const tmpl = document.createElement("template");
-  tmpl.innerHTML = html;
-  if (allowDegrade && performance.now() - started > RICH_FINALIZE_BUDGET_MS) {
-    delete body.dataset.mdPainted;
-    return;
-  }
+  tmpl.innerHTML = renderMarkdown(raw, { streaming: false });
   body.replaceChildren(tmpl.content);
   body.dataset.mdPainted = "1";
 }
@@ -364,6 +356,103 @@ function formatInlineMarkdown(escaped) {
     .replaceAll(/`([^`]+)`/g, '<code class="agent-md-inline">$1</code>');
 }
 
+const MD_LIST_ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+function startsMarkdownBlock(line) {
+  const trimmed = line.trim();
+  return (
+    line.includes("|") ||
+    /^(#{1,3})\s+/.test(trimmed) ||
+    /^>\s?/.test(trimmed) ||
+    /^\s*(\\\[|\$\$)/.test(line)
+  );
+}
+
+/* One list starting at lines[start]. Items continue across blank lines while
+   the next marker has the same kind and indent; non-list text directly under
+   an item (or indented after a blank) joins that item; deeper markers form a
+   nested list inside the current item. An ordered list says how many digits
+   its widest number has, so its gutter fits "10." as well as "9.". Returns
+   the html and the next line. */
+function renderMarkdownList(lines, start) {
+  const first = MD_LIST_ITEM.exec(lines[start]);
+  const indent = first[1].length;
+  const ordered = /\d/.test(first[2]);
+  const tag = ordered ? "ol" : "ul";
+  const number = ordered ? Number.parseInt(first[2], 10) : 1;
+  let html = "";
+  let items = 0;
+  let j = start;
+  for (;;) {
+    const marker = MD_LIST_ITEM.exec(lines[j]);
+    let parts = [marker[3]];
+    let body = "";
+    const flushText = () => {
+      const text = parts.join("\n").trim();
+      if (text) {
+        body += formatInlineMarkdown(escapeHtml(text)).replaceAll("\n", "<br>");
+      }
+      parts = [];
+    };
+    let nextItem = false;
+    j += 1;
+    while (j < lines.length) {
+      const line = lines[j];
+      if (!line.trim()) {
+        let k = j + 1;
+        while (k < lines.length && !lines[k].trim()) {
+          k += 1;
+        }
+        if (k >= lines.length) {
+          break;
+        }
+        const after = MD_LIST_ITEM.exec(lines[k]);
+        const afterIndent = /^\s*/.exec(lines[k])[0].length;
+        if (after && afterIndent === indent && /\d/.test(after[2]) === ordered) {
+          j = k;
+          nextItem = true;
+          break;
+        }
+        if (after ? afterIndent > indent : afterIndent > indent && !startsMarkdownBlock(lines[k])) {
+          if (!after) {
+            parts.push("");
+          }
+          j = k;
+          continue;
+        }
+        break;
+      }
+      const item = MD_LIST_ITEM.exec(line);
+      if (item) {
+        const itemIndent = item[1].length;
+        if (itemIndent > indent) {
+          flushText();
+          const sub = renderMarkdownList(lines, j);
+          body += sub.html;
+          j = sub.next;
+          continue;
+        }
+        nextItem = itemIndent === indent && /\d/.test(item[2]) === ordered;
+        break;
+      }
+      if (startsMarkdownBlock(line)) {
+        break;
+      }
+      parts.push(line.trim());
+      j += 1;
+    }
+    flushText();
+    html += `<li>${body}</li>`;
+    items += 1;
+    if (!nextItem) {
+      break;
+    }
+  }
+  const digits = ordered ? Math.min(String(number + items - 1).length, 4) : 1;
+  const attrs = `${number !== 1 ? ` start="${number}"` : ""}${digits > 1 ? ` data-marker-digits="${digits}"` : ""}`;
+  return { html: `<${tag} class="agent-md-list"${attrs}>${html}</${tag}>`, next: j };
+}
+
 function renderMarkdownBlocks(raw) {
   const lines = String(raw).replace(/\r\n/g, "\n").split("\n");
   let html = "";
@@ -385,13 +474,13 @@ function renderMarkdownBlocks(raw) {
     if (
       line.includes("|") &&
       i + 1 < lines.length &&
-      /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i + 1])
+      /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])
     ) {
       const rows = [];
       while (i < lines.length && lines[i].includes("|")) {
         rows.push(lines[i]);
         i += 1;
-        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i])) {
+        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i])) {
           i += 1; /* skip separator */
         } else if (rows.length > 1 && (!lines[i] || !lines[i].includes("|"))) {
           break;
@@ -467,16 +556,10 @@ function renderMarkdownBlocks(raw) {
       i += 1;
       continue;
     }
-    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
-      const ordered = /^\s*\d+\.\s+/.test(line);
-      const tag = ordered ? "ol" : "ul";
-      html += `<${tag} class="agent-md-list">`;
-      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
-        const item = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "");
-        html += `<li>${formatInlineMarkdown(escapeHtml(item))}</li>`;
-        i += 1;
-      }
-      html += `</${tag}>`;
+    if (MD_LIST_ITEM.test(line)) {
+      const list = renderMarkdownList(lines, i);
+      html += list.html;
+      i = list.next;
       continue;
     }
     if (/^>\s?/.test(line.trim())) {
@@ -490,7 +573,11 @@ function renderMarkdownBlocks(raw) {
       ).replaceAll("\n", "<br>")}</blockquote>`;
       continue;
     }
-    const para = [];
+    /* The current line matched no other block, so it opens the paragraph;
+       taking it unconditionally guarantees progress (a stray "|" or an
+       unclosed "$$" line would otherwise stall this loop forever). */
+    const para = [line];
+    i += 1;
     while (
       i < lines.length &&
       lines[i].trim() &&
@@ -516,6 +603,9 @@ export function formatStreamError(err) {
   if (code === "approval_denied") {
     return "This hosted connection was denied in Inbox. Your prompt is saved here; choose another model to send it.";
   }
+  if (code === "hosted_access_ended_during_reply") {
+    return "Hosted access ended during this reply. Approve the new request in Inbox to use it again.";
+  }
   if (code === "aborted") {
     return "Run status unavailable.";
   }
@@ -524,6 +614,10 @@ export function formatStreamError(err) {
   }
   if (code === "run_acceptance_unknown") {
     return "Run acceptance is unknown. Start a new chat.";
+  }
+  if (["model_invocation_refused", "remote_model_invocation_refused"].includes(code)
+      && err?.reason === "request_expired" && err?.preDispatchRefusal === true) {
+    return "This request is no longer valid. Check your device's clock, then try again.";
   }
   if (code === "remote_model_invocation_refused" && err?.preDispatchRefusal === true) {
     return "Request refused. This attempt stopped before provider dispatch. Review service access before a new request.";
@@ -686,9 +780,10 @@ export function updateJumpToLatestVisibility() {
     return;
   }
   const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-  btn.hidden = distance < 96 || !ctx?.turnBusy && distance < 160;
-  /* Show whenever user is meaningfully above bottom during/after turns. */
-  btn.hidden = distance < 120;
+  /* Offered whenever the reader is meaningfully above the end, except while a
+     reply streams and the room is following it (its own scroll events see
+     the reply a frame ahead of the follow). */
+  btn.hidden = scroller.classList.contains("is-follow-bottom") || distance < 120;
 }
 
 function commitAgentReply(session, answer, thinking = "", { partial = false, quiet = false, progress = null, run = null, turn = null } = {}) {
@@ -858,8 +953,35 @@ export function drainFollowUpQueue() {
     ...(Array.isArray(next.parts) && next.parts.length ? { parts: next.parts } : {}),
   });
   host.renderSessions();
-  appendMessage("user", displayText, { parts: next.parts, modelText: next.text });
+  appendMessage("user", displayText, { msgIndex: target.messages.length - 1, parts: next.parts, modelText: next.text });
   startTurnForPrompt(next.text);
+}
+
+/** Without a model the hero names the one step that unlocks chat. Only a
+ * successful read that found no usable model may say so: an unprobed or failed
+ * read, or a chosen model that is unavailable beside others, keeps the usual
+ * hero and the model menu path. */
+function paintEmptyModelHint(empty) {
+  const noModel = getLiveInferenceState().endpointState === "no-model-offers" && !liveDownloadingModel();
+  empty.querySelector(".agent-harness-empty-sub").textContent = noModel ? NO_MODEL_STATUS : "Private on this Home";
+  let get = empty.querySelector("[data-agent-get-model]");
+  if (noModel && !get) {
+    get = document.createElement("button");
+    get.type = "button";
+    get.className = "agent-harness-empty-action";
+    get.dataset.agentGetModel = "";
+    get.textContent = "Get a model";
+    get.addEventListener("click", () => openModelsFromAgent());
+    empty.append(get);
+  } else if (!noModel) {
+    get?.remove();
+  }
+}
+
+/** The harness calls this when the model list changes. */
+export function refreshEmptyModelHint() {
+  const empty = document.querySelector(".agent-harness-empty");
+  if (empty) paintEmptyModelHint(empty);
 }
 
 export function showEmptyState() {
@@ -877,12 +999,13 @@ export function showEmptyState() {
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
   empty.setAttribute("role", "status");
-  const sub = "Private on this Home";
-  empty.innerHTML =
-    `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub"></p>`;
-  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
-  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
+  for (const [className, text] of [["agent-harness-empty-greeting", greeting], ["agent-harness-empty-sub", ""]]) {
+    const line = document.createElement("p");
+    line.className = className;
+    line.textContent = text;
+    empty.append(line);
+  }
+  paintEmptyModelHint(empty);
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -1200,6 +1323,78 @@ function paintUserMessageBody(body, text, { parts = null, modelText = "" } = {})
   }
 }
 
+const MSG_ACTION_ICONS = {
+  copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
+  edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
+  regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
+  trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
+};
+
+function makeMsgAction(svg, label, extra = "") {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
+  btn.innerHTML = svg;
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  return btn;
+}
+
+function makeDeleteAction() {
+  const del = makeMsgAction(MSG_ACTION_ICONS.trash, "Delete", "is-danger");
+  del.dataset.deleteMessage = "1";
+  del.disabled = Boolean(ctx.turnBusy);
+  return del;
+}
+
+/* A reply that has just finished streaming gets what a redrawn one has: the
+   index of the message it was saved as, Regenerate enabled and Delete. Call
+   after commitAgentReply stored it as the session's last message. */
+function settleStreamedReply(row, session) {
+  if (!row?.isConnected) {
+    return;
+  }
+  const regen = row.querySelector("[data-regenerate]");
+  if (regen) {
+    regen.disabled = false;
+  }
+  const index = (session?.messages?.length ?? 0) - 1;
+  if (session?.messages?.[index]?.role !== "agent") {
+    return;
+  }
+  /* A resumed partial was drawn before this row; the message now holds this
+     row's text, so the stale row would answer to the same index. */
+  for (const stale of host.streamEl()?.querySelectorAll(`.agent-msg[data-msg-index="${index}"]`) || []) {
+    if (stale !== row) stale.remove();
+  }
+  row.dataset.msgIndex = String(index);
+  const actions = row.querySelector(".agent-msg-actions");
+  if (actions && !actions.querySelector("[data-delete-message]")) {
+    const del = makeDeleteAction();
+    del.disabled = false;
+    actions.append(del);
+  }
+}
+
+/** What a message's Copy writes: a reply's Markdown source (while it streams,
+    the source received so far), or the text a sent message shows (what the
+    person typed; attachment chips are not text). A reply whose source was never
+    recorded copies what it shows. */
+export function messageCopyText(row) {
+  const body = row?.querySelector(":scope > .agent-msg-body");
+  if (!body) {
+    return "";
+  }
+  if (row.dataset.role === "agent") {
+    const live = getLiveTurnCanonical();
+    if (row.classList.contains("is-streaming") && row.dataset.streamGeneration === String(live.generation)) {
+      return String(live.answer || "");
+    }
+    return String(body.dataset.mdSource || body.textContent || "");
+  }
+  return body.querySelector(".agent-msg-user-text")?.textContent || "";
+}
+
 export function appendMessage(
   role,
   text,
@@ -1232,41 +1427,23 @@ export function appendMessage(
 
   const actions = document.createElement("div");
   actions.className = "agent-msg-actions";
-  const makeIcon = (svg, label, extra = "") => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
-    btn.innerHTML = svg;
-    btn.title = label;
-    btn.setAttribute("aria-label", label);
-    return btn;
-  };
-  const ICONS = {
-    copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
-    edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
-    regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
-    trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
-  };
-  const copyBtn = makeIcon(ICONS.copy, "Copy");
+  const copyBtn = makeMsgAction(MSG_ACTION_ICONS.copy, "Copy");
   copyBtn.dataset.copyMessage = "1";
   actions.append(copyBtn);
   if (role === "user" && !streaming) {
-    const edit = makeIcon(ICONS.edit, "Edit and resubmit");
+    const edit = makeMsgAction(MSG_ACTION_ICONS.edit, "Edit and resubmit");
     edit.dataset.editMessage = "1";
     edit.disabled = Boolean(ctx.turnBusy);
     actions.append(edit);
   }
   if (role === "agent") {
-    const regen = makeIcon(ICONS.regen, "Regenerate reply");
+    const regen = makeMsgAction(MSG_ACTION_ICONS.regen, "Regenerate reply");
     regen.dataset.regenerate = "1";
     regen.disabled = streaming || Boolean(ctx.turnBusy);
     actions.append(regen);
   }
   if (!streaming) {
-    const del = makeIcon(ICONS.trash, "Delete", "is-danger");
-    del.dataset.deleteMessage = "1";
-    del.disabled = Boolean(ctx.turnBusy);
-    actions.append(del);
+    actions.append(makeDeleteAction());
   }
 
   if (!streaming) {
@@ -1319,6 +1496,49 @@ export function openCodeArtifact(code, lang = "") {
   });
 }
 
+/* Delete asks in the row: the Runtime serves app documents without
+   allow-modals, so window.confirm() is ignored and returns false. */
+export function beginDeleteMessage(msgIndex) {
+  const row = host.streamEl()?.querySelector(`.agent-msg[data-msg-index="${Number(msgIndex)}"]`);
+  const actions = row?.querySelector(".agent-msg-actions");
+  if (!row || !actions || ctx.turnBusy || row.querySelector("[data-delete-confirm-bar]")) {
+    return false;
+  }
+  actions.hidden = true;
+  const bar = document.createElement("div");
+  bar.className = "agent-msg-edit-bar agent-msg-delete-confirm";
+  bar.dataset.deleteConfirmBar = "1";
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Delete this message?");
+  const question = document.createElement("span");
+  question.textContent = "Delete this message?";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "agent-msg-edit-cancel";
+  cancel.dataset.deleteCancel = "1";
+  cancel.textContent = "Cancel";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "agent-msg-edit-send";
+  confirm.dataset.deleteConfirm = "1";
+  confirm.textContent = "Delete";
+  bar.append(question, cancel, confirm);
+  row.append(bar);
+  cancel.focus({ preventScroll: true });
+  return true;
+}
+
+/** Close any open Delete question; true when one was open. */
+export function cancelDeleteMessage() {
+  const bars = host.streamEl()?.querySelectorAll("[data-delete-confirm-bar]") || [];
+  for (const bar of bars) {
+    const actions = bar.closest(".agent-msg")?.querySelector(".agent-msg-actions");
+    if (actions) actions.hidden = false;
+    bar.remove();
+  }
+  return bars.length > 0;
+}
+
 export function deleteMessageAt(msgIndex) {
   const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
   if (!session || ctx.turnBusy) {
@@ -1326,9 +1546,6 @@ export function deleteMessageAt(msgIndex) {
   }
   const index = Number(msgIndex);
   if (!Number.isInteger(index) || index < 0 || index >= session.messages.length) {
-    return false;
-  }
-  if (!window.confirm("Delete this message from the chat?")) {
     return false;
   }
   session.messages.splice(index, 1);
@@ -1542,8 +1759,10 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
   }
 }
 
+export const NO_MODEL_STATUS = "Get a model to start. Models run on this Home.";
 export const NO_MODEL_OFFER_STATUS =
-  "No model offer on this Home — install a model provider (Store · Services) to chat";
+  "No model on this Home yet. Open Marketplace → Models to get one.";
+export const STOPPED_STATUS = "Stopped.";
 
 export function canSubmitNewTurn() {
   const turn = ctx.sessions.find((s) => s.id === ctx.activeSessionId)?.lastTurn;
@@ -1746,17 +1965,11 @@ function streamBucketP95(traces) {
 }
 
 function scheduleIdleWork(fn) {
-  const startedAt = performance.now();
-  const invoke = (abandonRich) => {
-    fn({ abandonRich: Boolean(abandonRich) || performance.now() - startedAt > 4000 });
-  };
   if (typeof requestIdleCallback === "function") {
-    requestIdleCallback((deadline) => {
-      invoke(Boolean(deadline?.didTimeout));
-    }, { timeout: 4000 });
+    requestIdleCallback(() => fn(), { timeout: 4000 });
     return;
   }
-  window.setTimeout(() => invoke(false), 32);
+  window.setTimeout(fn, 32);
 }
 
 /** Live turn: contract runs_events → scheduled DOM. Stop requests cancellation. */
@@ -1850,13 +2063,36 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   let lastFlushAt = 0;
   let sawFirstToken = false;
   let stickToBottom = true;
+  /* scrollTop the stream left a following reader at; null if not following. */
+  let endScrollTop = null;
+  /* Where the transcript was last seen (scroll event or the follow's own
+     scroll), to tell the reader moving up from layout; see onUserScroll. */
+  let lastScrollTop = 0;
+  let lastMaxTop = 0;
+  const noteScrollPosition = () => {
+    lastScrollTop = scroller.scrollTop;
+    lastMaxTop = scroller.scrollHeight - scroller.clientHeight;
+  };
+  /* Land on the end now and once more after layout settles, unless the reader
+     moved up in between or another turn took the transcript. */
+  const pinToEnd = () => {
+    scroller.scrollTop = scroller.scrollHeight;
+    const top = scroller.scrollTop;
+    window.requestAnimationFrame(() => {
+      if (generation === ctx.streamGeneration && scroller.scrollTop >= top - 1) {
+        scroller.scrollTop = scroller.scrollHeight;
+        if (endScrollTop === top) {
+          endScrollTop = scroller.scrollTop;
+        }
+      }
+    });
+    return top;
+  };
   let answerNotifiedAt = 0;
   let hiddenBuffered = false;
   let progressEl = null;
   let revealTimer = 0;
   let followRaf = 0;
-  let followScrollQuiet = false;
-  let streamAnchor = null;
   let longTaskObserver = null;
   let frameWatch = 0;
   let streamingFlush = false;
@@ -1909,6 +2145,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         reasoning: ctx.reasoningVisible ? getReasoning() : "",
         reasoningVisible: ctx.reasoningVisible,
       });
+      /* The status line appears and grows below the newest message: a
+         following reader keeps it in view above the composer. */
+      followAfterFlush();
     },
   });
   revealTimer = window.setTimeout(() => {
@@ -1978,21 +2217,20 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     followRaf = window.requestAnimationFrame(() => {
       followRaf = 0;
-      if (!stickToBottom || selectionInStream() || !streamAnchor?.isConnected) {
+      if (!stickToBottom || selectionInStream() || !scroller) {
         return;
       }
-      followScrollQuiet = true;
       const t0 = performance.now();
-      streamAnchor.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
+      /* True bottom: the stream's bottom padding keeps the end above the
+         floating composer; scrollIntoView on an anchor left it underneath. */
+      scroller.scrollTop = scroller.scrollHeight;
+      noteScrollPosition();
       const took = performance.now() - t0;
       perf.followMs += took;
       const last = perf.traces[perf.traces.length - 1];
       if (last) {
         last.followMs = Number(took.toFixed(2));
       }
-      window.requestAnimationFrame(() => {
-        followScrollQuiet = false;
-      });
     });
   };
 
@@ -2014,22 +2252,62 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
 
   const scroller = host.streamScrollEl?.();
   const streamRoot = host.streamEl?.();
+  /* The direction of a scroll says who moved. The reader going up (wheel,
+     keys such as ArrowUp or Shift+Space, a scrollbar, a screen reader)
+     lowers scrollTop and stops the follow, by any amount and whatever caused
+     it. The reply growing never lowers it: the follow and the reply row's
+     own scroll to the end move it down. One layout case lowers it too: a
+     block above the end shrinking clamps scrollTop. A scroll up is therefore
+     the reader's unless the room could have shrunk since the last scroll
+     (its furthest scroll position dropped) and the reader gave no input
+     (wheel, key, touch, pointer) in the last second; then the follow lands
+     on the end. Once stopped, only the reader scrolling down to the end, or
+     Jump to latest, starts it again. */
+  if (scroller) {
+    noteScrollPosition();
+  }
+  let readerHolding = false;
+  let readerInputAt = -Infinity;
+  const noteReaderInput = () => {
+    readerInputAt = performance.now();
+  };
+  const onReaderHold = () => {
+    readerHolding = true;
+    noteReaderInput();
+  };
+  const onReaderRelease = () => {
+    if (readerHolding) {
+      readerHolding = false;
+      noteReaderInput();
+    }
+  };
   const onUserScroll = () => {
-    if (followScrollQuiet || !scroller) {
+    if (!scroller) {
       return;
     }
-    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    if (distance > FOLLOW_RESUME_PX) {
-      if (stickToBottom) {
+    const top = scroller.scrollTop;
+    const maxTop = scroller.scrollHeight - scroller.clientHeight;
+    const movedUp = top < lastScrollTop - 1;
+    const movedDown = top > lastScrollTop + 1;
+    const roomShrank = maxTop < lastMaxTop - 1;
+    noteScrollPosition();
+    const readerInput = readerHolding || performance.now() - readerInputAt < READER_INPUT_MS;
+    if (stickToBottom) {
+      if (movedUp && (readerInput || !roomShrank)) {
         pauseFollow();
+      } else if (maxTop - top > 1) {
+        followAfterFlush();
       }
       return;
     }
-    if (!stickToBottom) {
+    /* Paused: only the reader coming back down to the end resumes; the reply
+       growing or a layout clamp never does. */
+    if (movedDown && maxTop - top <= FOLLOW_RESUME_PX) {
       setFollowBottom(true);
     }
   };
   const onUserScrollUp = (event) => {
+    noteReaderInput();
     if (event.deltaY < 0) {
       pauseFollow();
     }
@@ -2038,6 +2316,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     if (event.target?.closest?.("textarea, input, [contenteditable]")) {
       return;
     }
+    noteReaderInput();
     if (event.key === "PageUp" || event.key === "Home" || event.key === "ArrowUp") {
       pauseFollow();
     }
@@ -2069,6 +2348,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   setFollowBottom(true);
   scroller?.addEventListener("scroll", onUserScroll, { passive: true });
   scroller?.addEventListener("wheel", onUserScrollUp, { passive: true });
+  scroller?.addEventListener("pointerdown", onReaderHold, { passive: true });
+  scroller?.addEventListener("touchstart", onReaderHold, { passive: true });
+  for (const type of ["pointerup", "pointercancel", "touchend", "touchcancel"]) {
+    window.addEventListener(type, onReaderRelease, { passive: true });
+  }
   streamRoot?.addEventListener("selectstart", onSelectStart);
   streamRoot?.addEventListener("pointerdown", onStreamPointer);
   streamRoot?.addEventListener("contextmenu", onContextMenu);
@@ -2094,6 +2378,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       return;
     }
     answerRow.dataset.streamPhase = state.phase;
+    answerRow.dataset.streamGeneration = String(generation);
     answerBody.textContent = "";
     delete answerBody.dataset.mdPainted;
     frozenEl = document.createElement("div");
@@ -2102,10 +2387,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     tailEl.className = "agent-stream-tail";
     tailNode = document.createTextNode("");
     tailEl.append(tailNode);
-    streamAnchor = document.createElement("div");
-    streamAnchor.className = "agent-stream-anchor";
-    streamAnchor.setAttribute("aria-hidden", "true");
-    answerBody.append(frozenEl, tailEl, streamAnchor);
+    answerBody.append(frozenEl, tailEl);
   };
 
   const freezeSlice = (text, { markdown = false } = {}) => {
@@ -2519,6 +2801,14 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const partial = materializeCanonical();
       commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
+      paintAgentMessageBody(answerBody, String(partial.answer || "").trim());
+      settleStreamedReply(answerRow, session);
+      if (result.stopRequested && result.settlementUnknown) {
+        /* Local engines cannot confirm a stop; the turn keeps its unknown state. */
+        progress.dispatch({ type: "GENERATION_STOPPED" });
+        setStreamStatus(STOPPED_STATUS);
+        return;
+      }
       progress.dispatch({ type: "GENERATION_ERROR", text: "Settlement unknown" });
       showRunSettlement(result.turnManifest);
       return;
@@ -2540,10 +2830,12 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const reasoning = String(partial.reasoning || "").trim();
       commitAgentReply(session, answer, reasoning, { turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
+      paintAgentMessageBody(answerBody, answer);
       if (!answer) {
         progressEl?.remove();
         answerRow?.remove();
       }
+      settleStreamedReply(answerRow, session);
       if (session && result.turnManifest) {
         liveTurn = result.turnManifest;
         session.lastTurn = cheapTurnSnapshot(liveTurn);
@@ -2580,10 +2872,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     let thinking = String(joined.reasoning || "").trim();
     if (!answer && thinking) {
       /* Reasoning models often spend the budget thinking — surface it honestly.
-         Do not one-shot markdown a Think dump; that is what crashed Brave. */
+         It is rendered like any reply, the same way a reopened chat shows it. */
       answer = thinking;
       thinking = "";
-      state.quality = "plain";
     }
     const split = splitThinkTaggedContent(answer);
     if (split.thinking && !thinking) {
@@ -2625,37 +2916,33 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       answerBody = answerRow?.querySelector(".agent-msg-body") || null;
     }
     answerRow?.classList.remove("is-streaming");
+    if (answerBody) {
+      answerBody.dataset.mdSource = answer;
+    }
     const answerBodyRef = answerBody;
     const answerTextRef = answer;
-    const finalize = ({ abandonRich = false } = {}) => {
+    const finalize = () => {
       if (generation !== ctx.streamGeneration || !answerBodyRef?.isConnected) {
         return;
       }
-      const unhealthy =
-        abandonRich ||
-        perf.slowFrames > 12 ||
-        perf.longTasks.some((row) => row.duration >= 50);
-      answerBodyRef.dataset.mdSource = answerTextRef;
-      const skipRich = unhealthy || stoppedEarly || state.quality === "plain";
-      if (!skipRich) {
-        try {
-          if (frozenEl?.isConnected) {
-            const remaining = String(tailNode?.data || tail || "");
-            if (remaining) {
-              freezeSlice(remaining, { markdown: true });
-            }
-            tailEl?.remove();
-            tailEl = null;
-            tailNode = null;
-          } else {
-            paintAgentMessageBody(answerBodyRef, answerTextRef, {
-              streaming: false,
-              allowDegrade: true,
-            });
-          }
-        } catch {
-          /* keep streamed prefix — canonical survives presentation failure */
-        }
+      /* The last flush and the rich render below make the reply taller; keep
+         a reader who was following at the end. One who scrolled up since the
+         stream ended (its listeners are gone) stays where they are. */
+      const pinned = endScrollTop !== null && !!scroller && scroller.scrollTop >= endScrollTop - 1;
+      /* Streaming painted plain text (live tokens never run Markdown, see
+         adaptQuality). The finished reply, stopped early or not, now gets the
+         render a reopened chat gives it: the whole text through the history
+         painter, which keeps the same size cap. */
+      try {
+        paintAgentMessageBody(answerBodyRef, answerTextRef, { streaming: false });
+        frozenEl = null;
+        tailEl = null;
+        tailNode = null;
+      } catch {
+        /* keep streamed prefix — canonical survives presentation failure */
+      }
+      if (pinned) {
+        pinToEnd();
       }
       timings.t6 = Date.now();
       setPhase("presentation_done");
@@ -2722,10 +3009,6 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       }
     };
     scheduleIdleWork(finalize);
-    const regen = answerRow?.querySelector("[data-regenerate]");
-    if (regen) {
-      regen.disabled = false;
-    }
 
     const turnUsage = noteLiveTurnUsage({
       usage: result.usage || null,
@@ -2756,6 +3039,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         session.lastTurn = cheapTurnSnapshot(liveTurn);
       }
     }
+    settleStreamedReply(answerRow, session);
     if (stoppedEarly && answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
       const note = document.createElement("div");
       note.className = "agent-msg-stopped";
@@ -2804,10 +3088,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     if (partialAnswer) {
       persistPartialAgentReply(partialAnswer, partialThinking);
+      settleStreamedReply(answerRow, session);
       answerRow?.classList.remove("is-streaming");
-      if (answerBody) {
-        answerBody.dataset.mdSource = partialAnswer;
-      }
+      paintAgentMessageBody(answerBody, partialAnswer, { streaming: false });
       if (answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
         const note = document.createElement("div");
         note.className = "agent-msg-stopped";
@@ -2857,11 +3140,21 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       window.cancelAnimationFrame(followRaf);
       followRaf = 0;
     }
+    /* The cancelled frame carried the final flush (and the Stopped note sits
+       below it): land on the true end before the listeners go. */
+    if (stickToBottom && scroller && generation === ctx.streamGeneration) {
+      endScrollTop = pinToEnd();
+    }
     window.removeEventListener("resize", onResizeFollow);
     document.removeEventListener("keydown", onKeyNav);
     scroller?.classList.remove("is-live-streaming", "is-follow-bottom");
     scroller?.removeEventListener("scroll", onUserScroll);
     scroller?.removeEventListener("wheel", onUserScrollUp);
+    scroller?.removeEventListener("pointerdown", onReaderHold);
+    scroller?.removeEventListener("touchstart", onReaderHold);
+    for (const type of ["pointerup", "pointercancel", "touchend", "touchcancel"]) {
+      window.removeEventListener(type, onReaderRelease);
+    }
     jumpBtn?.removeEventListener("click", onJumpLatest);
     streamRoot?.removeEventListener("selectstart", onSelectStart);
     streamRoot?.removeEventListener("pointerdown", onStreamPointer);

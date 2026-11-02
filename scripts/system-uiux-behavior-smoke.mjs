@@ -274,9 +274,15 @@ async function main() {
   const appearanceRequests = [];
   const appearancePlans = [];
   const requestOrder = [];
+  // The gateway answers an opaque-origin app only when it sends its Home
+  // token; a call without it fails CORS in Home (/api/auth/passkey/status).
+  const tokenlessRequests = [];
   let heldRecoveryStatus = null;
   let heldChainNetworks = null;
-  let heldCapsuleCatalog = null;
+  let hostedStatus = null;
+  let hostedReads = 0;
+  const discardedStaged = [];
+  let failStagedDiscard = false;
   summaryAppearance = appearanceRecord();
   let appearanceInFlight = 0;
   let maxAppearanceInFlight = 0;
@@ -318,6 +324,9 @@ async function main() {
       }
       const url = new URL(request.url());
       requestOrder.push(url.pathname);
+      if (!request.headers()["x-elastos-home-token"]) {
+        tokenlessRequests.push(url.pathname);
+      }
       if (url.pathname === "/api/apps/system/summary") {
         summaryTrace.push({
           count: summaryTrace.length + 1,
@@ -379,9 +388,6 @@ async function main() {
         return;
       }
       if (url.pathname === "/api/capsules/catalog") {
-        if (heldCapsuleCatalog) {
-          await heldCapsuleCatalog.promise;
-        }
         await route.fulfill({
           status: 200,
           contentType: "application/json",
@@ -428,6 +434,38 @@ async function main() {
         }
         return;
       }
+      if (url.pathname === "/api/apps/system/ai-provider/validate" && hostedStatus) {
+        // Runtime stages the key before the provider refuses it.
+        const { id } = request.postDataJSON();
+        hostedStatus = { ...hostedStatus, staged_connections: [{ id, provider: "OpenRouter", has_saved_model: false }] };
+        await route.fulfill({ status: 400, contentType: "text/plain", headers: CORS_HEADERS, body: "invalid OpenRouter key" });
+        return;
+      }
+      if (url.pathname === "/api/apps/system/ai-provider/staged" && request.method() === "DELETE") {
+        if (failStagedDiscard) {
+          await route.fulfill({ status: 500, contentType: "text/plain", headers: CORS_HEADERS, body: "staged hosted connection unavailable" });
+          return;
+        }
+        const { id } = request.postDataJSON();
+        discardedStaged.push(id);
+        // Discard ends the connection's decisions: a saved connection needs Inbox review again.
+        hostedStatus = { ...hostedStatus,
+          connections: (hostedStatus.connections || []).map((entry) => entry.id === id
+            ? { ...entry, egress_state: "consent_required", egress_approval_state: "none" } : entry),
+          staged_connections: hostedStatus.staged_connections.filter((entry) => entry.id !== id) };
+        await route.fulfill({ status: 200, contentType: "application/json", headers: CORS_HEADERS, body: "{\"discarded\":true}" });
+        return;
+      }
+      if (url.pathname === "/api/apps/system/ai-provider" && hostedStatus) {
+        hostedReads += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: CORS_HEADERS,
+          body: JSON.stringify(hostedStatus),
+        });
+        return;
+      }
       const inert = inertSystemApiResponse(url.pathname);
       if (inert !== null) {
         await route.fulfill({
@@ -447,7 +485,6 @@ async function main() {
     });
 
     heldChainNetworks = deferred();
-    heldCapsuleCatalog = deferred();
     requestOrder.length = 0;
     await page.goto(`${server.baseUrl}/fixture?settings=security`, {
       waitUntil: "domcontentloaded",
@@ -458,7 +495,15 @@ async function main() {
         document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "security"
         && document.activeElement?.id === "recovery-download",
     );
+    // Chain networks is held, so its read is in flight, never answered, here.
+    for (let tries = 0; tries < 250 && !requestOrder.includes("/api/provider/chain/networks"); tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     const securityFocusOrder = [...requestOrder];
+    assert(
+      await frame.evaluate(() => document.activeElement?.id === "recovery-download"),
+      "System should keep Recovery focused while later reads run",
+    );
     assert(
       securityFocusOrder.indexOf("/api/auth/recovery/status") >= 0
         && securityFocusOrder.indexOf("/api/provider/chain/networks") >= 0
@@ -468,12 +513,17 @@ async function main() {
       "System should focus Recovery after recovery readiness resolves and before later reads",
       { requestOrder: securityFocusOrder },
     );
-    const catalogRequested = page.waitForRequest("**/api/capsules/catalog");
     heldChainNetworks.resolve();
-    await catalogRequested;
-    heldCapsuleCatalog.resolve();
     heldChainNetworks = null;
-    heldCapsuleCatalog = null;
+    await page.waitForLoadState("networkidle");
+    // Marketplace and Security > Technical Details list apps and components;
+    // System has no Apps & Services inventory to load.
+    assert(
+      !requestOrder.includes("/api/capsules/catalog")
+        && await frame.evaluate(() => !document.querySelector('[data-settings="catalog"]')),
+      "System still loads or shows an Apps & Services inventory",
+      { requestOrder },
+    );
 
     heldRecoveryStatus = deferred();
     requestOrder.length = 0;
@@ -540,6 +590,11 @@ async function main() {
         startup.errorText.length === 0,
       "System startup diagnostic failed",
       startup,
+    );
+    assert(
+      tokenlessRequests.length === 0,
+      "System must send its Home token on every Runtime call",
+      tokenlessRequests,
     );
     await activateTab(frame, "personalization");
 
@@ -840,17 +895,154 @@ async function main() {
         note: document.querySelector("#ai-provider-egress-note")?.textContent?.trim(),
         state: card?.querySelector(".ai-provider-state")?.textContent?.trim(),
         useDisabled: card?.querySelector("button")?.disabled,
-        lens: document.querySelector("#approval-lens-status")?.textContent?.trim(),
+        lensSection: Boolean(document.querySelector("#approval-lens")),
+        decisionButtons: [...([...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+          .find((node) => node.textContent.includes("Jev"))?.querySelectorAll("button") || [])]
+          .map((button) => button.textContent.trim()),
       };
     });
     assert(
       hostedPause.note?.includes("External HTTPS is paused") &&
         hostedPause.state === "External HTTPS paused" &&
         hostedPause.useDisabled === true &&
-        hostedPause.lens?.includes("external HTTPS paused"),
+        hostedPause.lensSection === false &&
+        hostedPause.decisionButtons.join() === "Edit,Disconnect",
       "System did not show saved hosted connections as paused",
       hostedPause,
     );
+
+    // An Inbox decision reaches the open System: Home forwards the Runtime's
+    // inbox event, or System is shown again. The open disclosure and focus stay.
+    const veniceStatus = (fields) => ({
+      hosted_external_https: "consent_required",
+      connections: [{
+        id: "model:hosted-22222222222222222222222222222222", name: "VeniceQwen3.8F", provider: "venice",
+        processor_label: "Venice", selected_model: "qwen-3-8-flash", operation: "text.generate",
+        connected: true, ...fields,
+      }],
+    });
+    const postHomeEvents = (events) => page.evaluate((list) => {
+      document.getElementById("system-frame").contentWindow.postMessage(
+        { type: "elastos:runtime-events", schema: "elastos.home.runtime-events/v1", events: list }, "*");
+    }, events);
+    const inboxChanged = [{ scope: "home", kind: "home.summary.changed" }, { scope: "inbox", kind: "inbox.changed" }];
+    const veniceAccess = () => frame.evaluate(() => {
+      const card = [...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+        .find((node) => node.textContent.includes("VeniceQwen3.8F"));
+      const details = card?.querySelector("details");
+      return {
+        state: card?.querySelector(".ai-provider-state")?.textContent?.trim() ?? "",
+        open: details?.open ?? null,
+        controls: [...(details?.querySelectorAll("button") ?? [])].map((node) => node.textContent),
+        focused: card?.contains(document.activeElement) ? document.activeElement.textContent : "",
+      };
+    });
+    hostedStatus = veniceStatus({ egress_state: "consent_required", egress_approval_state: "none" });
+    await postHomeEvents(inboxChanged);
+    await frame.waitForFunction(() => document.querySelector("#ai-provider-instances .ai-provider-state")
+      ?.textContent?.trim() === "Needs Inbox review");
+    await frame.click("#ai-provider-instances .ai-provider-instance summary");
+    hostedStatus = veniceStatus({ egress_state: "ready", egress_approval_state: "approved" });
+    const readsBeforeUnrelated = hostedReads;
+    await postHomeEvents([{ scope: "chat-room", kind: "chat-room.changed" }, { scope: "people", kind: "people.changed" }]);
+    await page.waitForTimeout(750);
+    const afterUnrelated = await veniceAccess();
+    assert(
+      hostedReads === readsBeforeUnrelated && !afterUnrelated.controls.includes("End hosted approval"),
+      "System re-read hosted access for an unrelated Home event",
+      { hostedReads, readsBeforeUnrelated, afterUnrelated },
+    );
+    await postHomeEvents(inboxChanged);
+    await frame.waitForFunction(() => [...document.querySelectorAll("#ai-provider-instances details button")]
+      .some((node) => node.textContent === "End hosted approval"));
+    const afterApproval = await veniceAccess();
+    assert(
+      afterApproval.open === true && afterApproval.focused === "Details and access" && afterApproval.state === "",
+      "System lost the open disclosure or focus when Inbox approval refreshed the card",
+      afterApproval,
+    );
+    hostedStatus = veniceStatus({ egress_state: "consent_required", egress_approval_state: "none" });
+    await frame.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+    await frame.waitForFunction(() => ![...document.querySelectorAll("#ai-provider-instances details button")]
+      .some((node) => node.textContent === "End hosted approval"));
+
+    // The Add form keeps typed input while an Inbox decision arrives; closing it catches up.
+    hostedStatus = veniceStatus({ egress_state: "ready", egress_approval_state: "approved" });
+    const readsBeforeForm = hostedReads;
+    await frame.click("#ai-provider-add");
+    await frame.fill("#ai-provider-name", "Typed name");
+    await postHomeEvents(inboxChanged);
+    await page.waitForTimeout(750);
+    const underForm = await frame.evaluate(() => ({
+      open: !document.querySelector("#ai-provider-form").hidden,
+      name: document.querySelector("#ai-provider-name").value,
+    }));
+    assert(
+      underForm.open && underForm.name === "Typed name" && hostedReads === readsBeforeForm,
+      "System disturbed the open Add form for an Inbox decision",
+      { underForm, hostedReads, readsBeforeForm },
+    );
+    await frame.click("#ai-provider-cancel");
+    await frame.waitForFunction(() => [...document.querySelectorAll("#ai-provider-instances details button")]
+      .some((node) => node.textContent === "End hosted approval"));
+
+    // A key the provider rejects is not left staged; the form stays open with Cancel.
+    await frame.click("#ai-provider-add");
+    await frame.fill("#ai-provider-key", "test");
+    await frame.click("#ai-provider-validate");
+    await frame.waitForFunction(() => {
+      const cancel = document.querySelector("#ai-provider-cancel");
+      return document.querySelector('[data-field="ai-provider-state"]')?.textContent === "The provider rejected this key."
+        && cancel.textContent === "Cancel" && !cancel.disabled;
+    });
+    assert(
+      discardedStaged.length === 1 && hostedStatus.staged_connections.length === 0
+        && await frame.evaluate(() => !document.querySelector("#ai-provider-form").hidden),
+      "System kept a rejected key staged or closed the form",
+      { discardedStaged, staged: hostedStatus.staged_connections },
+    );
+    await frame.click("#ai-provider-cancel");
+
+    // A success line from an earlier action clears when a decision elsewhere changes the cards.
+    const stagedId = "model:hosted-33333333333333333333333333333333";
+    hostedStatus = { ...veniceStatus({ egress_state: "consent_required", egress_approval_state: "none" }),
+      staged_connections: [{ id: stagedId, provider: "OpenRouter", has_saved_model: false }] };
+    await postHomeEvents(inboxChanged);
+    await frame.click("#ai-provider-instances .ai-provider-instance >> text=Discard staged key");
+    await frame.waitForFunction(() => document.querySelector('[data-field="ai-provider-state"]')?.textContent === "Staged key removed.");
+    hostedStatus = { ...veniceStatus({ egress_state: "ready", egress_approval_state: "approved" }), staged_connections: [] };
+    await postHomeEvents(inboxChanged);
+    await frame.waitForFunction(() => [...document.querySelectorAll("#ai-provider-instances details button")]
+      .some((node) => node.textContent === "End hosted approval")
+      && document.querySelector('[data-field="ai-provider-state"]')?.textContent === "");
+
+    // A key rejected while editing a saved connection is removed; the card then needs Inbox review.
+    await frame.click("#ai-provider-instances .ai-provider-instance >> text=Edit");
+    await frame.fill("#ai-provider-key", "rejected-key");
+    await frame.click("#ai-provider-validate");
+    await frame.waitForFunction(() => document.querySelector('[data-field="ai-provider-state"]')?.textContent
+      === "The provider rejected this key." && document.querySelector("#ai-provider-cancel").textContent === "Cancel"
+      && !document.querySelector("#ai-provider-cancel").disabled);
+    assert(
+      discardedStaged.at(-1) === "model:hosted-22222222222222222222222222222222",
+      "System kept a key rejected while editing a saved connection",
+      { discardedStaged },
+    );
+    await frame.click("#ai-provider-cancel");
+    await frame.waitForFunction(() => document.querySelector("#ai-provider-instances .ai-provider-state")
+      ?.textContent?.trim() === "Needs Inbox review");
+
+    // A rejected key that cannot be removed is reported and stays on its card with Discard.
+    failStagedDiscard = true;
+    await frame.click("#ai-provider-add");
+    await frame.fill("#ai-provider-key", "test");
+    await frame.click("#ai-provider-validate");
+    await frame.waitForFunction(() => document.querySelector('[data-field="ai-provider-state"]')?.textContent
+      === "The rejected key could not be removed. Select Close, then Discard staged key on its card."
+      && document.querySelector("#ai-provider-cancel").textContent === "Close");
+    await frame.click("#ai-provider-cancel");
+    await frame.waitForSelector("#ai-provider-instances .ai-provider-instance >> text=Discard staged key");
+    failStagedDiscard = false;
 
     assert(
       appearancePlans.length === 0,

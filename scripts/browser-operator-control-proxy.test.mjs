@@ -13,7 +13,7 @@ async function harness(t){
   const guest=http.createServer(async(req,res)=>{let body="";for await(const chunk of req)body+=chunk;requests.push({path:req.url,body:JSON.parse(body)});respond(req,res);});
   const activePages=new Map([["page:owned",{page:{control_socket_path:socket}}]]),activeVms=new Map();
   const context=vm.createContext({http,Buffer,Error,AbortController,setTimeout,clearTimeout});
-  vm.runInContext(["safeId","validateAbsolutePath","activePageGuestControl","requestJsonOverUnix","browserDisplayControlError","browserInspectionControlError","proxyGuestPageInput"].map(declaration).join("\n"),context);
+  vm.runInContext(["safeId","validateAbsolutePath","vmOwnsExactPage", "ownedVmRecord", "activePageGuestControl","requestJsonOverUnix","browserDisplayControlError","browserInspectionControlError","proxyGuestPageInput"].map(declaration).join("\n"),context);
   t.after(async()=>{guest.closeAllConnections();if(guest.listening)await new Promise(resolve=>guest.close(resolve));rmSync(root,{recursive:true,force:true});});
   await new Promise(resolve=>guest.listen(socket,resolve));
   return {activePages,requests,respond:fn=>{respond=fn;},input:()=>context.proxyGuestPageInput({},activePages,activeVms,"page:owned",{event:{type:"operator_ref"}})};

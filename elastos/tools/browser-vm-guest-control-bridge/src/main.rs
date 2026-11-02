@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -60,6 +62,7 @@ enum NetworkMode {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::enum_variant_names)] // Names preserve the serialized transport contract.
 enum HostListenConfig {
     UnixListen { path: String },
     TcpListen { host: String, port: u16 },

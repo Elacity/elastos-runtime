@@ -27,7 +27,7 @@ const MODEL_TEXT_OUTPUT_SCHEMA: &str = "elastos.model.output.text/v1";
 const MODEL_OBJECT_OUTPUT_SCHEMA: &str = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA: &str = "elastos.model.output.content/v1";
 const MODEL_OUTPUT_URI_MAX_BYTES: usize = 4 * 1024;
-const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
+use crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID;
 static LIBRARY_UPLOAD_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
@@ -1765,6 +1765,9 @@ pub(super) async fn gateway_provider_proxy(
                 Ok(value) => value,
                 Err((status, message)) => return (status, message).into_response(),
             };
+        if op == "runs_create" && !hosted_run_allowed(&state.data_dir, &context, &request) {
+            return (StatusCode::FORBIDDEN, HOSTED_RUN_ADMIN_ONLY).into_response();
+        }
         // Approved remote model grants route new runs to the granting Runtime.
         // A grant lookup failure keeps the local path; it cannot widen
         // authority. Runs already routed remotely settle through their stored
@@ -1800,7 +1803,7 @@ pub(super) async fn gateway_provider_proxy(
                     return (StatusCode::OK, Json(remote_response)).into_response();
                 }
                 Ok(None) => {}
-                Err(super::gateway_model_remote::RemoteRouteError::PreDispatchRefused {
+                Err(super::gateway_model_remote::RemoteRouteError::InvocationRefused {
                     binding,
                     reason,
                 }) => {
@@ -1808,7 +1811,9 @@ pub(super) async fn gateway_provider_proxy(
                         StatusCode::CONFLICT,
                         Json(serde_json::json!({
                             "status": "error", "code": "remote_model_invocation_refused",
-                            "message": "This invocation was refused before provider dispatch.",
+                            "message": if reason == elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE {
+                                elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+                            } else { "This invocation was refused before provider dispatch." },
                             "reason": reason, "refusal": binding,
                         })),
                     )
@@ -1977,9 +1982,10 @@ pub(super) async fn gateway_provider_proxy(
         if launch_capsule_id == "assistant" && op == "runs_create" {
             if let Some(offer_id) = request.get("offer_id").and_then(serde_json::Value::as_str) {
                 if let Some(hint) = crate::api::hosted_model_offer_hint(&state.data_dir, offer_id) {
-                    let gate = crate::jev_approval_lens::prepare_assistant_hosted_http(
+                    // No evaluator acts while Approval Lens is hidden: log the
+                    // hosted request and let it through to its own Inbox approval.
+                    let _ = crate::jev_approval_lens::record_assistant_hosted_http_shadow(
                         &state.data_dir,
-                        registry.as_ref(),
                         &crate::jev_approval_lens::AssistantHostedHttpContext {
                             request_id: audit.request_id,
                             principal_id: &principal_id,
@@ -1989,27 +1995,7 @@ pub(super) async fn gateway_provider_proxy(
                             offer_id,
                             hint,
                         },
-                    )
-                    .await;
-                    match gate {
-                        crate::jev_approval_lens::HostedHttpGate::Proceed => {}
-                        crate::jev_approval_lens::HostedHttpGate::NeedsReview => {
-                            return Json(serde_json::json!({
-                                "status": "error",
-                                "code": "approval_required",
-                                "message": crate::jev_approval_lens::HOSTED_HTTP_REVIEW_MESSAGE,
-                            }))
-                            .into_response();
-                        }
-                        crate::jev_approval_lens::HostedHttpGate::Denied => {
-                            return Json(serde_json::json!({
-                                "status": "error",
-                                "code": "approval_denied",
-                                "message": crate::jev_approval_lens::HOSTED_HTTP_DENIED_MESSAGE,
-                            }))
-                            .into_response();
-                        }
-                    }
+                    );
                 }
             }
         }
@@ -2066,7 +2052,12 @@ pub(super) async fn gateway_provider_proxy(
             }),
         }
     };
+    let mut response_status = StatusCode::OK;
     if scheme == "model" {
+        if let Some(refusal) = local_model_request_expiry_refusal(&request, &response) {
+            response = refusal;
+            response_status = StatusCode::CONFLICT;
+        }
         if op == "offers_list" && !remote_model_grants.is_empty() {
             // A consumer Home may run no local model provider at all; granted
             // remote offers still form its list.
@@ -2197,7 +2188,7 @@ pub(super) async fn gateway_provider_proxy(
         }
     }
 
-    Json(response).into_response()
+    (response_status, Json(response)).into_response()
 }
 
 async fn resolve_runtime_custody_creator_account(
@@ -3985,6 +3976,31 @@ pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value)
         .map(String::as_str)
 }
 
+const HOSTED_RUN_ADMIN_ONLY: &str =
+    "Hosted AI on this Home is for admins. Local models are still available.";
+
+/// Hosted AI spends this Home's paid connection, so in 0.8.0 only an admin's
+/// run may use a hosted offer. Other offers are not affected.
+fn hosted_run_allowed(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    request: &serde_json::Value,
+) -> bool {
+    let offer_id = request["offer_id"].as_str().unwrap_or_default();
+    if !crate::api::model_provider_config::is_hosted_offer_id(offer_id) {
+        return true;
+    }
+    context
+        .proof_binding_id
+        .as_deref()
+        .and_then(|proof| crate::auth::load_principal_for_proof_binding(data_dir, proof).ok())
+        .is_some_and(|principal| {
+            crate::auth::ensure_proof_binding_not_revoked(&principal).is_ok()
+                && principal.principal_id == context.principal_id
+                && crate::auth::is_admin(&principal)
+        })
+}
+
 pub(super) fn normalize_model_provider_request(
     op: &str,
     request: &serde_json::Value,
@@ -4080,6 +4096,37 @@ pub(super) fn normalize_model_provider_request(
             "Gateway provider operation not found".to_string(),
         )),
     }
+}
+
+fn local_model_request_expiry_refusal(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if request["op"] != "runs_create"
+        || !super::gateway_model_service::provider_refused_expired_request(response)
+    {
+        return None;
+    }
+    let binding: RuntimeCreateBinding =
+        serde_json::from_value(request.get("runtime_binding")?.clone()).ok()?;
+    binding
+        .validate(
+            request["offer_id"].as_str()?,
+            request["operation"].as_str()?,
+            request.get("input")?,
+        )
+        .ok()?;
+    Some(serde_json::json!({
+        "status": "error", "code": "model_invocation_refused",
+        "reason": elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+        "message": elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+        "refusal": {
+            "schema": super::gateway_model_service::INVOCATION_REFUSAL_SCHEMA,
+            "scope": "invocation", "dispatch": "provider_refused",
+            "request_id": binding.request_id, "offer_id": binding.offer_id,
+            "operation": binding.operation, "input_hash": binding.input_hash,
+        },
+    }))
 }
 
 fn model_provider_effect_audit<'a>(

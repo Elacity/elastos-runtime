@@ -148,16 +148,36 @@ fn run_server(config: LocalExitConfig, stdout: &mut dyn Write) -> Result<(), Str
     .map_err(|err| err.to_string())?;
     stdout.flush().map_err(|err| err.to_string())?;
 
-    for stream in listener.incoming() {
-        let stream = stream.map_err(|err| err.to_string())?;
+    serve_incoming(listener.incoming(), ACCEPT_ERROR_BACKOFF, |stream| {
         let config = config.clone();
         thread::spawn(move || {
             if let Err(err) = handle_session(stream, &config) {
                 eprintln!("browser-local-exit session failed: {err}");
             }
         });
-    }
+    });
     Ok(())
+}
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// An accept error (for example EMFILE under load) must not end every
+/// Browser session: log it, back off briefly so a full fd table can drain,
+/// and keep accepting.
+fn serve_incoming<S>(
+    incoming: impl Iterator<Item = io::Result<S>>,
+    backoff: Duration,
+    mut serve: impl FnMut(S),
+) {
+    for stream in incoming {
+        match stream {
+            Ok(stream) => serve(stream),
+            Err(err) => {
+                eprintln!("browser-local-exit accept failed: {err}");
+                thread::sleep(backoff);
+            }
+        }
+    }
 }
 
 fn handle_session(mut runtime_stream: UnixStream, config: &LocalExitConfig) -> Result<(), String> {
@@ -855,6 +875,21 @@ fn spawn_parent_eof_watch(socket: OwnedSocket) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accept_errors_do_not_stop_the_listener() {
+        let incoming = vec![
+            Ok(1),
+            Err(io::Error::from_raw_os_error(24)),
+            Err(io::Error::other("transient")),
+            Ok(2),
+        ];
+        let mut served = Vec::new();
+        super::serve_incoming(incoming.into_iter(), Duration::ZERO, |stream| {
+            served.push(stream)
+        });
+        assert_eq!(served, vec![1, 2]);
+    }
+
     use super::*;
     use std::net::TcpListener;
     use std::sync::mpsc;

@@ -1,3 +1,4 @@
+import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031d";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -6,10 +7,10 @@ import {
   normalizeUrl,
   sameBrowserStreamTarget,
   visibleAddressForUrl,
-} from "./browser-runtime-api.js?v=browser-20260907c";
+} from "./browser-runtime-api.js?v=browser-20261101d";
 import {
   createBrowserClipboardBridge,
-} from "./browser-clipboard.js?v=browser-20260725b";
+} from "./browser-clipboard.js?v=browser-20261022d";
 import {
   createHomeClipboardClient,
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
@@ -18,18 +19,17 @@ import {
   runtimePageOwner,
   sameRuntimePageOwner,
 } from "./browser-page-cleanup.js?v=browser-20260727a";
-import { selkiesMessagesForInput } from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260725b";
+import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261031a";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261031d";
 import {
   browserMetricsText,
   friendlyOpenError,
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260907c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260915d";
-import { renderServiceSelection } from "./browser-service-selection.js?v=browser-20260907c";
-import { createOperatorApprovalController, mountOperatorApproval } from "./browser-operator-approval.js";
+} from "./browser-status.js?v=browser-20261101d";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20261101d";
+import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261015a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -38,8 +38,18 @@ const PAGE_STATUS_AFTER_INPUT_DELAY_MS = 650;
 const PAGE_STATUS_AFTER_SCROLL_DELAY_MS = 1200;
 const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
-const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
+// The open job has no push channel; its status read is a local job lookup, so
+// a short interval costs little and shows the display as soon as it is ready.
+const BROWSER_OPEN_POLL_INTERVAL_MS = 250;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
+// While a window close waits for Runtime to settle an open, the frame repeats
+// "pending" this often; Home extends the close on each one (shell-windows.js).
+const HOME_CLOSE_PENDING_NOTICE_MS = 10_000;
+const WINDOW_CLOSE_OPEN_POLL_MS = 1_000;
+// Each ownership probe of a window close has its own deadline, so one hung
+// request cannot hold the close and every Close retry behind it.
+const WINDOW_CLOSE_PROBE_TIMEOUT_MS = 10_000;
+const BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS = 5;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
 const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
 const GUARANTEE_MECHANISM_MICROVM = "mechanism_microvm";
@@ -85,11 +95,15 @@ const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
 const profileResetButton = document.querySelector("#browser-profile-reset");
+const profileResetConfirmation = document.querySelector("#browser-profile-reset-confirmation");
+const profileResetCancel = document.querySelector("#browser-profile-reset-cancel");
+const profileResetCommit = document.querySelector("#browser-profile-reset-commit");
 const settingsButton = document.querySelector("#browser-settings");
 const settingsPanel = document.querySelector("#browser-settings-panel");
 const settingsCloseButton = document.querySelector("#browser-settings-close");
 const engineSelect = document.querySelector("#browser-engine");
 const engineSummaryNode = document.querySelector("#browser-engine-summary");
+const engineLabelNode = document.querySelector('label[for="browser-engine"]');
 const exitSelect = document.querySelector("#browser-exit");
 const exitSummaryNode = document.querySelector("#browser-exit-summary");
 const statusNode = document.querySelector("#browser-status");
@@ -103,7 +117,12 @@ let currentPage = null;
 let currentPageGeneration = 0;
 let nextPageGeneration = 1;
 const MAX_PENDING_BROWSER_INPUTS = 128;
+const DATACHANNEL_INPUT_BARRIER_TIMEOUT_MS = 3_000;
 let browserInputQueue = null;
+let lastDatachannelInputAt = 0;
+let datachannelDrainedAt = 0;
+let datachannelSendGeneration = 0;
+let datachannelSendDisplay = null;
 let restoredViewerOwner = null;
 let currentView = null;
 let currentDisplayMode = "";
@@ -113,8 +132,11 @@ let statusTimer = 0;
 let canGoBack = false;
 let canGoForward = false;
 let pageStatusTimer = 0;
+let pageStatusPollingRun = null;
 let pageStatusRefreshTimers = [];
+let pageStatusRefreshRun = null;
 let pageHeartbeatTimer = 0;
+let pageHeartbeatRun = null;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
 let recoverableDisplayAttachStarted = false;
@@ -134,6 +156,10 @@ let runtimeOpenInFlight = 0;
 let unsettledRuntimeOpen = null;
 let runtimeOwnershipTerminallyAbsent = false;
 let homeWindowCloseInFlight = false;
+// A Home Close that arrived while an open, summary or close was in flight; it runs when that settles.
+let deferredHomeWindowClose = null;
+// The network phase of an open or summary in flight; a Close aborts them so it never waits on a hung request.
+const windowCloseAbortControllers = new Set();
 let homeWindowTerminalCloseConfirmed = false;
 let pendingHomeWindowCloseDelivery = null;
 let selectedBrowserEngineId = params.get("browser_engine_id") || params.get("adapter_id") || "";
@@ -146,6 +172,7 @@ function setSettingsOpen(open) {
     return;
   }
   settingsPanel.hidden = !open;
+  if (!open) profileResetConfirmation.hidden = true;
   settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
@@ -386,18 +413,21 @@ function setLoading(loading) {
   if (profileResetButton) {
     profileResetButton.disabled = loading;
   }
+  if (profileResetCommit) profileResetCommit.disabled = loading;
   renderEmpty.hidden = true;
   refreshButton.disabled = loading || !currentPage;
   updateNavState();
 }
 
 function stopPageStatusPolling() {
+  pageStatusPollingRun = null;
   window.clearTimeout(pageStatusTimer);
   pageStatusTimer = 0;
   stopPageStatusRefresh();
 }
 
 function stopPageStatusRefresh() {
+  pageStatusRefreshRun = null;
   for (const timer of pageStatusRefreshTimers) {
     window.clearTimeout(timer);
   }
@@ -405,6 +435,7 @@ function stopPageStatusRefresh() {
 }
 
 function stopPageHeartbeat() {
+  pageHeartbeatRun = null;
   window.clearTimeout(pageHeartbeatTimer);
   pageHeartbeatTimer = 0;
 }
@@ -625,6 +656,7 @@ function runtimeViewerOwnerActive(owner) {
 function finalizeRuntimePageClose(owner) {
   if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
     currentPage = null;
+    resetPageInputDelivery();
     currentPageGeneration = 0;
     restoredViewerOwner = null;
     currentBrowserEngineId = "";
@@ -861,33 +893,41 @@ async function handleHomeBrowserWindowCloseRequest(event) {
     return false;
   }
   const message = event.data;
+  if (runtimeOpenInFlight > 0 || browserSummaryPromise || homeWindowCloseInFlight) {
+    // Close just closes. An open or summary still on the network is aborted, so the
+    // close runs at once; a running close finishes first. The latest request gets
+    // the result; Home shows "Closing…".
+    deferredHomeWindowClose = message;
+    postHomeBrowserWindowCloseResult(message, null, {
+      state: "pending",
+      page_id: "",
+      generation: 0,
+      reason: homeWindowCloseInFlight ? "window_close_in_flight" : "runtime_open_in_flight",
+    });
+    for (const controller of windowCloseAbortControllers) controller.abort();
+    return true;
+  }
+  await closeHomeBrowserWindow(message);
+  return true;
+}
+
+function resumeDeferredHomeBrowserWindowClose() {
+  if (!deferredHomeWindowClose || runtimeOpenInFlight > 0 || browserSummaryPromise || homeWindowCloseInFlight) {
+    return;
+  }
+  const message = deferredHomeWindowClose;
+  deferredHomeWindowClose = null;
+  void closeHomeBrowserWindow(message);
+}
+
+async function closeHomeBrowserWindow(message) {
   let page = currentPage || recoverableRuntimePage() || unsettledRuntimeOpen?.page;
   let generation = page === currentPage ? currentPageGeneration : 0;
   let owner = runtimePageOwner(page, generation);
-  if (
-    runtimeOpenInFlight > 0 ||
-    browserSummaryPromise ||
-    homeWindowCloseInFlight
-  ) {
-    showStatus(
-      "Browser ownership is changing. Close Browser again when the current action finishes.",
-      { sticky: true },
-    );
-    postHomeBrowserWindowCloseResult(message, owner, {
-      state: "pending",
-      page_id: owner?.page_id || "",
-      generation: owner?.generation || 0,
-      reason:
-        runtimeOpenInFlight > 0 || browserSummaryPromise
-          ? "runtime_open_in_flight"
-          : "window_close_in_flight",
-    });
-    return true;
-  }
   homeWindowCloseInFlight = true;
   try {
     if (!owner) {
-      const ownership = await resolveRuntimeOwnershipForWindowClose();
+      const ownership = await awaitRuntimeOwnershipForWindowClose(message);
       if (ownership.state !== "owned") {
         if (ownership.state === "terminal") {
           pendingHomeWindowCloseDelivery = null;
@@ -901,7 +941,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
           );
         }
         postHomeBrowserWindowCloseResult(message, null, ownership);
-        return true;
+        return;
       }
       page = ownership.page;
       generation = 0;
@@ -913,7 +953,7 @@ async function handleHomeBrowserWindowCloseRequest(event) {
           generation: 0,
           reason: "invalid_runtime_cleanup_handle",
         });
-        return true;
+        return;
       }
     }
     if (owner) {
@@ -962,8 +1002,9 @@ async function handleHomeBrowserWindowCloseRequest(event) {
     postHomeBrowserWindowCloseResult(message, owner, null, _error);
   } finally {
     homeWindowCloseInFlight = false;
+    // A Close that arrived meanwhile runs next: it confirms absence, or retries a pending cleanup.
+    resumeDeferredHomeBrowserWindowClose();
   }
-  return true;
 }
 
 function runtimeOpenResultPage(response) {
@@ -1032,13 +1073,23 @@ function normalizeRuntimeOpenUrl(value) {
   }
 }
 
+async function fetchWindowCloseProbe(path, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WINDOW_CLOSE_PROBE_TIMEOUT_MS);
+  try {
+    return await fetchJson(path, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function settleUnresolvedRuntimeOpenForWindowClose(settlement) {
   let response;
   try {
     if (settlement.statusUrl) {
-      response = await fetchJson(settlement.statusUrl, { method: "GET" });
+      response = await fetchWindowCloseProbe(settlement.statusUrl, { method: "GET" });
     } else {
-      response = await fetchJson("/api/apps/browser/open", {
+      response = await fetchWindowCloseProbe("/api/apps/browser/open", {
         method: "POST",
         body: settlement.body,
       });
@@ -1122,7 +1173,7 @@ async function resolveRuntimeOwnershipForWindowClose() {
   }
   let summary;
   try {
-    summary = await fetchJson(
+    summary = await fetchWindowCloseProbe(
       `/api/apps/browser/summary?browser_instance=${encodeURIComponent(browserInstanceId)}`,
       { method: "GET" },
     );
@@ -1131,6 +1182,31 @@ async function resolveRuntimeOwnershipForWindowClose() {
   }
   browserSummary = summary;
   return classifyFreshWindowCloseSummary(summary);
+}
+
+// An open whose Runtime job is still running owns this window's cleanup. The close
+// waits for it within the open's own deadline and keeps Home's request alive with a
+// repeated "pending"; the page it yields is then closed and never displayed.
+async function awaitRuntimeOwnershipForWindowClose(message) {
+  let noticeAt = Date.now();
+  for (;;) {
+    const ownership = await resolveRuntimeOwnershipForWindowClose();
+    const settlement = unsettledRuntimeOpen;
+    if (
+      ownership.state !== "pending" ||
+      !["runtime_open_status_pending", "runtime_open_status_unavailable"].includes(ownership.reason) ||
+      !(Date.now() - settlement?.startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS)
+    ) {
+      return ownership;
+    }
+    if (Date.now() - noticeAt >= HOME_CLOSE_PENDING_NOTICE_MS) {
+      noticeAt = Date.now();
+      for (const request of new Set([message, deferredHomeWindowClose].filter(Boolean))) {
+        postHomeBrowserWindowCloseResult(request, null, ownership);
+      }
+    }
+    await wait(WINDOW_CLOSE_OPEN_POLL_MS);
+  }
 }
 
 function settleInitialRuntimeOpenPostFailure(settlement, error) {
@@ -1243,8 +1319,9 @@ async function fetchPageStatus({
   history = "replace",
   forceAddress = false,
   fast = false,
+  isCurrent = () => true,
 } = {}) {
-  if (!currentPage?.page_id) {
+  if (!isCurrent() || !currentPage?.page_id) {
     return null;
   }
   const owner = currentRuntimePageOwner();
@@ -1253,7 +1330,7 @@ async function fetchPageStatus({
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
-  if (!runtimeViewerOwnerActive(owner)) return null;
+  if (!isCurrent() || !runtimeViewerOwnerActive(owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1408,12 +1485,16 @@ function schedulePageStatusRefresh({
     ),
   ];
   stopPageStatusRefresh();
+  const run = {};
+  pageStatusRefreshRun = run;
+  const isCurrent = () => pageStatusRefreshRun === run;
   pageStatusRefreshTimers = delays.map((nextDelay) => {
     const timer = window.setTimeout(async () => {
       pageStatusRefreshTimers = pageStatusRefreshTimers.filter(
         (candidate) => candidate !== timer,
       );
       if (
+        !isCurrent() ||
         unloadCleanupStarted ||
         !currentPage ||
         document.hidden ||
@@ -1423,9 +1504,9 @@ function schedulePageStatusRefresh({
       }
       const owner = currentRuntimePageOwner();
       try {
-        await fetchPageStatus({ history, forceAddress });
+        await fetchPageStatus({ history, forceAddress, isCurrent });
       } catch (error) {
-        await handlePageObservationFailure(error, owner);
+        if (isCurrent()) await handlePageObservationFailure(error, owner);
       }
     }, nextDelay);
     return timer;
@@ -1434,8 +1515,11 @@ function schedulePageStatusRefresh({
 
 function startPageStatusPolling() {
   stopPageStatusPolling();
+  const run = {};
+  pageStatusPollingRun = run;
+  const isCurrent = () => pageStatusPollingRun === run;
   const poll = async () => {
-    if (unloadCleanupStarted || !currentPage) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage) {
       return;
     }
     if (document.hidden) {
@@ -1448,11 +1532,12 @@ function startPageStatusPolling() {
     }
     const owner = currentRuntimePageOwner();
     try {
-      await fetchPageStatus({ fast: true });
+      await fetchPageStatus({ fast: true, isCurrent });
     } catch (error) {
-      await handlePageObservationFailure(error, owner);
+      if (isCurrent()) await handlePageObservationFailure(error, owner);
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
@@ -1467,8 +1552,11 @@ function startPageStatusPolling() {
 
 function startPageHeartbeat() {
   stopPageHeartbeat();
+  const run = {};
+  pageHeartbeatRun = run;
+  const isCurrent = () => pageHeartbeatRun === run;
   const beat = async () => {
-    if (unloadCleanupStarted || !currentPage?.page_id) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage?.page_id) {
       return;
     }
     const owner = currentRuntimePageOwner();
@@ -1479,9 +1567,10 @@ function startPageHeartbeat() {
         { method: "POST" },
       );
     } catch (error) {
-      if (await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
+      if (isCurrent() && await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
@@ -1576,7 +1665,7 @@ function encodeDatachannelInput(event) {
 
 async function sendBrowserInput(
   event,
-  { focus = true, history = "push" } = {},
+  { focus = true, history = "push", isStale = null } = {},
 ) {
   const owner = currentRuntimePageOwner();
   if (!owner) {
@@ -1598,9 +1687,16 @@ async function sendBrowserInput(
     if (queue.failed) {
       throw new Error("Browser input was canceled after a failed operation.");
     }
+    // Moves of a drag that already ended must not re-press the guest button.
+    if (isStale?.()) {
+      return;
+    }
     return dispatchBrowserInput(event, { focus, history }, owner);
   });
   queue.tail = pending.catch(() => {
+    // A failed resize leaves only the guest geometry unknown. The frame fence
+    // holds pointer input until a resize is accepted, so later input still runs.
+    if (event?.type === "resize") return;
     // Delivery can be uncertain. Abandon dependent input without replaying it.
     queue.failed = true;
     if (browserInputQueue === queue) {
@@ -1614,6 +1710,79 @@ async function sendBrowserInput(
   }
 }
 
+function noteDatachannelSend() {
+  const now = Date.now();
+  lastDatachannelInputAt = now;
+  datachannelSendDisplay = remoteDisplay;
+  datachannelSendGeneration = remoteDisplay?.currentInputChannelGeneration?.() ?? 0;
+  datachannelDrainedAt = Number(remoteDisplay?.inputBufferedAmount?.() || 0) === 0 ? now : 0;
+}
+
+// The guest must always get the button release that ends a drag, even while
+// a Runtime request is pending: it goes straight to the datachannel, after
+// the drag's own moves on that channel. The caller marks the drag ended so
+// its still-queued moves send nothing. A drag belongs to the page it started
+// on: once that page is replaced, the release is dropped rather than pressed
+// into the replacement's guest.
+function releaseDragButton(event, dragOwner) {
+  if (
+    !sameRuntimePageOwner(currentRuntimePageOwner(), dragOwner) ||
+    !remoteDisplay?.inputChannelOpen()
+  ) {
+    return;
+  }
+  remoteDisplay.sendInputMessages(encodeDatachannelInput(event));
+  noteDatachannelSend();
+}
+
+// Delivery receipts belong to one page and its display channel.
+function resetPageInputDelivery() {
+  lastDatachannelInputAt = 0;
+  datachannelDrainedAt = 0;
+  datachannelSendDisplay = null;
+  datachannelSendGeneration = 0;
+  resizeFrameFence.reset();
+}
+
+// The datachannel has no guest ack, so Runtime-route input that follows a
+// datachannel send waits until the drain is observed and the guest has had
+// the settle delay after it. It fails rather than reorder.
+async function awaitDatachannelInputSettled() {
+  if (!lastDatachannelInputAt) {
+    return;
+  }
+  const deadline = Date.now() + DATACHANNEL_INPUT_BARRIER_TIMEOUT_MS;
+  for (;;) {
+    const now = Date.now();
+    // A closed or rebound channel says nothing about the earlier bytes: refuse
+    // rather than treat its empty buffer as delivery.
+    if (
+      remoteDisplay !== datachannelSendDisplay ||
+      !remoteDisplay?.inputChannelOpen() ||
+      (remoteDisplay?.currentInputChannelGeneration?.() ?? 0) !== datachannelSendGeneration
+    ) {
+      lastDatachannelInputAt = 0;
+      throw new Error("Browser input is still being delivered. Check the page before typing again.");
+    }
+    if (Number(remoteDisplay?.inputBufferedAmount?.() || 0) > 0) {
+      datachannelDrainedAt = 0;
+    } else if (!datachannelDrainedAt) {
+      // Prefer the bufferedamountlow time; without it, the first poll that
+      // sees an empty buffer is the conservative drain time.
+      const eventAt = Number(remoteDisplay?.lastInputDrainAt?.() || 0);
+      datachannelDrainedAt = eventAt >= lastDatachannelInputAt ? eventAt : now;
+    }
+    if (datachannelDrainedAt && now >= datachannelDrainedAt + DATACHANNEL_INPUT_SETTLE_MS) {
+      lastDatachannelInputAt = 0;
+      return;
+    }
+    if (now >= deadline) {
+      throw new Error("Browser input is still being delivered. Check the page before typing again.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function dispatchBrowserInput(
   event,
   { focus = true, history = "push" } = {},
@@ -1624,6 +1793,7 @@ async function dispatchBrowserInput(
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
+    event?.type === "resize" ||
     // A following text insertion needs the Engine's completed click/focus,
     // rather than only a successful send on a different transport.
     event?.type === "click" ||
@@ -1639,6 +1809,7 @@ async function dispatchBrowserInput(
       throw new Error("Browser remote-display input channel is not open.");
     }
     remoteDisplay.sendInputMessages(encodeDatachannelInput(event));
+    noteDatachannelSend();
     schedulePageStatusRefresh({
       history,
       forceAddress: true,
@@ -1652,6 +1823,10 @@ async function dispatchBrowserInput(
     }
   } else {
     const inputPageId = inputOwner.page_id;
+    await awaitDatachannelInputSettled();
+    if (!sameRuntimePageOwner(currentRuntimePageOwner(), inputOwner)) {
+      return;
+    }
     let response;
     try {
       response = await fetchJson(
@@ -1675,6 +1850,7 @@ async function dispatchBrowserInput(
         (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
       throw new Error("The Browser file request changed. Check the page before trying again.");
     }
+    if (event?.type === "resize" && response?.resize_error) return response;
     handleFileChooserFromStatus(response);
     syncViewFromResponse(response);
     if (response.actual_url) {
@@ -1710,12 +1886,42 @@ const {
   writeHostClipboardTextFn: homeClipboard.writeText,
 });
 
+/** Home GUI (Browser's sandboxed parent, origin "null") reuses this window
+ * for a new Browser open instead of starting a second page (one live Browser
+ * page per user). Returns the validated address, or "" to ignore. */
+function homeBrowserNavigateUrl(event) {
+  const message = event.data;
+  if (
+    event.origin !== HOME_GUI_OPAQUE_ORIGIN ||
+    event.source !== window.parent ||
+    event.source === window.top ||
+    !hasExactMessageKeys(message, ["type", "homeToken", "url"]) ||
+    message.type !== "elastos.browser.navigate/v1" ||
+    !launchToken ||
+    message.homeToken !== launchToken ||
+    typeof message.url !== "string" ||
+    message.url.trim().length === 0
+  ) {
+    return "";
+  }
+  try {
+    return normalizeUrl(message.url);
+  } catch {
+    return "";
+  }
+}
+
 window.addEventListener("message", (event) => {
   if (isHomeBrowserWindowCloseRequest(event)) {
     void handleHomeBrowserWindowCloseRequest(event);
     return;
   }
   if (handleHomeBrowserAuthorityRenewalResult(event)) {
+    return;
+  }
+  const homeNavigateUrl = homeBrowserNavigateUrl(event);
+  if (homeNavigateUrl) {
+    navigateAddress(homeNavigateUrl).catch(() => {});
     return;
   }
   if (event.origin !== homeParentOrigin || event.source !== window.top) {
@@ -1759,6 +1965,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   },
   setActiveBrowserPage: () => {
     document.body.dataset.browserPage = "active";
+    stageResize.opened();
   },
   setDisplayInput: (input, protocol) => {
     currentDisplayInput = input;
@@ -1784,8 +1991,8 @@ function closeRemoteDisplay() {
   remoteDisplay?.close();
 }
 
-async function connectRemoteDisplay(displaySession, enginePage = currentPage) {
-  await remoteDisplay.connect(displaySession, enginePage);
+async function connectRemoteDisplay(displaySession, enginePage = currentPage, signal = null) {
+  await remoteDisplay.connect(displaySession, enginePage, { signal });
 }
 
 function unlockRemoteAudioFromGesture() {
@@ -1947,6 +2154,12 @@ function syncEngineSelect(summary) {
       ? "Your selected Browser Engine is unavailable. Choose another Engine to change where the page runs."
       : browserEngineSummary(selectedEngine);
   }
+  const hidden = engineChoiceHidden(engines, selectedBrowserEngineId);
+  for (const node of [engineLabelNode, engineSelect, engineSummaryNode]) {
+    if (node) {
+      node.hidden = hidden;
+    }
+  }
   updateSettingsTitle();
 }
 
@@ -1977,7 +2190,9 @@ async function fetchBrowserSummary({ remoteServices = true } = {}) {
   }
   const encoded = query.toString();
   const summaryPath = encoded ? `/api/apps/browser/summary?${encoded}` : "/api/apps/browser/summary";
-  browserSummaryPromise = fetchJson(summaryPath, { method: "GET" })
+  const summaryAbort = new AbortController();
+  windowCloseAbortControllers.add(summaryAbort);
+  browserSummaryPromise = fetchJson(summaryPath, { method: "GET", signal: summaryAbort.signal })
     .then((summary) => {
       browserSummary = summary;
       syncEngineSelect(summary);
@@ -1992,6 +2207,8 @@ async function fetchBrowserSummary({ remoteServices = true } = {}) {
     })
     .finally(() => {
       browserSummaryPromise = null;
+      windowCloseAbortControllers.delete(summaryAbort);
+      resumeDeferredHomeBrowserWindowClose();
     });
   return browserSummaryPromise;
 }
@@ -2072,7 +2289,7 @@ function browserOpenJobError(status) {
   return next;
 }
 
-async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
+async function waitForRuntimeOpen(response, signal = null) {
   if (response?.schema === "elastos.browser.open-result/v1") {
     return response;
   }
@@ -2084,13 +2301,18 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   }
   const startedAt = Date.now();
   while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
-    const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
     showStatus(
-      `Opening ${engineLabel} with ${exitLabel}... ${elapsedSeconds}s`,
+      elapsedSeconds >= BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS
+        ? `Starting Browser… ${elapsedSeconds}s`
+        : "Starting Browser…",
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
-    const status = await fetchJson(response.status_url, { method: "GET" });
+    if (signal?.aborted) {
+      throw new Error("Browser window is closing.");
+    }
+    const status = await fetchJson(response.status_url, { method: "GET", signal });
     if (status?.schema !== "elastos.browser.open-status/v1") {
       throw new Error("Browser did not finish starting.");
     }
@@ -2142,6 +2364,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   });
   let openedOwner = null;
   let runtimePostStarted = false;
+  // A window Close aborts the network phase; Close then owns the cleanup of anything the open started.
+  const networkAbort = new AbortController();
+  windowCloseAbortControllers.add(networkAbort);
   runtimeOpenInFlight += 1;
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
@@ -2212,7 +2437,11 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       body: { ...body },
       page: null,
       statusUrl: "",
+      startedAt: Date.now(),
     };
+    if (networkAbort.signal.aborted) {
+      throw new Error("Browser window is closing.");
+    }
     runtimePostStarted = true;
     runtimeOwnershipTerminallyAbsent = false;
     unsettledRuntimeOpen = openSettlement;
@@ -2221,6 +2450,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       accepted = await fetchJson("/api/apps/browser/open", {
         method: "POST",
         body,
+        signal: networkAbort.signal,
       });
     } catch (error) {
       settleInitialRuntimeOpenPostFailure(openSettlement, error);
@@ -2232,7 +2462,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     ) {
       openSettlement.statusUrl = accepted.status_url;
     }
-    const response = await waitForRuntimeOpen(accepted, { engineLabel, exitLabel });
+    const response = await waitForRuntimeOpen(accepted, networkAbort.signal);
     const openedPage = runtimeOpenResultPage(response);
     if (!openedPage) {
       throw new Error("Browser did not open the page.");
@@ -2242,6 +2472,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
     currentPage = openedPage;
+    resetPageInputDelivery();
     currentPageGeneration = nextPageGeneration++;
     openedOwner = currentRuntimePageOwner();
     if (unsettledRuntimeOpen === openSettlement) {
@@ -2250,6 +2481,10 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     currentBrowserEngineId = browserEngineId;
     currentRemoteExitId = remoteExitId;
     publishRuntimePageForHost(currentPage);
+    // The window is closing: the deferred Close closes this page; it never shows.
+    if (deferredHomeWindowClose) {
+      return;
+    }
     currentDisplayMode = openedPage.display_session?.mode || "";
     syncDisplayInputFromSession(openedPage.display_session);
     currentView =
@@ -2270,7 +2505,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
     }
-    await connectRemoteDisplay(openedPage.display_session, openedPage);
+    // Signaling stays cancellable by Close until the display is connected.
+    await connectRemoteDisplay(openedPage.display_session, openedPage, networkAbort.signal);
+    windowCloseAbortControllers.delete(networkAbort);
     publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
     startPageHeartbeat();
@@ -2282,6 +2519,11 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
   } catch (error) {
     if (!runtimePostStarted) {
       proveRuntimeOwnershipAbsentBeforeDispatch();
+    }
+    if (networkAbort.signal.aborted) {
+      // The window is closing. Its Close settles whatever this open started and
+      // closes the exact page the open retained (finalize closes the display).
+      throw error;
     }
     if (
       openedOwner &&
@@ -2305,7 +2547,9 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     throw error;
   } finally {
     runtimeOpenInFlight -= 1;
+    windowCloseAbortControllers.delete(networkAbort);
     setLoading(false);
+    resumeDeferredHomeBrowserWindowClose();
   }
 }
 
@@ -2481,9 +2725,6 @@ async function resetBrowserProfile() {
     showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
     return;
   }
-  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
-    return;
-  }
   const activePage = currentPage;
   const activeGeneration = currentPageGeneration;
   const activeOwner = runtimePageOwner(activePage, activeGeneration);
@@ -2534,23 +2775,63 @@ async function resetBrowserProfile() {
 }
 
 profileResetButton?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = false;
+  profileResetCancel.focus({ preventScroll: true });
+});
+
+profileResetCancel?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = true;
+  profileResetButton.focus({ preventScroll: true });
+});
+
+profileResetCommit?.addEventListener("click", () => {
+  if (profileResetConfirmation.hidden || profileResetCommit.disabled) return;
+  profileResetConfirmation.hidden = true;
   resetBrowserProfile().catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
   });
 });
 
+const resizeOwner = () => currentPage?.page_id && currentDisplayMode === PRODUCT_DISPLAY_MODE
+  && remoteDisplay?.isTrackReady() && !unloadCleanupStarted && !homeWindowCloseInFlight
+  ? `${currentPage.page_id}:${currentPageGeneration}` : null;
+const resizeFrameFence = createBrowserFrameFence(remoteVideo);
+const stageResize = observeBrowserStage({
+  stage: renderPanel,
+  getOwner: resizeOwner,
+  send: (event, owner) => resizeFrameFence.run(() => sendBrowserInput(event, {
+    focus: false, isStale: () => owner !== resizeOwner(),
+  }), event),
+  onError: error => {
+    // After the retry also fails, pointer input resumes on a frame the guest can still be showing.
+    showStatus(resizeFrameFence.recover()
+      ? "Browser could not confirm the new size."
+      : error?.message || "Browser could not resize the page. Resize the window to try again.");
+  },
+});
+window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
+
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage: () => currentPage,
+  getInputOwner: currentRuntimePageOwner,
+  sameInputOwner: sameRuntimePageOwner,
   getCurrentView: () => currentView,
+  inputBlocked: () => resizeFrameFence.blocked(),
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText: homeClipboard.readText,
   remoteVideo,
   renderPanel,
+  releaseDragButton,
   sendBrowserInput,
   showStatus,
+  // Held-button drags exist only as Selkies datachannel mouse messages.
+  streamsPointerDrag: () =>
+    currentDisplayMode === "webrtc_remote_display" &&
+    currentInputTransport() === "datachannel" &&
+    currentInputProtocol() === "selkies_v1",
   unlockRemoteAudioFromGesture,
 });
 
@@ -2647,6 +2928,7 @@ async function restoreRuntimePageViewer(summary) {
   const owner = runtimePageOwner(page, nextPageGeneration);
   if (!owner) throw new Error("Runtime could not restore Browser cleanup authority.");
   currentPage = page;
+  resetPageInputDelivery();
   currentPageGeneration = nextPageGeneration++;
   runtimeOwnershipTerminallyAbsent = false;
   if (page.recovery_state === "cleanup_pending") {
@@ -2718,29 +3000,15 @@ window.addEventListener("pagehide", (event) => {
   releaseRuntimePageForUnload();
 });
 
-mountOperatorApproval({
-  container: settingsPanel,
-  controller: createOperatorApprovalController({
-    fetchJson,
-    runtimeOrigin: new URL(window.location.href).origin,
-    getOwner: () => unloadCleanupStarted || homeWindowCloseInFlight
-      ? null : runtimePageOwner(currentPage, currentPageGeneration),
-    sameOwner: sameRuntimePageOwner,
-  }),
-});
-
 const requestedStartupUrl = params.get("url");
 const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
 setLoading(true);
+showStatus("Browser is checking its Engine. Wait, or reopen Browser from Home to retry.", { sticky: true });
 fetchBrowserSummary({ remoteServices: false })
   .then(async (summary) => {
     if (await restoreRuntimePageViewer(summary)) return;
-    if (!requestedStartupUrl) {
-      setLoading(false);
-      return;
-    }
-    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
+    return requestRuntimeOpen(initialUrl, { history: "replace" });
   })
   .catch((error) => {
     if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;

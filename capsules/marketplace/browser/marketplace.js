@@ -1,4 +1,4 @@
-import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_OFFER_ID } from "./model-services.js";
+import { sharedModelOffers, REMOTE_MODEL_ID } from "./model-services.js";
 
 (function () {
   const params = new URLSearchParams(window.location.search);
@@ -25,13 +25,12 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     appLoadError: null,
     mediaLoadError: null,
     mediaTruncated: false,
+    // Runtime policy: protected content (Media) ships after 0.8.0 (#91).
+    protectedContent: false,
     modelCatalogState: "unconfigured",
     sharedModels: [],
-    modelAccess: [],
     sharedLoading: false,
     sharedLoaded: false,
-    sharedError: "",
-    accessError: "",
     remoteAvailability: [],
   };
 
@@ -62,16 +61,16 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     { id: "viewers", label: "Viewers", icon: "play" },
     { id: "models", label: "Models", icon: "package" },
     { id: "content", label: "Content", icon: "document" },
-    { id: "providers", label: "Services", icon: "server" },
-    { id: "shells", label: "Home views", icon: "system" },
   ];
+
+  // Every model row and detail, local or shared, uses the content icon.
+  const MODEL_ICON = { icon: "document", gradient: "gradient-green", iconRoute: "" };
+  const MODEL_FIT_LABELS = { fits: "Fits this device", insufficient: "Needs more memory", unavailable: "Memory not checked" };
 
   const icons = {
     package: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16.5 9.4l-9-5.19M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
     document: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 3h7l4 4v14H7V3zm6 1.5V8h3.5L13 4.5zM9 12h6v1.5H9V12zm0 3h6v1.5H9V15z"/></svg>',
-    server: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 1h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V3c0-1.1.9-2 2-2zm0 8h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2v-4c0-1.1.9-2 2-2zm0 8h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2v-4c0-1.1.9-2 2-2zm2-12v2h2V5H6zm0 8v2h2v-2H6zm0 8v2h2v-2H6z"/></svg>',
-    system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
     close: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>',
     check: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>',
@@ -260,7 +259,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       return;
     }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open Apps from Home to use this model.", true);
+      showToast("Open Marketplace from Home to use this model.", true);
       return;
     }
     const query = { model_cid: cid };
@@ -277,6 +276,8 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
 
   function handleHomeMenuCommand(command) {
     if (command === "refresh") {
+      // View > Refresh also reads an open model detail again, in place.
+      void detailModels?.refresh();
       loadData()
         .then(render)
         .catch((error) => {
@@ -308,8 +309,14 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     state.mediaLoadError = null;
     renderSurfaceState();
     await Promise.all([
-      loadCatalogData().then(render),
-      loadMediaData().then(render),
+      loadCatalogData().then(() => {
+        render();
+        if (!state.protectedContent) {
+          state.mediaLoading = false;
+          return undefined;
+        }
+        return loadMediaData().then(render);
+      }),
       ...(state.sharedLoaded ? [loadSharedModels()] : []),
     ]);
   }
@@ -319,29 +326,24 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     state.sharedLoading = true;
     state.sharedLoaded = true;
     state.sharedModels = [];
-    state.modelAccess = [];
     state.remoteAvailability = [];
-    state.sharedError = state.accessError = "";
     render();
-    const read = async (url, post = false) => {
-      const response = await fetch(url, { method: post ? "POST" : "GET", headers: {
-        "x-elastos-home-token": homeToken, ...(post ? { "content-type": "application/json" } : {}),
-      }, ...(post ? { body: "{}" } : {}), signal: AbortSignal.timeout(35000) });
+    let failed = false;
+    try {
+      const response = await fetch("/api/provider/model/offers_list", { method: "POST", headers: {
+        "x-elastos-home-token": homeToken, "content-type": "application/json",
+      }, body: "{}", signal: AbortSignal.timeout(35000) });
       if (!response.ok) throw new Error("Model access unavailable");
       const reply = await response.json();
       if (reply?.status === "error") throw new Error("Model access unavailable");
-      return reply;
-    };
-    // Summary reconciles new Inbox approvals into grants before discovery reads them.
-    await read("/api/apps/services/summary")
-      .then(reply => { state.modelAccess = modelAccessOpportunities(reply); })
-      .catch(() => { state.accessError = "Access status is unavailable. Open Services or refresh."; });
-    await read("/api/provider/model/offers_list", true).then(reply => {
       state.sharedModels = sharedModelOffers(reply);
       state.remoteAvailability = (reply?.data ?? reply)?.remote_services || [];
-    }).catch(() => { state.sharedError = "Shared models are unavailable. Refresh to check again."; });
+    } catch {
+      failed = true;
+    }
     state.sharedLoading = false;
     render();
+    if (failed && state.destination === "models") showToast("Couldn’t load shared models.", true);
   }
 
   async function loadCatalogData() {
@@ -361,6 +363,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       }
       const capsules = Array.isArray(catalog.capsules) ? catalog.capsules : [];
       state.modelCatalogState = catalog.model_catalog_state || "unconfigured";
+      state.protectedContent = catalog.policy?.protected_content === true;
       const modelCids = new Set();
       for (const capsule of capsules.filter(item => item.source === "signed-model-catalog")) {
         if (catalog.model_catalog_state !== "verified" || capsule.role !== "content" || capsule.installed !== false || capsule.launchable !== false ||
@@ -383,6 +386,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         interfacesByCapsule.set(capsule, records);
       }
       state.apps = capsules
+        .filter(listedInMarketplace)
         .map((capsule) => capsuleToApp(
           capsule,
           capsulesByName,
@@ -423,6 +427,14 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     `).join("")}</div>`;
   }
 
+  // Marketplace lists only what a person can open or get: apps, viewers and
+  // content Home can open, and signed models. Home views, services and helpers
+  // Home cannot open are not listed.
+  function listedInMarketplace(capsule) {
+    if (capsule.source === "signed-model-catalog") return true;
+    return capsule.launchable === true && Boolean(capsule.launch_target) && String(capsule.role || "").toLowerCase() !== "shell";
+  }
+
   function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
     const model = capsule.source === "signed-model-catalog";
     const role = String(capsule.role || "").toLowerCase();
@@ -438,10 +450,13 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       id: model ? `model:${capsule.cid}` : String(capsule.name || ""),
       modelCid: model ? capsule.cid : null,
       contentBytes: model ? capsule.content_size_bytes : null,
+      modelFit: model ? String(capsule.model_memory_fit || "") : "",
       name: publicTitle(capsule),
-      developer: String(model ? capsule.publisher_did : capsule.author || "Unknown publisher"),
+      // Runtime names a publisher only for a signed model or an installed item
+      // whose package matches a record signed by a release key it trusts.
+      developer: typeof capsule.publisher_did === "string" && capsule.publisher_did.startsWith("did:") ? capsule.publisher_did : "",
       category: appCategory(capsule, role),
-      description: model ? "Language model for Assistant." : publicDescription(capsule),
+      description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
@@ -458,11 +473,17 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       badges: model ? ["model"] : appBadges(role, capsule, installed),
       acceptedContent: acceptedContentLabels(capsule, capsulesByName, interfaceEntries),
       dependencies,
-      availableActions: model ? [] : executableActions(interfaceEntries),
-      viewerTitle: model ? "Assistant" : String(capsule.viewer_title || ""),
-      size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Verified app" : "Local app",
+      availableActions: model ? ["Get and keep on this device", "Open in Assistant", "Remove in System → Models"] : executableActions(interfaceEntries),
+      viewerTitle: String(capsule.viewer_title || ""),
       sourceSummary: capsule.cid ? "SmartWeb" : "Local",
     };
+  }
+
+  // A signed catalogue entry may carry its own one-line description; without
+  // one, Runtime's generic capsule text is replaced by the model's purpose.
+  function modelDescription(capsule) {
+    const description = String(capsule.description || "").trim();
+    return description && !/\bruntime\b/i.test(description) ? description : "Language model for Assistant.";
   }
 
   function appCategory(capsule, role) {
@@ -472,8 +493,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       apps: "apps",
       viewers: "viewers",
       content: "content",
-      providers: "providers",
-      shells: "shells",
     };
     return canonical[category] || canonical[`${role}s`] || "apps";
   }
@@ -504,23 +523,19 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function appIcon(role) {
-    if (role === "provider") return "server";
-    if (role === "shell") return "system";
     if (role === "viewer") return "play";
     if (role === "content") return "document";
     return "package";
   }
 
   function appGradient(role) {
-    if (role === "provider") return "gradient-slate";
     if (role === "viewer") return "gradient-blue";
     if (role === "content") return "gradient-green";
-    if (role === "shell") return "gradient-indigo";
     return "gradient-teal";
   }
 
   function appBadges(role, capsule, installed) {
-    const badges = [role === "provider" ? "service" : (role || "app")];
+    const badges = [role || "app"];
     if (installed) badges.push("installed");
     if (String(capsule.drm_state || "") === "provider") badges.push("ddrm");
     if (String(capsule.payment_state || "") === "provider") badges.push("wallet");
@@ -579,6 +594,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function render() {
+    syncProtectedContent();
     selectDestination(state.destination, { silent: true });
     updateInstalledBadge();
     const surfaceBlocked = renderSurfaceState();
@@ -589,8 +605,15 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     openPendingModelDetail();
   }
 
+  function syncProtectedContent() {
+    document.querySelectorAll('[data-destination="media"]').forEach((node) => {
+      node.hidden = !state.protectedContent;
+    });
+    if (!state.protectedContent && state.destination === "media") selectDestination("discover", { silent: true });
+  }
+
   function normalizeDestination(id) {
-    if (id === "media") return "media";
+    if (id === "media") return state.protectedContent ? "media" : "discover";
     if (id === "installed") return "installed";
     if (categories.some((category) => category.id === id)) return id;
     return "discover";
@@ -669,7 +692,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function surfaceState() {
-    if (state.destination === "models") return { destination: "models", loading: false, error: null };
     if (state.destination === "media") {
       return {
         destination: "media",
@@ -737,54 +759,42 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     bindAppActions(els.storeSections);
   }
 
-  function openAiProviderSettings() {
-    if (window.top === window || !homeParentOrigin) {
-      showToast("Open Apps from Home to open Settings.", true);
+  // Models use the same store rows as every category: models this Home can run,
+  // then models shared with it.
+  function renderModels() {
+    const matches = item => !state.search || JSON.stringify(item).toLowerCase().includes(state.search);
+    const rows = [
+      ...filteredByDestination().map(renderAppRow),
+      ...state.sharedModels.filter(matches).map(renderSharedModelRow),
+    ];
+    if (!rows.length) {
+      els.storeSections.innerHTML = state.sharedLoading ? skeletonRows(3)
+        : state.search ? emptyState("No results", "Try a different search.", icons.search)
+        : state.modelCatalogState === "unavailable" ? emptyState("Models are not available right now.", "", icons.search)
+        : emptyState("No models to show", "Choose another category from the sidebar.", icons.search);
       return;
     }
-    window.top.postMessage({
-      type: "home:open-target",
-      target: "system",
-      query: { settings: "models" },
-      homeToken,
-    }, homeParentOrigin);
-  }
-
-  function modelsSettingsChrome() {
-    return `<div class="store-models-settings">
-      <button class="store-pill" type="button" data-action="open-ai-provider-settings">Manage models</button>
-      <button class="store-pill" type="button" data-action="refresh-shared-models" ${state.sharedLoading ? "disabled" : ""}>Refresh shared models</button>
-    </div>`;
-  }
-
-  function renderModels() {
-    const local = filteredByDestination();
-    const matches = item => !state.search || JSON.stringify(item).toLowerCase().includes(state.search);
-    const shared = state.sharedModels.filter(matches);
-    const access = state.modelAccess.filter(matches);
-    const localStatus = state.appLoading ? "Loading verified models…" : state.appLoadError
-      || (state.modelCatalogState === "unavailable" ? "The model catalog could not be verified." : "");
-    const unavailable = state.remoteAvailability.filter(service => service.status !== "reachable").length;
-    els.storeSections.innerHTML = `${modelsSettingsChrome()}
-      <section class="store-section"><h2 class="store-section-title">On this Home</h2>
-        <p>Get a verified model to run on this device. Prompts stay here.</p>
-        ${localStatus ? `<p role="status">${escapeHtml(localStatus)}</p>` : local.length ? renderSection("Models", local, { showHeading: false }) : '<p>No matching verified models.</p>'}
+    const unreachable = state.sharedLoading ? 0 : state.remoteAvailability.filter(service => service.status !== "reachable").length;
+    els.storeSections.innerHTML = `
+      <section class="store-section">
+        <div class="store-row-grid">${rows.join("")}</div>
+        ${unreachable ? `<p class="store-inline-note" role="status">${unreachable} approved service${unreachable === 1 ? " is" : "s are"} not reachable right now.</p>` : ""}
       </section>
-      <section class="store-section"><h2 class="store-section-title">Shared with me</h2>
-        <p>These exact models are available through access approved by their Home.</p>
-        ${state.sharedLoading ? '<p role="status">Checking shared models…</p>' : state.sharedError ? `<p role="status">${escapeHtml(state.sharedError)}</p>` : shared.length ? shared.map(model => `<article class="shared-model-card">
-          <div class="store-section-head"><h3>${escapeHtml(model.title)}</h3><button class="store-pill" data-action="use-shared-model" data-offer="${escapeAttr(model.id)}">Use in Assistant</button></div>
-          <p>Home: ${escapeHtml(model.owner)} · Available when checked</p>
-          <dl class="shared-model-facts">${[{ term: "Model", value: model.facts.requestedModel }, ...model.facts.detailRows].map(row => `<dt>${escapeHtml(row.term)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("")}</dl>
-          <details><summary>Access details</summary><p>Grant expires ${escapeHtml(new Date(model.expiresAt * 1000).toLocaleString())}.</p><p>${escapeHtml(model.id)}</p></details>
-        </article>`).join("") : '<p>No shared model is available from the current check.</p>'}
-        ${unavailable && !state.sharedLoading ? `<p role="status">${unavailable} approved service${unavailable === 1 ? " is" : "s are"} unavailable. Refresh or review access in Services.</p>` : ""}
-      </section>
-      <section class="store-section"><h2 class="store-section-title">Access through People</h2>
-        <p>Ask a connected person for access in Services. Their approval lets this Home check which models they share.</p>
-        ${state.accessError ? `<p role="status">${escapeHtml(state.accessError)}</p>` : access.map(item => `<article class="shared-model-card"><div class="store-section-head"><div><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.status)}</p></div><button class="store-pill" data-action="model-service-access" data-offer="${escapeAttr(item.id)}">${item.requestable ? "Request access" : "Review access"}</button></div></article>`).join("")}
-      </section>`;
+    `;
     bindAppActions(els.storeSections);
+  }
+
+  function renderSharedModelRow(model) {
+    return `
+      <article class="store-row" data-action="shared-detail" data-offer="${escapeAttr(model.id)}" tabindex="0">
+        ${appIconHtml(MODEL_ICON, "store-row-icon")}
+        <div class="store-row-text">
+          <div class="store-row-title">${escapeHtml(model.title)}</div>
+          <div class="store-row-sub">Shared by ${escapeHtml(model.owner)}</div>
+        </div>
+        <button class="store-pill" type="button" data-action="use-shared-model" data-offer="${escapeAttr(model.id)}">Open</button>
+      </article>
+    `;
   }
 
   function renderCategorySections() {
@@ -884,51 +894,31 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     els.installedBadge.classList.toggle("hidden", count === 0);
   }
 
-  function isFirstPartyPublisher(author) {
-    const value = String(author || "").trim();
-    return !value || /^elastos$/i.test(value) || value === "Unknown publisher";
-  }
-
-  function rowSubtitle(app) {
-    if (app.modelCid) return app.description;
-    if (!isFirstPartyPublisher(app.developer)) {
-      return app.developer;
-    }
-    const description = String(app.description || "").trim();
-    if (description) {
-      const line = description.split(/[.!?]/)[0].trim();
-      if (line) {
-        return line;
-      }
-    }
-    return roleLabel(app.role);
-  }
-
-  function shortDid(did) {
-    return did.length <= 32 ? did : `${did.slice(0, 16)}…${did.slice(-4)}`;
-  }
-
-  function detailPublisher(app) {
-    if (app.modelCid) return `Verified publisher · ${shortDid(app.developer)}`;
-    if (isFirstPartyPublisher(app.developer)) {
-      return "ElastOS";
-    }
-    return app.developer;
-  }
-
   function modelSizeLabel(bytes) {
     const units = ["B", "KB", "MB", "GB", "TB"];
     const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
     return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
 
+  // Only a Runtime-verified signer gives a publisher line; there is no other.
+  function detailPublisher(app) {
+    return app.developer ? "Verified publisher" : "";
+  }
+
+  // A model row shows its download size and whether it fits this device.
+  function rowSubtitle(app) {
+    if (!app.modelCid) return detailPublisher(app);
+    const fit = Object.hasOwn(MODEL_FIT_LABELS, app.modelFit) ? MODEL_FIT_LABELS[app.modelFit] : "";
+    return [modelSizeLabel(app.contentBytes), fit].filter(Boolean).join(" · ");
+  }
+
   function renderAppRow(app) {
     return `
-      <article class="store-row" data-action="detail" data-app="${escapeAttr(app.id)}" tabindex="0">
+      <article class="store-row" data-action="${app.modelCid ? "model-detail" : "detail"}" data-app="${escapeAttr(app.id)}" tabindex="0">
         ${appIconHtml(app, "store-row-icon")}
         <div class="store-row-text">
           <div class="store-row-title">${escapeHtml(app.name)}</div>
-          <div class="store-row-sub">${escapeHtml(rowSubtitle(app))}</div>
+          ${rowSubtitle(app) ? `<div class="store-row-sub">${escapeHtml(rowSubtitle(app))}</div>` : ""}
         </div>
         ${actionButton(app)}
       </article>
@@ -999,7 +989,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function actionButton(app) {
-    if (app.modelCid) return `<button class="store-pill" type="button" data-action="model-detail" data-app="${escapeAttr(app.id)}">Details</button>`;
     if (!app.launchable) {
       return "";
     }
@@ -1025,78 +1014,122 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const tips = {
       wallet: "Supports payments",
       ddrm: "Uses protected content",
-      provider: "System service",
       installed: "Installed on this Home",
     };
     return tips[badge] || "";
   }
 
+  function renderDetail({ icon, title, developer, developerTitle = "", version = "", badges, body, footerNote = "", actions = "" }) {
+    detailModels?.destroy();
+    detailModels = null;
+    detailPreviousFocus = document.activeElement;
+    els.detailContent.innerHTML = `
+      <header class="modal-header">
+        ${icon}
+        <div class="modal-title-section">
+          <div class="modal-title">${escapeHtml(title)}</div>
+          ${developer ? `<div class="modal-developer"${developerTitle ? ` title="${escapeAttr(developerTitle)}"` : ""}>${escapeHtml(developer)}</div>` : ""}
+          ${version ? `<div class="modal-version">Version ${escapeHtml(version)}</div>` : ""}
+          <div class="modal-badges">${badges}</div>
+        </div>
+        <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
+      </header>
+      <div class="modal-body">${body}</div>
+      <footer class="modal-footer">
+        ${footerNote ? `<div class="modal-footer-price"><span class="trust-chip">${escapeHtml(footerNote)}</span></div>` : ""}
+        <div class="modal-footer-actions">
+          <button class="modal-btn secondary" type="button" data-action="close-detail">Close</button>
+          ${actions}
+        </div>
+      </footer>
+    `;
+    bindAppActions(els.detailContent);
+  }
+
+  function activateDetail() {
+    els.detailModal.classList.add("active");
+    const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
+      || els.detailContent.querySelector("[data-action='close-detail']");
+    focusTarget?.focus();
+  }
+
+  // Every item uses one detail layout: About, Status, Works with (when it has
+  // relationships), Available actions and Technical details, with its one
+  // forward action next to Close.
   function showAppDetail(appId) {
     const app = state.apps.find((candidate) => candidate.id === appId);
     if (!app) {
       return;
     }
-    detailModels?.destroy();
-    detailModels = null;
-    detailPreviousFocus = document.activeElement;
-    const openButton = app.launchable
-      ? `<button class="modal-btn primary" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
-      : "";
-    els.detailContent.innerHTML = `
-      <header class="modal-header">
-        ${appIconHtml(app, "modal-icon-size")}
-        <div class="modal-title-section">
-          <div class="modal-title">${escapeHtml(app.name)}</div>
-          <div class="modal-developer"${app.modelCid ? ` title="${escapeAttr(app.developer)}"` : ""}>${escapeHtml(detailPublisher(app))}</div>
-          ${app.modelCid ? `<div class="modal-version">${escapeHtml(modelSizeLabel(app.contentBytes))} download${app.version ? ` · Version ${escapeHtml(app.version)}` : ""}</div>` : app.version ? `<div class="modal-version">Version ${escapeHtml(app.version)}</div>` : ""}
-          <div class="modal-badges">${badgesHtml(app)}</div>
-        </div>
-        <button class="modal-close" type="button" data-action="close-detail" aria-label="Close">${icons.close}</button>
-      </header>
-      <div class="modal-body">
-        ${app.modelCid ? `<section class="modal-section" data-model-management aria-label="Model controls"></section>
-        <section class="modal-section">
-          <button class="modal-btn secondary" type="button" data-action="open-ai-provider-settings">Manage storage in System</button>
-        </section>` : `<section class="modal-section">
-          <div class="modal-section-title">About</div>
-          <div class="modal-description">${escapeHtml(app.description)}</div>
-        </section>
-        <section class="modal-section">
-          <div class="modal-section-title">Status</div>
-          <ul class="permissions-list">
-            ${statusItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
-          </ul>
-        </section>
+    renderDetail({
+      icon: appIconHtml(app, "modal-icon-size"), title: app.name, developer: detailPublisher(app),
+      developerTitle: app.developer, version: app.version,
+      badges: badgesHtml(app), footerNote: packageLabel(app),
+      body: `${aboutSection(app.description)}
+        ${app.modelCid
+          ? listSection("Status", [], 'data-model-management role="group" aria-label="Model status"')
+          : listSection("Status", statusItems(app))}
         ${relationshipSection(app)}
-        <section class="modal-section">
-          <div class="modal-section-title">Available actions</div>
-          <ul class="permissions-list">
-            ${availableActionItems(app).map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
-          </ul>
-        </section>`}
-        ${technicalDetails(app)}
-      </div>
-      <footer class="modal-footer">
-        <div class="modal-footer-price"><span class="trust-chip">${escapeHtml(packageLabel(app))}</span></div>
-        <div class="modal-footer-actions">
-          <button class="modal-btn secondary" type="button" data-action="close-detail">Close</button>
-          ${openButton}
-        </div>
-      </footer>
-    `;
-    bindAppActions(els.detailContent);
+        ${listSection("Available actions", availableActionItems(app))}
+        ${technicalDetails(app)}`,
+      actions: app.modelCid ? '<span class="model-actions" data-model-actions></span>'
+        : app.launchable
+          ? `<button class="modal-btn primary" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
+          : "",
+    });
     if (app.modelCid) {
+      // Runtime owns the model's state: the shared controller fills Status and
+      // puts Get, Retry, Stop or Open in Assistant next to Close.
+      const itemMarker = document.createElement("span");
+      itemMarker.className = "permission-icon";
+      itemMarker.innerHTML = icons.check;
       detailModels = window.ElastosModelManagement.create({
         root: els.detailContent.querySelector("[data-model-management]"), capsule: "marketplace", token: homeToken,
-        buttonClass: "modal-btn secondary", cid: app.modelCid, compact: true,
+        buttonClass: "modal-btn secondary", primaryButtonClass: "modal-btn primary", cid: app.modelCid, compact: true, itemMarker,
         onReadyOpen: openReadyModelInAssistant,
+        actionsRoot: els.detailContent.querySelector("[data-model-actions]"),
       });
       detailModels.setVisible(true);
     }
-    els.detailModal.classList.add("active");
-    const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
-      || els.detailContent.querySelector("[data-action='close-detail']");
-    focusTarget?.focus();
+    activateDetail();
+  }
+
+  // A shared model shows where prompts go before it opens in Assistant.
+  function showSharedModelDetail(offerId) {
+    const model = state.sharedModels.find((candidate) => candidate.id === offerId);
+    if (!model) {
+      return;
+    }
+    const facts = [{ term: "Model", value: model.facts.requestedModel }, ...model.facts.detailRows];
+    renderDetail({
+      icon: appIconHtml(MODEL_ICON, "modal-icon-size"), title: model.title, developer: `Shared by ${model.owner}`,
+      badges: badgesHtml({ badges: ["model", "shared"] }),
+      footerNote: `Access ends ${new Date(model.expiresAt * 1000).toLocaleString()}`,
+      body: `${aboutSection(`Shared with this Home by ${model.owner}.`)}
+        ${listSection("Status", facts.map((row) => `${row.term}: ${row.value}`))}
+        ${listSection("Available actions", ["Open in Assistant"])}
+        ${technicalSection(["Shared", "Model", "Remote"], [`Offer ID: ${model.id}`])}`,
+      actions: `<button class="modal-btn primary" type="button" data-action="use-shared-model" data-offer="${escapeAttr(model.id)}">Open in Assistant</button>`,
+    });
+    activateDetail();
+  }
+
+  function aboutSection(description) {
+    return `<section class="modal-section">
+          <div class="modal-section-title">About</div>
+          <div class="modal-description">${escapeHtml(description)}</div>
+        </section>`;
+  }
+
+  function listSection(title, items, listAttributes = "") {
+    return `
+      <section class="modal-section">
+        <div class="modal-section-title">${escapeHtml(title)}</div>
+        <ul class="permissions-list"${listAttributes ? ` ${listAttributes}` : ""}>
+          ${items.map((item) => `<li><span class="permission-icon">${icons.check}</span><span>${escapeHtml(item)}</span></li>`).join("")}
+        </ul>
+      </section>
+    `;
   }
 
   function closeDetail() {
@@ -1112,8 +1145,8 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
 
   function trapDetailFocus(event) {
     const focusables = [...els.detailContent.querySelectorAll(
-      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-    )].filter((node) => !node.closest("[hidden]") && node.offsetParent !== null);
+      'button:not([disabled]), summary, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )].filter((node) => !node.closest("[hidden]") && node.offsetParent !== null && node.checkVisibility());
     if (focusables.length < 2) {
       event.preventDefault();
       focusables[0]?.focus();
@@ -1134,10 +1167,10 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       `Status: ${app.installed ? "Installed on this Home" : "Not installed on this Home"}`,
       `Launch: ${app.launchable ? "Open from Home available" : "Open from Home unavailable"}`,
     ];
-    if (app.paymentState && app.paymentState !== "none") {
+    if (app.paymentState === "provider") {
       items.push("Supports payments");
     }
-    if (app.drmState && app.drmState !== "none") {
+    if (app.drmState === "provider") {
       items.push("Uses protected content");
     }
     return items;
@@ -1155,62 +1188,56 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     if (app.viewerTitle) items.push(`Opens with ${app.viewerTitle}`);
     if (app.acceptedContent.length) items.push(`Accepts ${app.acceptedContent.join(", ")}`);
     if (app.dependencies.length) items.push(`Needs ${app.dependencies.join(", ")}`);
-    if (!items.length) {
-      return "";
-    }
-    return `
-      <section class="modal-section">
-        <div class="modal-section-title">Works with</div>
-        <ul class="permissions-list">
-          ${items.map((item) => `<li><span class="permission-icon">${icons.check}</span>${escapeHtml(item)}</li>`).join("")}
-        </ul>
-      </section>
-    `;
+    return items.length ? listSection("Works with", items) : "";
   }
 
   function technicalDetails(app) {
+    return app.modelCid
+      ? technicalSection([app.sourceSummary, roleLabel(app.role), "Model"], [
+        packageLabel(app), `Publisher: ${app.developer}`, `Content ID: ${app.modelCid}`, `${app.contentBytes.toLocaleString()} bytes`,
+      ])
+      : technicalSection([app.sourceSummary, roleLabel(app.role), app.capsuleType || "Unknown"], [
+        signatureLabel(app), packageLabel(app), ...(app.developer ? [`Publisher: ${app.developer}`] : []),
+      ]);
+  }
+
+  function technicalSection([source, role, type], rows) {
     return `
       <details class="modal-section technical-details">
         <summary class="modal-section-title">Technical details</summary>
         <div class="requirements-grid">
-          <div class="requirement-item"><div class="requirement-value">${escapeHtml(app.sourceSummary)}</div><div class="requirement-label">Source</div></div>
-          <div class="requirement-item"><div class="requirement-value">${escapeHtml(roleLabel(app.role))}</div><div class="requirement-label">Role</div></div>
-          <div class="requirement-item"><div class="requirement-value">${escapeHtml(app.capsuleType || "Unknown")}</div><div class="requirement-label">Type</div></div>
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(source)}</div><div class="requirement-label">Source</div></div>
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(role)}</div><div class="requirement-label">Role</div></div>
+          <div class="requirement-item"><div class="requirement-value">${escapeHtml(type)}</div><div class="requirement-label">Type</div></div>
         </div>
         <ul class="permissions-list">
-          <li><span class="permission-icon">${icons.check}</span>${escapeHtml(signatureLabel(app.signatureState))}</li>
-          ${app.modelCid ? `<li class="model-publisher-identity">Publisher: ${escapeHtml(app.developer)}</li><li class="model-content-identity">Content ID: ${escapeHtml(app.modelCid)}</li><li>${app.contentBytes.toLocaleString()} bytes</li>` : ""}
-          <li><span class="permission-icon">${icons.check}</span>${escapeHtml(packageLabel(app))}</li>
+          ${rows.map((row) => `<li><span class="permission-icon">${icons.check}</span><span>${escapeHtml(row)}</span></li>`).join("")}
         </ul>
       </details>
     `;
   }
 
   function packageLabel(app) {
-    if (app.modelCid) return "Verified publisher";
-    if (app.trustState === "cid-with-manifest-signature") return "Verified";
-    if (app.trustState === "local-manifest-signature") return "Signed local";
-    if (app.installed) return "On this device";
-    return "Catalog entry";
+    if (app.modelCid) return "Catalog signature verified";
+    return app.developer ? "Release signature verified" : "Publisher verification unavailable";
   }
 
   function trustLabel(stateValue) {
     const labels = {
-      "cid-with-manifest-signature": "Verified SmartWeb app",
-      "local-manifest-signature": "Signed local app",
-      "cid-without-manifest-signature": "Verification incomplete",
+      "cid-with-manifest-signature": "Published content and manifest signature declared",
+      "local-manifest-signature": "Local manifest signature declared",
+      "cid-without-manifest-signature": "Published content declared",
       "local-dev": "Local app",
     };
     return labels[stateValue] || "Not declared";
   }
 
-  function signatureLabel(stateValue) {
+  function signatureLabel(app) {
     const labels = {
       "manifest-signature-declared": "Manifest signature declared",
       "no-manifest-signature": "Manifest signature not declared",
-      "catalog-signature-verified": "Catalog publisher signature verified",
     };
-    return labels[stateValue] || "Manifest signature status unavailable";
+    return labels[app.signatureState] || "Manifest signature status unavailable";
   }
 
   function openApp(appId) {
@@ -1219,7 +1246,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       return;
     }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open Apps from Home to launch apps.", true);
+      showToast("Open Marketplace from Home to launch apps.", true);
       return;
     }
     window.top.postMessage({
@@ -1234,7 +1261,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       return;
     }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open Apps from Home to launch apps.", true);
+      showToast("Open Marketplace from Home to launch apps.", true);
       return;
     }
     window.top.postMessage({
@@ -1286,6 +1313,12 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
           }
           showAppDetail(appId);
         }
+        if (action === "shared-detail") {
+          if (target instanceof HTMLElement) {
+            target.focus();
+          }
+          showSharedModelDetail(target.dataset.offer);
+        }
         if (action === "open") {
           closeDetail();
           openApp(appId);
@@ -1322,23 +1355,18 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         if (action === "close-detail") {
           closeDetail();
         }
-        if (action === "open-ai-provider-settings") {
-          openAiProviderSettings();
-        }
-        if (action === "refresh-shared-models") void loadSharedModels();
         if (action === "use-shared-model" && REMOTE_MODEL_ID.test(target.dataset.offer || "")
             && state.sharedModels.some(model => model.id === target.dataset.offer)) {
+          closeDetail();
           window.top.postMessage({ type: "home:open-target", target: "assistant", query: { offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
-        }
-        if (action === "model-service-access" && SERVICE_OFFER_ID.test(target.dataset.offer || "")
-            && state.modelAccess.some(item => item.id === target.dataset.offer)) {
-          window.top.postMessage({ type: "home:open-target", target: "services", query: { service_offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
         }
       });
       node.addEventListener("keydown", (event) => {
-        if ((event.key === "Enter" || event.key === " ") && node.dataset.action === "detail") {
+        if (event.target === node && (event.key === "Enter" || event.key === " ")
+            && ["detail", "model-detail", "shared-detail"].includes(node.dataset.action)) {
           event.preventDefault();
-          showAppDetail(node.dataset.app);
+          if (node.dataset.action === "shared-detail") showSharedModelDetail(node.dataset.offer);
+          else showAppDetail(node.dataset.app);
         }
       });
     });
@@ -1368,7 +1396,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       <div class="empty-state">
         <div class="empty-icon">${icon}</div>
         <div class="empty-title">${escapeHtml(title)}</div>
-        <div class="empty-description">${escapeHtml(description)}</div>
+        ${description ? `<div class="empty-description">${escapeHtml(description)}</div>` : ""}
       </div>
     `;
   }
@@ -1410,13 +1438,11 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const description = String(capsule.description || "").trim();
     const role = String(capsule.role || "app").toLowerCase();
     const title = publicTitle(capsule);
-    if (role === "provider") return `${title} service for apps on this Home.`;
     if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capability surface|affordances?|host-loaded|structured home intents?)\b/i.test(description)) {
       return description;
     }
     if (role === "viewer") return `${title} opens compatible files and content.`;
     if (role === "content") return `${title} content.`;
-    if (role === "shell") return `${title} Home view.`;
     return `${title} app.`;
   }
 
@@ -1589,10 +1615,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const labels = {
       app: "App",
       viewer: "Viewer",
-      provider: "Service",
-      service: "Service",
       content: "Content",
-      shell: "Shell",
       ddrm: "dDRM",
       wallet: "Wallet",
       installed: "Installed",
@@ -1601,7 +1624,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function roleLabel(role) {
-    const labels = { app: "App", viewer: "Viewer", provider: "Service", content: "Content", shell: "Home view" };
+    const labels = { app: "App", viewer: "Viewer", content: "Content" };
     return labels[String(role || "").toLowerCase()] || "App";
   }
 

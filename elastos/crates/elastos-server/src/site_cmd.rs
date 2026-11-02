@@ -124,27 +124,14 @@ struct TunnelBridge {
     bridge: ProviderBridge,
 }
 
-pub(crate) struct PublicTunnelSession {
-    target: String,
-    public_url: String,
-    tunnel: TunnelBridge,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct SiteStatus {
+struct SiteStatus {
     #[serde(default)]
-    pub(crate) local_url: Option<String>,
-    #[serde(default)]
-    pub(crate) reused: Option<bool>,
+    local_url: Option<String>,
 }
 
 struct SiteBridge {
     bridge: ProviderBridge,
-}
-
-pub(crate) struct LocalSitePreviewSession {
-    site_path: PathBuf,
-    bridge: SiteBridge,
 }
 
 impl SiteBridge {
@@ -167,84 +154,6 @@ impl SiteBridge {
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("site-provider shutdown failed: {}", e))
     }
-}
-
-impl LocalSitePreviewSession {
-    async fn ensure_started(&mut self, addr: &str) -> anyhow::Result<SiteStatus> {
-        validate_site_path(&self.site_path)?;
-        self.bridge.start(addr).await
-    }
-
-    async fn shutdown(self) -> anyhow::Result<()> {
-        self.bridge.shutdown().await
-    }
-}
-
-pub(crate) async fn ensure_local_site_preview(
-    session: &mut Option<LocalSitePreviewSession>,
-    addr: &str,
-) -> anyhow::Result<SiteStatus> {
-    if session.is_none() {
-        let site_path = site_root_dir();
-        validate_site_path(&site_path)?;
-        let bridge = get_site_bridge(&site_path).await?;
-        *session = Some(LocalSitePreviewSession { site_path, bridge });
-    }
-
-    session
-        .as_mut()
-        .expect("site preview session initialized")
-        .ensure_started(addr)
-        .await
-}
-
-pub(crate) async fn shutdown_local_site_preview(
-    session: &mut Option<LocalSitePreviewSession>,
-) -> anyhow::Result<()> {
-    if let Some(session) = session.take() {
-        session.shutdown().await?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn ensure_public_tunnel(
-    session: &mut Option<PublicTunnelSession>,
-    target: &str,
-    timeout_secs: u64,
-) -> anyhow::Result<String> {
-    let needs_start = match session.as_mut() {
-        Some(current) if current.target == target => {
-            let status = current.tunnel.status().await.unwrap_or_default();
-            !(status.running || status.url.is_some())
-        }
-        Some(_) => true,
-        None => true,
-    };
-
-    if needs_start {
-        shutdown_public_tunnel(session).await?;
-        let tunnel = get_tunnel_bridge().await?;
-        let public_url = start_public_tunnel(&tunnel, target, timeout_secs).await?;
-        *session = Some(PublicTunnelSession {
-            target: target.to_string(),
-            public_url: public_url.clone(),
-            tunnel,
-        });
-    }
-
-    session
-        .as_ref()
-        .map(|current| current.public_url.clone())
-        .ok_or_else(|| anyhow::anyhow!("public tunnel did not start"))
-}
-
-pub(crate) async fn shutdown_public_tunnel(
-    session: &mut Option<PublicTunnelSession>,
-) -> anyhow::Result<()> {
-    if let Some(session) = session.take() {
-        session.tunnel.shutdown().await?;
-    }
-    Ok(())
 }
 
 impl TunnelBridge {
@@ -413,10 +322,6 @@ fn stage_site(source: &Path) -> anyhow::Result<()> {
     println!("  Path:       {}", dest.display());
     println!("  Serve:      elastos site serve");
     Ok(())
-}
-
-pub(crate) fn stage_site_from_home(source: &Path) -> anyhow::Result<()> {
-    stage_site(source)
 }
 
 fn print_site_path() -> anyhow::Result<()> {

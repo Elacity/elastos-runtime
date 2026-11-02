@@ -2,12 +2,14 @@
 //! The provider names an offer and effect; Runtime selects the destination,
 //! checks current owner authority, and adds the stored credential.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use elastos_runtime::provider::ProviderBridge;
@@ -29,6 +31,7 @@ use super::model_provider_egress_decision::{self, ActiveDecision, ConnectionScop
 #[derive(Clone, Copy)]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) enum ValidationEndpoint {
+    OpenRouterKey,
     OpenRouterModels,
     VeniceAccess,
     VeniceModels,
@@ -37,6 +40,9 @@ pub(crate) enum ValidationEndpoint {
 impl ValidationEndpoint {
     fn grant_binding(self) -> (&'static str, &'static str) {
         match self {
+            // Same effect as Venice's key check: the connection policy already
+            // names validate_access, so approved connections stay approved.
+            Self::OpenRouterKey => ("validation:openrouter", "validate_access"),
             Self::OpenRouterModels => ("validation:openrouter", "validate_models"),
             Self::VeniceAccess => ("validation:venice", "validate_access"),
             Self::VeniceModels => ("validation:venice", "validate_models"),
@@ -45,7 +51,7 @@ impl ValidationEndpoint {
 
     fn provider(self) -> &'static str {
         match self {
-            Self::OpenRouterModels => "OpenRouter",
+            Self::OpenRouterKey | Self::OpenRouterModels => "OpenRouter",
             Self::VeniceAccess | Self::VeniceModels => "Venice",
         }
     }
@@ -60,6 +66,7 @@ const MAX_JOB_BINDINGS: usize = 4096;
 const MAX_GRANTS: usize = 1024;
 const MAX_JOB_BINDINGS_BYTES: usize = 4 * 1024 * 1024;
 const JOB_BINDING_LIFETIME_MS: u64 = 2 * 60 * 60 * 1000;
+const OPENROUTER_KEY_URL: &str = "https://openrouter.ai/api/v1/key";
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_modalities=all";
 const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
@@ -75,6 +82,9 @@ enum DestinationClass {
 type JobCreateKey = (String, String, String);
 static JOB_CREATES: OnceLock<Mutex<HashSet<JobCreateKey>>> = OnceLock::new();
 static EGRESS_GRANTS: OnceLock<Mutex<()>> = OnceLock::new();
+use super::hosted_egress_admission::admission_gate;
+#[cfg(test)]
+use super::hosted_egress_admission::begin_hosted_end;
 
 struct JobCreateReservation(JobCreateKey);
 
@@ -213,6 +223,14 @@ async fn fetch_validation_inner(
     }
     let fixtures = load_hosted_validate_fixtures(data_dir)?;
     let raw = match endpoint {
+        ValidationEndpoint::OpenRouterKey => match fixtures.as_ref() {
+            Some(value) => value
+                .openrouter_key_url
+                .as_ref()
+                .map(|url| url.as_str())
+                .ok_or_else(|| anyhow::anyhow!("hosted validation destination unavailable"))?,
+            None => OPENROUTER_KEY_URL,
+        },
         ValidationEndpoint::OpenRouterModels => fixtures
             .as_ref()
             .map(|value| value.openrouter_models_url.as_str())
@@ -255,43 +273,33 @@ async fn fetch_validation_inner(
             || public_validation_destination_allowed(endpoint, &destination),
         "hosted validation destination unavailable"
     );
-    anyhow::ensure!(
-        !(connection_id.is_none()
-            && operator_hosted_ended(data_dir)
-            && public_validation_destination_allowed(endpoint, &destination)),
-        "owner ended hosted HTTPS"
-    );
     let (validation_offer_id, effect) = endpoint.grant_binding();
-    let operator_route = operator_hosted_validation_route(
-        data_dir,
-        validation_offer_id,
-        effect,
-        "GET",
-        &destination,
-    );
-    let offer_id = if operator_route {
-        validation_offer_id
-    } else {
-        connection_id.unwrap_or(validation_offer_id)
-    };
+    let offer_id = connection_id.unwrap_or(validation_offer_id);
     let scope = egress_scope(offer_id, effect, "GET", &destination)?;
-    if !operator_route
-        && active_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id)).is_err()
-    {
+    if active_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id)).is_err() {
+        let _decision = model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
+            .await;
         request_decision(data_dir, &scope, &destination, Some(owner_proof_binding_id))?;
         anyhow::bail!("hosted egress requires an Inbox decision");
     }
-    if !operator_route {
-        create_grant_after_decision(
-            data_dir,
-            offer_id,
-            effect,
-            "GET",
-            &destination,
-            Some(owner_proof_binding_id),
-            None,
-        )?;
-    }
+    create_grant_after_decision(
+        data_dir,
+        offer_id,
+        effect,
+        "GET",
+        &destination,
+        Some(owner_proof_binding_id),
+        None,
+    )?;
+    let gate = admission_gate(data_dir, offer_id);
+    let admission = gate.lock.read().await;
+    let mut ended = gate.changed.subscribe();
+    ended.borrow_and_update();
+    anyhow::ensure!(
+        gate.ending.load(Ordering::Acquire) == 0,
+        "hosted access is ending"
+    );
     current_grant_for(
         data_dir,
         offer_id,
@@ -325,6 +333,8 @@ async fn fetch_validation_inner(
     let mut monitor = tokio::time::interval(Duration::from_millis(250));
     let mut response = loop {
         tokio::select! {
+            biased;
+            _ = ended.changed() => anyhow::bail!("hosted access ended during send"),
             result = &mut send => break result?,
             _ = monitor.tick() => current_grant_for(
                 data_dir, offer_id, effect, "GET", &destination,
@@ -332,6 +342,7 @@ async fn fetch_validation_inner(
             )?,
         }
     };
+    drop(admission);
     if response.status().is_redirection() {
         anyhow::bail!("hosted validation redirect denied");
     }
@@ -453,12 +464,6 @@ async fn handle(
     {
         return deny(&mut stream).await;
     }
-    if operator_hosted_ended(data_dir)
-        && public_effect_destination_allowed(&request, &destination)
-        && !uses_connection_authority(data_dir, &request.offer_id, &request.effect).unwrap_or(false)
-    {
-        return deny(&mut stream).await;
-    }
     let scope = match egress_scope(
         &request.offer_id,
         &request.effect,
@@ -468,14 +473,10 @@ async fn handle(
         Ok(scope) => scope,
         Err(_) => return deny(&mut stream).await,
     };
-    let operator_route = operator_hosted_effect_route(
-        data_dir,
-        &request.offer_id,
-        &request.effect,
-        request.method.as_str(),
-        &destination,
-    );
-    if !operator_route && active_decision(data_dir, &scope, &destination, None).is_err() {
+    if active_decision(data_dir, &scope, &destination, None).is_err() {
+        let _decision = model_provider_egress_decision::transition_gate(data_dir)
+            .lock_owned()
+            .await;
         let prior = refusal_state(data_dir, &scope, &destination).ok().flatten();
         let requested = request_decision(data_dir, &scope, &destination, None);
         let state = if prior == Some("ended") && requested.is_ok() {
@@ -489,49 +490,74 @@ async fn handle(
         };
         return deny_access(&mut stream, state).await;
     }
-    if !operator_route
-        && create_grant_after_decision(
-            data_dir,
-            &request.offer_id,
-            &request.effect,
-            request.method.as_str(),
-            &destination,
-            None,
-            Some((&request.run_id, &request.request_id)),
-        )
-        .is_err()
+    let _grant = RequestGrant::hold(data_dir, &request, &destination);
+    if create_grant_after_decision(
+        data_dir,
+        &request.offer_id,
+        &request.effect,
+        request.method.as_str(),
+        &destination,
+        None,
+        Some((&request.run_id, &request.request_id)),
+    )
+    .is_err()
         || current_grant(data_dir, &request, &destination).is_err()
     {
         return deny(&mut stream).await;
     }
-    let result = {
-        let mut monitor = tokio::time::interval(Duration::from_millis(250));
-        let outbound = forward(&mut stream, data_dir, &request, &destination, || {
+    let result = drive_forward(
+        forward(&mut stream, data_dir, &request, &destination, || {
             bridge.confined_model_run_matches(
                 &request.offer_id,
                 &request.run_id,
                 &request.request_id,
             )
-        });
-        tokio::pin!(outbound);
-        loop {
-            tokio::select! {
-                result = &mut outbound => break result,
-                _ = monitor.tick() => {
-                    if bridge.confined_model_identity().map(|(pid, _)| pid) != Some(provider_pid)
-                        || !bridge.confined_model_run_matches(&request.offer_id, &request.run_id, &request.request_id)
-                        || current_grant(data_dir, &request, &destination).is_err()
-                    {
-                        break Err(io::Error::new(io::ErrorKind::PermissionDenied, "hosted authority ended"));
-                    }
-                }
-            }
-        }
-    };
+        }),
+        || {
+            bridge.confined_model_identity().map(|(pid, _)| pid) == Some(provider_pid)
+                && bridge.confined_model_run_matches(
+                    &request.offer_id,
+                    &request.run_id,
+                    &request.request_id,
+                )
+        },
+        || current_grant(data_dir, &request, &destination).is_ok(),
+    )
+    .await;
     if result.is_err() {
         let _ = stream.shutdown().await;
     }
     result
+}
+
+/// Runs one admitted hosted request until it finishes or loses authority.
+/// When the grant ends, `forward` gets a short grace to write the End line
+/// itself; then it is dropped with the upstream response and any pending
+/// write, even when the provider has stopped reading. A cut chunk gets no
+/// End line appended.
+async fn drive_forward(
+    outbound: impl Future<Output = io::Result<()>>,
+    run_still_ours: impl Fn() -> bool,
+    still_granted: impl Fn() -> bool,
+) -> io::Result<()> {
+    tokio::pin!(outbound);
+    let mut monitor = tokio::time::interval(AUTHORITY_CHECK_INTERVAL);
+    loop {
+        tokio::select! {
+            result = &mut outbound => return result,
+            _ = monitor.tick() => {
+                if !run_still_ours() {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "hosted authority ended"));
+                }
+                if !still_granted() {
+                    return match tokio::time::timeout(ENDED_REQUEST_GRACE, outbound.as_mut()).await {
+                        Ok(result) => result,
+                        Err(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "hosted access ended")),
+                    };
+                }
+            }
+        }
+    }
 }
 
 async fn read_request(stream: &mut UnixStream) -> io::Result<EffectRequest> {
@@ -964,182 +990,6 @@ fn refusal_state(
     model_provider_egress_decision::refusal_state(data_dir, scope, connection.as_ref())
 }
 
-// An explicit Mac owner installation can keep its configured public hosted
-// routes available while the permanent per-route consent flow is completed.
-// Runtime still selects every URL and credential; this never gives the
-// provider a raw socket or an arbitrary destination.
-fn operator_hosted_enabled(data_dir: &Path) -> bool {
-    cfg!(target_os = "macos") && operator_hosted_owner(data_dir) && !operator_hosted_ended(data_dir)
-}
-
-pub(crate) fn operator_hosted_access_enabled(data_dir: &Path) -> bool {
-    operator_hosted_enabled(data_dir)
-}
-
-fn operator_hosted_owner(data_dir: &Path) -> bool {
-    std::env::var_os("ELASTOS_HOSTED_HTTPS_OWNER_DATA_DIR")
-        .map(PathBuf::from)
-        .is_some_and(|root| root.is_absolute() && root == data_dir)
-}
-
-fn operator_hosted_end_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(".audit/temporary-hosted-demo-revoked.json")
-}
-
-fn operator_hosted_ended(data_dir: &Path) -> bool {
-    match std::fs::symlink_metadata(operator_hosted_end_path(data_dir)) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    }
-}
-
-pub(crate) fn end_operator_hosted_access(data_dir: &Path, offer_id: &str) -> anyhow::Result<bool> {
-    if !cfg!(target_os = "macos") || !operator_hosted_owner(data_dir) {
-        return Ok(false);
-    }
-    if !matches!(offer_id, "validation:openrouter" | "validation:venice")
-        && !load_model_provider_operator_offers(data_dir)?
-            .iter()
-            .any(|offer| offer["id"] == offer_id)
-    {
-        return Ok(false);
-    }
-    if operator_hosted_ended(data_dir) {
-        return Ok(true);
-    }
-    let path = operator_hosted_end_path(data_dir);
-    std::fs::create_dir_all(path.parent().expect("hosted end parent"))?;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut marker = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(marker) => marker,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(true),
-        Err(error) => return Err(error.into()),
-    };
-    use std::io::Write as _;
-    marker.write_all(b"owner ended hosted HTTPS\n")?;
-    marker.sync_all()?;
-    Ok(true)
-}
-
-fn operator_hosted_effect_route(
-    data_dir: &Path,
-    offer_id: &str,
-    effect: &str,
-    method: &str,
-    destination: &Destination,
-) -> bool {
-    operator_hosted_enabled(data_dir)
-        && public_effect_route_allowed(effect, method, destination)
-        && load_model_provider_operator_offers(data_dir)
-            .ok()
-            .is_some_and(|offers| {
-                offers.iter().any(|offer| {
-                    let adapter = &offer["adapter"];
-                    let operation_matches = match effect {
-                        "text" => {
-                            offer["operation"] == "text.generate"
-                                && adapter["kind"] == "open_ai_compatible_text"
-                        }
-                        "decisions" => {
-                            offer["operation"] == "decision.evaluate"
-                                && adapter["kind"] == "open_router_decisions"
-                        }
-                        _ => false,
-                    };
-                    offer["id"] == offer_id
-                        && offer["enabled"] != false
-                        && operation_matches
-                        && adapter["api_url"] == destination.grant_url
-                        && adapter["hosted"]["backend_provider_label"] == destination.provider
-                })
-            })
-}
-
-fn operator_hosted_validation_route(
-    data_dir: &Path,
-    offer_id: &str,
-    effect: &str,
-    method: &str,
-    destination: &Destination,
-) -> bool {
-    let Some(endpoint) =
-        operator_validation_endpoint(offer_id, effect, method, destination.provider.as_str())
-    else {
-        return false;
-    };
-    operator_hosted_enabled(data_dir)
-        && public_validation_destination_allowed(endpoint, destination)
-}
-
-fn operator_validation_endpoint(
-    offer_id: &str,
-    effect: &str,
-    method: &str,
-    provider: &str,
-) -> Option<ValidationEndpoint> {
-    match (offer_id, effect, method, provider) {
-        ("validation:openrouter", "validate_models", "GET", "OpenRouter") => {
-            Some(ValidationEndpoint::OpenRouterModels)
-        }
-        ("validation:venice", "validate_access", "GET", "Venice") => {
-            Some(ValidationEndpoint::VeniceAccess)
-        }
-        ("validation:venice", "validate_models", "GET", "Venice") => {
-            Some(ValidationEndpoint::VeniceModels)
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn operator_hosted_offer_ready(data_dir: &Path, offer_id: &str) -> bool {
-    if !operator_hosted_enabled(data_dir) {
-        return false;
-    }
-    load_model_provider_operator_offers(data_dir)
-        .ok()
-        .and_then(|offers| {
-            offers.into_iter().find(|offer| {
-                let adapter = &offer["adapter"];
-                let configured = matches!(
-                    (
-                        offer["operation"].as_str(),
-                        adapter["kind"].as_str(),
-                        adapter["hosted"]["backend_provider_label"].as_str(),
-                        adapter["api_url"].as_str(),
-                    ),
-                    (
-                        Some("text.generate"),
-                        Some("open_ai_compatible_text"),
-                        Some("OpenRouter"),
-                        Some(OPENROUTER_CHAT_URL),
-                    ) | (
-                        Some("text.generate"),
-                        Some("open_ai_compatible_text"),
-                        Some("Venice"),
-                        Some(VENICE_CHAT_URL),
-                    ) | (
-                        Some("decision.evaluate"),
-                        Some("open_router_decisions"),
-                        Some("OpenRouter"),
-                        Some(OPENROUTER_DECISIONS_URL),
-                    )
-                );
-                offer["id"] == offer_id && offer["enabled"] != false && configured
-            })
-        })
-        .is_some()
-        && read_hosted_secret(data_dir, offer_id)
-            .ok()
-            .flatten()
-            .is_some()
-}
-
 fn grant_file(data_dir: &Path) -> anyhow::Result<GrantFile> {
     let Some(bytes) = read_hosted_egress_grants(data_dir)? else {
         return Ok(GrantFile {
@@ -1172,8 +1022,10 @@ fn create_grant_after_decision(
         .unwrap_or_else(|error| error.into_inner());
     let mut file = grant_file(data_dir)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-    file.grants
-        .retain(|grant| grant.active && grant.expires_at_ms > now);
+    let approved = model_provider_egress_decision::approved_ids(data_dir)?;
+    file.grants.retain(|grant| {
+        grant.active && grant.expires_at_ms > now && approved.contains(&grant.decision_id)
+    });
     if file.grants.iter().any(|grant| {
         grant.active
             && grant.decision_id == decision.id
@@ -1206,6 +1058,87 @@ fn create_grant_after_decision(
     write_hosted_egress_grants(data_dir, &serde_json::to_vec(&file)?)
 }
 
+/// One hosted request's use of its run-bound grant. Requests that share the
+/// same grant (same route, run and request) count up; the grant is removed
+/// when the last of them finishes.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RequestGrantKey {
+    data_dir: PathBuf,
+    offer_id: String,
+    effect: String,
+    method: String,
+    url: String,
+    run_id: String,
+    request_id: String,
+}
+
+static REQUEST_GRANT_USERS: LazyLock<Mutex<HashMap<RequestGrantKey, usize>>> =
+    LazyLock::new(Default::default);
+
+fn release_request_grant(key: &RequestGrantKey) -> anyhow::Result<()> {
+    let _guard = EGRESS_GRANTS
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut file = grant_file(&key.data_dir)?;
+    let before = file.grants.len();
+    file.grants.retain(|grant| {
+        !(grant.offer_id == key.offer_id
+            && grant.effect == key.effect
+            && grant.method == key.method
+            && grant.url == key.url
+            && grant.run_id.as_deref() == Some(key.run_id.as_str())
+            && grant.request_id.as_deref() == Some(key.request_id.as_str()))
+    });
+    if file.grants.len() == before {
+        return Ok(());
+    }
+    write_hosted_egress_grants(&key.data_dir, &serde_json::to_vec(&file)?)
+}
+
+/// Releases a request's grant on every exit path, including cancellation.
+struct RequestGrant {
+    key: RequestGrantKey,
+}
+
+impl RequestGrant {
+    fn hold(data_dir: &Path, request: &EffectRequest, destination: &Destination) -> Self {
+        let key = RequestGrantKey {
+            data_dir: data_dir.to_path_buf(),
+            offer_id: request.offer_id.clone(),
+            effect: request.effect.clone(),
+            method: request.method.as_str().to_string(),
+            url: destination.grant_url.clone(),
+            run_id: request.run_id.clone(),
+            request_id: request.request_id.clone(),
+        };
+        *REQUEST_GRANT_USERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key.clone())
+            .or_default() += 1;
+        Self { key }
+    }
+}
+
+impl Drop for RequestGrant {
+    fn drop(&mut self) {
+        // Held across the file write so a request starting now waits and
+        // then creates its grant afresh.
+        let mut users = REQUEST_GRANT_USERS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(count) = users.get_mut(&self.key) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            users.remove(&self.key);
+            let _ = release_request_grant(&self.key);
+        }
+    }
+}
+
 fn current_grant_for(
     data_dir: &Path,
     offer_id: &str,
@@ -1215,24 +1148,6 @@ fn current_grant_for(
     current_admin_proof: Option<&str>,
     run_binding: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
-    if operator_hosted_ended(data_dir)
-        && !uses_connection_authority(data_dir, offer_id, effect)?
-        && (public_effect_route_allowed(effect, method, destination)
-            || operator_validation_endpoint(
-                offer_id,
-                effect,
-                method,
-                destination.provider.as_str(),
-            )
-            .is_some_and(|endpoint| public_validation_destination_allowed(endpoint, destination)))
-    {
-        anyhow::bail!("owner ended hosted HTTPS");
-    }
-    if operator_hosted_effect_route(data_dir, offer_id, effect, method, destination)
-        || operator_hosted_validation_route(data_dir, offer_id, effect, method, destination)
-    {
-        return Ok(());
-    }
     let scope = egress_scope(offer_id, effect, method, destination)?;
     let decision = active_decision(data_dir, &scope, destination, current_admin_proof)?;
     let file = grant_file(data_dir)?;
@@ -1554,11 +1469,17 @@ async fn forward(
         Ok(client) => client,
         Err(_) => return deny(stream).await,
     };
-    if !run_authorized()
+    let gate = admission_gate(data_dir, &request.offer_id);
+    let admission = gate.lock.read().await;
+    let mut ended = gate.changed.subscribe();
+    ended.borrow_and_update();
+    if gate.ending.load(Ordering::Acquire) != 0
+        || !run_authorized()
         || current_grant(data_dir, request, destination).is_err()
         || (matches!(request.effect.as_str(), "job_status" | "job_cancel")
             && current_job_binding(data_dir, request, backend_id).is_err())
     {
+        drop(admission);
         return deny(stream).await;
     }
     let mut outbound = client.request(request.method.clone(), url.clone());
@@ -1570,7 +1491,10 @@ async fn forward(
         // in the provider's raw body must not select a different upstream ID.
         let body: serde_json::Value = match serde_json::from_slice(&request.body) {
             Ok(body) => body,
-            Err(_) => return deny(stream).await,
+            Err(_) => {
+                drop(admission);
+                return deny(stream).await;
+            }
         };
         outbound = outbound
             .header("content-type", "application/json")
@@ -1579,10 +1503,30 @@ async fn forward(
     if request.effect == "job_create"
         && mark_job_create_attempt(data_dir, request, backend_id).is_err()
     {
+        drop(admission);
         return deny(stream).await;
     }
-    let mut response = match outbound.send().await {
-        Ok(response) if !response.status().is_redirection() => response,
+    let sent = {
+        let send = outbound.send();
+        tokio::pin!(send);
+        let mut check = tokio::time::interval(AUTHORITY_CHECK_INTERVAL);
+        loop {
+            tokio::select! {
+                biased;
+                _ = ended.changed() => break None,
+                result = &mut send => break Some(result),
+                _ = check.tick() => {
+                    if !run_authorized() || current_grant(data_dir, request, destination).is_err() {
+                        break None;
+                    }
+                }
+            }
+        }
+    };
+    drop(admission);
+    let mut response = match sent {
+        None => return unavailable(stream).await,
+        Some(Ok(response)) if !response.status().is_redirection() => response,
         _ => return unavailable(stream).await,
     };
     let status = response.status();
@@ -1599,7 +1543,20 @@ async fn forward(
         .to_string();
     if request.effect == "job_create" && status.is_success() {
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(io::Error::other)? {
+        let mut monitor = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = ended.changed() => return unavailable(stream).await,
+                _ = monitor.tick() => {
+                    if !run_authorized() || current_grant(data_dir, request, destination).is_err() {
+                        return unavailable(stream).await;
+                    }
+                    continue;
+                }
+                chunk = response.chunk() => chunk.map_err(io::Error::other)?,
+            };
+            let Some(chunk) = chunk else { break };
             if body.len().saturating_add(chunk.len()) > MAX_BODY
                 || !run_authorized()
                 || current_grant(data_dir, request, destination).is_err()
@@ -1623,32 +1580,105 @@ async fn forward(
         return Ok(());
     }
     write_response_head(stream, status, &content_type).await?;
+    // A streamed reply is forwarded in whole lines, so when hosted access ends
+    // mid-reply Runtime can say so in-band on a line of its own before closing.
+    // Only Runtime may write that line: upstream copies of it are dropped.
+    let event_stream = content_type.starts_with("text/event-stream");
+    let mut held = Vec::new();
     let mut total = 0usize;
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(AUTHORITY_CHECK_INTERVAL);
+    let still_granted = || current_grant(data_dir, request, destination).is_ok();
     loop {
         let chunk = tokio::select! {
             _ = tick.tick() => {
-                if current_grant(data_dir, request, destination).is_err() { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "hosted grant ended")); }
+                if !still_granted() {
+                    return end_stream_for_lost_access(stream, event_stream).await;
+                }
                 continue;
             }
             chunk = response.chunk() => chunk.map_err(io::Error::other)?,
         };
         let Some(chunk) = chunk else { break };
         total = total.saturating_add(chunk.len());
-        if total > MAX_BODY || current_grant(data_dir, request, destination).is_err() {
+        if total > MAX_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "hosted stream ended",
             ));
         }
-        stream
-            .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
-            .await?;
-        stream.write_all(&chunk).await?;
-        stream.write_all(b"\r\n").await?;
+        if !still_granted() {
+            return end_stream_for_lost_access(stream, event_stream).await;
+        }
+        let ready = if event_stream {
+            held.extend_from_slice(&chunk);
+            match held.iter().rposition(|byte| *byte == b'\n') {
+                Some(end) => without_reserved_lines(held.drain(..=end).as_slice()),
+                None => continue,
+            }
+        } else {
+            chunk.to_vec()
+        };
+        write_chunk(stream, &ready).await?;
+    }
+    if !held.is_empty() {
+        let rest = if event_stream {
+            without_reserved_lines(&held)
+        } else {
+            held
+        };
+        write_chunk(stream, &rest).await?;
     }
     stream.write_all(b"0\r\n\r\n").await?;
     Ok(())
+}
+
+/// How often an admitted hosted request re-checks its authority.
+const AUTHORITY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long a request whose access ended may take to write the End line
+/// before Runtime drops it, even when the provider has stopped reading.
+const ENDED_REQUEST_GRACE: Duration = Duration::from_secs(1);
+
+/// The line a streamed hosted reply ends with when its access ended mid-reply.
+const HOSTED_ACCESS_ENDED_LINE: &[u8] = b": elastos-hosted-access ended\n\n";
+
+/// Runtime's reserved SSE comment inside a forwarded reply.
+const RESERVED_COMMENT_PREFIX: &[u8] = b": elastos-hosted-access";
+
+/// Drops upstream SSE lines that would impersonate Runtime's End line.
+/// Comment lines carry no model data, so nothing the provider reads is lost.
+fn without_reserved_lines(lines: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(lines.len());
+    for line in lines.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if !content.starts_with(RESERVED_COMMENT_PREFIX) {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
+
+/// Writes one chunk. An empty chunk would end the chunked body, so it is skipped.
+async fn write_chunk(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    stream
+        .write_all(format!("{:X}\r\n", bytes.len()).as_bytes())
+        .await?;
+    stream.write_all(bytes).await?;
+    stream.write_all(b"\r\n").await
+}
+
+async fn end_stream_for_lost_access(stream: &mut UnixStream, event_stream: bool) -> io::Result<()> {
+    if event_stream {
+        write_chunk(stream, HOSTED_ACCESS_ENDED_LINE).await?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "hosted access ended",
+    ))
 }
 
 async fn write_job_replay(stream: &mut UnixStream, job_id: &str) -> io::Result<()> {
@@ -1735,7 +1765,8 @@ fn public_destination_allowed(url: &Url, grant_url: &str) -> bool {
     url.as_str() == grant_url
         && matches!(
             grant_url,
-            OPENROUTER_MODELS_URL
+            OPENROUTER_KEY_URL
+                | OPENROUTER_MODELS_URL
                 | OPENROUTER_CHAT_URL
                 | OPENROUTER_DECISIONS_URL
                 | VENICE_ACCESS_URL
@@ -1749,6 +1780,7 @@ fn public_validation_destination_allowed(
     destination: &Destination,
 ) -> bool {
     let expected = match endpoint {
+        ValidationEndpoint::OpenRouterKey => OPENROUTER_KEY_URL,
         ValidationEndpoint::OpenRouterModels => OPENROUTER_MODELS_URL,
         ValidationEndpoint::VeniceAccess => VENICE_ACCESS_URL,
         ValidationEndpoint::VeniceModels => VENICE_MODELS_URL,
@@ -1784,6 +1816,7 @@ fn fixture_destination_allowed(
     Ok(fixtures.as_ref().is_some_and(|fixtures| {
         [
             Some(fixtures.openrouter_models_url.as_str()),
+            fixtures.openrouter_key_url.as_ref().map(|url| url.as_str()),
             Some(fixtures.venice_rate_limits_url.as_str()),
             Some(fixtures.venice_models_url.as_str()),
             fixtures
@@ -1888,91 +1921,105 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     #[test]
-    fn operator_hosted_end_marker_stops_all_routes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = operator_hosted_end_path(dir.path());
-        assert!(!operator_hosted_ended(dir.path()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"owner ended hosted HTTPS\n").unwrap();
-        assert!(operator_hosted_ended(dir.path()));
-        for (offer_id, effect, method, url, provider) in [
-            ("model:venice", "text", "POST", VENICE_CHAT_URL, "Venice"),
+    fn retired_operator_setting_requires_inbox_for_saved_routes() {
+        const CHILD: &str = "ELASTOS_TEST_RETIRED_HOSTED_OWNER";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "retired_operator_setting_requires_inbox_for_saved_routes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ELASTOS_HOSTED_HTTPS_OWNER_DATA_DIR", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "isolated retired-route control failed: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            return;
+        }
+        let data_dir =
+            PathBuf::from(std::env::var_os("ELASTOS_HOSTED_HTTPS_OWNER_DATA_DIR").unwrap());
+        let saved = [
+            (
+                "model:openrouter",
+                "text",
+                OPENROUTER_CHAT_URL,
+                "OpenRouter",
+            ),
+            ("model:venice", "text", VENICE_CHAT_URL, "Venice"),
             (
                 "model:jev",
                 "decisions",
-                "POST",
                 OPENROUTER_DECISIONS_URL,
                 "OpenRouter",
             ),
-            (
-                "validation:venice",
-                "validate_models",
-                "GET",
-                VENICE_MODELS_URL,
-                "Venice",
-            ),
-        ] {
+        ];
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            &data_dir,
+            saved.iter().map(|(id, effect, url, provider)| json!({
+                "id":id, "operation":if *effect == "text" {"text.generate"} else {"decision.evaluate"},
+                "enabled":true, "adapter":{
+                    "kind":if *effect == "text" {"open_ai_compatible_text"} else {"open_router_decisions"},
+                    "api_url":url, "api_key":"fixture-key", "model":"fixture/model",
+                    "hosted":{"backend_provider_label":provider}
+                }
+            })).collect(),
+        ).unwrap();
+        let offers = load_model_provider_operator_offers(&data_dir).unwrap();
+        for (id, effect, method, url, provider) in saved
+            .into_iter()
+            .map(|(id, effect, url, provider)| (id, effect, "POST", url, provider))
+            .chain([
+                (
+                    "validation:openrouter",
+                    "validate_models",
+                    "GET",
+                    OPENROUTER_MODELS_URL,
+                    "OpenRouter",
+                ),
+                (
+                    "validation:venice",
+                    "validate_access",
+                    "GET",
+                    VENICE_ACCESS_URL,
+                    "Venice",
+                ),
+                (
+                    "validation:venice",
+                    "validate_models",
+                    "GET",
+                    VENICE_MODELS_URL,
+                    "Venice",
+                ),
+            ])
+        {
             let destination = Destination {
                 url: Url::parse(url).unwrap(),
                 grant_url: url.into(),
-                credential: Some("private-key".into()),
+                credential: Some("fixture-key".into()),
                 job_backend_id: None,
                 provider: provider.into(),
-                configuration_id: "configuration".into(),
+                configuration_id: "a".repeat(64),
                 fixture_ca_pem: None,
             };
-            let error = current_grant_for(
-                dir.path(),
-                offer_id,
-                effect,
-                method,
-                &destination,
-                None,
-                None,
-            )
-            .err()
-            .unwrap();
-            assert!(error.to_string().contains("owner ended hosted HTTPS"));
+            assert!(
+                current_grant_for(&data_dir, id, effect, method, &destination, None, None).is_err(),
+                "the retired operator setting must require Inbox for {effect}"
+            );
         }
-    }
-
-    #[test]
-    fn operator_validation_matches_only_exact_provider_effect_and_get() {
-        assert!(matches!(
-            operator_validation_endpoint(
-                "validation:openrouter",
-                "validate_models",
-                "GET",
-                "OpenRouter"
-            ),
-            Some(ValidationEndpoint::OpenRouterModels)
-        ));
-        assert!(matches!(
-            operator_validation_endpoint("validation:venice", "validate_access", "GET", "Venice"),
-            Some(ValidationEndpoint::VeniceAccess)
-        ));
-        assert!(matches!(
-            operator_validation_endpoint("validation:venice", "validate_models", "GET", "Venice"),
-            Some(ValidationEndpoint::VeniceModels)
-        ));
-        for (offer, effect, method, provider) in [
-            (
-                "validation:openrouter",
-                "validate_models",
-                "POST",
-                "OpenRouter",
-            ),
-            (
-                "validation:openrouter",
-                "validate_access",
-                "GET",
-                "OpenRouter",
-            ),
-            ("validation:venice", "validate_models", "GET", "OpenRouter"),
-            ("model:hosted-venice", "validate_models", "GET", "Venice"),
-        ] {
-            assert!(operator_validation_endpoint(offer, effect, method, provider).is_none());
-        }
+        assert_eq!(
+            load_model_provider_operator_offers(&data_dir).unwrap(),
+            offers
+        );
+        assert_eq!(
+            offers.len(),
+            3,
+            "saved connections stay available for owner management"
+        );
     }
 
     fn write_private(path: &Path, bytes: &[u8]) {
@@ -2924,6 +2971,307 @@ mod tests {
         assert_ne!(create.job_backend_id, changed_account.job_backend_id);
     }
 
+    struct StreamedReplyFixture {
+        dir: tempfile::TempDir,
+        proof: String,
+        sink: tokio::net::TcpListener,
+        request: EffectRequest,
+        destination: Destination,
+        decision: String,
+    }
+
+    /// An approved hosted text route whose upstream is a local listener.
+    async fn streamed_reply_fixture() -> StreamedReplyFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let path = format!("http://127.0.0.1:{port}/openrouter/api/v1/chat/completions");
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id":offer_id,"title":"Fixture","operation":"text.generate",
+                "input_modalities":["text/plain"],"output_modalities":["text/plain"],"enabled":true,
+                "policy":{"inline_output_bytes_limit":128},
+                "adapter":{
+                    "kind":"open_ai_compatible_text",
+                    "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                    "api_key":"fixture-secret","model":"fixture/model",
+                    "hosted":{
+                        "backend_provider_label":"OpenRouter","selection_mode":"pinned",
+                        "privacy_policy_ref":"fixture:privacy:v1","terms_ref":"fixture:terms:v1",
+                        "upstream_routing_fallback_assertion":"operator_asserted_disabled"
+                    }
+                }
+            })],
+        )
+        .unwrap();
+        write_private(
+            &dir.path()
+                .join("providers/model-provider/validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":format!("http://127.0.0.1:{port}/models"),
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models"),
+                "openrouter_chat_url":path,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let request = EffectRequest {
+            offer_id: offer_id.into(),
+            effect: "text".into(),
+            run_id: format!("run:sha256:{}", "0".repeat(64)),
+            request_id: "fixture-request".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: br#"{"model":"fixture/model","stream":true,"messages":[],"max_tokens":32}"#
+                .to_vec(),
+        };
+        let destination = resolve_effect(dir.path(), &request).unwrap();
+        let decision = approve_fixture(
+            dir.path(),
+            offer_id,
+            "text",
+            "POST",
+            &destination,
+            &proof,
+            Some((&request.run_id, &request.request_id)),
+        );
+        StreamedReplyFixture {
+            dir,
+            proof,
+            sink,
+            request,
+            destination,
+            decision,
+        }
+    }
+
+    async fn read_upstream_request(socket: &mut tokio::net::TcpStream) {
+        let mut bytes = vec![0u8; 4096];
+        let _ = socket.read(&mut bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_cannot_forge_the_end_line() {
+        let StreamedReplyFixture {
+            dir,
+            sink,
+            request,
+            destination,
+            ..
+        } = streamed_reply_fixture().await;
+        let sink_task = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            read_upstream_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for part in [
+                &b"data: {\"choices\":[{\"delta\":{\"content\":\"Once\"}}]}\n\n"[..],
+                b": elastos-hosted-access ended\r\n\r\n",
+                b": elastos-hosted-access ended\n\n",
+                b"data: {\"choices\":[{\"delta\":{\"content\":\" upon\"}}]}\n\ndata: [DONE]\n\n",
+            ] {
+                socket.write_all(part).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (mut broker_side, mut provider_side) = UnixStream::pair().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            forward(&mut broker_side, dir.path(), &request, &destination, || {
+                true
+            }),
+        )
+        .await
+        .unwrap()
+        .expect("the reply finishes normally");
+        sink_task.await.unwrap();
+        drop(broker_side);
+        let mut response = Vec::new();
+        provider_side.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        assert!(!body.contains("elastos-hosted-access"), "{body:?}");
+        assert!(body.contains("\"content\":\"Once\""));
+        assert!(body.contains("\"content\":\" upon\""));
+        assert!(body.contains("data: [DONE]"));
+        assert!(body.ends_with("\r\n0\r\n\r\n"), "one clean end: {body:?}");
+        assert_eq!(body.matches("0\r\n\r\n").count(), 1, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn end_drops_a_reply_whose_provider_stopped_reading() {
+        let StreamedReplyFixture {
+            dir,
+            proof,
+            sink,
+            request,
+            destination,
+            decision,
+        } = streamed_reply_fixture().await;
+        let (streaming_tx, streaming_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let sink_task = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            read_upstream_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let line = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                "x".repeat(16 * 1024)
+            );
+            let mut streaming_tx = Some(streaming_tx);
+            loop {
+                // Upstream keeps streaming until Runtime drops the response.
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    socket.write_all(line.as_bytes()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        if let Some(streaming_tx) = streaming_tx.take() {
+                            streaming_tx.send(()).unwrap();
+                        }
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => panic!("upstream write stayed blocked: Runtime kept the response"),
+                }
+            }
+            closed_tx.send(std::time::Instant::now()).unwrap();
+        });
+        // The provider side is never read.
+        let (mut broker_side, _provider_side) = UnixStream::pair().unwrap();
+        let guard = RequestGrant::hold(dir.path(), &request, &destination);
+        create_grant_after_decision(
+            dir.path(),
+            &request.offer_id,
+            &request.effect,
+            request.method.as_str(),
+            &destination,
+            None,
+            Some((&request.run_id, &request.request_id)),
+        )
+        .unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let ender = tokio::spawn(async move {
+            streaming_rx.await.unwrap();
+            // Let the downstream socket fill so `forward` blocks in a write.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            model_provider_egress_decision::end_decision(&data_dir, &decision, &proof).unwrap();
+            std::time::Instant::now()
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_forward(
+                forward(&mut broker_side, dir.path(), &request, &destination, || {
+                    true
+                }),
+                || true,
+                || current_grant(dir.path(), &request, &destination).is_ok(),
+            ),
+        )
+        .await
+        .expect("End stops a request whose provider stopped reading");
+        let returned = std::time::Instant::now();
+        assert!(result.is_err());
+        let ended = ender.await.unwrap();
+        assert!(
+            returned.duration_since(ended)
+                <= ENDED_REQUEST_GRACE + AUTHORITY_CHECK_INTERVAL + Duration::from_millis(250),
+            "returned {:?} after End",
+            returned.duration_since(ended)
+        );
+        drop(guard);
+        let closed = tokio::time::timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("upstream sees the connection close")
+            .unwrap();
+        assert!(closed.duration_since(ended) < Duration::from_secs(3));
+        assert!(
+            !grant_file(dir.path())
+                .unwrap()
+                .grants
+                .iter()
+                .any(|grant| { grant.request_id.as_deref() == Some(request.request_id.as_str()) }),
+            "the request grant is gone"
+        );
+        sink_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn end_during_a_streamed_reply_is_reported_on_its_own_line() {
+        let StreamedReplyFixture {
+            dir,
+            proof,
+            sink,
+            request,
+            destination,
+            decision,
+        } = streamed_reply_fixture().await;
+        let (streaming_tx, streaming_rx) = tokio::sync::oneshot::channel();
+        let sink_task = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut bytes = vec![0u8; 4096];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            socket
+                .write_all(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"Once\"}}]}\n\ndata: {\"partial",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            streaming_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(socket);
+        });
+        let (mut broker_side, mut provider_side) = UnixStream::pair().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let ender = tokio::spawn(async move {
+            streaming_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            model_provider_egress_decision::end_decision(&data_dir, &decision, &proof).unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            forward(&mut broker_side, dir.path(), &request, &destination, || {
+                true
+            }),
+        )
+        .await
+        .expect("End stops the streamed reply");
+        assert!(result.is_err());
+        ender.await.unwrap();
+        drop(broker_side);
+        let mut response = Vec::new();
+        provider_side.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        assert!(body.contains("\"content\":\"Once\""));
+        assert!(
+            !body.contains("partial"),
+            "a partial line is never forwarded"
+        );
+        assert!(
+            body.contains("\n: elastos-hosted-access ended\n\n"),
+            "End is reported on its own line: {body:?}"
+        );
+        sink_task.abort();
+    }
+
     #[tokio::test]
     async fn exact_fixture_grant_routes_one_text_effect_and_revoke_denies_next_effect() {
         let dir = tempfile::tempdir().unwrap();
@@ -3069,7 +3417,65 @@ mod tests {
         )
         .unwrap();
         current_grant(dir.path(), &continued, &destination).unwrap();
-        model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let slow_sink = tokio::spawn(async move {
+            let (mut socket, _) = sink.accept().await.unwrap();
+            let mut first = [0u8; 1];
+            socket.read_exact(&mut first).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            drop(socket);
+            sink
+        });
+        let (mut slow, mut slow_peer) = UnixStream::pair().unwrap();
+        let slow_send = forward(&mut slow, dir.path(), &continued, &destination, || true);
+        let end_during_send = async {
+            accepted_rx.await.unwrap();
+            let end = tokio::time::timeout(
+                Duration::from_secs(1),
+                begin_hosted_end(dir.path(), &continued.offer_id),
+            )
+            .await
+            .expect("End must cancel an unresolved send promptly");
+            drop(end);
+        };
+        let (slow_result, ()) = tokio::join!(slow_send, end_during_send);
+        slow_result.unwrap();
+        slow.shutdown().await.unwrap();
+        let mut slow_response = String::new();
+        slow_peer.read_to_string(&mut slow_response).await.unwrap();
+        assert!(slow_response.starts_with("HTTP/1.1 502 Bad Gateway"));
+        release_tx.send(()).unwrap();
+        let sink = slow_sink.await.unwrap();
+        let end = begin_hosted_end(dir.path(), &continued.offer_id).await;
+        let (mut racing, mut racing_peer) = UnixStream::pair().unwrap();
+        {
+            let racing_send = forward(&mut racing, dir.path(), &continued, &destination, || true);
+            tokio::pin!(racing_send);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut racing_send)
+                    .await
+                    .is_err(),
+                "a send must wait while End owns admission"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                    .await
+                    .is_err(),
+                "End must prevent a new upstream request before its decision write"
+            );
+            model_provider_egress_decision::end_offer(dir.path(), &request.offer_id).unwrap();
+            drop(end);
+            racing_send.await.unwrap();
+        }
+        racing.shutdown().await.unwrap();
+        let mut racing_response = String::new();
+        racing_peer
+            .read_to_string(&mut racing_response)
+            .await
+            .unwrap();
+        assert!(racing_response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(current_grant(dir.path(), &request, &destination).is_err());
         assert!(current_grant(dir.path(), &continued, &destination).is_err());
         let (mut denied, mut denied_peer) = UnixStream::pair().unwrap();
@@ -3115,7 +3521,6 @@ mod tests {
         use elastos_runtime::provider::bridge::{
             ProviderConfig, ProviderRequest, ProviderResponse,
         };
-        use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let proof = admin_proof(dir.path());
@@ -3206,63 +3611,27 @@ mod tests {
             Some((&run_id, request_id)),
         );
 
-        let script = dir.path().join("synthetic-provider.py");
-        fs::write(&script, r#"#!/usr/bin/python3
-import json, socket, sys
-extra = None
-for line in sys.stdin:
-    request = json.loads(line)
-    if request['op'] == 'init':
-        extra = request['config']['extra']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'runs_create':
-        approved_input = request['input']
-        print('{"status":"ok"}', flush=True)
-    elif request['op'] == 'exists':
-        messages = json.loads(json.dumps(approved_input.get('messages', [{'role':'user','content':approved_input.get('prompt')}])))
-        path = request['path']
-        if path == 'altered':
-            messages[-1]['content'] = 'changed text'
-        elif path == 'extra-message':
-            messages.append({'role':'user','content':'extra'})
-        elif path == 'extra-field':
-            messages[0]['name'] = 'hidden'
-        elif path == 'changed-role':
-            messages[0]['role'] = 'assistant'
-        elif path == 'swapped':
-            messages[0], messages[1] = messages[1], messages[0]
-        body = json.dumps({'model':'fixture/model','stream':True,'max_tokens':32,
-                           'messages':messages}).encode()
-        if request['path'] in ('raised-cap', 'missing-cap'):
-            payload = json.loads(body)
-            if request['path'] == 'raised-cap':
-                payload['max_tokens'] = 33
-            else:
-                del payload['max_tokens']
-            body = json.dumps(payload).encode()
-        headers = ('POST /v1/hosted-effect HTTP/1.1\r\nHost: runtime.invalid\r\n'
-                   'Content-Type: application/json\r\nContent-Length: %d\r\n'
-                   'X-Elastos-Offer-Id: %s\r\nX-Elastos-Effect: text\r\n'
-                   'X-Elastos-Run-Id: %s\r\nX-Elastos-Request-Id: %s\r\n\r\n') % (
-                   len(body), extra['fixture_offer_id'], extra['fixture_run_id'], extra['fixture_request_id'])
-        with socket.socket(socket.AF_UNIX) as client:
-            client.connect(extra['runtime_hosted_socket'])
-            client.sendall(headers.encode() + body)
-            status = client.recv(1024).split(b'\r\n', 1)[0].decode()
-        print(json.dumps({'status':'ok','data':{'http_status':status}}), flush=True)
-    elif request['op'] == 'shutdown':
-        print('{"status":"ok"}', flush=True)
-        break
-"#).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let source = base.join("hosted-effect-probe.c");
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/hosted_effect_probe.c"),
+        )
+        .unwrap();
+        let script = base.join("hosted-effect-probe");
+        assert!(std::process::Command::new("/usr/bin/clang")
+            .args(["-O2", "-Wall", "-Wextra", "-o"])
+            .arg(&script)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
         let config = ProviderConfig {
-            extra: json!({
-                "offers":[], "fixture_offer_id":offer_id, "fixture_run_id":run_id,
-                "fixture_request_id":request_id,
-            }),
+            base_path: base.to_string_lossy().into_owned(),
+            extra: json!({"offers":[], "journal_dir":base.join("providers/model-provider/journal")}),
             ..Default::default()
         };
-        let (bridge, _, _, _, hosted_listener) =
+        let (bridge, _, _, confined_config, hosted_listener) =
             ProviderBridge::spawn_confined_model(&script, config)
                 .await
                 .unwrap();
@@ -3305,9 +3674,35 @@ for line in sys.stdin:
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
             }
         });
-        let probe = |path: &str| ProviderRequest::Exists {
-            path: path.into(),
-            token: String::new(),
+        let hosted_socket = confined_config.extra["runtime_hosted_socket"]
+            .as_str()
+            .unwrap();
+        let probe = |kind: &str| {
+            let mut probe_messages = messages.clone();
+            let array = probe_messages.as_array_mut().unwrap();
+            match kind {
+                "altered" => array.last_mut().unwrap()["content"] = json!("changed text"),
+                "extra-message" => array.push(json!({"role":"user","content":"extra"})),
+                "extra-field" => array[0]["name"] = json!("hidden"),
+                "changed-role" => array[0]["role"] = json!("assistant"),
+                "swapped" => array.swap(0, 1),
+                _ => {}
+            }
+            let mut body = json!({"model":"fixture/model","stream":true,
+                "max_tokens":32,"messages":probe_messages});
+            if kind == "raised-cap" {
+                body["max_tokens"] = json!(33);
+            }
+            if kind == "missing-cap" {
+                body.as_object_mut().unwrap().remove("max_tokens");
+            }
+            ProviderRequest::Exists {
+                path: format!(
+                    "{hosted_socket}|{offer_id}|{run_id}|{request_id}|{}",
+                    hex::encode(serde_json::to_vec(&body).unwrap())
+                ),
+                token: String::new(),
+            }
         };
         let changed = bridge.request(probe("altered")).await.unwrap();
         let ProviderResponse::Ok {
@@ -3360,6 +3755,233 @@ for line in sys.stdin:
         let body: serde_json::Value =
             serde_json::from_str(captured.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["messages"], messages);
+        sink_task.abort();
+        bridge.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn grant_count(data_dir: &Path) -> usize {
+        grant_file(data_dir).unwrap().grants.len()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_request_grants_end_with_their_request_and_never_fill_up() {
+        use elastos_model_contract::{
+            model_input_hash, model_run_id, RuntimeCreateBinding, RUNTIME_CREATE_BINDING_SCHEMA,
+        };
+        use elastos_runtime::provider::bridge::{
+            ProviderConfig, ProviderRequest, ProviderResponse,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let proof = admin_proof(dir.path());
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/openrouter/api/v1/chat/completions");
+        let offer_id = "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let input = json!({"schema":elastos_model_contract::TEXT_INPUT_V1_SCHEMA,"prompt":"hello"});
+        let body = json!({"model":"fixture/model","stream":true,"max_tokens":32,
+            "messages":[{"role":"user","content":"hello"}]});
+        super::super::model_provider_config::seed_model_provider_operator_offers_for_test(
+            dir.path(),
+            vec![json!({
+                "id":offer_id,"title":"Fixture","operation":"text.generate",
+                "input_modalities":["text/plain"],"output_modalities":["text/plain"],"enabled":true,
+                "policy":{"inline_output_bytes_limit":128},
+                "adapter":{
+                    "kind":"open_ai_compatible_text",
+                    "api_url":"https://openrouter.ai/api/v1/chat/completions",
+                    "api_key":"fixture-secret","model":"fixture/model",
+                    "hosted":{
+                        "backend_provider_label":"OpenRouter","selection_mode":"pinned",
+                        "privacy_policy_ref":"fixture:privacy:v1","terms_ref":"fixture:terms:v1",
+                        "upstream_routing_fallback_assertion":"operator_asserted_disabled"
+                    }
+                }
+            })],
+        )
+        .unwrap();
+        write_private(
+            &dir.path()
+                .join("providers/model-provider/validate-fixtures.json"),
+            json!({
+                "openrouter_models_url":format!("http://127.0.0.1:{port}/models"),
+                "venice_rate_limits_url":format!("http://127.0.0.1:{port}/limits"),
+                "venice_models_url":format!("http://127.0.0.1:{port}/venice-models"),
+                "openrouter_chat_url":url,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let seed_run = format!("run:sha256:{}", "b".repeat(64));
+        let template = EffectRequest {
+            offer_id: offer_id.into(),
+            effect: "text".into(),
+            run_id: seed_run.clone(),
+            request_id: "seed-request".into(),
+            job_id: None,
+            method: reqwest::Method::POST,
+            body: serde_json::to_vec(&body).unwrap(),
+        };
+        let destination = resolve_effect(dir.path(), &template).unwrap();
+        let first_decision = approve_fixture(
+            dir.path(),
+            offer_id,
+            "text",
+            "POST",
+            &destination,
+            &proof,
+            Some((&seed_run, "seed-request")),
+        );
+        assert_eq!(grant_count(dir.path()), 1);
+
+        let base = dir.path().canonicalize().unwrap();
+        let source = base.join("hosted-effect-probe.c");
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/hosted_effect_probe.c"),
+        )
+        .unwrap();
+        let script = base.join("hosted-effect-probe");
+        assert!(std::process::Command::new("/usr/bin/clang")
+            .args(["-O2", "-Wall", "-Wextra", "-o"])
+            .arg(&script)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        let config = ProviderConfig {
+            base_path: base.to_string_lossy().into_owned(),
+            extra: json!({"offers":[], "journal_dir":base.join("providers/model-provider/journal")}),
+            ..Default::default()
+        };
+        let (bridge, _, _, confined_config, hosted_listener) =
+            ProviderBridge::spawn_confined_model(&script, config)
+                .await
+                .unwrap();
+        let bridge = Arc::new(bridge);
+        start(hosted_listener, bridge.clone(), dir.path().to_path_buf()).unwrap();
+        let sink_task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = sink.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 1024];
+                        let count = socket.read(&mut chunk).await.unwrap_or(0);
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length: ")
+                                        .and_then(|v| v.parse().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                });
+            }
+        });
+        let hosted_socket = confined_config.extra["runtime_hosted_socket"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let data_dir = dir.path().to_path_buf();
+        let run_once = |index: usize| {
+            let bridge = bridge.clone();
+            let hosted_socket = hosted_socket.clone();
+            let input = input.clone();
+            let body = body.clone();
+            let data_dir = data_dir.clone();
+            async move {
+                let request_id = format!("grant-request-{index}");
+                let binding = RuntimeCreateBinding {
+                    schema: RUNTIME_CREATE_BINDING_SCHEMA.into(),
+                    principal_id: "principal:fixture".into(),
+                    session_id: "session:fixture".into(),
+                    capsule_id: "assistant".into(),
+                    grant_id: "grant:fixture".into(),
+                    request_id: request_id.clone(),
+                    offer_id: offer_id.into(),
+                    operation: "text.generate".into(),
+                    input_hash: model_input_hash(&input).unwrap(),
+                };
+                let run_id = model_run_id(&binding);
+                bridge
+                    .send_raw(&json!({"op":"runs_create","offer_id":offer_id,
+                    "operation":"text.generate","input":input,"runtime_binding":binding}))
+                    .await
+                    .unwrap();
+                let response = bridge
+                    .request(ProviderRequest::Exists {
+                        path: format!(
+                            "{hosted_socket}|{offer_id}|{run_id}|{request_id}|{}",
+                            hex::encode(serde_json::to_vec(&body).unwrap())
+                        ),
+                        token: String::new(),
+                    })
+                    .await
+                    .unwrap();
+                let ProviderResponse::Ok { data: Some(data) } = response else {
+                    panic!("missing hosted response for request {index}")
+                };
+                assert_eq!(
+                    data["http_status"], "HTTP/1.1 200 OK",
+                    "hosted request {index}"
+                );
+                for _ in 0..100 {
+                    let file = grant_file(&data_dir).unwrap();
+                    if !file
+                        .grants
+                        .iter()
+                        .any(|grant| grant.request_id.as_deref() == Some(request_id.as_str()))
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("finished hosted request {index} left its grant behind");
+            }
+        };
+
+        for index in 0..MAX_GRANTS + 1 {
+            run_once(index).await;
+        }
+        assert_eq!(grant_count(dir.path()), 1, "only the seed grant remains");
+
+        model_provider_egress_decision::end_decision(dir.path(), &first_decision, &proof).unwrap();
+        // An ended request blocks a new one for the same route until it lapses;
+        // age it out so the owner can approve again.
+        let decisions = dir
+            .path()
+            .join("providers/model-provider/egress-decisions.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&fs::read(&decisions).unwrap()).unwrap();
+        for decision in file["decisions"].as_array_mut().unwrap() {
+            decision["expires_at_ms"] = json!(1);
+        }
+        fs::remove_file(&decisions).unwrap();
+        write_private(&decisions, file.to_string().as_bytes());
+        let scope = egress_scope(offer_id, "text", "POST", &destination).unwrap();
+        let second = model_provider_egress_decision::request(dir.path(), &scope, None).unwrap();
+        model_provider_egress_decision::approve(dir.path(), &second, &proof).unwrap();
+        run_once(MAX_GRANTS + 1).await;
+        assert_eq!(
+            grant_count(dir.path()),
+            0,
+            "grants of the ended approval are pruned"
+        );
         sink_task.abort();
         bridge.shutdown().await.unwrap();
     }
@@ -3460,7 +4082,7 @@ for line in sys.stdin:
             let mut bytes = vec![0u8; 4096];
             let count = socket.read(&mut bytes).await.unwrap();
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
-            String::from_utf8_lossy(&bytes[..count]).to_string()
+            (sink, String::from_utf8_lossy(&bytes[..count]).to_string())
         });
         let (status, body) = fetch_validation(
             dir.path(),
@@ -3472,13 +4094,37 @@ for line in sys.stdin:
         .unwrap();
         assert_eq!(status, reqwest::StatusCode::OK);
         assert_eq!(body, br#"{"data":[]}"#);
-        let observed = sink_task.await.unwrap();
+        let (sink, observed) = sink_task.await.unwrap();
         assert!(observed.starts_with("GET /models "));
         assert!(
             observed.contains("authorization: Bearer fixture-key")
                 || observed.contains("Authorization: Bearer fixture-key")
         );
-        model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
+        let end = begin_hosted_end(dir.path(), "validation:openrouter").await;
+        {
+            let racing = fetch_validation(
+                dir.path(),
+                ValidationEndpoint::OpenRouterModels,
+                "fixture-key",
+                &proof,
+            );
+            tokio::pin!(racing);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut racing)
+                    .await
+                    .is_err(),
+                "validation must wait while End owns admission"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                    .await
+                    .is_err(),
+                "End must prevent a new validation request"
+            );
+            model_provider_egress_decision::end_offer(dir.path(), "validation:openrouter").unwrap();
+            drop(end);
+            assert!(racing.await.is_err());
+        }
         assert!(fetch_validation(
             dir.path(),
             ValidationEndpoint::OpenRouterModels,
@@ -3740,6 +4386,71 @@ for line in sys.stdin:
             &request("text"),
             &custom_ca
         ));
+    }
+
+    #[test]
+    fn openrouter_validation_reaches_only_key_and_model_list() {
+        let destination = |raw: &str| Destination {
+            url: Url::parse(raw).unwrap(),
+            grant_url: raw.into(),
+            credential: Some("private-key".into()),
+            job_backend_id: None,
+            provider: "OpenRouter".into(),
+            configuration_id: "configuration".into(),
+            fixture_ca_pem: None,
+        };
+        let candidates = [
+            OPENROUTER_KEY_URL,
+            OPENROUTER_MODELS_URL,
+            OPENROUTER_CHAT_URL,
+            OPENROUTER_DECISIONS_URL,
+            VENICE_ACCESS_URL,
+            VENICE_MODELS_URL,
+            VENICE_CHAT_URL,
+            "https://openrouter.ai/api/v1/keys",
+            "https://openrouter.ai/api/v1/credits",
+            "https://openrouter.ai/api/v1/key?extra=1",
+            "https://openrouter.ai/api/v1/key/",
+            "http://openrouter.ai/api/v1/key",
+            "https://openrouter.ai:443/api/v1/key",
+            "https://user@openrouter.ai/api/v1/key",
+            "https://openrouter.ai.evil.invalid/api/v1/key",
+        ];
+        for (endpoint, allowed) in [
+            (ValidationEndpoint::OpenRouterKey, OPENROUTER_KEY_URL),
+            (ValidationEndpoint::OpenRouterModels, OPENROUTER_MODELS_URL),
+        ] {
+            for raw in candidates {
+                assert_eq!(
+                    public_validation_destination_allowed(endpoint, &destination(raw)),
+                    raw == allowed,
+                    "{raw}"
+                );
+            }
+        }
+        assert_eq!(
+            ValidationEndpoint::OpenRouterKey.grant_binding(),
+            ("validation:openrouter", "validate_access")
+        );
+        let mut custom_ca = destination(OPENROUTER_KEY_URL);
+        custom_ca.fixture_ca_pem = Some("private CA".into());
+        assert!(!public_validation_destination_allowed(
+            ValidationEndpoint::OpenRouterKey,
+            &custom_ca
+        ));
+        // The key route is a validation route only, never a capsule effect.
+        for effect in ["text", "decisions", "validate_access"] {
+            assert!(!public_effect_route_allowed(
+                effect,
+                "GET",
+                &destination(OPENROUTER_KEY_URL)
+            ));
+            assert!(!public_effect_route_allowed(
+                effect,
+                "POST",
+                &destination(OPENROUTER_KEY_URL)
+            ));
+        }
     }
 
     #[test]

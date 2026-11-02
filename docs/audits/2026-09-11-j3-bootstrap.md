@@ -30,7 +30,7 @@ the new helper. The existing media reuse and integrity behavior is preserved.
 
 | Required behavior | Source | Target and check | Result |
 | --- | --- | --- | --- |
-| Verify platform-selected engine/model inputs and reuse valid bytes | `components.json`, `scripts/fetch/fetch-model.sh` | Mac-hosted synthetic platform fixtures: `python3 scripts/fetch/fetch-model-smoke.py` | Pass |
+| Verify platform-selected engine/model inputs and reuse valid bytes | `components.json`, [fetch-model.sh at 9f714bdc](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/scripts/fetch/fetch-model.sh) | Mac-hosted synthetic platform fixtures: [fetch-model-smoke.py at 9f714bdc](https://github.com/Elacity/elastos-runtime/blob/9f714bdc/scripts/fetch/fetch-model-smoke.py) | Pass |
 | Reject altered, missing, added or unsafe bundle entries and invalid protection | Fetch helper and engine receipt | Same isolated bootstrap smoke | Pass |
 | Preserve existing bytes after checksum failure; clean interrupted download | Fetch helper | Same bootstrap smoke with small loopback fixtures | Pass |
 | Runtime setup and fetch agree on bundle identity and stable executable path | `setup.rs`, `setup/local_model_engine_receipt.rs` | Mac ARM64: `cargo +1.91.0 test --locked -p elastos-server setup::tests:: -- --test-threads=1` from `elastos/` | 56 pass, including media reuse/integrity tests |

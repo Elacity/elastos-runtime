@@ -17,11 +17,8 @@ use elastos_common::localhost::{is_plaintext_root, parse_localhost_path, parse_l
 
 /// Provider protocol version
 const PROTOCOL_VERSION: &str = "1.0";
-/// Release version for startup logging
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+/// Crate version for startup logging and status
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Request from runtime to provider
 #[derive(Debug, Clone, Serialize, Deserialize)]

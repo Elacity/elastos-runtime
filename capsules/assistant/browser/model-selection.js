@@ -19,18 +19,37 @@ export function catalogModels(catalog) {
         !text(row.title) || row.signature_state !== "catalog-signature-verified" || !facts ||
         typeof facts.admitted !== "boolean" || typeof facts.dispatch_ready !== "boolean" ||
         (facts.dispatch_ready ? !facts.admitted || !text(facts.offer_id) : facts.offer_id !== null)) throw new Error("Model catalog unavailable");
-    return { cid: row.cid, title: row.title, offerId: facts.offer_id, ready: facts.dispatch_ready };
+    return { cid: row.cid, title: row.title, offerId: facts.offer_id, ready: facts.dispatch_ready,
+      downloadPercent: downloadPercent(facts.preparation) };
   });
 }
 
+// Runtime preparation states that are still fetching or checking model files.
+const DOWNLOADING_STATES = new Set(["capacity_pending", "reserved", "preparing", "verifying", "admission_pending"]);
+
+// Whole-percent download progress for a running preparation, otherwise null.
+function downloadPercent(preparation) {
+  if (!preparation || !DOWNLOADING_STATES.has(preparation.state) || preparation.cancel_requested) return null;
+  const { completed_bytes: done, total_bytes: total } = preparation;
+  if (!Number.isSafeInteger(done) || !Number.isSafeInteger(total) || total <= 0) return 0;
+  return Math.min(100, Math.floor((Math.max(0, done) * 100) / total));
+}
+
+// The model a running preparation is downloading, for when no model is ready yet.
+export function downloadingModel(models) {
+  return models.find(row => !row.ready && row.downloadPercent !== null) || null;
+}
+
 export function selectedModelOffer(offers, offerId, selectedCid, models) {
-  const matches = offers.filter(offer => offer.id === offerId);
-  if (!offerId || matches.length !== 1) return null;
   if (selectedCid != null) {
     if (!validModelCid(selectedCid)) return null;
-    const mapped = models.filter(row => row.cid === selectedCid && row.ready && row.offerId === offerId);
-    if (mapped.length !== 1) return null;
+    const mapped = models.filter(row => row.cid === selectedCid);
+    if (mapped.length !== 1 || !mapped[0].ready) return null;
+    // CID is saved user intent. The current verified row supplies its offer hint.
+    offerId = mapped[0].offerId;
   }
+  const matches = offers.filter(offer => offer.id === offerId);
+  if (!offerId || matches.length !== 1) return null;
   return matches[0];
 }
 

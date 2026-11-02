@@ -17,6 +17,7 @@ use elastos_server::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
 use elastos_server::binaries;
+use elastos_server::carrier::configured_carrier_bind_addr;
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
@@ -64,11 +65,6 @@ const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
 #[cfg(test)]
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-#[cfg(test)]
-const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -432,11 +428,15 @@ async fn register_media_provider(
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(true).await
+    setup_server_infrastructure_impl(true, elastos_server::ipfs::IpfsHostRole::User).await
 }
 
 pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(false).await
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::User).await
+}
+
+pub(crate) async fn setup_gateway_infrastructure() -> anyhow::Result<ServerInfrastructure> {
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::Gateway).await
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +448,7 @@ pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<Serve
 
 /// Register the in-process content plane: the `content` scheme provider and
 /// the `elastos://content` sub-provider a Carrier replica receive dispatches
-/// to for `import_object` / `import_exact`.
+/// to for `import_exact`.
 pub(crate) async fn register_content_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     data_dir: &Path,
@@ -473,7 +473,21 @@ pub(crate) async fn register_ipfs_provider_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     binary_path: &Path,
 ) -> anyhow::Result<()> {
-    let bridge = provider::ProviderBridge::spawn(binary_path, Default::default())
+    register_ipfs_provider_plane_with_role(
+        provider_registry,
+        binary_path,
+        elastos_server::ipfs::IpfsHostRole::User,
+    )
+    .await
+}
+
+async fn register_ipfs_provider_plane_with_role(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    role: elastos_server::ipfs::IpfsHostRole,
+) -> anyhow::Result<()> {
+    let config = elastos_server::ipfs::ipfs_provider_config(role);
+    let bridge = provider::ProviderBridge::spawn(binary_path, config)
         .await
         .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -592,6 +606,7 @@ pub(crate) async fn start_carrier_plane(
     did: &str,
     data_dir: &Path,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> anyhow::Result<elastos_server::carrier::CarrierNode> {
     let carrier_node = elastos_server::carrier::start_carrier_node_with_registry_bound(
         signing_key,
@@ -599,6 +614,7 @@ pub(crate) async fn start_carrier_plane(
         data_dir.to_path_buf(),
         Some(Arc::downgrade(provider_registry)),
         bind_addr,
+        community_bootstrap_node_ids,
     )
     .await?;
     provider_registry
@@ -621,29 +637,9 @@ async fn serve_capability_store(
         .map_err(|err| anyhow::anyhow!("capability store unavailable: {err}"))
 }
 
-/// A configured listener is an operator-owned address; it must survive restarts
-/// and fail closed rather than silently selecting an ephemeral replacement.
-fn configured_carrier_bind_addr(data_dir: &Path) -> anyhow::Result<Option<std::net::SocketAddr>> {
-    let contents = match std::fs::read_to_string(data_dir.join("config.toml")) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Cannot read Runtime config.toml"),
-    };
-    let table: toml::Table = contents.parse().context("Invalid Runtime config.toml")?;
-    table
-        .get("carrier_bind_addr")
-        .map(|value| {
-            value
-                .as_str()
-                .context("carrier_bind_addr must be a socket address string")?
-                .parse()
-                .context("Invalid carrier_bind_addr")
-        })
-        .transpose()
-}
-
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
+    ipfs_role: elastos_server::ipfs::IpfsHostRole,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
@@ -872,8 +868,9 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn content-block-graph-provider: {}", e),
             }
         }
+        // Not in the 0.8.0 Home profile; `setup --with` adds it.
         Ok(None) => {
-            tracing::warn!(
+            tracing::debug!(
                 "content-block-graph-provider binary is not installed; arbitrary DAG repair will fail closed"
             );
         }
@@ -976,7 +973,8 @@ async fn setup_server_infrastructure_impl(
             Ok(None) => tracing::info!("media-provider is installed but unconfigured"),
             Err(_) => tracing::warn!("Skipping media-provider due to invalid private config"),
         },
-        Ok(None) => tracing::warn!(
+        // Protected content ships after 0.8.0; its providers install with `setup --with`.
+        Ok(None) => tracing::debug!(
             "media-provider binary is not installed; protected-content media sessions will fail closed"
         ),
         Err(_) => tracing::warn!("Skipping media-provider due to verification failure"),
@@ -1012,10 +1010,13 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match register_ipfs_provider_plane(&provider_registry, &path).await {
-            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
-            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
-        },
+        Ok(Some(path)) => {
+            match register_ipfs_provider_plane_with_role(&provider_registry, &path, ipfs_role).await
+            {
+                Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
+                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+            }
+        }
         Ok(None) => {
             tracing::warn!(
                 "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
@@ -1030,12 +1031,26 @@ async fn setup_server_infrastructure_impl(
             match model_provider_startup_config(&data_dir, &provider_registry).await {
                 Ok((mut model_config, worker)) => {
                     #[cfg(target_os = "macos")]
-                    let bridge_result =
-                        provider::ProviderBridge::spawn_confined_model(&path, model_config.clone())
-                            .await
-                            .map(|(bridge, sockets, vacant, config, listener)| {
+                    let bridge_result = async {
+                        let root = Path::new(&model_config.base_path);
+                        let bundle = api::model_provider_engine_bundle(root).map_err(|_| {
+                            provider::bridge::BridgeError::InitFailed(
+                                "model engine confinement unavailable".into(),
+                            )
+                        })?;
+                        provider::ProviderBridge::spawn_confined_model_with_engine_bundle(
+                            &path,
+                            model_config.clone(),
+                            bundle.as_deref(),
+                        )
+                        .await
+                        .map(
+                            |(bridge, sockets, vacant, config, listener)| {
                                 (bridge, Some((sockets, vacant)), config, Some(listener))
-                            });
+                            },
+                        )
+                    }
+                    .await;
                     #[cfg(target_os = "linux")]
                     let bridge_result = provider::ProviderBridge::spawn_confined_model_linux(
                         &path,
@@ -1209,7 +1224,14 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping net-provider due to verification failure: {}", e),
     }
 
-    if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
+    // Retained Browser helpers from an earlier release stay stopped where
+    // Browser is unavailable.
+    let browser_available =
+        elastos_server::setup::browser_available(&elastos_server::setup::detect_platform());
+    if let Some(local_exit_config) = browser_available
+        .then(|| browser_local_exit_config_from_env(&data_dir))
+        .flatten()
+    {
         if let Some(path) = crate::find_installed_provider_binary("browser-local-exit") {
             if let Err(e) = verify_provider_binary("browser-local-exit", &path) {
                 tracing::warn!(
@@ -1261,14 +1283,21 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping exit-provider due to verification failure: {}", e),
     }
 
-    match binaries::resolve_verified_native_provider_binary("browser-engine-adapter") {
+    let browser_engine_adapter = if browser_available {
+        binaries::resolve_verified_native_provider_binary("browser-engine-adapter")
+    } else {
+        Ok(None)
+    };
+    match browser_engine_adapter {
         Ok(Some(path)) => {
             let browser_engine_config = provider::BridgeProviderConfig {
                 extra: browser_engine_adapter_config_from_env(&data_dir)
                     .unwrap_or(serde_json::Value::Null),
                 ..Default::default()
             };
-            match provider::ProviderBridge::spawn(&path, browser_engine_config).await {
+            match provider::ProviderBridge::spawn_with_owned_helpers(&path, browser_engine_config)
+                .await
+            {
                 Ok(bridge) => {
                     let bridge = Arc::new(bridge);
                     match start_browser_engine_provider(
@@ -1457,7 +1486,7 @@ async fn setup_server_infrastructure_impl(
             .await;
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "protected-content-decrypt-provider binary is not installed; protected-content open and play will fail closed"
         );
     }
@@ -1483,7 +1512,7 @@ async fn setup_server_infrastructure_impl(
             );
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "protected-content-protect-provider binary is not installed; protected-content mint will fail closed"
         );
     }
@@ -1517,6 +1546,19 @@ async fn setup_server_infrastructure_impl(
         );
     }
 
+    // Peers are served only CIDs an active publication lists: bring that
+    // index in line with the publish records before Carrier answers anyone.
+    {
+        let data_dir = data_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            elastos_server::library::reconcile_published_cids(&data_dir)
+        })
+        .await
+        {
+            tracing::warn!("Published CID index reconcile failed: {}", e);
+        }
+    }
+
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.
     // Carrier is fundamental infrastructure: gossip, content, identity.
     // Identity is DID (derived from device_key), not raw device_key.
@@ -1529,6 +1571,7 @@ async fn setup_server_infrastructure_impl(
             &carrier_did,
             &data_dir,
             carrier_bind_addr,
+            &collaboration_configuration.community_bootstrap_node_ids(),
         )
         .await
         {
@@ -1586,6 +1629,7 @@ async fn setup_server_infrastructure_impl(
             collaboration_configuration,
             collaboration_carrier_provider,
             provider_registry.clone(),
+            Some(capability_manager.clone()),
         )
         .await?;
     if let (Some(collaboration), Some(carrier)) =
@@ -2205,7 +2249,7 @@ mod tests {
             "data": {
                 "provider": MEDIA_PROVIDER_ID,
                 "protocol_version": MEDIA_PROVIDER_PROTOCOL_VERSION,
-                "version": MEDIA_PROVIDER_VERSION,
+                "version": "0.7.2-alpha.5",
                 "configured": true,
                 "supported_operations": ["status", "prepare"],
             }
@@ -2382,8 +2426,7 @@ mod tests {
             request_log.display(),
             status_response,
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log)
     }
 
@@ -2406,9 +2449,46 @@ mod tests {
             status_release.display(),
             media_provider_status(),
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log, status_signal, status_release)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn browser_helper_pipe_closes_with_runtime_provider_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/browser-helper-parent-lifetime.test.py");
+        let binary = temp.path().join("browser-provider.sh");
+        crate::test_support::write_from_child(
+            &binary,
+            format!(
+                "#!/bin/sh\nexec python3 '{}' --provider '{}'\n",
+                script.display(),
+                temp.path().display()
+            ),
+            0o700,
+        );
+        let bridge =
+            provider::ProviderBridge::spawn_with_owned_helpers(&binary, Default::default())
+                .await
+                .unwrap();
+        let ready: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("ready.json")).unwrap()).unwrap();
+        let pid = ready["helper"].as_u64().unwrap() as libc::pid_t;
+        bridge.shutdown().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gone = unsafe { libc::kill(pid, 0) } != 0;
+        if !gone {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        assert!(gone, "Browser helper outlived Runtime provider shutdown");
+        assert!(temp.path().join("clean-stop").exists());
     }
 
     #[tokio::test]
@@ -2794,7 +2874,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_provider_startup_registers_only_the_runtime_media_route() {
+    async fn media_provider_startup_accepts_another_release_and_registers_only_the_runtime_media_route(
+    ) {
         let registry = provider::ProviderRegistry::new();
         let (bridge, provider) = test_provider_bridge(media_provider_status(), Duration::ZERO);
 
@@ -3505,15 +3586,14 @@ mod tests {
         );
         let script_path = tempdir.path().join("fake-model-provider.sh");
         let pid_path = tempdir.path().join("fake-model-provider.pid");
-        fs::write(
+        crate::test_support::write_from_child(
             &script_path,
             format!(
                 "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nprintf '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"invalid configuration\"}}\\n'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
                 pid_path.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
 
         let error = match provider::ProviderBridge::spawn(
             &script_path,
@@ -3886,15 +3966,15 @@ mod tests {
     //
     // These exercise the real composition: a real custody-provider process on
     // the Runtime-only `custody` target, the in-process content plane that
-    // serves a Carrier replica `import_object`, and a real Carrier node — with
+    // serves a Carrier replica `import_exact`, and a real Carrier node, with
     // no HTTP or TLS surface anywhere.
     // ---------------------------------------------------------------------
 
     #[cfg(unix)]
     const PROVIDER_HOST_TEST_CUSTODY_BIN_ENV: &str = "ELASTOS_TEST_CUSTODY_PROVIDER_BIN";
 
-    /// A CID the mock ipfs-provider returns for every `add_directory`, so the
-    /// content plane's exact-object check sees a matching import.
+    /// A CID the mock ipfs-provider returns for every add, so the content
+    /// plane's exact import check sees a matching import.
     #[cfg(unix)]
     const PROVIDER_HOST_TEST_CID: &str =
         "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
@@ -3941,14 +4021,13 @@ mod tests {
         let bin_dir = temp.path().join("mock-bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let path = bin_dir.join("ipfs-provider");
-        fs::write(
+        crate::test_support::write_from_child(
             &path,
             format!(
                 "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{{\"status\":\"ok\",\"data\":{{\"cid\":\"%s\"}}}}\\n' '{PROVIDER_HOST_TEST_CID}'\ndone\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         path
     }
 
@@ -3970,21 +4049,17 @@ mod tests {
     /// The exact request a Carrier peer's `provider_invoke` dispatch hands to
     /// `ProviderRegistry::send_raw("content", ..)` for a replica receive.
     #[cfg(unix)]
-    fn carrier_replica_import_object_request(source_endpoint_did: &str) -> serde_json::Value {
+    fn carrier_replica_import_exact_request(source_endpoint_did: &str) -> serde_json::Value {
         serde_json::json!({
-            "op": "import_object",
+            "op": "import_exact",
             "cid": PROVIDER_HOST_TEST_CID,
-            "object_kind": "directory",
-            "files": [{
-                "path": "payload.bin",
-                "data": "ZWxhc3Rvcy1yZXBsaWNh",
-            }],
+            "data": "ZWxhc3Rvcy1yZXBsaWNh",
             "_runtime_invocation": {
                 "schema": "elastos.provider.invocation/v1",
                 "source": "carrier-availability",
                 "target": "content",
-                "op": "import_object",
-                "capability": "provider:carrier-availability->content:import_object",
+                "op": "import_exact",
+                "capability": "provider:carrier-availability->content:import_exact",
                 "transport": "carrier-provider-plane",
                 "carrier": {"source_endpoint_did": source_endpoint_did},
                 "transfer": "json",
@@ -4098,7 +4173,7 @@ mod tests {
         let (_signing_key, did) = elastos_identity::load_or_create_did(&data_dir).unwrap();
         let import = host
             .registry()
-            .send_raw("content", &carrier_replica_import_object_request(&did))
+            .send_raw("content", &carrier_replica_import_exact_request(&did))
             .await
             .unwrap();
         assert_eq!(import["status"], "ok", "{import}");
@@ -4114,7 +4189,7 @@ mod tests {
         assert_eq!(content_status["status"], "ok", "{content_status}");
         assert_eq!(
             content_status["data"]["availability"]["policy"],
-            "carrier_object_import"
+            "carrier_exact_import"
         );
 
         host.shutdown().await.unwrap();

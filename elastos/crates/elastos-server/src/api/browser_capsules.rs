@@ -12,8 +12,8 @@ use super::capsule_inventory::{
     load_capsule_manifest,
 };
 use super::gateway::{
-    capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
-    validate_file_path, GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
+    capsule_icon_variants, capsule_is_offered, content_type, request_uses_tls, validate_file_path,
+    GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
@@ -23,21 +23,6 @@ const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_DOCUMENT_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_ASSET_CORP: &str = "cross-origin";
 const BROWSER_CAPSULE_OPAQUE_ORIGIN: &str = "null";
-pub(super) fn is_allowed_capsule_origin(origin: &axum::http::HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    if origin == BROWSER_CAPSULE_OPAQUE_ORIGIN {
-        return true;
-    }
-    match url::Url::parse(origin) {
-        Ok(url) => matches!(
-            url.host_str(),
-            Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
-        ),
-        Err(_) => false,
-    }
-}
 
 struct BrowserCapsule {
     root: PathBuf,
@@ -83,6 +68,19 @@ pub async fn serve_home_index(
     headers: axum::http::HeaderMap,
 ) -> Response {
     serve_browser_capsule_path(&state.data_dir, &headers, HOME_CAPSULE_ID, None).await
+}
+
+/// The restart owner hashes the same installed document that the Home route serves.
+pub(crate) fn installed_home_document(data_dir: &Path) -> Option<PathBuf> {
+    let capsule = resolve_browser_capsule(data_dir, HOME_CAPSULE_ID).ok()?;
+    validate_file_path(&capsule.entrypoint).ok()?;
+    let root = std::fs::canonicalize(installed_capsules_root(data_dir)).ok()?;
+    let capsule_root = std::fs::canonicalize(capsule.root).ok()?;
+    if !capsule_root.starts_with(root) {
+        return None;
+    }
+    let document = std::fs::canonicalize(capsule_root.join(capsule.entrypoint)).ok()?;
+    document.starts_with(capsule_root).then_some(document)
 }
 
 pub async fn serve_home_asset(
@@ -214,7 +212,7 @@ async fn serve_browser_capsule_asset(
     requested_path: Option<&str>,
     raw_query: Option<&str>,
 ) -> Response {
-    if ensure_wallet_connector_configured(data_dir, app).is_err() {
+    if !capsule_is_offered(data_dir, app) {
         return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
     }
 
@@ -264,7 +262,10 @@ async fn serve_browser_capsule_asset(
             BROWSER_CAPSULE_ASSET_CORP
         };
 
-    let is_document = relative_path == capsule.entrypoint;
+    let is_document = matches!(
+        content_type(relative_path),
+        "text/html; charset=utf-8" | "application/xhtml+xml" | "image/svg+xml"
+    );
     let cache_control = browser_capsule_cache_control(relative_path, raw_query);
     let etag = browser_capsule_versioned_static_asset(relative_path, raw_query)
         .then(|| browser_capsule_etag(&bytes));
@@ -292,6 +293,16 @@ async fn serve_browser_capsule_asset(
             );
             headers.insert("referrer-policy", "no-referrer".parse().unwrap());
             headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+            if is_document {
+                if let Some(policy) = shell_content_security_policy(
+                    request_headers,
+                    app,
+                    relative_path == capsule.entrypoint,
+                    capsule.manifest.role == CapsuleRole::Shell,
+                ) {
+                    headers.insert("content-security-policy", policy.parse().unwrap());
+                }
+            }
             return response;
         }
     }
@@ -318,23 +329,34 @@ async fn serve_browser_capsule_asset(
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     if is_document {
-        if let Some(policy) = shell_content_security_policy(request_headers, app) {
+        if let Some(policy) = shell_content_security_policy(
+            request_headers,
+            app,
+            relative_path == capsule.entrypoint,
+            capsule.manifest.role == CapsuleRole::Shell,
+        ) {
             headers.insert("content-security-policy", policy.parse().unwrap());
         }
     }
     response
 }
 
-fn shell_content_security_policy(headers: &axum::http::HeaderMap, app: &str) -> Option<String> {
-    if app != super::gateway::HOME_CAPSULE_ID && !super::gateway::is_trusted_home_shell_id(app) {
-        return None;
-    }
+fn shell_content_security_policy(
+    headers: &axum::http::HeaderMap,
+    app: &str,
+    entrypoint: bool,
+    shell: bool,
+) -> Option<String> {
     let home_source = home_document_origin(headers)?;
-    let is_home_host = app == super::gateway::HOME_CAPSULE_ID;
+    let is_home_host = app == super::gateway::HOME_CAPSULE_ID && entrypoint;
+    // App documents are framed by the sandboxed shell. frame-ancestors checks
+    // every ancestor and an opaque origin never matches, so apps cannot carry it.
     let frame_ancestors = if is_home_host {
-        "'none'".to_string()
+        "; frame-ancestors 'none'".to_string()
+    } else if shell {
+        format!("; frame-ancestors {home_source}")
     } else {
-        home_source.clone()
+        String::new()
     };
     let (default_source, style_source) = if is_home_host {
         ("'self'".to_string(), "'self'".to_string())
@@ -344,13 +366,25 @@ fn shell_content_security_policy(headers: &axum::http::HeaderMap, app: &str) -> 
             format!("{home_source} 'unsafe-inline'"),
         )
     };
-    let connect_source = if app == super::gateway::HOME_CLI_SHELL_ID {
+    let connect_source = if !is_home_host {
         format!("{default_source} {}", home_websocket_origin(&home_source)?)
     } else {
         default_source.clone()
     };
+    // No allow-popups: a new window escapes connect-src and frame-src. Home
+    // opens web links for its apps (`home:open-external`).
+    let sandbox = if is_home_host {
+        ""
+    } else {
+        "sandbox allow-scripts allow-forms allow-downloads; "
+    };
+    let script_source = if is_home_host {
+        "'self'"
+    } else {
+        "'self' 'wasm-unsafe-eval'"
+    };
     Some(format!(
-        "default-src {default_source}; script-src {default_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}; frame-ancestors {frame_ancestors}"
+        "{sandbox}default-src {default_source}; script-src {script_source}; style-src {style_source}; img-src {default_source} blob: data:; connect-src {connect_source}; frame-src {default_source}; object-src 'none'; base-uri 'none'; form-action {default_source}{frame_ancestors}"
     ))
 }
 
@@ -381,12 +415,22 @@ fn home_document_origin(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<LaunchableBrowserCapsule> {
+    list_launchable_browser_capsules_for(data_dir, &crate::setup::detect_platform())
+}
+
+fn list_launchable_browser_capsules_for(
+    data_dir: &Path,
+    platform: &str,
+) -> Vec<LaunchableBrowserCapsule> {
     let mut capsules = BTreeMap::new();
     for manifest in list_active_capsule_manifests(data_dir) {
         if !manifest.role.is_shell_launchable() {
             continue;
         }
-        if ensure_wallet_connector_configured(data_dir, &manifest.name).is_err() {
+        if !capsule_is_offered(data_dir, &manifest.name) {
+            continue;
+        }
+        if manifest.name == "browser" && !crate::setup::browser_available(platform) {
             continue;
         }
         let Ok(capsule) = resolve_browser_capsule(data_dir, &manifest.name) else {
@@ -944,6 +988,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cached_svg_documents_keep_the_opaque_script_policy_on_revalidation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "test-browser", "Browser test", "app");
+        fs::write(
+            data_dir.path().join("capsules/test-browser/probe.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><script href="probe.js"/></svg>"#,
+        )
+        .unwrap();
+        let mut headers = test_request_headers();
+        let first = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("probe.svg"),
+            Some("v=browser-fixture"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let policy = first.headers()["content-security-policy"].clone();
+        assert!(policy.to_str().unwrap().starts_with("sandbox "));
+        assert!(!policy.to_str().unwrap().contains("allow-same-origin"));
+        assert!(policy
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox allow-scripts allow-forms allow-downloads; "));
+        assert!(!policy.to_str().unwrap().contains("allow-popups"));
+        headers.insert("if-none-match", first.headers()["etag"].clone());
+        let cached = serve_browser_capsule_asset(
+            data_dir.path(),
+            &headers,
+            "test-browser",
+            Some("probe.svg"),
+            Some("v=browser-fixture"),
+        )
+        .await;
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(cached.headers()["content-security-policy"], policy);
+    }
+
     #[test]
     fn resolves_installed_data_browser_capsule() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -1031,6 +1115,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(BROWSER_CAPSULE_DOCUMENT_CORP)
         );
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(csp.starts_with("sandbox "));
+        assert!(!csp.contains("allow-same-origin"));
+        assert!(!csp.contains("frame-ancestors"));
     }
 
     #[cfg(unix)]
@@ -1082,14 +1173,10 @@ mod tests {
                 .unwrap();
             assert!(csp.contains("frame-src http://localhost:61180"));
             assert!(csp.contains("frame-ancestors http://localhost:61180"));
-            assert!(csp.contains("script-src http://localhost:61180"));
-            assert!(!csp.contains("script-src 'self'"));
-            if shell == "home-cli" {
-                assert!(csp.contains("connect-src http://localhost:61180 ws://localhost:61180"));
-            } else {
-                assert!(csp.contains("connect-src http://localhost:61180;"));
-                assert!(!csp.contains("ws://localhost:61180"));
-            }
+            assert!(csp.contains("script-src 'self'"));
+            assert!(csp.starts_with("sandbox "));
+            assert!(!csp.contains("allow-same-origin"));
+            assert!(csp.contains("connect-src http://localhost:61180 ws://localhost:61180"));
         }
     }
 
@@ -1407,6 +1494,23 @@ mod tests {
     }
 
     #[test]
+    fn browser_is_launchable_only_on_hosts_with_a_local_engine() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "browser", "Browser", "app");
+        for (platform, listed) in [
+            ("linux-amd64", false),
+            ("linux-arm64", false),
+            ("darwin-arm64", true),
+        ] {
+            let names: Vec<_> = list_launchable_browser_capsules_for(data_dir.path(), platform)
+                .into_iter()
+                .map(|capsule| capsule.name)
+                .collect();
+            assert_eq!(names.contains(&"browser".to_string()), listed, "{platform}");
+        }
+    }
+
+    #[test]
     fn list_launchable_browser_capsules_prefers_installed_metadata() {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_browser_capsule(
@@ -1439,6 +1543,100 @@ mod tests {
         assert!(names.contains(&"system".to_string()));
         assert!(!names.contains(&"removed-capsule".to_string()));
         assert!(resolve_browser_capsule(data_dir.path(), "removed-capsule").is_err());
+    }
+
+    #[test]
+    fn targeted_browser_resolution_reloads_registry_metadata_and_entrypoint() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "system", "Before", "app");
+        let dir = root.path().join("capsules/system");
+        assert_eq!(
+            resolve_browser_capsule(root.path(), "system")
+                .unwrap()
+                .manifest
+                .description
+                .as_deref(),
+            Some("Before")
+        );
+
+        write_test_browser_capsule(root.path(), "system", "After", "app");
+        assert_eq!(
+            resolve_browser_capsule(root.path(), "system")
+                .unwrap()
+                .manifest
+                .description
+                .as_deref(),
+            Some("After")
+        );
+        write_test_components_manifest(root.path(), &[]);
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        activate_test_capsule(root.path(), "system");
+        assert!(resolve_browser_capsule(root.path(), "system").is_ok());
+
+        let contract = fs::read(dir.join("capsule.json")).unwrap();
+        fs::remove_file(dir.join("capsule.json")).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        fs::write(dir.join("capsule.json"), b"invalid manifest").unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        let mut mismatch: serde_json::Value = serde_json::from_slice(&contract).unwrap();
+        mismatch["name"] = "other".into();
+        fs::write(
+            dir.join("capsule.json"),
+            serde_json::to_vec(&mismatch).unwrap(),
+        )
+        .unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        fs::write(dir.join("capsule.json"), contract).unwrap();
+        fs::remove_file(dir.join("index.html")).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+    }
+
+    #[test]
+    fn targeted_browser_resolution_keeps_platform_install_path_rules() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "system", "System", "app");
+        let path = root.path().join("components.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let absolute = root.path().join("capsules/system");
+        let platform = crate::setup::detect_platform();
+        for unsafe_path in [absolute.to_str().unwrap(), "../outside", "missing"] {
+            let mut changed = original.clone();
+            changed["external"]["system"]["platforms"][platform.as_str()] =
+                serde_json::json!({"install_path": unsafe_path});
+            fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                resolve_browser_capsule(root.path(), "system").is_err(),
+                "{unsafe_path}"
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_ok());
+    }
+
+    #[test]
+    fn targeted_viewer_resolution_rechecks_both_current_contracts() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "viewer", "Viewer", "viewer");
+        write_test_viewer_capsule(root.path(), "content", "viewer", "game.gba", "Content");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_some());
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "other").is_none());
+        let path = root.path().join("capsules/content/capsule.json");
+        let original = fs::read(&path).unwrap();
+        let mut retargeted: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        retargeted["viewer"] = "other".into();
+        fs::write(&path, serde_json::to_vec(&retargeted).unwrap()).unwrap();
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        fs::write(path, original).unwrap();
+        write_test_components_manifest(root.path(), &["content"]);
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        activate_test_capsule(root.path(), "viewer");
+        write_test_browser_capsule(root.path(), "viewer", "Wrong role", "app");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        write_test_browser_capsule(root.path(), "viewer", "Viewer", "viewer");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_some());
+        fs::remove_file(root.path().join("capsules/content/game.gba")).unwrap();
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
     }
 
     #[test]

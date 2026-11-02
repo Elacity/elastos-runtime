@@ -432,6 +432,15 @@ async fn viewer_library_object(
     viewer: &str,
     request: ViewerLibraryObjectRequest,
 ) -> anyhow::Result<Value> {
+    // Documents opens and saves files by URI, including the plain files its
+    // list shows from the Documents folder: never through a link.
+    if viewer == "documents" {
+        crate::library::refuse_linked_library_object(
+            &state.data_dir,
+            &context.principal_id,
+            &request.uri,
+        )?;
+    }
     let stat = viewer_object_provider_request(
         state,
         context,

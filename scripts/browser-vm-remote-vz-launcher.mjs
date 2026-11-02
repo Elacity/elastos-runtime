@@ -26,7 +26,9 @@ const localSocketRoot =
 const remoteSocketRoot =
   process.env.ELASTOS_BROWSER_REMOTE_VZ_REMOTE_SOCKET_ROOT || "/tmp/evzrc";
 const remoteProfileRoot = process.env.ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT || "";
-const remoteRelayMaxSessions = Number(process.env.ELASTOS_BROWSER_REMOTE_VZ_RELAY_MAX_SESSIONS || "16");
+// Match the supervisor: Chromium uses up to 128 sockets per proxy; TURN media stays small.
+const REMOTE_WEB_RELAY_MAX_SESSIONS = 128;
+const REMOTE_MEDIA_RELAY_MAX_SESSIONS = 16;
 const launchTimeoutMs = Number(process.env.ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS || "180000");
 const defaultControlProxyRequestTimeoutMs = "120000";
 const socketTimeoutMs = Number(process.env.ELASTOS_BROWSER_REMOTE_VZ_SOCKET_TIMEOUT_MS || "15000");
@@ -1137,6 +1139,7 @@ function startRemoteUnixToTcpBridge(
   remoteUnixPath,
   remoteTcpPort,
   remotePidPath,
+  maxSessions,
   effect,
 ) {
   const remoteScript = [
@@ -1144,7 +1147,7 @@ function startRemoteUnixToTcpBridge(
     "ulimit -n 1024 2>/dev/null || true",
     `export ELASTOS_BRIDGE_UNIX=${shellQuote(remoteUnixPath)}`,
     `export ELASTOS_BRIDGE_PORT=${shellQuote(String(remoteTcpPort))}`,
-    `export ELASTOS_BRIDGE_MAX_SESSIONS=${shellQuote(String(remoteRelayMaxSessions))}`,
+    `export ELASTOS_BRIDGE_MAX_SESSIONS=${shellQuote(String(maxSessions))}`,
     `export ELASTOS_BRIDGE_PIDFILE=${shellQuote(remotePidPath)}`,
     "mkdir -p \"$(dirname \"$ELASTOS_BRIDGE_PIDFILE\")\"",
     "bridge_pid=",
@@ -1304,6 +1307,7 @@ async function startRemoteRelayTunnel(
   remoteRelayPath,
   remoteRelayPidPath,
   suffix,
+  maxSessions,
   effect,
 ) {
   cleanupCommands.push(remoteRelayCleanupCommand(remoteRelayPidPath, remoteRelayPath));
@@ -1317,6 +1321,7 @@ async function startRemoteRelayTunnel(
     remoteRelayPath,
     remoteTcpPort,
     remoteRelayPidPath,
+    maxSessions,
     effect,
   );
   await waitForReadyLine(shim, "remote relay Unix shim");
@@ -1668,6 +1673,8 @@ async function startRemoteSupervisor(
   const remoteScript = [
     "set -euo pipefail",
     "umask 077",
+    // The supervisor holds ~4 fds per web egress stream; macOS SSH sessions start at 256.
+    'nofile=$(ulimit -Hn); if [ "$nofile" = unlimited ] || [ "$nofile" -gt 10240 ]; then nofile=10240; fi; ulimit -n "$nofile" 2>/dev/null || true',
     `DATA=${remoteDataDirExpr}`,
     `NATIVE_SUPERVISOR=${shellQuote(nativeSupervisorPath)}`,
     `PIDFILE=${shellQuote(supervisorPidPath)}`,
@@ -1684,7 +1691,6 @@ async function startRemoteSupervisor(
     `export ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS=${shellQuote(process.env.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS || defaultControlProxyRequestTimeoutMs)}`,
     `export ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS=${shellQuote(process.env.ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS || "3000")}`,
     `export ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS=${shellQuote(remoteDebugHoldOnOpenErrorMs())}`,
-    `export ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS=${shellQuote(process.env.ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS || String(remoteRelayMaxSessions))}`,
     `export ELASTOS_BROWSER_VM_VSOCK_ATTEMPT_TIMEOUT_MS=${shellQuote(process.env.ELASTOS_BROWSER_VM_VSOCK_ATTEMPT_TIMEOUT_MS || "1000")}`,
     `export ELASTOS_BROWSER_VM_TRACE=${shellQuote(process.env.ELASTOS_BROWSER_VM_TRACE || "1")}`,
     `export ELASTOS_BROWSER_VM_TRACE_EGRESS=${shellQuote(process.env.ELASTOS_BROWSER_VM_TRACE_EGRESS || "0")}`,
@@ -2192,9 +2198,6 @@ async function main() {
     remoteSocketRoot,
     "ELASTOS_BROWSER_REMOTE_VZ_REMOTE_SOCKET_ROOT",
   );
-  if (!Number.isInteger(remoteRelayMaxSessions) || remoteRelayMaxSessions < 1 || remoteRelayMaxSessions > 256) {
-    throw new Error("ELASTOS_BROWSER_REMOTE_VZ_RELAY_MAX_SESSIONS must be an integer from 1 to 256");
-  }
 
   const remoteDataDir = resolveRemoteDataDir();
   const transportAuthority = launch.transport_authority;
@@ -2254,6 +2257,7 @@ async function main() {
     remoteRelayPath,
     remoteRelayPidPath,
     suffix,
+    REMOTE_WEB_RELAY_MAX_SESSIONS,
     "ordinary_stream_bridge",
   );
   await startRemoteRelayTunnel(
@@ -2261,6 +2265,7 @@ async function main() {
     remoteMediaRelayPath,
     remoteMediaRelayPidPath,
     `${suffix}-media`,
+    REMOTE_MEDIA_RELAY_MAX_SESSIONS,
     "media_stream_bridge",
   );
   startTcpLocalForward(

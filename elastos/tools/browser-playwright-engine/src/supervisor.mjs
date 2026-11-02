@@ -9,6 +9,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { PARENT_PIPE_ENV, parentPipeFd, forwardedParentPipeEnv, watchParentPipe }
+  from "../../../../scripts/browser-vm-control-service.mjs";
 import jpeg from "jpeg-js";
 import { chromium } from "playwright";
 import wrtc from "@roamhq/wrtc";
@@ -76,6 +78,7 @@ async function runDaemon() {
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
+  watchParentPipe(shutdown, 30000);
   server.listen(config.control_socket_path);
   await once(server, "listening");
   process.stdout.write(
@@ -262,11 +265,11 @@ async function ensureDaemon(config, requestedDisplayMode) {
   await unlinkSocket(config.control_socket_path);
   const child = spawn(process.execPath, [__filename, "--daemon"], {
     detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
-    env: {
+    stdio: ["ignore", "ignore", "ignore", parentPipeFd(true)],
+    env: forwardedParentPipeEnv({
       ...process.env,
       [CONFIG_ENV]: JSON.stringify(config),
-    },
+    }),
   });
   child.unref();
   const deadline = Date.now() + 15000;
@@ -321,7 +324,9 @@ async function stopStaleDaemon(status) {
 }
 
 function configFingerprint(config) {
-  return createHash("sha256").update(JSON.stringify(config)).digest("hex");
+  return createHash("sha256").update(JSON.stringify({ config,
+    owner: (process.env[PARENT_PIPE_ENV] || "").split(":").slice(1),
+  })).digest("hex");
 }
 
 async function handleControlRequest(state, req, res) {

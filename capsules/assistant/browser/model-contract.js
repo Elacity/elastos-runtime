@@ -10,6 +10,30 @@ export const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 export const MODEL_TEXT_INPUT_V2_SCHEMA = "elastos.model.input.text/v2";
 export const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
 
+/** Capture once before persistence or network work; retained retries reuse it. */
+export function newModelRequestId(nowMs = Date.now(), cryptoRef = globalThis.crypto) {
+  if (!Number.isSafeInteger(nowMs) || nowMs <= 0 || typeof cryptoRef?.randomUUID !== "function") {
+    throw contractError("request_id_unavailable", "A fresh request ID is unavailable.");
+  }
+  const nonce = cryptoRef.randomUUID();
+  if (typeof nonce !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(nonce)) {
+    throw contractError("request_id_unavailable", "A fresh request ID is unavailable.");
+  }
+  return `model-v1:${nowMs}:${nonce}`;
+}
+
+/** This invocation's provider refusal does not settle an earlier lost create. */
+export function isExpiredInvocationRefusal(payload, body) {
+  const refusal = payload?.refusal;
+  return payload?.status === "error"
+    && ["model_invocation_refused", "remote_model_invocation_refused"].includes(payload.code)
+    && payload.reason === "request_expired"
+    && refusal?.schema === "elastos.model.invocation-refusal/v1"
+    && refusal.scope === "invocation" && refusal.dispatch === "provider_refused"
+    && /^sha256:[0-9a-f]{64}$/.test(refusal.input_hash)
+    && ["request_id", "offer_id", "operation"].every(key => refusal[key] === body[key]);
+}
+
 const TEXT_MODALITY = "text/plain";
 
 /** Offers that take text and answer with text, exactly as the provider lists them. */

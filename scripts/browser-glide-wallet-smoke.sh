@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${ELASTOS_UPDATE_PARENT_PIPE:-}" ]]; then
+  exec python3 "$(dirname "${BASH_SOURCE[0]}")/browser-helper-owner.py" bash "$0" "$@"
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
 local_exit_pid=""

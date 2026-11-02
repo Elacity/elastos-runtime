@@ -39,14 +39,13 @@ These are supported shortcuts, but they are not the primary product story:
 
 | Path | Runtime owner | Status |
 |---|---|---|
-| `elastos chat` | reuse healthy managed Home runtime first; otherwise managed `chat` runtime | secondary supported shortcut |
+| `elastos chat` (hidden) | reuse healthy managed Home runtime first; otherwise managed `chat` runtime | developer smoke tests only |
 | `elastos capsule <name> --lifecycle interactive --interactive` | reuse active runtime when compatible; otherwise managed Home runtime | secondary packaged surface path |
 
 These are explicit operator or developer surfaces, not part of the boring front door:
 
 | Path | Runtime owner | Status |
 |---|---|---|
-| `elastos agent` | operator runtime (`elastos serve`) | operator-only |
 | `elastos run` (WASM / microVM) | operator runtime (`elastos serve`) | developer / operator-only |
 | `elastos capsule ...` (non-interactive) | operator runtime (`elastos serve`) | operator-only |
 
@@ -58,15 +57,13 @@ These are explicit operator or developer surfaces, not part of the boring front 
 
 It is a different lane from explicit `elastos serve`. The current public line does not pretend those two live hosts are interchangeable.
 
-### 2. Native chat is a supported shortcut
+### 2. Native chat is a hidden developer path
 
-The direct native chat story is:
-
-- entered through `elastos chat` as a shortcut
+`elastos chat` joins the legacy `#general` gossip topic, a different network from the Chat app on the Desktop. It is hidden from help, Home does not offer it, and only the native chat smoke scripts use it.
 
 `elastos chat` first tries to reuse a healthy managed Home runtime. If no healthy managed Home runtime exists, it starts or reuses the managed `chat` runtime.
 
-The browser `Chat Room` surface is separate from the native chat shortcut. It is shipped with the demo profile and hosted through the explicit operator lane when exposed outside Home.
+The browser `Chat Room` surface is separate from the native chat shortcut. It is installed with Home and hosted through the explicit operator lane when exposed outside Home.
 
 ### 3. Packaged interactive capsules are not automatically first-class
 
@@ -117,7 +114,7 @@ That is why direct packaged chat launch remains secondary today, even though the
 
 ### Operator surfaces
 
-`elastos agent`, non-interactive `elastos capsule ...`, and explicit `elastos run ...` do not share the Home contract.
+Non-interactive `elastos capsule ...` and explicit `elastos run ...` do not share the Home contract.
 
 They are explicit operator or developer surfaces:
 

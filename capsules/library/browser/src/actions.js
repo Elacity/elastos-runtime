@@ -1,6 +1,7 @@
 import {
   archiveLibraryObjectPayload,
   baseName,
+  canPublishObject,
   canPreviewObject,
   childUri,
   contentCid,
@@ -14,8 +15,10 @@ import {
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
+  libraryErrorText,
   parentUri,
-  publishedCid,
+  publishFailureText,
+  publishedLink,
   viewerOptions,
 } from "./model.js";
 
@@ -23,13 +26,14 @@ export function createLibraryActions({
   clearSelection,
   closeSelf,
   confirmDestructive,
+  confirmPublish,
   currentFolderReadOnly,
   deliverToTarget,
   downloadObjectRaw,
   loadCurrentFolder,
   loadRoots,
   navigate,
-  openPublishedUri,
+  offerDownload,
   openTarget,
   previewObject,
   providerApi,
@@ -41,8 +45,7 @@ export function createLibraryActions({
   showObjectStatus,
   showProtectAndListDialog,
   showProperties,
-  showShareDialog,
-  showShareReceipt,
+  showPublishedLink,
   showSharedAccessReceipt,
   startCreateObject,
   state,
@@ -51,8 +54,12 @@ export function createLibraryActions({
   writeResourceUri,
 }) {
   const RUNTIME_CUSTODY_METADATA_SCHEMA = "elastos.library.protected-content-identity/v1";
+  // Chat accepts files up to 8 MiB; Library does not read a larger file for it.
+  const CHAT_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
   const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
   const protectAndListInFlight = new Map();
+  const activeUploads = new Set();
+  let uploadBatchId = 0;
 
   async function openObject(object) {
     if (!object) return;
@@ -91,6 +98,13 @@ export function createLibraryActions({
       await previewObject(object);
       return;
     }
+    if (hasCapability(object, "download")) {
+      if (await offerDownload(object)) {
+        await downloadObject(object);
+        setStatus(`Downloaded ${object.name}.`);
+      }
+      return;
+    }
     setStatus("No installed app can open this item.");
     showProperties(object);
   }
@@ -112,11 +126,6 @@ export function createLibraryActions({
 
   function openWithViewer(object, viewer) {
     if (!viewer) return false;
-    const cid = publishedCid(object);
-    if (object.published && cid) {
-      openPublishedUri("elastos://" + cid, viewer);
-      return true;
-    }
     const query = {
       objectUri: object.uri,
       uri: object.uri,
@@ -131,26 +140,27 @@ export function createLibraryActions({
     return openTarget(viewer, query);
   }
 
+  // Chat's Community posts a Library file by its address and revision, so it
+  // gets no bytes for a file over the Chat limit; a local room still sends the
+  // bytes it is given. Browser always gets the file's bytes.
   async function attachObject(object) {
     const targetLabel = state.returnTarget === "browser" ? "Browser" : "Chat Room";
     setStatus("Preparing attachment...");
     try {
-      const raw = await downloadObjectRaw({ uri: object.uri });
-      const cid = publishedCid(object);
+      const chat = state.returnTarget === "chat-room";
+      const raw = chat && Number(object.size || 0) > CHAT_ATTACHMENT_MAX_BYTES
+        ? null
+        : await downloadObjectRaw({ uri: object.uri });
       const payload = {
-        type: state.returnTarget === "browser"
-          ? "browser:file-picker-selection"
-          : "chat-room:attach-library-item",
-        blob: raw.blob,
-        fileName: object.name || raw.filename || "Library item",
-        mimeType: object.mime || raw.blob?.type || "application/octet-stream",
-        sizeBytes: raw.blob?.size || object.size || 0,
+        type: chat ? "chat-room:attach-library-item" : "browser:file-picker-selection",
+        fileName: object.name || raw?.filename || "Library item",
+        mimeType: object.mime || raw?.blob?.type || "application/octet-stream",
+        sizeBytes: raw?.blob?.size ?? Number(object.size || 0),
         title: object.name || "",
         objectUri: object.uri,
       };
-      if (state.returnTarget === "chat-room" && object.published && cid) {
-        payload.publishedUri = "elastos://" + cid;
-      }
+      if (raw) payload.blob = raw.blob;
+      if (chat) payload.revision = String(object.revision || "");
       if (await deliverToTarget(state.returnTarget, payload)) {
         setStatus(`Attached to ${targetLabel}.`);
         closeSelf();
@@ -195,23 +205,27 @@ export function createLibraryActions({
       setStatus("This Space is read-only.");
       return;
     }
-    const batch = Date.now().toString(36);
-    state.uploads = list.map((file, index) => ({
+    const destinationUri = state.currentUri;
+    const batch = ++uploadBatchId;
+    const uploads = list.map((file, index) => ({
       id: `${batch}:${index}`,
       name: file.name,
       progress: 0,
       status: "Queued",
     }));
+    // A new selection replaces old results while active batches keep their rows.
+    state.uploads = state.uploads.filter((upload) => activeUploads.has(upload)).concat(uploads);
+    for (const upload of uploads) activeUploads.add(upload);
     renderUploads();
     try {
       for (let index = 0; index < list.length; index += 1) {
         const file = list[index];
-        const upload = state.uploads[index];
+        const upload = uploads[index];
         try {
           setStatus(`Uploading ${file.name}...`);
           setUploadProgress(upload.id, { status: "Preparing", progress: 4 });
           await uploadObject({
-            uri: childUri(state.currentUri, file.name),
+            uri: childUri(destinationUri, file.name),
             file,
             mime: file.type || "application/octet-stream",
             onProgress: (fraction) => {
@@ -227,16 +241,28 @@ export function createLibraryActions({
           });
           setUploadProgress(upload.id, { status: "Complete", progress: 100 });
         } catch (error) {
-          setUploadProgress(upload.id, { status: "Upload failed" });
+          setUploadProgress(upload.id, {
+            status: "Upload not confirmed. Check the destination before retrying.",
+          });
+          for (const pending of uploads.slice(index + 1)) {
+            setUploadProgress(pending.id, { status: "Not started" });
+          }
           throw error;
         }
       }
-      setStatus(`Uploaded ${list.length} file${list.length === 1 ? "" : "s"}.`);
-      await loadCurrentFolder();
+      const completedStatus = `Uploaded ${list.length} file${list.length === 1 ? "" : "s"}.`;
+      try {
+        await loadCurrentFolder();
+        setStatus(completedStatus);
+      } catch {
+        setStatus(`${completedStatus} Refresh Library to see the latest items.`);
+      }
     } finally {
+      for (const upload of uploads) activeUploads.delete(upload);
       window.setTimeout(() => {
-        if (state.uploads.every((upload) => upload.progress >= 100)) {
-          state.uploads = [];
+        if (uploads.every((upload) => upload.progress >= 100)) {
+          const completedIds = new Set(uploads.map((upload) => upload.id));
+          state.uploads = state.uploads.filter((upload) => !completedIds.has(upload.id));
           renderUploads();
         }
       }, 1_200);
@@ -333,11 +359,17 @@ export function createLibraryActions({
     URL.revokeObjectURL(url);
   }
 
-  async function publishObject(object) {
-    setStatus(`Publishing ${object.name}...`);
-    await providerApi("publish", { uri: object.uri, if_revision: object.revision });
-    setStatus(`Published ${object.name}.`);
-    await loadCurrentFolder();
+  // A shared file is in the local content store, not a Library folder. Read it
+  // and save it like any Library download: a link to /content would navigate
+  // this frame, and the gateway refuses that navigation. The gateway serves
+  // content only to a request carrying this Home's token.
+  async function downloadSharedFile(cid, name) {
+    const response = await fetch(`/content/${encodeURIComponent(cid)}`, {
+      cache: "no-store",
+      headers: { "x-elastos-home-token": state.homeToken || "" },
+    });
+    if (!response.ok) throw new Error("Could not read the shared file. Open the link in Chat again.");
+    saveDownloadBlob(await response.blob(), name || cid);
   }
 
   async function protectAndListObject(object) {
@@ -398,10 +430,97 @@ export function createLibraryActions({
   }
 
   async function unpublishObject(object) {
-    setStatus(`Unpublishing ${object.name}...`);
+    setStatus(`Stopping sharing ${object.name}...`);
     await providerApi("unpublish", { uri: object.uri, if_revision: object.revision });
-    setStatus(`Unpublished ${object.name}.`);
+    setStatus(`Stopped sharing ${object.name}.`);
     await loadCurrentFolder();
+  }
+
+  async function publishObject(object) {
+    if (!canPublishObject(object)) return;
+    if (!await confirmPublish({ files: [object], excluded: [] })) return;
+    setStatus(`Sharing ${object.name}...`);
+    try {
+      await providerApi("publish", { uri: object.uri, if_revision: object.revision });
+    } catch (error) {
+      setStatus(publishFailureText(error, object.name));
+      return;
+    }
+    await showAfterReload(`Shared ${object.name} with your contacts.`);
+  }
+
+  // Reloading the folder writes its own status, so a result shows after it.
+  async function showAfterReload(status) {
+    try {
+      await loadCurrentFolder();
+    } finally {
+      setStatus(status);
+    }
+  }
+
+  // One confirmation for the whole selection: it lists the files that will be
+  // published and the items left out (folders, files already published).
+  async function publishSelectedObjects() {
+    const selection = selectedObjects().filter(Boolean);
+    const files = selection.filter(canPublishObject);
+    if (!files.length) {
+      setStatus("Select files to share. Folders can't be shared.");
+      return;
+    }
+    const excluded = selection.filter((object) => !files.includes(object));
+    if (!await confirmPublish({ files, excluded })) return;
+    const failed = [];
+    for (const object of files) {
+      setStatus(`Sharing ${object.name}...`);
+      try {
+        await providerApi("publish", { uri: object.uri, if_revision: object.revision });
+      } catch (error) {
+        failed.push({ object, text: publishFailureText(error, object.name) });
+      }
+    }
+    clearSelection(false);
+    const published = files.length - failed.length;
+    const count = (value) => `${value} file${value === 1 ? "" : "s"}`;
+    if (!failed.length) {
+      await showAfterReload(`Shared ${count(published)} with your contacts.`);
+      return;
+    }
+    const details = failed.map(({ object, text }) => `${object.name}: ${text}`).join(" ");
+    await showAfterReload(`Shared ${published} of ${count(files.length)}. ${details}`);
+  }
+
+  // Copies the recorded publication link. When the clipboard refuses, the link
+  // shows as selectable text so it can still be copied by hand.
+  async function copyPublishedLink(object) {
+    const link = publishedLink(object);
+    if (!object?.published || !link) return;
+    try {
+      await writeResourceUri(link);
+    } catch {
+      showPublishedLink({ name: object.name, link });
+      setStatus("Copying didn't work. Select the link to copy it.");
+      return;
+    }
+    setStatus(`Copied the link to ${object.name}.`);
+  }
+
+  // Share again: the existing repair, for a shared file whose last repair
+  // could not pin it.
+  async function shareAgain(object) {
+    setStatus(`Sharing ${object.name} again...`);
+    let repaired;
+    try {
+      repaired = await providerApi("repair", { uri: object.uri });
+    } catch (error) {
+      setStatus(libraryErrorText(error) || `${object.name} couldn't be shared again. Try again later.`);
+      return;
+    }
+    // Repair answers with the availability it reached; repair_needed means it failed.
+    const availability = repaired?.availability;
+    const failed = (typeof availability === "string" ? availability : availability?.status) === "repair_needed";
+    await showAfterReload(failed
+      ? `${object.name} couldn't be shared again. Try again later.`
+      : `${object.name} is shared again.`);
   }
 
   async function repairObject(object) {
@@ -416,19 +535,6 @@ export function createLibraryActions({
     const status = await providerApi("status", { uri: object.uri });
     showObjectStatus(status);
     setStatus(`Availability ready for ${object.name}.`);
-  }
-
-  async function shareObject(object) {
-    const decision = await showShareDialog(object);
-    if (!decision) return;
-    const payload = { uri: object.uri, policy: decision.policy };
-    if (decision.policy === "recipient_scoped") {
-      payload.recipients = decision.recipients;
-    }
-    const share = await providerApi("share", payload);
-    await copyText(share.uri, "share URI");
-    showShareReceipt(share);
-    await loadCurrentFolder();
   }
 
   async function checkMyAccess(object) {
@@ -469,6 +575,7 @@ export function createLibraryActions({
         ? `${object.name} will be removed from Trash and cannot be restored.`
         : `${object.name} will be permanently removed from this location. This cannot be restored.`,
       confirmLabel: "Delete Permanently",
+      targetUris: [object.uri],
     });
     if (!confirmed) return;
     await providerApi("delete_permanently", { uri: object.uri, if_revision: object.revision });
@@ -489,17 +596,9 @@ export function createLibraryActions({
     await loadCurrentFolder();
   }
 
-  async function publishSelectedObjects() {
-    const objects = selectedObjects().filter((object) => !isDirectory(object) && !inTrash(object) && !object.published && hasCapability(object, "publish"));
-    await runBatchAction("Published", objects, (object) => providerApi("publish", {
-      uri: object.uri,
-      if_revision: object.revision,
-    }));
-  }
-
   async function unpublishSelectedObjects() {
     const objects = selectedObjects().filter((object) => !isDirectory(object) && !inTrash(object) && object.published && hasCapability(object, "unpublish"));
-    await runBatchAction("Unpublished", objects, (object) => providerApi("unpublish", {
+    await runBatchAction("Stopped sharing", objects, (object) => providerApi("unpublish", {
       uri: object.uri,
       if_revision: object.revision,
     }));
@@ -620,9 +719,10 @@ export function createLibraryActions({
     const confirmed = await confirmDestructive({
       title: "Delete permanently?",
       message: allTrash
-        ? `${objects.length} item${objects.length === 1 ? "" : "s"} will be removed from Trash and cannot be restored.`
-        : `${objects.length} item${objects.length === 1 ? "" : "s"} will be permanently removed. This cannot be restored.`,
+        ? `${describeObjects(objects)} will be removed from Trash and cannot be restored.`
+        : `${describeObjects(objects)} will be permanently removed. This cannot be restored.`,
       confirmLabel: "Delete Permanently",
+      targetUris: objects.map((object) => object.uri),
     });
     if (!confirmed) return;
     await runBatchAction("Deleted", objects, (object) => providerApi("delete_permanently", {
@@ -691,6 +791,7 @@ export function createLibraryActions({
     compressObjectToZip,
     compressSelectedObjectsToZip,
     copySelectedObjectsTo,
+    copyPublishedLink,
     copyText,
     createFolder,
     createTextDocument,
@@ -700,6 +801,7 @@ export function createLibraryActions({
     downloadObjectAsZip,
     downloadSelectedObjects,
     downloadSelectedObjectsAsZip,
+    downloadSharedFile,
     emptyTrash,
     extractArchiveObject,
     moveSelectedObjectsTo,
@@ -713,7 +815,7 @@ export function createLibraryActions({
     restoreObject,
     restoreSelectedObjects,
     setClipboard,
-    shareObject,
+    shareAgain,
     showStatusObject,
     trashObject,
     trashSelectedObjects,
@@ -721,4 +823,11 @@ export function createLibraryActions({
     unpublishSelectedObjects,
     uploadFiles,
   };
+}
+
+function describeObjects(objects, limit = 3) {
+  const count = `${objects.length} item${objects.length === 1 ? "" : "s"}`;
+  const names = objects.slice(0, limit).map((object) => object.name || object.uri);
+  const more = objects.length - names.length;
+  return `${count} (${names.join(", ")}${more ? ` and ${more} more` : ""})`;
 }

@@ -1211,7 +1211,9 @@ chmod 1777 /tmp/.X11-unix
 rm -f /tmp/.X11-unix/X${DISPLAY#:} /tmp/.X${DISPLAY#:}-lock "$ELASTOS_BROWSER_VM_CONTROL_SOCKET"
 
 selkies_checkpoint "starting xvfb"
-Xvfb "$DISPLAY" -screen 0 "${ELASTOS_BROWSER_VM_WIDTH}x${ELASTOS_BROWSER_VM_HEIGHT}x24" \
+# Xvfb fixes its RandR maximum at startup. Select the initial mode before
+# Chromium paints, while retaining room for portrait and larger stages.
+Xvfb "$DISPLAY" -screen 0 "3840x2160x24" \
   +extension COMPOSITE +extension DAMAGE +extension GLX +extension RANDR \
   +extension RENDER +extension MIT-SHM +extension XFIXES +extension XTEST \
   -nolisten tcp -ac -noreset >"$ELASTOS_BROWSER_VM_LOG_DIR/browser-vm-xvfb.log" 2>&1 &
@@ -1224,6 +1226,10 @@ done
   echo "browser-vm-selkies-start: Xvfb did not create display socket" >&2
   exit 1
 }
+/opt/elastos/bin/node --input-type=module - "$ELASTOS_BROWSER_VM_WIDTH" "$ELASTOS_BROWSER_VM_HEIGHT" <<'BROWSER_INITIAL_GEOMETRY'
+import { applyBrowserDisplayMode } from "/opt/elastos/bin/browser-selkies-control-service.mjs";
+await applyBrowserDisplayMode(Number(process.argv[2]), Number(process.argv[3]));
+BROWSER_INITIAL_GEOMETRY
 selkies_checkpoint "xvfb ready"
 selkies_checkpoint "starting audio"
 start_browser_audio_stack
@@ -2089,7 +2095,7 @@ selkies_checkpoint "starting selkies service"
   --stun_host= \
   --stun_port= \
   --enable_clipboard=true \
-  --enable_resize=true \
+  --enable_resize=false \
   --enable_basic_auth=true \
   --basic_auth_user "$ELASTOS_BROWSER_VM_SELKIES_AUTH_USER" \
   --basic_auth_password "$ELASTOS_BROWSER_VM_SELKIES_AUTH_PASSWORD" \

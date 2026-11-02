@@ -327,10 +327,10 @@ if debugfs and mke2fs:
             })}
         service = subprocess.Popen([shutil.which("node"), str(repo / "scripts/browser-vm-control-service.mjs")],
                                    env=service_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        def get(path):
-            client = http.client.HTTPConnection("browser-vm", timeout=12)
+        def get(path, timeout=12):
+            client = http.client.HTTPConnection("browser-vm", timeout=timeout)
             client.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.sock.settimeout(12)
+            client.sock.settimeout(timeout)
             client.sock.connect(control_socket)
             try:
                 client.request("GET", path)
@@ -358,10 +358,12 @@ if debugfs and mke2fs:
             assert status["active_pages"] == status["active_vms"] == status["pending_launches"] == 0
             checks.append("readiness creates no page or VM")
             sleeper_pid = scratch / "readiness-sleeper.pid"
-            installed_probe.write_text("#!/bin/sh\necho $$ > " + shlex.quote(str(sleeper_pid)) + "\nexec sleep 30\n")
+            # The controller allows 30 seconds to hash a release image. Keep
+            # the probe asleep beyond that bound and let the client see its refusal.
+            installed_probe.write_text("#!/bin/sh\necho $$ > " + shlex.quote(str(sleeper_pid)) + "\nexec sleep 60\n")
             started = time.monotonic()
-            assert get("/readiness")["readiness"] == {"state":"unavailable","reason":"preparation_required"}
-            assert time.monotonic() - started < 10
+            assert get("/readiness", timeout=40)["readiness"] == {"state":"unavailable","reason":"preparation_required"}
+            assert time.monotonic() - started < 35
             try:
                 os.kill(int(sleeper_pid.read_text()), 0)
             except ProcessLookupError:

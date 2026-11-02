@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/archive-manager/browser");
+const homeNavigationClientPath = join(repoRoot, "capsules/home/browser/home-navigation-client.js");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -15,9 +16,13 @@ const { chromium } = require("playwright");
 const token = "archive-layout-test-token";
 const archiveUri = "localhost://Users/archive/Documents/Portable.zip";
 const previewText = "Portable archive preview text.";
+// Rows carry the server's archive_entry_listing shape: `path` is the key sent
+// back to preview or extract; `display_path` and `name` are what is shown (#432).
 const entries = [
   {
     path: "docs/guide.md",
+    display_path: "docs/guide.md",
+    name: "guide.md",
     kind: "file",
     size: 128,
     modified_at: 1_780_000_000,
@@ -26,6 +31,8 @@ const entries = [
   },
   {
     path: "images/logo.txt",
+    display_path: "images/logo.txt",
+    name: "logo.txt",
     kind: "file",
     size: 64,
     modified_at: 1_780_000_100,
@@ -34,6 +41,8 @@ const entries = [
   },
   {
     path: "blocked/device.bin",
+    display_path: "blocked/device.bin",
+    name: "device.bin",
     kind: "file",
     size: 32,
     modified_at: 1_780_000_200,
@@ -183,6 +192,16 @@ function startServer() {
         const appSrc = url.searchParams.get("app_src") || "";
         const body = Buffer.from(buildShellDocument(appSrc));
         response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/apps/home/home-navigation-client.js") {
+        const body = await readFile(homeNavigationClientPath);
+        response.writeHead(200, {
+          "access-control-allow-origin": "null",
+          "content-length": body.length,
+          "content-type": "text/javascript",
+        });
         response.end(body);
         return;
       }

@@ -204,6 +204,11 @@ test("approved Engine selection binds the active Runtime page and concrete adapt
     assert.throws(() => browserJourneyEngineRoute({ sessions: { recoverable_page: bad } }, choice, "page-one"), /different Engine or page/);
   }
   assert.throws(() => browserJourneyEngineRoute(summary, choice, "page-one"), /different Engine or page/);
-  assert.deepEqual(browserJourneyEngineChoice({ engine_adapter: { adapters: [{ ...adapter, id: adapterId }] } }, adapterId),
+  const local = { ...adapter, id: adapterId, backing_substrate: "local_microvm" };
+  assert.deepEqual(browserJourneyEngineChoice({ engine_adapter: { adapters: [local] } }, adapterId),
+    { engineId: "", adapterId }, "a lone local engine is reached through Automatic, as Settings hides the selector");
+  assert.deepEqual(browserJourneyEngineChoice({ engine_adapter: { adapters: [local, { ...local, id: "other" }] } }, adapterId),
     { engineId: adapterId, adapterId });
+  assert.deepEqual(browserJourneyEngineChoice({ engine_adapter: { adapters: [{ ...local, backing_substrate: "remote_operator_vm" }] } }, adapterId),
+    { engineId: adapterId, adapterId }, "Automatic skips remote VMs, so they stay explicit");
 });

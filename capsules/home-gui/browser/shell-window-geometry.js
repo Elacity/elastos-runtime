@@ -10,125 +10,16 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261101d";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101d";
+import { registerStageGesture } from "./shell-popovers.js?v=home-20261101d";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
 const WINDOW_SNAP_ACTIVATION_DISTANCE = 12;
 const BROWSER_TARGET_ID = "browser";
-const BROWSER_REMOTE_ASPECT_RATIO = 16 / 9;
-const BROWSER_DEFAULT_CHROME_HEIGHT = 52;
-
 function safeClamp(value, min, max) {
   return max < min ? min : clamp(value, min, max);
-}
-
-function browserAspectConfig(node) {
-  if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true") {
-    return null;
-  }
-  const headHeight = Math.round(
-    node.querySelector(".window-head")?.getBoundingClientRect().height || 38,
-  );
-  let appChromeHeight = BROWSER_DEFAULT_CHROME_HEIGHT;
-  try {
-    const frame = node.querySelector(".window-frame");
-    const chrome = frame?.contentDocument?.querySelector(".browser-chrome");
-    appChromeHeight = Math.round(chrome?.getBoundingClientRect().height || appChromeHeight);
-  } catch (_error) {
-    // Cross-origin or not-yet-loaded frames use the stable Browser chrome default.
-  }
-  return {
-    aspectRatio: BROWSER_REMOTE_ASPECT_RATIO,
-    extraHeight: headHeight + appChromeHeight,
-  };
-}
-
-function browserAspectBoundsFromWidth(node, bounds) {
-  const config = browserAspectConfig(node);
-  if (!config) {
-    return bounds;
-  }
-  const height = Math.round(config.extraHeight + bounds.width / config.aspectRatio);
-  let fitted = fitWindowBounds({ ...bounds, height }, { allowPartial: true });
-  if (fitted.height < height - 1) {
-    const stageHeight = Math.max(1, fitted.height - config.extraHeight);
-    const width = Math.round(stageHeight * config.aspectRatio);
-    fitted = fitWindowBounds({ ...fitted, width, height: fitted.height }, { allowPartial: true });
-  }
-  return fitted;
-}
-
-function browserAspectBoundsForState(node, bounds, state) {
-  const fitted = browserAspectBoundsFromWidth(node, bounds);
-  const horizontalRoom = Math.max(0, bounds.width - fitted.width);
-  const verticalRoom = Math.max(0, bounds.height - fitted.height);
-  const anchorRight = state === "right" || state === "ne" || state === "se";
-  const anchorBottom = state === "sw" || state === "se";
-  const centerHorizontal = state === "maximize";
-  const centerVertical = state === "maximize" || state === "left" || state === "right";
-  return {
-    ...fitted,
-    x: Math.round(
-      bounds.x +
-        (centerHorizontal ? horizontalRoom / 2 : anchorRight ? horizontalRoom : 0),
-    ),
-    y: Math.round(
-      bounds.y +
-        (centerVertical ? verticalRoom / 2 : anchorBottom ? verticalRoom : 0),
-    ),
-  };
-}
-
-function browserAspectResizeBounds(node, bounds, resizing, limits) {
-  const config = browserAspectConfig(node);
-  if (!config) {
-    return bounds;
-  }
-  const horizontal = resizing.directions.includes("e") || resizing.directions.includes("w");
-  const vertical = resizing.directions.includes("n") || resizing.directions.includes("s");
-  const deltaX = Math.abs((bounds.x + bounds.width) - resizing.right) + Math.abs(bounds.x - resizing.left);
-  const deltaY = Math.abs((bounds.y + bounds.height) - resizing.bottom) + Math.abs(bounds.y - resizing.top);
-  const deriveFromWidth = horizontal && (!vertical || deltaX >= deltaY);
-
-  let next = { ...bounds };
-  if (deriveFromWidth) {
-    next.height = Math.round(config.extraHeight + next.width / config.aspectRatio);
-    if (resizing.directions.includes("n") && !resizing.directions.includes("s")) {
-      next.y = bounds.y + bounds.height - next.height;
-    }
-  } else {
-    const stageHeight = Math.max(1, next.height - config.extraHeight);
-    next.width = Math.round(stageHeight * config.aspectRatio);
-    if (resizing.directions.includes("w") && !resizing.directions.includes("e")) {
-      next.x = bounds.x + bounds.width - next.width;
-    }
-  }
-
-  if (next.x < WINDOW_SIDE_INSET) {
-    next.x = WINDOW_SIDE_INSET;
-  }
-  if (next.y < WINDOW_TOP_INSET) {
-    next.y = WINDOW_TOP_INSET;
-  }
-  if (next.x + next.width > limits.maxRight) {
-    if (resizing.directions.includes("w") && !resizing.directions.includes("e")) {
-      next.x = Math.max(WINDOW_SIDE_INSET, limits.maxRight - next.width);
-    } else {
-      next.width = limits.maxRight - next.x;
-      next.height = Math.round(config.extraHeight + next.width / config.aspectRatio);
-    }
-  }
-  if (next.y + next.height > limits.maxBottom) {
-    if (resizing.directions.includes("n") && !resizing.directions.includes("s")) {
-      next.y = Math.max(WINDOW_TOP_INSET, limits.maxBottom - next.height);
-    } else {
-      next.height = limits.maxBottom - next.y;
-      const stageHeight = Math.max(1, next.height - config.extraHeight);
-      next.width = Math.round(stageHeight * config.aspectRatio);
-    }
-  }
-  return next;
 }
 
 function partialDragBoundsForWindow(width) {
@@ -209,17 +100,14 @@ export function fitWindowBounds({ x, y, width, height }, { allowPartial = false 
   };
 }
 
-export function fitWindowToBrowserAspect(node) {
-  const config = browserAspectConfig(node);
-  if (!config) {
-    return;
-  }
-  applyWindowBounds(node, browserAspectBoundsFromWidth(node, normalWindowBounds(node)));
+// Browser width and height follow the available workspace independently.
+export function fitBrowserWindow(node) {
+  if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true") return;
+  applyWindowBounds(node, node.dataset.browserMaximized === "true"
+    ? snappedWindowBounds("maximize")
+    : fitWindowBounds(normalWindowBounds(node), { allowPartial: true }));
 }
 
-export function fitWindowToLargestBrowserAspect(node) {
-  fitWindowToBrowserAspect(node);
-}
 
 export function rememberWindowRestoreBounds(node) {
   if (
@@ -282,9 +170,7 @@ export function applyWindowPlacement(node, placement) {
     node.dataset.snap = snapState;
     applyWindowBounds(
       node,
-      node.dataset.target === BROWSER_TARGET_ID
-        ? browserAspectBoundsForState(node, snappedWindowBounds(snapState), snapState)
-        : snappedWindowBounds(snapState),
+      snappedWindowBounds(snapState),
     );
     return;
   }
@@ -315,6 +201,12 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     if (event.target.closest("button")) {
       return;
     }
+    // Phone windows fill the stage: the title bar is a gesture surface, not
+    // a drag handle. Focus still follows the touch.
+    if (isPhone()) {
+      focusWindow(windowNode.dataset.windowId);
+      return;
+    }
     hideWindowSnapPreview();
     focusWindow(windowNode.dataset.windowId);
     const workspaceRect = desktop.getBoundingClientRect();
@@ -343,6 +235,9 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     };
     beginShellInteraction();
     handle.setPointerCapture(event.pointerId);
+    // One pointer drags or resizes at a time; a stage reset ends it as a cancel.
+    const pointerId = event.pointerId;
+    registerStageGesture("window-geometry", () => stopDrag({ type: "pointercancel", pointerId }));
   });
 
   handle.addEventListener("pointermove", (event) => {
@@ -410,7 +305,7 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
     const directions = handle.dataset.resize || "";
 
     handle.addEventListener("pointerdown", (event) => {
-      if (windowNode.dataset.maximized === "true") {
+      if (windowNode.dataset.maximized === "true" || isPhone()) {
         return;
       }
       event.stopPropagation();
@@ -433,6 +328,8 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
       };
       beginShellInteraction();
       handle.setPointerCapture(event.pointerId);
+      const pointerId = event.pointerId;
+      registerStageGesture("window-geometry", () => stopResize({ type: "pointercancel", pointerId }));
     });
 
     handle.addEventListener("pointermove", (event) => {
@@ -477,12 +374,12 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
         );
       }
 
-      const nextBounds = browserAspectResizeBounds(windowNode, {
+      const nextBounds = {
         x: left,
         y: top,
         width: right - left,
         height: bottom - top,
-      }, resizing, { maxRight, maxBottom });
+      };
       applyWindowBounds(windowNode, nextBounds);
     });
 
@@ -561,9 +458,7 @@ export function applyWindowSnapState(node, state) {
   node.dataset.snap = state;
   applyWindowBounds(
     node,
-    node.dataset.target === BROWSER_TARGET_ID
-      ? browserAspectBoundsForState(node, snappedWindowBounds(state), state)
-      : snappedWindowBounds(state),
+    snappedWindowBounds(state),
   );
 }
 
@@ -677,8 +572,6 @@ function applyWindowSnap(node, target) {
   node.dataset.snap = target.state;
   applyWindowBounds(
     node,
-    node.dataset.target === BROWSER_TARGET_ID
-      ? browserAspectBoundsForState(node, target.bounds, target.state)
-      : target.bounds,
+    target.bounds,
   );
 }

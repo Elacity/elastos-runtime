@@ -24,6 +24,7 @@ const SCHEMA: &str = "elastos.model.egress-decisions/v1";
 const DURATION_MS: u64 = 10 * 60 * 1000;
 const MAX_DECISIONS: usize = 1024;
 static DECISION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TRANSITION_GATES: OnceLock<super::model_provider_config::HostedHomeGates> = OnceLock::new();
 
 pub(super) struct ActiveDecision {
     #[cfg(target_os = "macos")]
@@ -94,19 +95,19 @@ enum DecisionStatus {
 
 #[derive(Serialize)]
 pub(super) struct HostedRouteSummary {
-    id: String,
+    pub(super) id: String,
     connection: bool,
-    provider: String,
+    pub(super) provider: String,
     offer_id: String,
     method: String,
-    origin: String,
+    pub(super) origin: String,
     path: String,
     url_sha256: String,
     recipient: String,
     payer: String,
     purpose: String,
     status: &'static str,
-    requested_at: u64,
+    pub(super) requested_at: u64,
     decided_at: Option<u64>,
     ended_at: Option<u64>,
     expires_at: u64,
@@ -161,6 +162,12 @@ impl HostedRouteSummary {
 
 fn lock() -> &'static Mutex<()> {
     DECISION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+// Product End holds this across its decision write and admission drain. Other
+// product decision transitions take it before changing the same decision.
+pub(super) fn transition_gate(data_dir: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    super::model_provider_config::hosted_home_gate(&TRANSITION_GATES, data_dir)
 }
 
 fn now_ms() -> anyhow::Result<u64> {
@@ -475,6 +482,34 @@ pub(super) fn end_decision(data_dir: &Path, id: &str, proof: &str) -> anyhow::Re
     write(data_dir, &file)
 }
 
+pub(super) fn endable_decision_offer_id(
+    data_dir: &Path,
+    id: &str,
+    proof: &str,
+) -> anyhow::Result<String> {
+    let principal = crate::auth::load_principal_for_proof_binding(data_dir, proof)?;
+    crate::auth::ensure_proof_binding_not_revoked(&principal)?;
+    anyhow::ensure!(
+        crate::auth::is_admin(&principal) && principal.proof_binding.passkey.is_some(),
+        "hosted egress owner unavailable"
+    );
+    let _guard = lock().lock().unwrap_or_else(|error| error.into_inner());
+    let file = read(data_dir)?;
+    let decision = file
+        .decisions
+        .iter()
+        .find(|decision| decision.id == id)
+        .ok_or_else(|| anyhow::anyhow!("hosted egress decision unavailable"))?;
+    anyhow::ensure!(
+        matches!(
+            decision.status,
+            DecisionStatus::Pending | DecisionStatus::Approved
+        ) && decision.expires_at_ms > now_ms()?,
+        "hosted egress decision is no longer active"
+    );
+    Ok(decision.scope.offer_id.clone())
+}
+
 pub(super) fn inbox_history(data_dir: &Path) -> anyhow::Result<Vec<HostedRouteSummary>> {
     let now = now_ms()?;
     let file = read(data_dir)?;
@@ -536,6 +571,39 @@ pub(super) fn inbox_history(data_dir: &Path) -> anyhow::Result<Vec<HostedRouteSu
             })
         })
         .collect()
+}
+
+/// Current decisions as Home events compare them: a request, decision, End or
+/// expiry changes what Inbox and System show for hosted access.
+pub(super) fn realtime_signature(data_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let now = now_ms()?;
+    Ok(read(data_dir)?
+        .decisions
+        .iter()
+        .map(|decision| {
+            format!(
+                "hosted-route:{}:{:?}:{}",
+                decision.id,
+                decision.status,
+                decision.expires_at_ms <= now
+            )
+        })
+        .collect())
+}
+
+/// Ids of decisions that still carry authority; grants of any other decision are dead.
+#[cfg(target_os = "macos")]
+pub(super) fn approved_ids(data_dir: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let file = read(data_dir)?;
+    let now = now_ms()?;
+    Ok(file
+        .decisions
+        .into_iter()
+        .filter(|decision| {
+            decision.status == DecisionStatus::Approved && decision.expires_at_ms > now
+        })
+        .map(|decision| decision.id)
+        .collect())
 }
 
 pub(super) fn active(

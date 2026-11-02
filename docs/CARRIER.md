@@ -5,9 +5,8 @@
 > Read the [repository README](../README.md) and
 > [ARCHITECTURE.md](ARCHITECTURE.md) first.
 > This file narrows the Carrier concept and its placement in the runtime. It is
-> not the current shipped-behavior contract. For current behavior and proof
-> levels, use [../state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
-> [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md).
+> not the current shipped-behavior contract. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+> own status and proof; [COMMAND_MATRIX.md](COMMAND_MATRIX.md) defines command expectations.
 
 ## Carrier
 
@@ -407,26 +406,16 @@ it reports adapter status and refuses page launch unless the stream session has
 attached `adapter_ipc` byte transport. This keeps CEF/Chromium/WebView work
 behind the same typed Runtime Browser/Net/Exit contract instead of exposing host
 browser or socket authority to web pages.
-Native Linux engine processes go through `browser-engine-supervisor`, a small
-host helper that reads `ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG`, starts the
-operator-approved engine under `linux_new_netns`, and returns a typed supervisor
-proof. It passes only the adapter IPC path, stream id, target, and URL to the
-engine; wallet, chain, filesystem, DNS, and direct network authority stay outside
-the browser process contract.
-The local byte path is separate: `browser-stream-bridge` reads
-`ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG`, accepts a private Unix-socket connection
-from the engine side, and forwards bytes only to a Runtime-owned Unix stream
-socket. It contains no TCP socket, DNS, HTTP client, wallet, chain, or filesystem
-authority beyond the configured socket paths.
-`browser-engine-supervisor` can launch this bridge before the native engine when
-the operator-approved supervisor config includes a `stream_bridge` program and
-the internal `adapter_ipc` descriptor carries `runtime_stream_path`. Gateway
-allocates that path under `Runtime/BrowserStreams/` after Net/Exit validation and
-before Browser Engine launch. Gateway then relays bytes to the private
-`relay_ipc` Exit socket when one is configured, or accepts and closes
-fail-closed when no Exit relay exists. Browser UI responses never include
-`adapter_ipc`, `runtime_stream_path`, or `relay_ipc`, and Browser Engine Adapter
-never receives `relay_ipc`.
+The Browser VM supervisor starts one Linux guest per launch. Mac Apple
+Virtualization and Linux crosvm adapt host resources behind the same Engine
+contract. Chromium and Selkies execute inside the guest; its network wrapper
+forwards website streams through the Runtime-owned private byte path.
+`browser-stream-bridge` forwards that private adapter stream to Runtime, which
+opens the authorized Exit connection. Runtime owns grants, page lifecycle and
+bridge cleanup. The guest owns website execution and rendering. Browser UI
+receives the WebRTC display contract while Runtime retains private socket paths
+and route credentials. The shared lifetime pipe closes helpers when their
+Runtime owner ends.
 The first server-side Exit daemon is `browser-local-exit`: it requires
 `ELASTOS_BROWSER_LOCAL_EXIT_CONFIG`, accepts typed `elastos.exit.relay-open/v1`
 handshakes only from Runtime, dials only operator-allowlisted public targets,
@@ -481,15 +470,22 @@ HTTP here is a control-plane protocol. It is not the Carrier substrate.
 
 ### 2. Carrier network and content plane (node to world)
 
-Peer discovery, gossip messaging, relay, and peer-to-peer content transfer. Built into the runtime as `carrier.rs`.
+Peer discovery, gossip messaging, and peer-to-peer content transfer. Built into the runtime as `carrier.rs`.
 
 **Current implementation:**
-- Built-in Carrier node using **Iroh 1.0.2** with iroh-gossip 0.101.0,
-  distributed-topic-tracker 0.3.5, mDNS, and relay support
+- Built-in Carrier node using **Iroh 1.0.2** with iroh-gossip 0.101.0 and
+  mDNS
 - `tunnel-provider` capsule using **cloudflared** (HTTP tunnel to public internet)
 
-**Transport:** Iroh (QUIC + N0 DNS discovery + relay), with mainline DHT topic
-discovery through `distributed-topic-tracker` and mDNS on the local network.
+**Transport:** direct Iroh QUIC only. With `ELASTOS_CARRIER_NETWORK` unset or
+`direct`, Carrier uses Iroh's Minimal preset: no relay and no public address
+discovery. Peers resolve through mDNS on the local network and through
+explicit tickets and bootstrap peers; gossip topics join those peers directly.
+`ELASTOS_CARRIER_NETWORK=public` is refused, and so is `ELASTOS_RELAY_URL`
+with the direct network.
+Relay support is planned in
+[#345](https://github.com/Elacity/elastos-runtime/issues/345) and
+[#354](https://github.com/Elacity/elastos-runtime/issues/354).
 
 ### 3. Data plane (host to VM networking)
 
@@ -535,6 +531,5 @@ not an alternate compatibility path.
 This placement is an implementation choice, not a rule that all Carrier
 protocol logic belongs in the trusted core. A later adapter may move protocol
 work behind a private host contract if Runtime continues to own endpoint
-admission, routing, lifecycle, capabilities, and audit. Active work belongs in
-[`TASKS.md`](../TASKS.md); future research belongs in
-[deferred work](DEFERRED_WORK.md) and [`ROADMAP.md`](../ROADMAP.md).
+admission, routing, lifecycle, capabilities, and audit. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+own active work; [deferred work](DEFERRED_WORK.md) and [`ROADMAP.md`](../ROADMAP.md) provide research context.

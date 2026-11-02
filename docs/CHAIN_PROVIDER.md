@@ -213,5 +213,5 @@ Use these checks for the current slice:
 cargo test --manifest-path capsules/chain-provider/Cargo.toml
 cargo clippy --manifest-path capsules/chain-provider/Cargo.toml -- -D warnings
 cargo test -p elastos-server --lib --manifest-path elastos/Cargo.toml
-bash scripts/check-wci-alignment.sh
+node scripts/check-product-data.mjs
 ```

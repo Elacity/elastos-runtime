@@ -6,6 +6,8 @@ import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/inbox/browser");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
@@ -192,7 +194,7 @@ async function run() {
     assert(reviewFilter.rowCount === 1, "review filter must use only current attention entries", reviewFilter);
     assert(reviewFilter.detailTitle === "Contact request", "review filter must keep the matching detail entry", reviewFilter);
 
-    await page.getByRole("button", { name: "Pending" }).click();
+    await page.getByRole("button", { name: "All, 2 pending requests", exact: true }).click();
     await page.getByRole("option").nth(1).click();
     const secondSelection = await page.evaluate(() => ({
       rowCount: document.querySelectorAll("#entry-rows .entry-row").length,
@@ -225,6 +227,54 @@ async function run() {
     assert(mobile.splitColumns === "520px" || mobile.splitColumns.split(" ").length === 1, "mobile must stack the list/detail split", mobile);
     assert(mobile.detailTop > mobile.rowsTop, "mobile detail must sit below the list", mobile);
     await noHorizontalOverflow(page, "mobile");
+
+    // Phone stage: the phone bar carries no app menu, so the filters are a
+    // two-segment row of 44 px targets above the list.
+    await page.setViewportSize(PHONE_VIEWPORT);
+    await setPhoneFormFactor(page);
+    const phone = await page.evaluate(() => {
+      const box = (node) => {
+        const rect = node.getBoundingClientRect();
+        return { top: Math.round(rect.top), left: Math.round(rect.left), right: Math.round(rect.right), bottom: Math.round(rect.bottom), height: Math.round(rect.height) };
+      };
+      const lastRow = [...document.querySelectorAll("#entry-rows .entry-row")].at(-1);
+      return {
+        segments: [...document.querySelectorAll(".summary-card[data-filter]")].map(box),
+        rows: box(document.getElementById("entry-rows")),
+        lastRow: box(lastRow),
+        detail: box(document.getElementById("entry-detail")),
+      };
+    });
+    // On a phone (only) the list is as tall as its requests, so the detail
+    // reads directly beneath; a narrow desktop window keeps its fixed split.
+    assert(
+      phone.rows.bottom - phone.lastRow.bottom <= 16 && phone.detail.top - phone.rows.bottom <= 1,
+      "phone list must fit its requests so the detail reads directly beneath, not mid-screen",
+      phone,
+    );
+    const phoneActions = await page.evaluate(() =>
+      [...document.querySelectorAll("#refresh, #entry-detail .entry-action")].map((button) => Math.round(button.getBoundingClientRect().height)));
+    assert(phoneActions.length >= 2 && phoneActions.every((height) => height >= 44), "phone Refresh and request actions must be 44 px targets", phoneActions);
+    const [allSegment, reviewSegment] = phone.segments;
+    assert(
+      phone.segments.length === 2 &&
+        phone.segments.every((segment) => segment.height >= 44) &&
+        allSegment.top === reviewSegment.top &&
+        reviewSegment.left >= allSegment.right &&
+        reviewSegment.bottom <= phone.rows.top,
+      "phone filters must be one row of two 44 px segments above the list",
+      phone,
+    );
+    await page.getByRole("button", { name: "Needs Review" }).click();
+    const phoneReview = await page.evaluate(() => ({
+      listTitle: document.getElementById("list-title")?.textContent?.trim() || "",
+      rowCount: document.querySelectorAll("#entry-rows .entry-row").length,
+    }));
+    assert(phoneReview.listTitle === "Needs Review" && phoneReview.rowCount === 1, "phone review filter must narrow the list", phoneReview);
+    await page.getByRole("button", { name: /^All, \d+ pending requests?$/ }).click();
+    await noHorizontalOverflow(page, "phone");
+    await page.screenshot({ path: "/tmp/inbox-phone-390x844.png" });
+    await setPhoneFormFactor(page, false);
 
     const railPage = await browser.newPage({ viewport: { width: 420, height: 900 } });
     await launchPage(railPage, baseUrl, "rail");

@@ -39,7 +39,6 @@ const VM_CONTROL_TIMEOUT_MS = "210000";
 const VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS = "120000";
 const VM_ENGINE_TIMEOUT_MS = "225000";
 const VM_SUPERVISOR_TIMEOUT_MS = 240000;
-const VM_EGRESS_MAX_SESSIONS = "16";
 const VM_ADAPTER_MAX_ACTIVE_SESSIONS = "4";
 const VM_CONTROL_MAX_ACTIVE_PAGES = "1";
 const VM_IDLE_KEEPALIVE_MS = "300000";
@@ -62,6 +61,7 @@ Options:
   --vm-control-launcher <path>    Optional launcher used to auto-start the VM control socket.
                                   Linux default: <data-dir>/bin/browser-vm-local-crosvm-launcher
                                   Darwin default: <data-dir>/bin/browser-vz-engine-supervisor
+  --release-image                Use the atomic Browser image set supplied by the signed release
   --vm-rootfs <path>              Optional Browser VM rootfs path
   --allow-private-targets         Allow Browser Exit to resolve private targets. Disabled by default.
 `;
@@ -100,6 +100,9 @@ function parseArgs(argv) {
         break;
       case "--vm-control-launcher":
         args.vmControlLauncher = next();
+        break;
+      case "--release-image":
+        args.releaseImage = true;
         break;
       case "--vm-rootfs":
         args.vmRootfs = next();
@@ -492,12 +495,14 @@ function browserVzTransportConfig(
       1,
       0xffffffff,
     ),
+    // Same as the Home launch token (12 h): a Browser session ends when the user
+    // closes it or Home stops its heartbeat, not when this credential expires.
     ttl_secs: boundedIntegerEnv(
       env,
       "ELASTOS_BROWSER_VZ_TRANSPORT_TTL_SECS",
-      600,
+      43200,
       120,
-      3600,
+      43200,
     ),
   };
 }
@@ -608,7 +613,6 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     ELASTOS_BROWSER_VM_ENGINE_TIMEOUT_MS: VM_ENGINE_TIMEOUT_MS,
     ELASTOS_BROWSER_VM_CONTROL_LAUNCH_TIMEOUT_MS: VM_CONTROL_TIMEOUT_MS,
     ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS: VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS,
-    ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS: VM_EGRESS_MAX_SESSIONS,
     ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES: VM_CONTROL_MAX_ACTIVE_PAGES,
     ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS: args.platform.startsWith("linux-")
       ? VM_LINUX_IDLE_KEEPALIVE_MS
@@ -633,6 +637,13 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
   if (!remoteVzControlLauncher && !vzTransport) {
     copyVmIceEnv(env, sourceEnv);
     copyVmMediaRelayEnv(env, args.platform, sourceEnv);
+  }
+  for (const key of ["ELASTOS_BROWSER_VM_PYTHON", "ELASTOS_DEBUGFS_BIN"]) {
+    const value = sourceEnv[key];
+    if (value) {
+      validateAbsolute(key, value);
+      env[key] = value;
+    }
   }
   copyVmDiagnosticEnv(env, sourceEnv);
   if (!remoteVzControlLauncher) {
@@ -659,8 +670,16 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
   if (args.platform.startsWith("linux-") && !remoteVzControlLauncher) {
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR = path.join(args.dataDir, "browser-vm/rootfs-pool");
     env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
-    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "2";
+    // Keep one spare image so a closed Browser leaves room for update staging.
+    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "1";
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
+  }
+  if (args.releaseImage) {
+    const image = path.join(args.dataDir, "browser-vm/image-set");
+    env.ELASTOS_BROWSER_VM_ROOTFS = path.join(image, "rootfs.ext4");
+    env.ELASTOS_BROWSER_VM_ROOTFS_MANIFEST = path.join(image, "browser-vm-rootfs-manifest.json");
+    env.ELASTOS_BROWSER_VM_KERNEL = path.join(image, "vmlinux");
+    env[args.platform === "darwin-arm64" ? "ELASTOS_BROWSER_VM_INITRAMFS" : "ELASTOS_BROWSER_VM_INITRD"] = path.join(image, "initrd");
   }
   supervisorConfig.env = env;
   return {
@@ -688,6 +707,20 @@ function main() {
     validateAbsolute("--data-dir", args.dataDir);
     const outDir = args.outDir || path.join(args.dataDir, "config");
     validateAbsolute("--out-dir", outDir);
+    if (args.platform === "linux-amd64") {
+      if (args.vmControlLauncher || args.vmRootfs || args.releaseImage) {
+        throw new Error("This host uses an approved remote Engine; the local guest is ARM64.");
+      }
+      writeJson(path.join(outDir, "browser-engine-adapter.json"), { adapters: [] });
+      writeOwnerOnlyJson(path.join(outDir, "browser-viewer-ingress.json"), {
+        schema: "elastos.browser.viewer-ingress-config/v1",
+        listen_host: "127.0.0.1", advertised_host: "127.0.0.1",
+        port_start: 48100, port_end: 48131,
+      });
+      console.log(JSON.stringify({ ok: true, engine_mode: "remote", platform: args.platform,
+        files: ["browser-engine-adapter.json", "browser-viewer-ingress.json"] }));
+      return;
+    }
     const adapterSocket = runtimeSocketPath(args, "exit-adapter");
     const relaySocket = runtimeSocketPath(args, "exit-relay");
     const sourceEnv = runtimeTurnEnv(args);
