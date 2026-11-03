@@ -3924,18 +3924,27 @@ async fn connect_vsock_with_retry(
         .min(deadline.saturating_duration_since(Instant::now()));
         match tokio::time::timeout(attempt_timeout, provider.vsock_connect(handle, port)).await {
             Ok(Ok(fd)) => return Ok(fd),
-            Ok(Err(error)) => {
-                last_error = error.to_string();
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+            Ok(Err(error)) => last_error = error.to_string(),
             Err(_) => {
                 last_error = format!(
                     "connect attempt timed out after {} ms",
                     attempt_timeout.as_millis()
                 );
-                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
+        // A stopped VM never answers; end the launch now instead of at the
+        // startup observation budget.
+        let state = provider.guest_state_label(handle).await;
+        if state == "Stopped" || state == "Error" {
+            #[cfg(target_os = "linux")]
+            if let Some(detail) = provider.exit_detail(handle) {
+                last_error = detail;
+            }
+            return Err(format!(
+                "Browser VM guest stopped ({state}) before it answered on vsock port {port}: {last_error}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     Err(format!(
         "timed out connecting to Browser VM guest vsock port {port}: {last_error}"

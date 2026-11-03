@@ -31,6 +31,19 @@ const SETUP_ROOT: &str = "/run/elastos-browser";
 const SETUP_STATE: &str = "/var/lib/elastos-browser";
 const SETUP_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
 const CONNECT_BUDGET: Duration = Duration::from_millis(200);
+/// One vsock vring size for both vhost-user peers. crosvm's frontend offers
+/// its 32768 maximum when `max-queue-size` is unset; vhost-device-vsock
+/// refuses any ring above its `--queue-size`, drops the device, and crosvm
+/// then stops the guest. 1024 is the backend's default and was proven on the
+/// Orin (2048 fails the same way).
+const VSOCK_QUEUE_SIZE: u16 = 1024;
+/// Bytes of the crosvm log (which carries the guest serial console) and of
+/// the vsock backend log kept after the VM exits on its own.
+const RETAINED_CROSVM_LOG_BYTES: u64 = 64 * 1024;
+const RETAINED_BACKEND_LOG_BYTES: u64 = 16 * 1024;
+/// Kept in the Browser VM state root, outside the per-VM directory that
+/// launch cleanup removes. Each unrequested exit replaces it.
+const RETAINED_EXIT_LOG: &str = "last-vm-exit.log";
 
 #[derive(Clone, Debug)]
 enum Transport {
@@ -346,6 +359,8 @@ struct Vm {
     stop: AtomicBool,
     writer_locks: Mutex<Vec<File>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Set before STOPPED when crosvm or its backend exited unrequested.
+    exit: Mutex<Option<String>>,
 }
 
 pub(super) struct CrosvmBrowserProvider {
@@ -431,6 +446,7 @@ impl CrosvmBrowserProvider {
             stop: AtomicBool::new(false),
             writer_locks: Mutex::new(vec![lease]),
             worker: Mutex::new(None),
+            exit: Mutex::new(None),
         });
         self.vms
             .lock()
@@ -578,7 +594,9 @@ impl CrosvmBrowserProvider {
     ) -> Result<OwnedFd, String> {
         let vm = self.vm(handle)?;
         if vm.state.load(Ordering::Acquire) != RUNNING {
-            return Err("Browser crosvm is not running".into());
+            return Err(
+                vm_exit_detail(&vm).unwrap_or_else(|| "Browser crosvm is not running".into())
+            );
         }
         let cid = vm.cid;
         tokio::task::spawn_blocking(move || match &vm.transport {
@@ -588,6 +606,15 @@ impl CrosvmBrowserProvider {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    /// Why crosvm or its backend exited on its own, with the retained log.
+    pub(super) fn exit_detail(&self, handle: &CapsuleHandle) -> Option<String> {
+        self.vm(handle).ok().and_then(|vm| vm_exit_detail(&vm))
+    }
+}
+
+fn vm_exit_detail(vm: &Vm) -> Option<String> {
+    vm.exit.lock().ok().and_then(|exit| exit.clone())
 }
 
 fn command(
@@ -645,7 +672,7 @@ fn command(
             command
                 .arg("--vhost-user")
                 .arg(format!(
-                    "type=vsock,socket={}",
+                    "type=vsock,socket={},max-queue-size={VSOCK_QUEUE_SIZE}",
                     vm.socket_dir.join("u/v.sock").display()
                 ))
                 .args(["--vhost-user-connect-timeout-ms", "2000"]);
@@ -751,7 +778,14 @@ fn backend_command(vm: &Vm, state_dir: &Path) -> Result<Option<Command>, String>
         .args(["--sync-fd", "3"])
         .args(["--", "/backend", "--guest-cid"])
         .arg(vm.cid.to_string())
-        .args(["--socket", "/s/v.sock", "--uds-path", "/s/h.sock"])
+        .args([
+            "--socket",
+            "/s/v.sock",
+            "--uds-path",
+            "/s/h.sock",
+            "--queue-size",
+        ])
+        .arg(VSOCK_QUEUE_SIZE.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log));
@@ -779,7 +813,7 @@ fn run_owned_vm(
             return;
         }
     };
-    let child = command(&vm, binary, socket, state_dir)
+    let child = command(&vm, binary, socket, state_dir.clone())
         .and_then(|mut command| command.spawn().map_err(|e| e.to_string()));
     let mut child = match child {
         Ok(child) => child,
@@ -803,11 +837,11 @@ fn run_owned_vm(
     vm.state.store(RUNNING, Ordering::Release);
     let _ = ready.send(Ok(()));
     let mut stop_at = None;
-    loop {
+    let crosvm_exited_first = loop {
         // WNOWAIT keeps the exact leader PID reserved. Group signaling never
         // follows a reap that could expose this numeric PGID to reuse.
         match observe_exit(pgid) {
-            Ok(true) => break,
+            Ok(true) => break true,
             Err(_) => {
                 vm.state.store(INDETERMINATE, Ordering::Release);
                 thread::sleep(Duration::from_millis(20));
@@ -817,7 +851,7 @@ fn run_owned_vm(
         }
         if let Some(backend_pgid) = backend_pgid {
             match observe_exit(backend_pgid) {
-                Ok(true) => break,
+                Ok(true) => break false,
                 Err(_) => vm.state.store(INDETERMINATE, Ordering::Release),
                 Ok(false) => {}
             }
@@ -842,7 +876,8 @@ fn run_owned_vm(
             }
         }
         thread::sleep(Duration::from_millis(20));
-    }
+    };
+    let requested = vm.stop.load(Ordering::Acquire);
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
         if let Some(backend_pgid) = backend_pgid {
@@ -857,7 +892,101 @@ fn run_owned_vm(
             reap_owned_group_workers(Path::new("/proc"), backend_pgid)
         });
     }
+    if !requested {
+        // Both groups are reaped, so the logs are complete. std keeps the
+        // reaped status, so try_wait reports the first exit exactly.
+        let status = if crosvm_exited_first {
+            child.try_wait().ok().flatten()
+        } else {
+            backend
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+        };
+        let who = if crosvm_exited_first {
+            "crosvm"
+        } else {
+            "the vsock backend"
+        };
+        let status = status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "status unknown".into());
+        let kept = match retain_exit_log(&state_dir, who, &status) {
+            Ok(path) => format!(
+                "its last log and guest console output are kept in {}",
+                path.display()
+            ),
+            Err(error) => format!("its log could not be kept: {error}"),
+        };
+        if let Ok(mut exit) = vm.exit.lock() {
+            *exit = Some(format!(
+                "Browser VM stopped on its own: {who} exited ({status}); {kept}"
+            ));
+        }
+    }
     vm.state.store(STOPPED, Ordering::Release);
+}
+
+/// Copies the tails of this VM's crosvm log (serial console included) and
+/// backend log next to the per-VM directory, which launch cleanup removes.
+fn retain_exit_log(state_dir: &Path, who: &str, status: &str) -> Result<PathBuf, String> {
+    let root = state_dir
+        .parent()
+        .ok_or("Browser VM state root is absent")?;
+    let mut bytes = format!("{who} exited on its own ({status})\n").into_bytes();
+    for (name, limit) in [
+        ("crosvm.log", RETAINED_CROSVM_LOG_BYTES),
+        ("vsock-backend.log", RETAINED_BACKEND_LOG_BYTES),
+    ] {
+        match log_tail(&state_dir.join(name), limit) {
+            Ok(Some(tail)) => {
+                bytes.extend_from_slice(
+                    format!("==> {name} (last {} bytes) <==\n", tail.len()).as_bytes(),
+                );
+                bytes.extend_from_slice(&tail);
+                if !tail.ends_with(b"\n") {
+                    bytes.push(b'\n');
+                }
+            }
+            Ok(None) => {}
+            Err(error) => bytes.extend_from_slice(format!("==> {name}: {error} <==\n").as_bytes()),
+        }
+    }
+    let target = root.join(RETAINED_EXIT_LOG);
+    let partial = root.join(format!(".{RETAINED_EXIT_LOG}.{}", std::process::id()));
+    let _ = fs::remove_file(&partial);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&partial)
+        .map_err(|e| e.to_string())?;
+    let written = file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .and_then(|_| fs::rename(&partial, &target));
+    if let Err(error) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(error.to_string());
+    }
+    Ok(target)
+}
+
+fn log_tail(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata()?.len();
+    io::Seek::seek(&mut file, io::SeekFrom::Start(length.saturating_sub(limit)))?;
+    let mut tail = Vec::with_capacity(length.min(limit) as usize);
+    file.take(limit).read_to_end(&mut tail)?;
+    Ok(Some(tail))
 }
 
 fn retire_owned_child(
@@ -1533,9 +1662,13 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.contains(&"--vhost-user".into()));
+        // Both vhost-user peers use one ring size; crosvm's unset default
+        // (32768) makes vhost-device-vsock drop the device and stop the VM.
+        assert_eq!(VSOCK_QUEUE_SIZE, 1024);
         assert!(args
             .iter()
-            .any(|s| s.starts_with("type=vsock,socket=") && s.ends_with("/u/v.sock")));
+            .any(|s| s.starts_with("type=vsock,socket=")
+                && s.ends_with("/u/v.sock,max-queue-size=1024")));
         assert!(args.iter().all(|s| !s.contains("vhost-vsock")
             && s != "--vsock"
             && !s.contains("tap")
@@ -1559,6 +1692,7 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--socket", "/s/v.sock"]));
         assert!(args.windows(2).any(|p| p == ["--uds-path", "/s/h.sock"]));
         assert!(args.windows(2).any(|p| p == ["--sync-fd", "3"]));
+        assert!(args.windows(2).any(|p| p == ["--queue-size", "1024"]));
         assert!(args.iter().all(|s| !s.contains("auth_secret")
             && !s.contains("turn:")
             && !s.contains("--share-net")
@@ -1824,5 +1958,68 @@ mod tests {
         assert!(!super::super::try_lock_exclusive(&slot).unwrap());
         assert!(provider.release_terminal_native_vm(&handle).await);
         assert!(super::super::try_lock_exclusive(&slot).unwrap());
+    }
+
+    #[tokio::test]
+    async fn early_crosvm_exit_ends_vsock_wait_at_once_and_keeps_its_log_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        // More than the retained 64 KiB: the first line must be cut, the
+        // guest console's last lines kept.
+        fs::write(
+            &provider.binary,
+            "#!/bin/sh\nprintf 'FIRST-LINE\\n'\nhead -c 70000 /dev/zero | tr '\\0' x\nprintf '\\n[    1.9] browser-vm-init: last console line\\n'\nprintf 'vu-vsock: Backend device disconnected early\\n' >&2\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider.binary, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.init().await.unwrap();
+        let handle = load_fixture(&provider, config);
+        let provider = Arc::new(provider);
+        provider.start(&handle).await.unwrap();
+        let started = Instant::now();
+        let error = super::super::connect_vsock_with_retry(
+            Arc::clone(&provider),
+            &handle,
+            5000,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?}",
+            started.elapsed()
+        );
+        let kept = root.path().join("state").join(RETAINED_EXIT_LOG);
+        assert!(error.contains("guest stopped (Stopped) before it answered on vsock port 5000"));
+        assert!(error.contains("crosvm exited (exit status: 0)"), "{error}");
+        assert!(error.contains(&kept.display().to_string()), "{error}");
+        let metadata = fs::metadata(&kept).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        let text = fs::read_to_string(&kept).unwrap();
+        assert!(text.starts_with("crosvm exited on its own (exit status: 0)\n"));
+        assert!(text.contains("browser-vm-init: last console line"));
+        assert!(text.contains("Backend device disconnected early"));
+        assert!(!text.contains("FIRST-LINE"));
+        assert!(metadata.len() <= RETAINED_CROSVM_LOG_BYTES + 256);
+        // Launch cleanup removes the per-VM directory; the tail stays.
+        assert!(provider.release_terminal_native_vm(&handle).await);
+        fs::remove_dir_all(root.path().join("state/test-vm")).unwrap();
+        assert!(kept.is_file());
+    }
+
+    #[tokio::test]
+    async fn requested_stop_keeps_no_exit_log() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        fs::write(&provider.binary, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&provider.binary, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.init().await.unwrap();
+        let handle = load_fixture(&provider, config);
+        provider.start(&handle).await.unwrap();
+        provider.stop(&handle).await.unwrap();
+        assert!(provider.exit_detail(&handle).is_none());
+        assert!(!root.path().join("state").join(RETAINED_EXIT_LOG).exists());
+        assert!(provider.release_terminal_native_vm(&handle).await);
     }
 }
