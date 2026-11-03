@@ -105,12 +105,14 @@ const ROOTFS_POOL_ENV = [
 
 // A Linux Home copies the next Browser rootfs once its native Engine is ready,
 // off the first open's path (#90: a 4 GiB copy takes minutes on an SD card).
-// One refill per service; it stops when this service, its parent, stops.
+// One refill per service; it stops when this service, its parent, stops. A
+// launch in progress refills after it is ready or has ended (the native
+// owner does that), so the copy never competes with a guest boot.
 export function rootfsPoolPrefiller({ env = process.env, spawnProgram = spawn, log = logEvent } = {}) {
   let started = false;
-  return (config, readiness) => {
+  return (config, readiness, { launchInProgress = false } = {}) => {
     const linux = env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
-    if (started || !linux || !env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR ||
+    if (started || launchInProgress || !linux || !env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR ||
         readiness?.readiness?.state !== "ready") {
       return null;
     }
@@ -138,6 +140,10 @@ export function rootfsPoolPrefiller({ env = process.env, spawnProgram = spawn, l
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
+// A probe without the image set's verified-identity record hashes the 4 GiB
+// root disk once: 82 s cold on a Jetson SD card (#90). Runtime does not wait
+// for this at Home start; concurrent requests share the one probe.
+const HOST_READINESS_PROBE_TIMEOUT_MS = 240_000;
 // Probe inputs that are not files: where the preflight resolves its tools and
 // which platform it admits for. The Darwin TURN program is a stamped file.
 const READINESS_INPUT_ENV = [
@@ -149,7 +155,9 @@ const READINESS_INPUT_ENV = [
 
 // Key of the in-memory ready result: host platform/architecture/OS release,
 // the probe's environment, and each input file's dev/inode/mode/size/mtime/
-// ctime. A changed input, platform or architecture probes again.
+// ctime. A changed input, platform or architecture probes again. /dev/kvm is
+// keyed by device identity and owner/permissions only: its times change at
+// every VM exit, and live access is checked by the native owner on each call.
 function readinessInputStamps(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
@@ -173,11 +181,15 @@ function readinessInputStamps(dataDir, launcher) {
     const info = fs.statSync(file, { bigint: true });
     return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
   };
+  const deviceStamp = (file) => {
+    const info = fs.statSync(file, { bigint: true });
+    return [file, info.dev, info.ino, info.mode, info.uid, info.gid, info.rdev].map(String);
+  };
   try {
     return JSON.stringify({
       host: [process.platform, process.arch, os.release()],
       env: READINESS_INPUT_ENV.map((key) => [key, process.env[key] ?? null]),
-      files: files.map(stamp),
+      files: files.map((file) => (file === "/dev/kvm" ? deviceStamp : stamp)(file)),
       // The preflight runs these through the same PATH; debugfs is optional.
       tools: [
         ["python", process.env.ELASTOS_BROWSER_VM_PYTHON || "python3"],
@@ -266,10 +278,8 @@ function probeHostReadiness(config, dataDir, stamps) {
   };
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
   return new Promise((resolve) => {
-    // ELASTOS_BROWSER_VM_TEST_HOST_READINESS_TIMEOUT_MS is test-only (#90 Jetson
-    // measurement of the image hash on slow storage); no Home config sets it.
     execFile(script, ["--host-readiness"], {
-      timeout: Number(process.env.ELASTOS_BROWSER_VM_TEST_HOST_READINESS_TIMEOUT_MS || 30000), maxBuffer: 64 * 1024,
+      timeout: HOST_READINESS_PROBE_TIMEOUT_MS, maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
         ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program,
@@ -4804,7 +4814,7 @@ function main() {
       const url = new URL(req.url || "/", "http://browser-vm-control");
       if (req.method === "GET" && url.pathname === "/readiness") {
         const readiness = await engineReadiness(config);
-        prefillRootfsPool(config, readiness);
+        prefillRootfsPool(config, readiness, { launchInProgress: pendingLaunches.size > 0 });
         sendJson(200, readiness);
         return;
       }
@@ -5151,7 +5161,9 @@ function main() {
     })}\n`);
     // Verify the image now, off the first open's path; then copy the next
     // Browser rootfs when the native Engine is ready.
-    engineReadiness(config).then((readiness) => prefillRootfsPool(config, readiness)).catch(() => {});
+    engineReadiness(config)
+      .then((readiness) => prefillRootfsPool(config, readiness, { launchInProgress: pendingLaunches.size > 0 }))
+      .catch(() => {});
   });
 }
 

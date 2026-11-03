@@ -125,7 +125,7 @@ function controller(t, { platform = "darwin-arm64", delayed = false } = {}) {
       const turn = options.env[turnKey];
       const result = linux ? (turn && fs.existsSync(turn) ? ready : unavailable()) : probe(options.env);
       const finish = () => done(null, JSON.stringify(result));
-      probes.push({ finish });
+      probes.push({ finish, options });
       if (!delayed) finish();
     },
   });
@@ -338,6 +338,27 @@ test("ARM Linux readiness uses its native capability contract before cached imag
   assert.equal(c.probes.length, 2);
 });
 
+test("ARM Linux readiness survives a VM exit's /dev/kvm time change but not a device change", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  const kvm = path.join(c.root, "kvm");
+  assert.deepEqual(await c.read(), ready);
+  // Every VM exit updates /dev/kvm's mtime and ctime (#90, Jetson).
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(kvm, later, later);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1, "a VM exit must not re-hash the image");
+  fs.chmodSync(kvm, 0o600);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 2, "changed device permissions probe again");
+});
+
+test("a readiness probe has room for a first-time image hash on slow storage", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  assert.deepEqual(await c.read(), ready);
+  // 82 s measured cold on a Jetson SD card; the old 30 s limit refused it.
+  assert.equal(c.probes[0].options.timeout, 240_000);
+});
+
 for (const capabilities of ["failure", "{", '{"available":true}',
   '{"schema":"elastos.browser.vm-host-capabilities/v1","available":false}']) {
   test(`ARM Linux cached readiness observes native capability loss: ${capabilities}`, async t => {
@@ -414,6 +435,25 @@ test("a Linux Home starts one rootfs pool refill when its native Engine is ready
   assert.deepEqual(events.map(({ event, state, created, status }) => [event, state, created, status]),
     [["rootfs_pool_prefill_start", undefined, undefined, undefined], ["rootfs_pool_prefill", "ready", 1, 0]]);
   assert.equal(events[1].schema, undefined, "the event keeps the service's log schema");
+});
+
+test("a launch in progress defers the Home rootfs refill to that launch", async () => {
+  const { rootfsPoolPrefiller } = await import("./browser-vm-control-service.mjs");
+  const { EventEmitter } = await import("node:events");
+  const spawns = [];
+  const env = { ELASTOS_BROWSER_VM_PLATFORM: "linux-arm64", ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR: "/d/browser-vm/rootfs-pool" };
+  const prefill = rootfsPoolPrefiller({
+    env, log: () => {},
+    spawnProgram(program, args) {
+      spawns.push(args);
+      return Object.assign(new EventEmitter(), { pid: 1, stdout: new EventEmitter() });
+    },
+  });
+  const config = { launcher_program: "/d/bin/browser-vz-engine-supervisor" };
+  assert.equal(prefill(config, ready, { launchInProgress: true }), null, "no copy during a guest boot");
+  assert.equal(spawns.length, 0);
+  assert.notEqual(prefill(config, ready), null, "the next idle readiness still starts the one refill");
+  assert.equal(spawns.length, 1);
 });
 
 test("a Home without a Linux rootfs pool starts no refill", async () => {
