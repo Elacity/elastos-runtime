@@ -2139,7 +2139,7 @@ fn remove_file_if_present(path: &Path) -> Result<(), String> {
 
 impl LaunchPaths {
     fn from_env(launch: &Value) -> Result<Self, String> {
-        let data_dir = env_path("ELASTOS_BROWSER_VM_DATA_DIR").unwrap_or_else(default_data_dir);
+        let data_dir = browser_data_dir();
         let kernel_path =
             env_path("ELASTOS_BROWSER_VM_KERNEL").unwrap_or_else(|| data_dir.join("bin/vmlinux"));
         let rootfs_path = env_path("ELASTOS_BROWSER_VM_ROOTFS")
@@ -2879,6 +2879,17 @@ fn resources_in_use_error(resource: &str, path: &Path) -> String {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+/// The Home data root this supervisor serves. Runtime starts its capability
+/// probe with a cleared environment and only `ELASTOS_BROWSER_VM_DATA_DIR`, so
+/// that variable wins over HOME/XDG resolution (#90, Jetson).
+fn browser_data_dir() -> PathBuf {
+    data_dir_from(env_path("ELASTOS_BROWSER_VM_DATA_DIR"))
+}
+
+fn data_dir_from(selected: Option<PathBuf>) -> PathBuf {
+    selected.unwrap_or_else(default_data_dir)
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32, String> {
@@ -5072,6 +5083,15 @@ mod tests {
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn runtime_selected_data_dir_wins_over_home_resolution() {
+        // Runtime's capability probe clears the environment and passes only
+        // ELASTOS_BROWSER_VM_DATA_DIR; host programs must resolve under it.
+        let selected = PathBuf::from("/fixture/home/.local/share/elastos");
+        assert_eq!(data_dir_from(Some(selected.clone())), selected);
+        assert_eq!(data_dir_from(None), default_data_dir());
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

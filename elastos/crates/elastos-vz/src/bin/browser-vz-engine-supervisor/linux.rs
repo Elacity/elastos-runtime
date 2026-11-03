@@ -144,7 +144,7 @@ fn transport_for_mode(mode: Option<&str>) -> Result<Transport, String> {
         Some("kernel-vsock") => Ok(Transport::Kernel),
         Some("userspace-vsock") => Ok(Transport::Userspace {
             binary: super::env_path("ELASTOS_BROWSER_VM_VHOST_DEVICE_VSOCK_BIN")
-                .unwrap_or_else(|| super::default_data_dir().join("bin/vhost-device-vsock")),
+                .unwrap_or_else(|| super::browser_data_dir().join("bin/vhost-device-vsock")),
             sandbox: trusted_program(Path::new("/usr/bin/bwrap"))?,
         }),
         _ => Err("Browser host setup must select kernel-vsock or userspace-vsock".into()),
@@ -358,7 +358,7 @@ pub(super) struct CrosvmBrowserProvider {
 
 impl CrosvmBrowserProvider {
     pub(super) fn new(config: VzConfig, socket_dir: PathBuf) -> Result<Self, String> {
-        let data = super::default_data_dir();
+        let data = super::browser_data_dir();
         let binary = super::env_path("ELASTOS_BROWSER_VM_CROSVM_BIN")
             .unwrap_or_else(|| data.join("bin/crosvm"));
         let transport = setup_transport()?;
