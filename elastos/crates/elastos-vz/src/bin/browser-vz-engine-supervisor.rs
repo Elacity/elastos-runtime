@@ -29,6 +29,9 @@ use elastos_vz::{VmConfig, VzConfig};
 #[cfg(target_os = "linux")]
 #[path = "browser-vz-engine-supervisor/linux.rs"]
 mod linux;
+#[cfg(target_os = "linux")]
+#[path = "browser-vz-engine-supervisor/rootfs_pool.rs"]
+mod rootfs_pool;
 use hmac::{Hmac, Mac};
 #[cfg(target_os = "linux")]
 use linux::CrosvmBrowserProvider as VzProvider;
@@ -111,6 +114,11 @@ async fn main() {
             })
         );
         return;
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(rootfs_pool::REFILL_ARG) {
+        let args = std::env::args().skip(2).collect::<Vec<_>>();
+        process::exit(rootfs_pool::refill_main(&args));
     }
     init_tracing();
     if let Err(error) = run().await {
@@ -826,6 +834,8 @@ async fn run() -> Result<(), String> {
     }
     trace_stage("prepare_rootfs_start", "");
     owner.launch_rootfs = Some(post_effect_try!(prepare_launch_rootfs(&owner.paths)));
+    #[cfg(target_os = "linux")]
+    start_rootfs_pool_refill(&owner.paths.rootfs_path);
     trace_stage(
         "prepared_rootfs",
         format!(
@@ -2950,11 +2960,14 @@ struct PreparedLaunchRootfs {
     _lock: Option<LifetimeFileLock>,
 }
 
-fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
-    if std::env::var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH")
+fn shared_writable_rootfs() -> bool {
+    std::env::var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH")
         .map(|value| value == "0" || value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
-    {
+}
+
+fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
+    if shared_writable_rootfs() {
         return Ok(PreparedLaunchRootfs {
             path: paths.rootfs_path.clone(),
             _lock: Some(LifetimeFileLock::acquire_disk_sidecar(
@@ -2965,14 +2978,20 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     }
 
     let launch_rootfs = paths.session_dir.join("rootfs.ext4");
-    clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
-        format!(
-            "failed to prepare per-launch Browser VM rootfs {} from {}: {}",
-            launch_rootfs.display(),
-            paths.rootfs_path.display(),
-            err
-        )
-    })?;
+    #[cfg(target_os = "linux")]
+    let pooled = take_pooled_rootfs(&paths.rootfs_path, &launch_rootfs);
+    #[cfg(not(target_os = "linux"))]
+    let pooled = false;
+    if !pooled {
+        clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
+            format!(
+                "failed to prepare per-launch Browser VM rootfs {} from {}: {}",
+                launch_rootfs.display(),
+                paths.rootfs_path.display(),
+                err
+            )
+        })?;
+    }
     // Linux consumes the admitted guest's baked control service. The Mac
     // overlay is separately shipped and remains part of that host's closure.
     #[cfg(target_os = "macos")]
@@ -2982,6 +3001,59 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
         path: launch_rootfs,
         _lock: None,
     })
+}
+
+/// Linux boots a prepared pool copy of the admitted image when one is ready;
+/// the caller copies the seed only when none is (#90, Jetson SD card).
+#[cfg(target_os = "linux")]
+fn take_pooled_rootfs(seed: &Path, launch_rootfs: &Path) -> bool {
+    let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
+        Ok(Some(pool)) => pool,
+        Ok(None) => return false,
+        Err(error) => {
+            trace_stage("rootfs_pool_unavailable", error);
+            return false;
+        }
+    };
+    let take = pool.take(launch_rootfs);
+    for (name, reason) in &take.refused {
+        trace_stage(
+            "rootfs_pool_refused",
+            format!("entry={name} reason={reason}"),
+        );
+    }
+    match take.taken {
+        Some(entry) => {
+            trace_stage("rootfs_pool_taken", format!("entry={}", entry.display()));
+            true
+        }
+        None => {
+            trace_stage("rootfs_pool_empty", "mode=copy");
+            false
+        }
+    }
+}
+
+/// After this launch has its rootfs, a background copy brings the pool back
+/// to its target for the next launch.
+#[cfg(target_os = "linux")]
+fn start_rootfs_pool_refill(seed: &Path) {
+    if shared_writable_rootfs() {
+        return;
+    }
+    let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
+        Ok(Some(pool)) => pool,
+        Ok(None) => return,
+        Err(error) => {
+            trace_stage("rootfs_pool_unavailable", error);
+            return;
+        }
+    };
+    match pool.start_refill() {
+        Ok(Some(pid)) => trace_stage("rootfs_pool_refill", format!("started pid={pid}")),
+        Ok(None) => trace_stage("rootfs_pool_refill", "full"),
+        Err(error) => trace_stage("rootfs_pool_refill", format!("not started: {error}")),
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -7495,6 +7567,62 @@ mod tests {
             .unwrap();
         disk.write_all(b"owned guest writes").unwrap();
         assert_eq!(fs::read(&seed).unwrap(), b"immutable guest image");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_takes_a_pooled_rootfs_and_copies_the_seed_only_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
+        let _pool_dir = EnvVarRestore::capture(rootfs_pool::POOL_DIR_ENV);
+        let _manifest = EnvVarRestore::capture(rootfs_pool::MANIFEST_ENV);
+        let _count = EnvVarRestore::capture(rootfs_pool::POOL_COUNT_ENV);
+        std::env::remove_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
+        std::env::remove_var(rootfs_pool::POOL_COUNT_ENV);
+        let image = "c838a0e0d1fad60ca23ece17b8e69f9bedd09e88d37a68bb7dcacff56087f947";
+        let seed = tmp.path().join("rootfs.ext4");
+        fs::write(&seed, b"admitted seed bytes").unwrap();
+        let manifest = tmp.path().join("browser-vm-rootfs-manifest.json");
+        fs::write(&manifest, json!({"sha256": image, "size": 19}).to_string()).unwrap();
+        let pool = tmp.path().join("rootfs-pool");
+        fs::create_dir(&pool).unwrap();
+        std::env::set_var(rootfs_pool::POOL_DIR_ENV, &pool);
+        std::env::set_var(rootfs_pool::MANIFEST_ENV, &manifest);
+        let paths = LaunchPaths {
+            kernel_path: tmp.path().join("kernel"),
+            rootfs_path: seed.clone(),
+            initramfs_path: None,
+            state_dir: tmp.path().join("state"),
+            rootfs_cache_dir: tmp.path().join("rootfs-cache"),
+            session_dir: tmp.path().join("session"),
+            socket_dir: tmp.path().join("socket"),
+            control_socket_path: tmp.path().join("socket/c.sock"),
+            runtime_stream_path: tmp.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        fs::create_dir(&paths.session_dir).unwrap();
+
+        // A ready copy of the admitted image is moved in; the seed is not read.
+        let ready = pool.join(format!("rootfs-{image}-a.ext4"));
+        fs::write(&ready, b"pooled copy bytes!!").unwrap();
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o600)).unwrap();
+        let taken = prepare_launch_rootfs(&paths).unwrap();
+        assert_eq!(fs::read(&taken.path).unwrap(), b"pooled copy bytes!!");
+        assert!(!ready.exists());
+        fs::remove_file(&taken.path).unwrap();
+
+        // An empty pool, or only a copy of another image: the seed is copied
+        // and the stale copy is not booted.
+        let stale = pool.join(format!("rootfs-{}-b.ext4", "0".repeat(64)));
+        fs::write(&stale, b"other image copy!!!").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        let copied = prepare_launch_rootfs(&paths).unwrap();
+        assert_eq!(fs::read(&copied.path).unwrap(), b"admitted seed bytes");
+        assert_eq!(fs::read(&stale).unwrap(), b"other image copy!!!");
+        assert_eq!(fs::read(&seed).unwrap(), b"admitted seed bytes");
     }
 
     #[test]

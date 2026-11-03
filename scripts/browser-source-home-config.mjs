@@ -667,12 +667,16 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     validateAbsolute("--vm-rootfs", args.vmRootfs);
     env.ELASTOS_BROWSER_VM_ROOTFS = args.vmRootfs;
   }
-  if (args.platform.startsWith("linux-") && !remoteVzControlLauncher && !vzTransport) {
+  if (args.platform.startsWith("linux-") && !remoteVzControlLauncher) {
+    // A launch takes a prepared copy instead of copying the whole image on
+    // storage without reflink (SD cards: minutes). Keep one spare image so a
+    // closed Browser leaves room for update staging.
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR = path.join(args.dataDir, "browser-vm/rootfs-pool");
-    env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
-    // Keep one spare image so a closed Browser leaves room for update staging.
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "1";
-    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
+    if (!vzTransport) {
+      env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
+      env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
+    }
   }
   if (args.platform === "linux-arm64" && !remoteVzControlLauncher && vzTransport) {
     env.ELASTOS_BROWSER_VM_INITRAMFS = path.join(args.dataDir, "browser-vm/initrd");

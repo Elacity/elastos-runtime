@@ -39,7 +39,10 @@ test("ARM Linux selects the managed native owner with private session transport"
     assert.equal(env.ELASTOS_BROWSER_VM_TURN_PROGRAM, path.join(data, "bin/turnserver"));
     assert.equal(env.ELASTOS_BROWSER_VM_INITRAMFS, path.join(data, "browser-vm/image-set/initrd"));
     assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE, undefined);
-    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR, undefined);
+    // The native owner takes one prepared copy per launch and refills it itself.
+    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR, path.join(data, "browser-vm/rootfs-pool"));
+    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT, "1");
+    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT, undefined);
     assert.equal(env.ELASTOS_BROWSER_VM_HIBERNATION, undefined);
     assert.ok(Object.keys(env).every(key => !key.startsWith("ELASTOS_BROWSER_VM_ICE_")));
     const transport = read("browser-vz-vsock-transport.json");

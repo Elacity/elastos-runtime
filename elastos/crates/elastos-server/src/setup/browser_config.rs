@@ -1355,6 +1355,14 @@ mod tests {
             .keys()
             .all(|key| !key.starts_with("ELASTOS_BROWSER_VM_ICE_")));
         assert!(env.get("ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE").is_none());
+        assert_eq!(
+            env["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR"],
+            data.join("browser-vm/rootfs-pool").to_str().unwrap()
+        );
+        assert_eq!(env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"], "1");
+        assert!(env
+            .get("ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT")
+            .is_none());
         let transport = read("browser-vz-vsock-transport.json");
         assert_eq!(transport["enabled"], true);
         assert_eq!(transport["turn_advertised_host"], "127.0.0.1");
