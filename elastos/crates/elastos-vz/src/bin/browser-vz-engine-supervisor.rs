@@ -496,6 +496,9 @@ impl VzLaunchOwner {
         // Keep both disk leases and owned paths until every possible writer is
         // absent. Path retirement can fail too; that keeps the owner pending.
         let path_absence = if writers_absent {
+            if let Some(rootfs) = self.launch_rootfs.as_mut() {
+                rootfs.remove_overlay();
+            }
             remove_owned_launch_paths(&self.paths, &self.acquired_paths)
         } else {
             OwnedPathAbsence {
@@ -3075,19 +3078,29 @@ struct PreparedLaunchRootfs {
     overlay: bool,
 }
 
-impl Drop for PreparedLaunchRootfs {
-    fn drop(&mut self) {
-        if self.overlay {
-            // What the guest wrote during this launch, for the launch trace.
-            #[cfg(target_os = "linux")]
-            if let Ok(metadata) = fs::metadata(&self.path) {
-                trace_stage_bytes("rootfs_overlay_allocated", metadata.blocks() * 512);
-            }
-            let _ = fs::remove_file(&self.path);
+impl PreparedLaunchRootfs {
+    /// Records what the guest wrote into a Linux launch overlay and removes
+    /// it while its lease is still held. Launch cleanup calls this before it
+    /// removes the session directory; drop does it for any other end.
+    fn remove_overlay(&mut self) {
+        if !std::mem::take(&mut self.overlay) {
+            return;
         }
+        #[cfg(target_os = "linux")]
+        if let Ok(metadata) = fs::metadata(&self.path) {
+            trace_stage_bytes("rootfs_overlay_allocated", metadata.blocks() * 512);
+        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 
+impl Drop for PreparedLaunchRootfs {
+    fn drop(&mut self) {
+        self.remove_overlay();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn shared_writable_rootfs() -> bool {
     std::env::var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH")
         .map(|value| value == "0" || value.eq_ignore_ascii_case("false"))
@@ -3095,23 +3108,23 @@ fn shared_writable_rootfs() -> bool {
 }
 
 fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
-    if shared_writable_rootfs() {
-        return Ok(PreparedLaunchRootfs {
-            path: paths.rootfs_path.clone(),
-            _lock: Some(LifetimeFileLock::acquire_disk_sidecar(
-                &paths.rootfs_path,
-                "shared writable Browser VZ rootfs",
-            )?),
-            overlay: false,
-        });
-    }
-
+    // Every Linux launch boots an overlay, so no guest can write the seed.
     #[cfg(target_os = "linux")]
     {
         prepare_launch_rootfs_overlay(paths)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        if shared_writable_rootfs() {
+            return Ok(PreparedLaunchRootfs {
+                path: paths.rootfs_path.clone(),
+                _lock: Some(LifetimeFileLock::acquire_disk_sidecar(
+                    &paths.rootfs_path,
+                    "shared writable Browser VZ rootfs",
+                )?),
+                overlay: false,
+            });
+        }
         let launch_rootfs = paths.session_dir.join("rootfs.ext4");
         clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
             format!(
@@ -7897,6 +7910,7 @@ mod tests {
         drop(prepared);
         assert!(!overlay.exists());
         assert!(try_lock_exclusive(&lease).unwrap());
+        drop(lease);
         assert_eq!(fs::read(&seed).unwrap(), seed_bytes);
         assert_eq!(
             seed_identity(fs::metadata(&seed).unwrap()),
@@ -7950,6 +7964,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn shared_writable_rootfs_rejects_a_second_vm_owner() {
         let tmp = tempfile::tempdir().unwrap();
