@@ -54,6 +54,16 @@ const DEFAULT_CONTROL_PORT: u32 = 19092;
 const TURN_PORT_ABSENCE_BUDGET: Duration = Duration::from_secs(3);
 const CLEANUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
 const STARTUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
+/// Test-only (#90 Jetson measurement): replaces `STARTUP_ATTEMPT_BUDGET` so a
+/// slow host's real startup stage times can be measured. No Home config sets it.
+const TEST_STARTUP_STEP_BUDGET_ENV: &str = "ELASTOS_BROWSER_VM_TEST_STARTUP_STEP_BUDGET_MS";
+/// Test-only (#90 Jetson measurement): the launch does not start the
+/// background rootfs refill, so the copy does not compete with the guest boot.
+#[cfg(target_os = "linux")]
+const TEST_NO_LAUNCH_REFILL_ENV: &str = "ELASTOS_BROWSER_VM_TEST_NO_LAUNCH_REFILL";
+/// Test-only (#90 Jetson measurement): every startup trace stage is also
+/// appended to this file with the wall-clock time.
+const TEST_TRACE_FILE_ENV: &str = "ELASTOS_BROWSER_VM_TEST_TRACE_FILE";
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
 /// Launch time kept for the VM boot after a launch waits for a prepared
@@ -639,7 +649,7 @@ impl VzLaunchOwner {
         }));
         tokio::select! {
             _ = wait_for_shutdown_signal(signals) => Err("Browser VZ startup cancelled".to_string()),
-            result = tokio::time::timeout(STARTUP_ATTEMPT_BUDGET,
+            result = tokio::time::timeout(startup_attempt_budget(),
                 self.startup.as_mut().expect("owned native startup operation")) => match result {
                 Ok(Ok(result)) => {
                     self.startup.take();
@@ -1169,6 +1179,13 @@ fn browser_vm_id(transport: &VzTransportLaunch) -> Result<String, String> {
         .ok_or_else(|| "Browser VZ transport VM identity is invalid".to_string())
 }
 
+fn startup_attempt_budget() -> Duration {
+    std::env::var(TEST_STARTUP_STEP_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(STARTUP_ATTEMPT_BUDGET, Duration::from_millis)
+}
+
 fn trace_stage(stage: &str, detail: impl AsRef<str>) {
     static START: OnceLock<Instant> = OnceLock::new();
     let started = START.get_or_init(Instant::now);
@@ -1181,6 +1198,15 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
             started.elapsed().as_micros(),
             detail.as_ref(),
         ));
+    }
+    if let Some(path) = env_path(TEST_TRACE_FILE_ENV) {
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let line = stage_trace_line(stage, started.elapsed().as_micros(), detail.as_ref());
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{wall_ms} pid={} {line}", std::process::id());
+        }
     }
 }
 
@@ -3132,6 +3158,13 @@ fn rootfs_getting_ready_error(left: Option<Duration>) -> String {
 #[cfg(target_os = "linux")]
 fn start_rootfs_pool_refill(seed: &Path) {
     if shared_writable_rootfs() {
+        return;
+    }
+    if env_bool(TEST_NO_LAUNCH_REFILL_ENV, false) {
+        trace_stage(
+            "rootfs_pool_refill",
+            format!("held by {TEST_NO_LAUNCH_REFILL_ENV}"),
+        );
         return;
     }
     let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {

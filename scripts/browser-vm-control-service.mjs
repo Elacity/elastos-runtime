@@ -266,8 +266,10 @@ function probeHostReadiness(config, dataDir, stamps) {
   };
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
   return new Promise((resolve) => {
+    // ELASTOS_BROWSER_VM_TEST_HOST_READINESS_TIMEOUT_MS is test-only (#90 Jetson
+    // measurement of the image hash on slow storage); no Home config sets it.
     execFile(script, ["--host-readiness"], {
-      timeout: 30000, maxBuffer: 64 * 1024,
+      timeout: Number(process.env.ELASTOS_BROWSER_VM_TEST_HOST_READINESS_TIMEOUT_MS || 30000), maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
         ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program,
