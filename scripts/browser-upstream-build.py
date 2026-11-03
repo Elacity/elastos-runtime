@@ -17,6 +17,10 @@ CROSVM_PATCHED_FILES = (
     'devices/device_virtio_block/src/asynchronous.rs',
     'src/crosvm/cmdline.rs',
 )
+# The pinned aarch64 block-device seccomp policy omits pread64, which qcow2
+# reads use (the x86_64 block policy allows it): without it the sandboxed
+# block device of a qcow2 overlay boot dies with SIGSYS (#90, Jetson).
+CROSVM_AARCH64_BLOCK_POLICY = 'jail/seccomp/aarch64/block_device.policy'
 
 
 def source_header(member):
@@ -121,9 +125,19 @@ def apply_crosvm_patch(source, recipe, cache, upstream):
     return notice['source']['checksum']
 
 
+def allow_qcow_reads_in_aarch64_block_policy(source):
+    policy = source / CROSVM_AARCH64_BLOCK_POLICY
+    original = policy.read_text()
+    marker = '\npreadv: 1\n'
+    if original.count(marker) != 1 or 'pread64' in original:
+        raise ValueError('pinned crosvm aarch64 block policy changed')
+    policy.write_text(original.replace(marker, '\npread64: 1' + marker))
+
+
 def retain_crosvm_patched_sources(archive, recipe, source, work, patch_checksum, upstream):
     """Retain the final modified files beside the immutable original archives."""
-    files = (*CROSVM_PATCHED_FILES, 'third_party/minijail/rust/minijail-sys/build.rs', '.cargo/config.toml')
+    files = (*CROSVM_PATCHED_FILES, CROSVM_AARCH64_BLOCK_POLICY,
+             'third_party/minijail/rust/minijail-sys/build.rs', '.cargo/config.toml')
     provenance = {
         'schema': 'elastos.crosvm-patched-source/v1',
         'source': recipe['source']['checksum'],
@@ -426,6 +440,7 @@ def build_browser_native(recipe, payload, cache, upstream):
             binaries['vhost-device-vsock'] = source / 'target' / target / 'release/vhost-device-vsock'
         else:
             patch_checksum = apply_crosvm_patch(source, recipe, cache, upstream)
+            allow_qcow_reads_in_aarch64_block_policy(source)
             dependency_root, dependency = inputs[1]
             minijail = extract(dependency, dependency_root, work / 'dependencies', upstream)
             destination = source / 'third_party/minijail'
@@ -476,8 +491,10 @@ def build_browser_native(recipe, payload, cache, upstream):
                        + str(work) + '=/usr/src/elastos-browser -L native=' + str(libcap / 'libcap'))
             env['CC_aarch64_unknown_linux_musl'] = env['CC']
             env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER'] = env['CC']
+            # qcow: a Linux launch boots a per-launch qcow2 overlay over the
+            # read-only rootfs seed instead of copying the seed.
             subprocess.run(['cargo', '+1.91.0', 'build', '--locked', '--offline', '--release',
-                            '--target', target, '--no-default-features', '--features', 'net',
+                            '--target', target, '--no-default-features', '--features', 'net,qcow',
                             '--bin', 'crosvm', '-j', jobs], cwd=source, env=env, check=True)
             subprocess.run(['cargo', '+1.91.0', 'test', '--locked', '--offline', '--release',
                             '--target', target, '-p', 'device_virtio_block', '--features',

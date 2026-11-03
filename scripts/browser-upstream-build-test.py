@@ -45,11 +45,12 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
     def test_crosvm_lifecycle_recipe_changes_the_installed_identity(self):
         recipe = next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == 'crosvm')
         component = json.loads((ROOT / 'components.json').read_bytes())['external']['crosvm']
-        self.assertEqual(recipe['version'], '0.1.0-2ac141082d17.elastos.1')
+        self.assertEqual(recipe['version'], '0.1.0-2ac141082d17.elastos.2')
         self.assertEqual(component['version'], recipe['version'])
         self.assertEqual(recipe['install_path'], 'libexec/browser/crosvm/' + recipe['version'] + '/linux-arm64')
         self.assertEqual(component['platforms']['linux-arm64']['install_path'], recipe['install_path'])
-        self.assertNotEqual(recipe['install_path'], 'libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64')
+        for earlier in ('0.1.0-2ac141082d17', '0.1.0-2ac141082d17.elastos.1'):
+            self.assertNotEqual(recipe['install_path'], 'libexec/browser/crosvm/' + earlier + '/linux-arm64')
 
     def test_crosvm_patch_applies_to_pinned_source_and_refuses_changed_context(self):
         recipe = assets.resolved_recipe(next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == 'crosvm'))
@@ -566,6 +567,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
             recipe['source'] = source(recipe['root'], {
                 **crosvm_sources(),
                 'Cargo.lock': b'pinned lock fixture',
+                builder.CROSVM_AARCH64_BLOCK_POLICY: b'fstat: 1\npreadv: 1\npwrite64: 1\n',
                 'vendor/generic/crypto/Cargo.toml': b'workspace path crate'})
             recipe['build']['dependencies'][0]['source'] = source(recipe['build']['dependencies'][0]['root'], {
                 'rust/minijail-sys/build.rs': b'.arg(&jobs)\n            .status()?;',
@@ -598,11 +600,15 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                 if args[:3] == ['cargo', '+1.91.0', 'build']:
                     src, env = kwargs['cwd'], kwargs['env']
                     last_build.update(cwd=src, env=env.copy(), jobs=args[args.index('-j') + 1])
+                    self.assertEqual(args[args.index('--features') + 1], 'net,qcow')
                     self.assertEqual((src / 'vendor/generic/crypto/Cargo.toml').read_bytes(), b'workspace path crate')
                     self.assertNotIn('MINIJAIL_DEFAULT_RET_LOG', env)
                     self.assertNotIn('MINIJAIL_DO_NOT_BUILD', env)
                     self.assertEqual(env['MINIJAIL_DIR'], str(src / 'third_party/minijail'))
                     self.assertIn('CC_STATIC_LIBRARY(libminijail.pic.a)', (src / 'third_party/minijail/rust/minijail-sys/build.rs').read_text())
+                    # qcow2 overlay reads use pread64 in the sandboxed block device.
+                    self.assertEqual((src / builder.CROSVM_AARCH64_BLOCK_POLICY).read_bytes(),
+                                     b'fstat: 1\npread64: 1\npreadv: 1\npwrite64: 1\n')
                     self.assertIn('--offline', args)
                     self.assertIn('let _lifecycle_fds = lifecycle_fds;',
                                   (src / 'devices/device_virtio_block/src/asynchronous.rs').read_text())

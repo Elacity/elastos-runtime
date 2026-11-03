@@ -1312,14 +1312,14 @@
       }
     },
     "crosvm": {
-      "version": "0.1.0-2ac141082d17.elastos.1",
+      "version": "0.1.0-2ac141082d17.elastos.2",
       "description": "Browser Linux VM monitor from the signed release",
       "platforms": {
         "linux-arm64": {
           "strategy": "source-build",
           "release_path": "crosvm-linux-arm64.tar.gz",
           "extract_path": "crosvm-2ac141082d171e76a39cdabf98f6e48a377a126b",
-          "install_path": "libexec/browser/crosvm/0.1.0-2ac141082d17.elastos.1/linux-arm64",
+          "install_path": "libexec/browser/crosvm/0.1.0-2ac141082d17.elastos.2/linux-arm64",
           "binary_path": "bin/crosvm"
         }
       }

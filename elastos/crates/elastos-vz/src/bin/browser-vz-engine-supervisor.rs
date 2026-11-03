@@ -29,9 +29,6 @@ use elastos_vz::{VmConfig, VzConfig};
 #[cfg(target_os = "linux")]
 #[path = "browser-vz-engine-supervisor/linux.rs"]
 mod linux;
-#[cfg(target_os = "linux")]
-#[path = "browser-vz-engine-supervisor/rootfs_pool.rs"]
-mod rootfs_pool;
 use hmac::{Hmac, Mac};
 #[cfg(target_os = "linux")]
 use linux::CrosvmBrowserProvider as VzProvider;
@@ -67,12 +64,6 @@ const LAUNCH_TRACE_LOG: &str = "last-launch-trace.log";
 const LAUNCH_TRACE_MAX_LINES: usize = 256;
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
-/// Launch time kept for the VM boot after a launch waits for a prepared
-/// rootfs copy.
-const ROOTFS_WAIT_BOOT_RESERVE: Duration = Duration::from_secs(60);
-/// The control service's launch limit, as it passes it to this owner.
-const LAUNCH_TIMEOUT_ENV: &str = "ELASTOS_BROWSER_VM_LAUNCH_TIMEOUT_MS";
-const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
@@ -131,14 +122,6 @@ async fn main() {
             })
         );
         return;
-    }
-    #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some(rootfs_pool::REFILL_ARG) {
-        let data_dir = browser_data_dir();
-        process::exit(rootfs_pool::refill_main(
-            &seed_rootfs_path(&data_dir),
-            &data_dir,
-        ));
     }
     init_tracing();
     if let Err(error) = run().await {
@@ -279,12 +262,6 @@ struct VzLaunchOwner {
     control_proxy: Option<thread::JoinHandle<bool>>,
     launch_rootfs: Option<PreparedLaunchRootfs>,
     profile_disk: Option<PreparedBrowserProfileDisk>,
-    /// This launch took a prepared rootfs; the pool's next copy waits until
-    /// the launch has ended.
-    rootfs_refill_pending: bool,
-    /// The pool's launch lock, held until this launch has ended: a refill
-    /// stops its copy while a launch runs.
-    rootfs_pool_launch: Option<std::fs::File>,
 }
 
 #[expect(
@@ -354,8 +331,6 @@ impl VzLaunchOwner {
             control_proxy: None,
             launch_rootfs: None,
             profile_disk: None,
-            rootfs_refill_pending: false,
-            rootfs_pool_launch: None,
         }
     }
 
@@ -388,7 +363,6 @@ impl VzLaunchOwner {
                 profile_durability,
             );
             if terminal {
-                self.start_deferred_rootfs_refill();
                 return report;
             }
             if last_report.as_ref() != Some(&report) {
@@ -642,19 +616,6 @@ impl VzLaunchOwner {
         }
     }
 
-    /// Starts the pool's next rootfs copy once this launch has ended (its
-    /// cleanup is complete). On an SD card a copy keeps the disk busy for
-    /// minutes: during the boot it starved the page open, and after ready it
-    /// starved the running guest until its input timed out (#90, Jetson).
-    /// The launch lock is released first, or the refill would yield to it.
-    fn start_deferred_rootfs_refill(&mut self) {
-        self.rootfs_pool_launch.take();
-        if std::mem::take(&mut self.rootfs_refill_pending) {
-            #[cfg(target_os = "linux")]
-            start_rootfs_pool_refill(&self.paths.rootfs_path);
-        }
-    }
-
     async fn startup_operation<F>(
         &mut self,
         signals: &ShutdownSignalReporter,
@@ -747,7 +708,6 @@ fn emit_stderr_line(line: &str) {
 }
 
 async fn run() -> Result<(), String> {
-    let launch_started = Instant::now();
     trace_stage("read_request", "");
     let (request, request_from_stdin) = read_open_request().map_err(unbound_launch_error)?;
     let launch = request
@@ -880,19 +840,7 @@ async fn run() -> Result<(), String> {
         }
     }
     trace_stage("prepare_rootfs_start", "");
-    owner.launch_rootfs = Some({
-        let cancelled = || signals.cancellation_requested();
-        let rootfs_wait = RootfsWait {
-            deadline: RootfsWait::deadline(launch_started),
-            cancelled: &cancelled,
-        };
-        post_effect_try!(prepare_launch_rootfs(&owner.paths, &rootfs_wait))
-    });
-    owner.rootfs_refill_pending = cfg!(target_os = "linux");
-    #[cfg(target_os = "linux")]
-    {
-        owner.rootfs_pool_launch = hold_rootfs_pool_launch(&owner.paths.rootfs_path);
-    }
+    owner.launch_rootfs = Some(post_effect_try!(prepare_launch_rootfs(&owner.paths)));
     trace_stage(
         "prepared_rootfs",
         format!(
@@ -1150,7 +1098,6 @@ async fn run() -> Result<(), String> {
 
     let readiness = post_effect_try!(serde_json::to_string(&result));
     post_effect_try!(writeln!(std::io::stdout().lock(), "{readiness}"));
-    // The rootfs refill waits for this launch's end: see start_deferred_rootfs_refill.
     let shutdown_reason = wait_for_shutdown_or_transport_expiry(
         &signals,
         Some(&owner.transport),
@@ -1299,6 +1246,18 @@ fn keep_launch_trace(state_root: &Path) {
 }
 
 fn trace_stage(stage: &str, detail: impl AsRef<str>) {
+    // Stage times only: details can name the profile and boot arguments.
+    record_stage(stage, detail.as_ref(), "");
+}
+
+/// A stage whose kept detail is a byte count (no names or paths).
+#[cfg(target_os = "linux")]
+fn trace_stage_bytes(stage: &str, bytes: u64) {
+    let detail = format!("bytes={bytes}");
+    record_stage(stage, &detail, &detail);
+}
+
+fn record_stage(stage: &str, detail: &str, kept_detail: &str) {
     static START: OnceLock<Instant> = OnceLock::new();
     let started = START.get_or_init(Instant::now);
     let elapsed_us = started.elapsed().as_micros();
@@ -1306,9 +1265,8 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
         .map(|value| value != "0")
         .unwrap_or(false);
     if enabled {
-        emit_stderr_line(&stage_trace_line(stage, elapsed_us, detail.as_ref()));
+        emit_stderr_line(&stage_trace_line(stage, elapsed_us, detail));
     }
-    // Stage times only: details can name the profile and boot arguments.
     let wall_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
@@ -1316,7 +1274,7 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
         trace.record(format!(
             "{wall_ms} pid={} {}",
             process::id(),
-            stage_trace_line(stage, elapsed_us, "")
+            stage_trace_line(stage, elapsed_us, kept_detail)
         ));
     }
 }
@@ -2306,7 +2264,8 @@ impl LaunchPaths {
         let data_dir = browser_data_dir();
         let kernel_path =
             env_path("ELASTOS_BROWSER_VM_KERNEL").unwrap_or_else(|| data_dir.join("bin/vmlinux"));
-        let rootfs_path = seed_rootfs_path(&data_dir);
+        let rootfs_path = env_path("ELASTOS_BROWSER_VM_ROOTFS")
+            .unwrap_or_else(|| data_dir.join("browser-vm/rootfs.ext4"));
         let initramfs_path = env_path("ELASTOS_BROWSER_VM_INITRAMFS").or_else(|| {
             let default_initrd = data_dir.join("bin/initrd");
             default_initrd.is_file().then_some(default_initrd)
@@ -3051,11 +3010,6 @@ fn browser_data_dir() -> PathBuf {
     data_dir_from(env_path("ELASTOS_BROWSER_VM_DATA_DIR"))
 }
 
-/// The admitted guest image each launch copies from.
-fn seed_rootfs_path(data_dir: &Path) -> PathBuf {
-    env_path("ELASTOS_BROWSER_VM_ROOTFS").unwrap_or_else(|| data_dir.join("browser-vm/rootfs.ext4"))
-}
-
 fn data_dir_from(selected: Option<PathBuf>) -> PathBuf {
     selected.unwrap_or_else(default_data_dir)
 }
@@ -3116,6 +3070,22 @@ fn validate_unix_socket_path_budget(label: &str, path: &Path) -> Result<(), Stri
 struct PreparedLaunchRootfs {
     path: PathBuf,
     _lock: Option<LifetimeFileLock>,
+    /// A Linux launch overlay: removed when the launch ends, before its lease
+    /// is released, so a free lease beside an overlay marks a crashed launch.
+    overlay: bool,
+}
+
+impl Drop for PreparedLaunchRootfs {
+    fn drop(&mut self) {
+        if self.overlay {
+            // What the guest wrote during this launch, for the launch trace.
+            #[cfg(target_os = "linux")]
+            if let Ok(metadata) = fs::metadata(&self.path) {
+                trace_stage_bytes("rootfs_overlay_allocated", metadata.blocks() * 512);
+            }
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn shared_writable_rootfs() -> bool {
@@ -3124,28 +3094,7 @@ fn shared_writable_rootfs() -> bool {
         .unwrap_or(false)
 }
 
-/// How long a launch may wait for a prepared rootfs copy, and whether its
-/// startup was cancelled meanwhile.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct RootfsWait<'a> {
-    deadline: Instant,
-    cancelled: &'a dyn Fn() -> bool,
-}
-
-impl RootfsWait<'_> {
-    /// The deadline for a launch that started at `started`: the control
-    /// service's launch limit less the boot that follows.
-    fn deadline(started: Instant) -> Instant {
-        let limit = env_u64(LAUNCH_TIMEOUT_ENV, DEFAULT_LAUNCH_TIMEOUT_MS)
-            .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS);
-        started + Duration::from_millis(limit).saturating_sub(ROOTFS_WAIT_BOOT_RESERVE)
-    }
-}
-
-fn prepare_launch_rootfs(
-    paths: &LaunchPaths,
-    wait: &RootfsWait<'_>,
-) -> Result<PreparedLaunchRootfs, String> {
+fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
     if shared_writable_rootfs() {
         return Ok(PreparedLaunchRootfs {
             path: paths.rootfs_path.clone(),
@@ -3153,18 +3102,17 @@ fn prepare_launch_rootfs(
                 &paths.rootfs_path,
                 "shared writable Browser VZ rootfs",
             )?),
+            overlay: false,
         });
     }
 
-    let launch_rootfs = paths.session_dir.join("rootfs.ext4");
     #[cfg(target_os = "linux")]
-    let pooled = take_pooled_rootfs(&paths.rootfs_path, &launch_rootfs, wait)?;
+    {
+        prepare_launch_rootfs_overlay(paths)
+    }
     #[cfg(not(target_os = "linux"))]
-    let pooled = {
-        let _ = wait;
-        false
-    };
-    if !pooled {
+    {
+        let launch_rootfs = paths.session_dir.join("rootfs.ext4");
         clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
             format!(
                 "failed to prepare per-launch Browser VM rootfs {} from {}: {}",
@@ -3173,142 +3121,119 @@ fn prepare_launch_rootfs(
                 err
             )
         })?;
+        // The Mac overlay is separately shipped and remains part of that
+        // host's closure; Linux consumes the admitted guest's baked service.
+        #[cfg(target_os = "macos")]
+        overlay_guest_selkies_control_service(&launch_rootfs)?;
+        overlay_guest_webrtc_send_diagnostic(&launch_rootfs)?;
+        Ok(PreparedLaunchRootfs {
+            path: launch_rootfs,
+            _lock: None,
+            overlay: false,
+        })
     }
-    // Linux consumes the admitted guest's baked control service. The Mac
-    // overlay is separately shipped and remains part of that host's closure.
-    #[cfg(target_os = "macos")]
-    overlay_guest_selkies_control_service(&launch_rootfs)?;
-    overlay_guest_webrtc_send_diagnostic(&launch_rootfs)?;
-    Ok(PreparedLaunchRootfs {
-        path: launch_rootfs,
-        _lock: None,
+}
+
+/// The per-launch qcow2 overlay in the launch's session directory.
+#[cfg(target_os = "linux")]
+const ROOTFS_OVERLAY_NAME: &str = "rootfs.qcow2";
+
+/// Free space a launch keeps beyond its overlay's worst case (every block of
+/// the seed rewritten): the room the Home keeps for update staging.
+#[cfg(target_os = "linux")]
+const ROOTFS_OVERLAY_FREE_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The refusal when this computer cannot hold a launch overlay's worst case
+/// plus the floor.
+#[cfg(target_os = "linux")]
+fn rootfs_overlay_space_refusal(seed_bytes: u64, available: u64) -> Option<String> {
+    let required = seed_bytes.saturating_add(ROOTFS_OVERLAY_FREE_FLOOR);
+    // Tenths of a GB: the need rounded up, the free space rounded down.
+    let tenths = |tenths: u64| format!("{}.{}", tenths / 10, tenths % 10);
+    (available < required).then(|| {
+        format!(
+            "Browser needs {} GB free on this computer to open; {} GB are free. Free some space, then open Browser again.",
+            tenths(required.div_ceil(100_000_000)),
+            tenths(available / 100_000_000)
+        )
     })
 }
 
-/// Linux boots a prepared pool copy of the admitted image when one is ready,
-/// or waits for the copy a running refill makes when it can finish in time.
-/// The caller copies the seed only when no copy is ready or coming (#90,
-/// Jetson SD card).
+/// Linux boots a per-launch qcow2 overlay whose backing file is the
+/// read-only seed: guest writes go to the overlay and everything else is
+/// read from the seed, so a launch copies nothing (#90: copying the 4 GiB
+/// seed took minutes on a Jetson SD card and starved the whole host). The
+/// overlay's lease is held from before it exists until it is removed, and by
+/// crosvm's disk workers.
 #[cfg(target_os = "linux")]
-fn take_pooled_rootfs(
-    seed: &Path,
-    launch_rootfs: &Path,
-    wait: &RootfsWait<'_>,
-) -> Result<bool, String> {
-    let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
-        Ok(Some(pool)) => pool,
-        Ok(None) => return Ok(false),
-        Err(error) => {
-            trace_stage("rootfs_pool_unavailable", error);
-            return Ok(false);
-        }
-    };
-    let take = match pool.take_or_wait(launch_rootfs, wait.deadline, wait.cancelled) {
-        rootfs_pool::Waited::Done(take) => take,
-        rootfs_pool::Waited::GettingReady(left) => {
-            trace_stage(
-                "rootfs_pool_getting_ready",
-                format!(
-                    "left_ms={}",
-                    left.map_or_else(
-                        || "unknown".to_string(),
-                        |left| left.as_millis().to_string()
-                    )
-                ),
-            );
-            return Err(rootfs_getting_ready_error(left));
-        }
-        rootfs_pool::Waited::Cancelled => return Err("Browser VZ startup cancelled".to_string()),
-    };
-    for (name, reason) in &take.refused {
-        trace_stage(
-            "rootfs_pool_refused",
-            format!("entry={name} reason={reason}"),
+fn prepare_launch_rootfs_overlay(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
+    if webrtc_send_overlay_requested() {
+        return Err(
+            "Browser webrtc send overlay edits a rootfs copy; a Linux launch boots an overlay of the read-only seed"
+                .to_string(),
         );
     }
-    match take.taken {
-        Some(entry) => {
-            trace_stage(
-                "rootfs_pool_taken",
-                format!(
-                    "entry={} waited_ms={}",
-                    entry.display(),
-                    take.waited.as_millis()
-                ),
-            );
-            Ok(true)
-        }
-        None => {
-            trace_stage("rootfs_pool_empty", "mode=copy");
-            Ok(false)
-        }
+    if let Some(session_root) = paths.session_dir.parent() {
+        remove_stale_rootfs_overlays(session_root);
     }
-}
-
-/// The typed launch error while the next rootfs copy is still being made and
-/// cannot finish within this launch.
-#[cfg(any(target_os = "linux", test))]
-fn rootfs_getting_ready_error(left: Option<Duration>) -> String {
-    let when = match left {
-        Some(left) => match left.as_secs().div_ceil(60).max(1) {
-            1 => "in about a minute".to_string(),
-            minutes => format!("in about {minutes} minutes"),
-        },
-        None => "in a few minutes".to_string(),
+    let seed_bytes = fs::metadata(&paths.rootfs_path)
+        .map_err(|error| format!("Browser VM rootfs seed: {error}"))?
+        .len();
+    if let Some(refusal) =
+        rootfs_overlay_space_refusal(seed_bytes, linux::available_bytes(&paths.session_dir)?)
+    {
+        return Err(refusal);
+    }
+    let overlay = paths.session_dir.join(ROOTFS_OVERLAY_NAME);
+    let lock = LifetimeFileLock::acquire_disk_sidecar(&overlay, "Browser VM rootfs overlay")?;
+    let prepared = PreparedLaunchRootfs {
+        path: overlay,
+        _lock: Some(lock),
+        overlay: true,
     };
-    json!({
-        "schema": "elastos.browser.engine.launch-error/v1",
-        "code": "browser_getting_ready",
-        "message": format!("Browser is still getting ready on this computer. Open it again {when}."),
-    })
-    .to_string()
+    linux::create_rootfs_overlay(&linux::crosvm_binary(), &paths.rootfs_path, &prepared.path)
+        .map_err(|error| format!("failed to prepare the Browser VM rootfs overlay: {error}"))?;
+    Ok(prepared)
 }
 
-/// Once a launch is ready or has ended, a background copy brings the pool
-/// back to its target for the next launch.
+/// Removes the overlays that crashed launches left in other session
+/// directories. A live launch holds its overlay's lease; a launch that ended
+/// removed its overlay before releasing the lease.
 #[cfg(target_os = "linux")]
-fn start_rootfs_pool_refill(seed: &Path) {
-    if shared_writable_rootfs() {
+fn remove_stale_rootfs_overlays(session_root: &Path) {
+    let Ok(entries) = fs::read_dir(session_root) else {
         return;
-    }
-    let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
-        Ok(Some(pool)) => pool,
-        Ok(None) => return,
-        Err(error) => {
-            trace_stage("rootfs_pool_unavailable", error);
-            return;
-        }
     };
-    match pool.start_refill() {
-        Ok(Some(pid)) => trace_stage("rootfs_pool_refill", format!("started pid={pid}")),
-        Ok(None) => trace_stage("rootfs_pool_refill", "full"),
-        Err(error) => trace_stage("rootfs_pool_refill", format!("not started: {error}")),
-    }
-}
-
-/// The pool's launch lock for this launch; a running refill stops its copy
-/// and leaves the disk to the guest (#90, Jetson reopen after Close).
-#[cfg(target_os = "linux")]
-fn hold_rootfs_pool_launch(seed: &Path) -> Option<std::fs::File> {
-    if shared_writable_rootfs() {
-        return None;
-    }
-    let pool = rootfs_pool::Pool::from_env(seed, &browser_data_dir()).ok()??;
-    match pool.hold_launch() {
-        Ok(lock) => Some(lock),
-        Err(error) => {
-            trace_stage("rootfs_pool_launch_unheld", error);
-            None
+    for entry in entries.flatten() {
+        let is_session = entry.file_name().to_string_lossy().starts_with("vz-")
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let overlay = entry.path().join(ROOTFS_OVERLAY_NAME);
+        if !is_session || fs::symlink_metadata(&overlay).is_err() {
+            continue;
+        }
+        let Ok(lease) = open_lifetime_lock(&disk_lifetime_lock_path(&overlay), false) else {
+            continue;
+        };
+        if try_lock_exclusive(&lease) == Ok(true) && fs::remove_file(&overlay).is_ok() {
+            trace_stage(
+                "stale_rootfs_overlay_removed",
+                overlay.display().to_string(),
+            );
         }
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
 const GUEST_SELKIES_CONTROL_SERVICE: &str = "/opt/elastos/bin/browser-selkies-control-service.mjs";
+// Guest file overlays edit a launch's rootfs copy; a Linux launch boots an
+// overlay of the read-only seed instead.
+#[cfg(any(not(target_os = "linux"), test))]
 const GUEST_GSTWEBRTC_APP: &str =
     "/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py";
+#[cfg(any(not(target_os = "linux"), test))]
 const GUEST_SELKIES_START: &str = "/opt/elastos/bin/browser-vm-selkies-start";
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn find_debugfs_bin() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("ELASTOS_DEBUGFS_BIN") {
         let path = PathBuf::from(explicit);
@@ -3416,6 +3341,7 @@ fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn host_data_script(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.parent()?.join("scripts").join(name);
@@ -3429,6 +3355,7 @@ fn webrtc_send_overlay_requested() -> bool {
         == Some("1")
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn host_webrtc_send_overlay_sources() -> Option<(PathBuf, PathBuf)> {
     let gst = std::env::var("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC")
         .ok()
@@ -3444,12 +3371,14 @@ fn host_webrtc_send_overlay_sources() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn sha256_file_label(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|err| format!("read overlay {} failed: {err}", path.display()))?;
     Ok(sha256_label(&bytes))
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn require_overlay_input_hash(env_name: &str, actual: &str) -> Result<(), String> {
     let expected = std::env::var(env_name).map_err(|_| {
         format!("{env_name} is required when Browser webrtc send overlay is enabled")
@@ -3464,6 +3393,7 @@ fn require_overlay_input_hash(env_name: &str, actual: &str) -> Result<(), String
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn overlay_guest_file(rootfs: &Path, source: &Path, guest_path: &str) -> Result<(), String> {
     let debugfs = find_debugfs_bin()?;
     let staging = std::env::temp_dir().join(format!(
@@ -3508,6 +3438,7 @@ fn overlay_guest_file(rootfs: &Path, source: &Path, guest_path: &str) -> Result<
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn overlay_guest_webrtc_send_diagnostic(rootfs: &Path) -> Result<(), String> {
     if !webrtc_send_overlay_requested() {
         return Ok(());
@@ -3536,6 +3467,7 @@ fn overlay_guest_webrtc_send_diagnostic(rootfs: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -3555,27 +3487,9 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
             .status(),
         Ok(status) if status.success()
     );
-    #[cfg(target_os = "linux")]
-    {
-        let result = std::process::Command::new("/bin/cp")
-            .args(["--reflink=auto", "--sparse=always", "--"])
-            .arg(source)
-            .arg(destination)
-            .status()?;
-        if !result.success() {
-            // removal-ok: this copy's partial rootfs in the caller-owned launch directory.
-            let _ = fs::remove_file(destination);
-            return Err(std::io::Error::other(
-                "Browser sparse rootfs staging failed",
-            ));
-        }
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     let cloned = false;
 
-    #[cfg(not(target_os = "linux"))]
     if !cloned {
         // A failed clone can leave a partial copy with the immutable seed mode.
         // Recreate the owned destination before the fallback opens it for writes.
@@ -3588,11 +3502,8 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
     }
     // The seed can be immutable. Guest overlays and the writable VZ attachment
     // own only this launch's copy, including when cp preserves the seed mode.
-    #[cfg(not(target_os = "linux"))]
-    {
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), String> {
@@ -6080,6 +5991,7 @@ mod tests {
             _lock: Some(
                 LifetimeFileLock::acquire_disk_sidecar(&rootfs_path, "test rootfs").unwrap(),
             ),
+            overlay: false,
         });
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -6298,30 +6210,6 @@ mod tests {
             Duration::from_secs(125)
         );
         assert!(startup_step_budget(limits.transport_bootstrap) > STARTUP_ATTEMPT_BUDGET);
-    }
-
-    #[tokio::test]
-    async fn a_launch_starts_the_rootfs_refill_once_its_cleanup_ends() {
-        let root = tempfile::tempdir().unwrap();
-        let mut owner = cleanup_owner_fixture(root.path());
-        owner.rootfs_refill_pending = true;
-        owner.rootfs_pool_launch = Some(tempfile::tempfile().unwrap());
-        let settlement = tokio::time::timeout(
-            Duration::from_secs(10),
-            owner.finish_cleanup("injected launch failure", None),
-        )
-        .await
-        .unwrap();
-        let settlement: Value = serde_json::from_str(&settlement).unwrap();
-        assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
-        assert!(
-            !owner.rootfs_refill_pending,
-            "the refill starts exactly once"
-        );
-        assert!(
-            owner.rootfs_pool_launch.is_none(),
-            "the launch lock is released before the refill starts"
-        );
     }
 
     #[test]
@@ -7903,6 +7791,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn per_launch_rootfs_from_read_only_seed_is_private_and_writable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7929,62 +7818,49 @@ mod tests {
         assert_eq!(fs::read(&seed).unwrap(), b"immutable guest image");
     }
 
-    static NEVER_CANCELLED: fn() -> bool = || false;
-
-    fn test_rootfs_wait() -> RootfsWait<'static> {
-        RootfsWait {
-            deadline: Instant::now() + Duration::from_secs(30),
-            cancelled: &NEVER_CANCELLED,
-        }
-    }
-
-    #[test]
-    fn rootfs_getting_ready_is_a_typed_launch_error_with_the_time_left() {
-        for (left, when) in [
-            (Some(Duration::from_secs(20)), "in about a minute."),
-            (Some(Duration::from_secs(290)), "in about 5 minutes."),
-            (None, "in a few minutes."),
-        ] {
-            let error: Value = serde_json::from_str(&rootfs_getting_ready_error(left)).unwrap();
-            assert_eq!(error["schema"], "elastos.browser.engine.launch-error/v1");
-            assert_eq!(error["code"], "browser_getting_ready");
-            let message = error["message"].as_str().unwrap();
-            assert!(
-                message.starts_with("Browser is still getting ready"),
-                "{message}"
-            );
-            assert!(message.ends_with(when), "{message}");
-            assert_eq!(error.as_object().unwrap().len(), 3);
-        }
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
-    fn launch_takes_a_pooled_rootfs_and_copies_the_seed_only_without_one() {
+    fn linux_launch_boots_an_overlay_of_the_untouched_seed_and_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = ENV_LOCK.lock().unwrap();
         let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
-        let _pool_dir = EnvVarRestore::capture(rootfs_pool::POOL_DIR_ENV);
-        let _manifest = EnvVarRestore::capture(rootfs_pool::MANIFEST_ENV);
-        let _count = EnvVarRestore::capture(rootfs_pool::POOL_COUNT_ENV);
+        let _crosvm = EnvVarRestore::capture("ELASTOS_BROWSER_VM_CROSVM_BIN");
         std::env::remove_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
-        std::env::remove_var(rootfs_pool::POOL_COUNT_ENV);
-        let image = "c838a0e0d1fad60ca23ece17b8e69f9bedd09e88d37a68bb7dcacff56087f947";
-        let seed = tmp.path().join("rootfs.ext4");
-        fs::write(&seed, b"admitted seed bytes").unwrap();
-        let manifest = tmp.path().join("browser-vm-rootfs-manifest.json");
-        fs::write(&manifest, json!({"sha256": image, "size": 19}).to_string()).unwrap();
-        let pool = tmp.path().join("rootfs-pool");
-        fs::create_dir(&pool).unwrap();
-        std::env::set_var(rootfs_pool::POOL_DIR_ENV, &pool);
-        std::env::set_var(rootfs_pool::MANIFEST_ENV, &manifest);
+        // crosvm's create_qcow2, faked: records its call, writes a v3 header.
+        let calls = tmp.path().join("crosvm-calls");
+        let crosvm = tmp.path().join("crosvm");
+        fs::write(
+            &crosvm,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'QFI\\373\\000\\000\\000\\003' > \"$4\"\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&crosvm, fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("ELASTOS_BROWSER_VM_CROSVM_BIN", &crosvm);
+        let seed = tmp.path().join("image-set/rootfs.ext4");
+        fs::create_dir(tmp.path().join("image-set")).unwrap();
+        let seed_bytes = vec![0x5a; 256 * 1024];
+        fs::write(&seed, &seed_bytes).unwrap();
+        fs::set_permissions(&seed, fs::Permissions::from_mode(0o600)).unwrap();
+        let seed_identity = |metadata: fs::Metadata| {
+            (
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let before = seed_identity(fs::metadata(&seed).unwrap());
         let paths = LaunchPaths {
             kernel_path: tmp.path().join("kernel"),
             rootfs_path: seed.clone(),
             initramfs_path: None,
             state_dir: tmp.path().join("state"),
             rootfs_cache_dir: tmp.path().join("rootfs-cache"),
-            session_dir: tmp.path().join("session"),
+            session_dir: tmp.path().join("bvm/vz-launch"),
             socket_dir: tmp.path().join("socket"),
             control_socket_path: tmp.path().join("socket/c.sock"),
             runtime_stream_path: tmp.path().join("runtime.sock"),
@@ -7992,26 +7868,86 @@ mod tests {
             memory_mib: 2048,
             vcpu_count: 2,
         };
-        fs::create_dir(&paths.session_dir).unwrap();
+        fs::create_dir_all(&paths.session_dir).unwrap();
 
-        // A ready copy of the admitted image is moved in; the seed is not read.
-        let ready = pool.join(format!("rootfs-{image}-a.ext4"));
-        fs::write(&ready, b"pooled copy bytes!!").unwrap();
-        fs::set_permissions(&ready, fs::Permissions::from_mode(0o600)).unwrap();
-        let taken = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
-        assert_eq!(fs::read(&taken.path).unwrap(), b"pooled copy bytes!!");
-        assert!(!ready.exists());
-        fs::remove_file(&taken.path).unwrap();
+        let prepared = prepare_launch_rootfs(&paths).unwrap();
+        let overlay = paths.session_dir.join(ROOTFS_OVERLAY_NAME);
+        assert_eq!(prepared.path, overlay);
+        let metadata = fs::metadata(&overlay).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.len(), 8, "the launch copies nothing of the seed");
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            format!(
+                "create_qcow2 --backing-file {} {}\n",
+                seed.canonicalize().unwrap().display(),
+                overlay.display()
+            )
+        );
+        assert_eq!(
+            fs::read_dir(&paths.session_dir).unwrap().count(),
+            2,
+            "overlay and its lease only"
+        );
+        // The launch holds the overlay's lease (crosvm's disk workers get it too).
+        let lease = open_lifetime_lock(&disk_lifetime_lock_path(&overlay), false).unwrap();
+        assert!(!try_lock_exclusive(&lease).unwrap());
 
-        // An empty pool, or only a copy of another image: the seed is copied
-        // and the stale copy is not booted.
-        let stale = pool.join(format!("rootfs-{}-b.ext4", "0".repeat(64)));
-        fs::write(&stale, b"other image copy!!!").unwrap();
-        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
-        let copied = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
-        assert_eq!(fs::read(&copied.path).unwrap(), b"admitted seed bytes");
-        assert_eq!(fs::read(&stale).unwrap(), b"other image copy!!!");
-        assert_eq!(fs::read(&seed).unwrap(), b"admitted seed bytes");
+        // The launch's end removes the overlay before its lease is free.
+        drop(prepared);
+        assert!(!overlay.exists());
+        assert!(try_lock_exclusive(&lease).unwrap());
+        assert_eq!(fs::read(&seed).unwrap(), seed_bytes);
+        assert_eq!(
+            seed_identity(fs::metadata(&seed).unwrap()),
+            before,
+            "the seed is never written"
+        );
+
+        // A crosvm that cannot write the overlay fails the launch and leaves none.
+        fs::write(&crosvm, "#!/bin/sh\nexit 3\n").unwrap();
+        let error = prepare_launch_rootfs(&paths).unwrap_err();
+        assert!(error.contains("create_qcow2 failed"), "{error}");
+        assert!(!overlay.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_crashed_launch_overlay_is_removed_and_a_live_one_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let overlay_in = |name: &str| {
+            let dir = root.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            dir.join(ROOTFS_OVERLAY_NAME)
+        };
+        // A crashed launch left its overlay beside a lease nobody holds.
+        let crashed = overlay_in("vz-crashed");
+        drop(LifetimeFileLock::acquire_disk_sidecar(&crashed, "crashed overlay").unwrap());
+        fs::write(&crashed, b"QFI\xfb").unwrap();
+        let live = overlay_in("vz-live");
+        let _live_lease = LifetimeFileLock::acquire_disk_sidecar(&live, "live overlay").unwrap();
+        fs::write(&live, b"QFI\xfb").unwrap();
+        // Not a launch session directory: left alone.
+        let other = overlay_in("other");
+        fs::write(&other, b"QFI\xfb").unwrap();
+
+        remove_stale_rootfs_overlays(root.path());
+        assert!(!crashed.exists());
+        assert!(live.exists());
+        assert!(other.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_refuses_an_overlay_the_disk_could_not_hold() {
+        // The worst case is every seed block rewritten, plus the update floor.
+        let seed = 4 * 1024 * 1024 * 1024;
+        let required = seed + ROOTFS_OVERLAY_FREE_FLOOR;
+        assert_eq!(rootfs_overlay_space_refusal(seed, required), None);
+        assert_eq!(
+            rootfs_overlay_space_refusal(seed, required - 1).as_deref(),
+            Some("Browser needs 8.6 GB free on this computer to open; 8.5 GB are free. Free some space, then open Browser again.")
+        );
     }
 
     #[test]
@@ -8036,7 +7972,7 @@ mod tests {
             memory_mib: 2048,
             vcpu_count: 2,
         };
-        let owner = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
+        let owner = prepare_launch_rootfs(&paths).unwrap();
         let lock_path = disk_lifetime_lock_path(&paths.rootfs_path);
         assert_eq!(
             lock_path,
@@ -8049,14 +7985,14 @@ mod tests {
         assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
         assert_disk_inode_is_unlocked(&paths.rootfs_path);
 
-        let error = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap_err();
+        let error = prepare_launch_rootfs(&paths).unwrap_err();
         let typed: Value = serde_json::from_str(&error).unwrap();
         assert_eq!(typed["code"], "resources_in_use");
         assert_eq!(typed["resource"], "shared writable Browser VZ rootfs");
         assert_eq!(typed["path"], paths.rootfs_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
+        prepare_launch_rootfs(&paths).unwrap();
     }
 
     fn assert_disk_inode_is_unlocked(disk_path: &Path) {
@@ -8089,22 +8025,6 @@ mod tests {
         let owned = root.path().join("owned");
         assert!(open_lifetime_lock(&owned, true).is_ok());
         assert_eq!(fs::metadata(owned).unwrap().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sparse_rootfs_copy_preserves_holes_and_refuses_cp_failure() {
-        let root = tempfile::tempdir().unwrap();
-        let seed = root.path().join("seed");
-        let source = File::create(&seed).unwrap();
-        source.set_len(16 * 1024 * 1024).unwrap();
-        let destination = root.path().join("copy");
-        clone_or_copy_writable_rootfs(&seed, &destination).unwrap();
-        let metadata = fs::metadata(&destination).unwrap();
-        assert_eq!(metadata.len(), 16 * 1024 * 1024);
-        assert!(metadata.blocks() * 512 < metadata.len());
-        assert!(clone_or_copy_writable_rootfs(root.path(), &destination).is_err());
-        assert!(!destination.exists());
     }
 
     #[test]

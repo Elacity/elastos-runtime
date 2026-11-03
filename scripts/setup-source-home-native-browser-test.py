@@ -180,9 +180,7 @@ class NativeSourceHomeTest(unittest.TestCase):
                         continue
                     owner = config['adapters'][0]['supervisor']['env']
                     self.assertEqual(owner['ELASTOS_BROWSER_VM_CONTROL_LAUNCHER'], str(data / 'bin/browser-vz-engine-supervisor'))
-                    # The native owner takes a prepared rootfs copy per launch (#90).
-                    self.assertEqual(owner['ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR'], str(data / 'browser-vm/rootfs-pool'))
-                    self.assertNotIn('ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE', owner)
+                    self.assertNotIn('ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR', owner)
                     self.assertNotIn('ELASTOS_BROWSER_VM_ICE_SERVERS_JSON', owner)
                     transport = data / 'config/browser-vz-vsock-transport.json'
                     self.assertEqual(transport.stat().st_mode & 0o777, 0o600)

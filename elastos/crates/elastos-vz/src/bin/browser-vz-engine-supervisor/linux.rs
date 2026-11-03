@@ -44,6 +44,9 @@ const RETAINED_BACKEND_LOG_BYTES: u64 = 16 * 1024;
 /// Kept in the Browser VM state root, outside the per-VM directory that
 /// launch cleanup removes. Each unrequested exit replaces it.
 const RETAINED_EXIT_LOG: &str = "last-vm-exit.log";
+/// crosvm writes a launch overlay's header and tables in milliseconds.
+const ROOTFS_OVERLAY_CREATE_BUDGET: Duration = Duration::from_secs(30);
+const QCOW2_MAGIC: &[u8; 4] = b"QFI\xfb";
 
 #[derive(Clone, Debug)]
 enum Transport {
@@ -75,6 +78,99 @@ fn executable(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
         return Err("Browser host program must be an executable regular file".into());
+    }
+    Ok(())
+}
+
+/// Bytes an unprivileged writer can still use on the filesystem of `path`.
+pub(super) fn available_bytes(path: &Path) -> Result<u64, String> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: a NUL-terminated path and a statvfs the call fills on success.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(format!("free space: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: statvfs returned 0, so it initialized `stats`.
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+/// The crosvm this owner runs: the admitted one under the Home data root.
+pub(super) fn crosvm_binary() -> PathBuf {
+    super::env_path("ELASTOS_BROWSER_VM_CROSVM_BIN")
+        .unwrap_or_else(|| super::browser_data_dir().join("bin/crosvm"))
+}
+
+/// Creates a launch's qcow2 overlay of `seed` with crosvm's own writer
+/// (version 3, 16-bit refcounts, the absolute seed path as backing file and
+/// `raw` as its format), the form crosvm boots. The overlay starts private
+/// and empty; crosvm opens the seed read-only, now and when it boots.
+pub(super) fn create_rootfs_overlay(
+    crosvm: &Path,
+    seed: &Path,
+    overlay: &Path,
+) -> Result<(), String> {
+    // crosvm resolves a relative backing path against its working directory.
+    let seed = fs::canonicalize(seed).map_err(|e| format!("rootfs seed: {e}"))?;
+    if !fs::metadata(&seed).map_err(|e| e.to_string())?.is_file() {
+        return Err("rootfs seed is not a regular file".into());
+    }
+    // create_qcow2 truncates the file it is given and keeps its mode.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(overlay)
+        .map_err(|e| format!("create {}: {e}", overlay.display()))?;
+    let mut command = Command::new(crosvm);
+    command
+        .arg("create_qcow2")
+        .arg("--backing-file")
+        .arg(&seed)
+        .arg(overlay)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    own_process_group(&mut command, Vec::new());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + ROOTFS_OVERLAY_CREATE_BUDGET;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let mut detail = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut detail);
+    }
+    let detail = detail.lines().last().unwrap_or_default().to_string();
+    match status {
+        None => return Err("crosvm create_qcow2 timed out".into()),
+        Some(status) if !status.success() => {
+            return Err(format!("crosvm create_qcow2 failed ({status}): {detail}"))
+        }
+        Some(_) => {}
+    }
+    let mut file = File::open(overlay).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("read overlay header: {e}"))?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+        || &header[..4] != QCOW2_MAGIC
+        || header[4..] != 3_u32.to_be_bytes()
+    {
+        return Err("crosvm create_qcow2 left no private qcow2 v3 overlay".into());
     }
     Ok(())
 }
@@ -373,9 +469,7 @@ pub(super) struct CrosvmBrowserProvider {
 
 impl CrosvmBrowserProvider {
     pub(super) fn new(config: VzConfig, socket_dir: PathBuf) -> Result<Self, String> {
-        let data = super::browser_data_dir();
-        let binary = super::env_path("ELASTOS_BROWSER_VM_CROSVM_BIN")
-            .unwrap_or_else(|| data.join("bin/crosvm"));
+        let binary = crosvm_binary();
         let transport = setup_transport()?;
         if executable(&binary).is_err() || !host_supports_transport(&transport) {
             return Err(
