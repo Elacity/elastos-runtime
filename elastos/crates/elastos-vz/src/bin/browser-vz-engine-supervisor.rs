@@ -280,7 +280,7 @@ struct VzLaunchOwner {
     launch_rootfs: Option<PreparedLaunchRootfs>,
     profile_disk: Option<PreparedBrowserProfileDisk>,
     /// This launch took a prepared rootfs; the pool's next copy waits until
-    /// the launch is ready or has ended.
+    /// the launch has ended.
     rootfs_refill_pending: bool,
 }
 
@@ -638,9 +638,10 @@ impl VzLaunchOwner {
         }
     }
 
-    /// Starts the pool's next rootfs copy once, after this launch is ready or
-    /// has ended. A copy during the guest boot keeps an SD card busy for
-    /// minutes and starves the page open (#90).
+    /// Starts the pool's next rootfs copy once this launch has ended (its
+    /// cleanup is complete). On an SD card a copy keeps the disk busy for
+    /// minutes: during the boot it starved the page open, and after ready it
+    /// starved the running guest until its input timed out (#90, Jetson).
     fn start_deferred_rootfs_refill(&mut self) {
         if std::mem::take(&mut self.rootfs_refill_pending) {
             #[cfg(target_os = "linux")]
@@ -1139,7 +1140,7 @@ async fn run() -> Result<(), String> {
 
     let readiness = post_effect_try!(serde_json::to_string(&result));
     post_effect_try!(writeln!(std::io::stdout().lock(), "{readiness}"));
-    owner.start_deferred_rootfs_refill();
+    // The rootfs refill waits for this launch's end: see start_deferred_rootfs_refill.
     let shutdown_reason = wait_for_shutdown_or_transport_expiry(
         &signals,
         Some(&owner.transport),
@@ -6273,7 +6274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_launch_starts_the_rootfs_refill_once_its_cleanup_ends() {
+    async fn a_launch_starts_the_rootfs_refill_once_its_cleanup_ends() {
         let root = tempfile::tempdir().unwrap();
         let mut owner = cleanup_owner_fixture(root.path());
         owner.rootfs_refill_pending = true;

@@ -105,14 +105,14 @@ const ROOTFS_POOL_ENV = [
 
 // A Linux Home copies the next Browser rootfs once its native Engine is ready,
 // off the first open's path (#90: a 4 GiB copy takes minutes on an SD card).
-// One refill per service; it stops when this service, its parent, stops. A
-// launch in progress refills after it is ready or has ended (the native
-// owner does that), so the copy never competes with a guest boot.
+// One refill per service; it stops when this service, its parent, stops.
+// While a Browser launch or VM runs, its native owner refills after that
+// launch has ended, so the copy never competes with a running guest.
 export function rootfsPoolPrefiller({ env = process.env, spawnProgram = spawn, log = logEvent } = {}) {
   let started = false;
-  return (config, readiness, { launchInProgress = false } = {}) => {
+  return (config, readiness, { browserRunning = false } = {}) => {
     const linux = env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
-    if (started || launchInProgress || !linux || !env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR ||
+    if (started || browserRunning || !linux || !env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR ||
         readiness?.readiness?.state !== "ready") {
       return null;
     }
@@ -4814,7 +4814,7 @@ function main() {
       const url = new URL(req.url || "/", "http://browser-vm-control");
       if (req.method === "GET" && url.pathname === "/readiness") {
         const readiness = await engineReadiness(config);
-        prefillRootfsPool(config, readiness, { launchInProgress: pendingLaunches.size > 0 });
+        prefillRootfsPool(config, readiness, { browserRunning: pendingLaunches.size + activeVms.size > 0 });
         sendJson(200, readiness);
         return;
       }
@@ -5162,7 +5162,7 @@ function main() {
     // Verify the image now, off the first open's path; then copy the next
     // Browser rootfs when the native Engine is ready.
     engineReadiness(config)
-      .then((readiness) => prefillRootfsPool(config, readiness, { launchInProgress: pendingLaunches.size > 0 }))
+      .then((readiness) => prefillRootfsPool(config, readiness, { browserRunning: pendingLaunches.size + activeVms.size > 0 }))
       .catch(() => {});
   });
 }

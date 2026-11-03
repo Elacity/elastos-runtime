@@ -437,7 +437,7 @@ test("a Linux Home starts one rootfs pool refill when its native Engine is ready
   assert.equal(events[1].schema, undefined, "the event keeps the service's log schema");
 });
 
-test("a launch in progress defers the Home rootfs refill to that launch", async () => {
+test("a running Browser defers the Home rootfs refill to its owner", async () => {
   const { rootfsPoolPrefiller } = await import("./browser-vm-control-service.mjs");
   const { EventEmitter } = await import("node:events");
   const spawns = [];
@@ -450,7 +450,7 @@ test("a launch in progress defers the Home rootfs refill to that launch", async 
     },
   });
   const config = { launcher_program: "/d/bin/browser-vz-engine-supervisor" };
-  assert.equal(prefill(config, ready, { launchInProgress: true }), null, "no copy during a guest boot");
+  assert.equal(prefill(config, ready, { browserRunning: true }), null, "no copy beside a running guest");
   assert.equal(spawns.length, 0);
   assert.notEqual(prefill(config, ready), null, "the next idle readiness still starts the one refill");
   assert.equal(spawns.length, 1);
