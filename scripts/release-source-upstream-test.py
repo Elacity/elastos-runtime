@@ -34,7 +34,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
                     'SOURCE_COMMIT': self.commit, 'SOURCE_TREE': self.tree,
                     'INSTALL_VERSION': '1.2.3', 'UPDATE_VERSION': '1.2.4',
-                    'GITHUB_REPOSITORY': 'Elacity/elastos-runtime', 'GITHUB_REF': 'refs/heads/develop',
+                    'GITHUB_REPOSITORY': 'elastos/elastos-runtime', 'GITHUB_REF': 'refs/heads/develop',
                     'GITHUB_OUTPUT': str(self.output),
                     'GH_CALLS': str(self.calls), 'GH_TREE': self.tree, 'GH_ON_DEVELOP': 'true',
                     'PYTHONDONTWRITEBYTECODE': '1'}

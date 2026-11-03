@@ -2,7 +2,7 @@
 
 This document defines the work needed for a stable Browser experience for people
 and agents. It gives implementation instructions and acceptance criteria. The
-owning [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) hold the work status. These criteria are proposed release requirements, not claims that
+owning [GitHub issues](https://github.com/elastos/elastos-runtime/issues) hold the work status. These criteria are proposed release requirements, not claims that
 the current product meets them.
 
 ## Product contract

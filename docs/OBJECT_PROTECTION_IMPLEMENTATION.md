@@ -30,7 +30,7 @@ before implementing a second real cryptographic backend.
 
 Resolve the approved integration commit before editing; symbols and release
 state can move. [Protected content](PROTECTED_CONTENT.md) describes the selected
-protocol and its acceptance requirements. Read [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for
+protocol and its acceptance requirements. Read [GitHub issues](https://github.com/elastos/elastos-runtime/issues) for
 verified source and installed behavior. Record the exact implementation and
 verification revisions there or in a dated evidence record.
 

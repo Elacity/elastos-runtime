@@ -197,7 +197,7 @@ The approval has these fields:
 ```json
 {
   "schema": "elastos.release.approval/v1",
-  "repository": "Elacity/elastos-runtime",
+  "repository": "elastos/elastos-runtime",
   "source": {"commit": "APPROVED_SOURCE_COMMIT", "tree": "APPROVED_SOURCE_TREE"},
   "workflow": {
     "commit": "APPROVED_BUILDER_COMMIT",

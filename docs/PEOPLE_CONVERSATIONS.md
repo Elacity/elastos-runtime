@@ -12,7 +12,7 @@ bootstrap configuration, while Profile and Runtime checks own person, contact
 and message authority.
 
 Current implementation and installed acceptance are recorded in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues), with current J6 work;
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues), with current J6 work;
 later collaboration work belongs in [deferred work](DEFERRED_WORK.md).
 
 ## Goal
