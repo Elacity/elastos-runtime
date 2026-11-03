@@ -195,6 +195,12 @@ class NativeSourceHomeTest(unittest.TestCase):
         self.assertEqual((self.data / 'bin/elastos').read_bytes(), self.runtime.read_bytes())
         receipt = json.loads((self.data / 'receipts/source-home-installation.json').read_text())
         self.assertEqual(receipt['runtime']['installed_sha256'], 'sha256:' + hashlib.sha256(self.runtime.read_bytes()).hexdigest())
+        # Runtime setup admits only prepared Browser host rows (browser_config::host_rows).
+        stamped = json.loads((self.data / 'components.json').read_text())
+        for name in stamped['profiles']['browser-host']['components']:
+            info = stamped['external'][name]['platforms'].get(PLATFORM)
+            if info is not None and name in stamped['profiles']['source-home']['components']:
+                self.assertEqual(info.get('strategy'), 'prebuilt', name)
         events = self.recorded_events()
         self.assertEqual([event['name'] for event in events if event['phase'] == 'build'],
                          ['browser-vz-engine-supervisor', 'shell', 'browser-local-exit', 'home-cli'])

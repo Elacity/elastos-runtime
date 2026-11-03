@@ -921,7 +921,9 @@ for name in manifest["profiles"]["browser-host"]["components"]:
     if not stat.S_ISREG(path.lstat().st_mode):
         raise SystemExit(f"Browser helper {name} must be an installed regular file")
     content = path.read_bytes()
-    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content))
+    # These are the installed bytes Runtime setup admits as prepared helpers
+    # (browser_config::host_rows refuses a source-build row).
+    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content), strategy="prebuilt")
     if name not in selected:
         selected.append(name)
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
