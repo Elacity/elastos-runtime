@@ -53,17 +53,18 @@ const VZ_MEDIA_DIAGNOSTIC_SCHEMA: &str = "elastos.browser.media-diagnostic/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
 const TURN_PORT_ABSENCE_BUDGET: Duration = Duration::from_secs(3);
 const CLEANUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
+/// Limit for a host-side startup step that has no configured limit of its own.
 const STARTUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
-/// Test-only (#90 Jetson measurement): replaces `STARTUP_ATTEMPT_BUDGET` so a
-/// slow host's real startup stage times can be measured. No Home config sets it.
-const TEST_STARTUP_STEP_BUDGET_ENV: &str = "ELASTOS_BROWSER_VM_TEST_STARTUP_STEP_BUDGET_MS";
-/// Test-only (#90 Jetson measurement): the launch does not start the
-/// background rootfs refill, so the copy does not compete with the guest boot.
-#[cfg(target_os = "linux")]
-const TEST_NO_LAUNCH_REFILL_ENV: &str = "ELASTOS_BROWSER_VM_TEST_NO_LAUNCH_REFILL";
-/// Test-only (#90 Jetson measurement): every startup trace stage is also
-/// appended to this file with the wall-clock time.
-const TEST_TRACE_FILE_ENV: &str = "ELASTOS_BROWSER_VM_TEST_TRACE_FILE";
+/// A guest step with its own configured limit (transport bootstrap, page
+/// open) is observed for that limit plus this margin, so the step's own
+/// timeout reports the failure, not the observer (#90: the page open takes
+/// 32-33 s on a Jetson SD card).
+const STARTUP_STEP_GRACE: Duration = Duration::from_secs(5);
+/// The last launch's startup stages with wall-clock times, beside the VM
+/// state, replaced by each launch so a slow or failed open can be read after
+/// cleanup.
+const LAUNCH_TRACE_LOG: &str = "last-launch-trace.log";
+const LAUNCH_TRACE_MAX_LINES: usize = 256;
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
 /// Launch time kept for the VM boot after a launch waits for a prepared
@@ -278,6 +279,9 @@ struct VzLaunchOwner {
     control_proxy: Option<thread::JoinHandle<bool>>,
     launch_rootfs: Option<PreparedLaunchRootfs>,
     profile_disk: Option<PreparedBrowserProfileDisk>,
+    /// This launch took a prepared rootfs; the pool's next copy waits until
+    /// the launch is ready or has ended.
+    rootfs_refill_pending: bool,
 }
 
 #[expect(
@@ -347,6 +351,7 @@ impl VzLaunchOwner {
             control_proxy: None,
             launch_rootfs: None,
             profile_disk: None,
+            rootfs_refill_pending: false,
         }
     }
 
@@ -379,6 +384,7 @@ impl VzLaunchOwner {
                 profile_durability,
             );
             if terminal {
+                self.start_deferred_rootfs_refill();
                 return report;
             }
             if last_report.as_ref() != Some(&report) {
@@ -632,9 +638,20 @@ impl VzLaunchOwner {
         }
     }
 
+    /// Starts the pool's next rootfs copy once, after this launch is ready or
+    /// has ended. A copy during the guest boot keeps an SD card busy for
+    /// minutes and starves the page open (#90).
+    fn start_deferred_rootfs_refill(&mut self) {
+        if std::mem::take(&mut self.rootfs_refill_pending) {
+            #[cfg(target_os = "linux")]
+            start_rootfs_pool_refill(&self.paths.rootfs_path);
+        }
+    }
+
     async fn startup_operation<F>(
         &mut self,
         signals: &ShutdownSignalReporter,
+        budget: Duration,
         operation: F,
     ) -> Result<StartupValue, String>
     where
@@ -649,7 +666,7 @@ impl VzLaunchOwner {
         }));
         tokio::select! {
             _ = wait_for_shutdown_signal(signals) => Err("Browser VZ startup cancelled".to_string()),
-            result = tokio::time::timeout(startup_attempt_budget(),
+            result = tokio::time::timeout(budget,
                 self.startup.as_mut().expect("owned native startup operation")) => match result {
                 Ok(Ok(result)) => {
                     self.startup.take();
@@ -791,6 +808,8 @@ async fn run() -> Result<(), String> {
         .map_err(|error| did_not_act_settlement(&identity, error))?;
     preflight_vz_launch(&paths, &transport, request_from_stdin)
         .map_err(|error| did_not_act_settlement(&identity, error))?;
+    let step_timeouts = StartupStepTimeouts::from_env()
+        .map_err(|error| did_not_act_settlement(&identity, error))?;
     let signals = install_shutdown_signal_reporter()
         .map_err(|error| did_not_act_settlement(&identity, error))?;
     let mut owner = VzLaunchOwner::new(identity, paths, transport);
@@ -820,6 +839,7 @@ async fn run() -> Result<(), String> {
         &mut owner.acquired_paths,
     ));
     post_effect_try!(fs::create_dir_all(&owner.paths.state_dir));
+    keep_launch_trace(&owner.paths.state_dir);
     post_effect_try!(prepare_socket_path(&owner.paths.control_socket_path));
     owner.profile_disk = Some(post_effect_try!(prepare_browser_profile_disk(&request)));
     append_browser_profile_boot_arg(
@@ -861,8 +881,7 @@ async fn run() -> Result<(), String> {
         };
         post_effect_try!(prepare_launch_rootfs(&owner.paths, &rootfs_wait))
     });
-    #[cfg(target_os = "linux")]
-    start_rootfs_pool_refill(&owner.paths.rootfs_path);
+    owner.rootfs_refill_pending = cfg!(target_os = "linux");
     trace_stage(
         "prepared_rootfs",
         format!(
@@ -891,7 +910,7 @@ async fn run() -> Result<(), String> {
     let init_provider = Arc::clone(&provider);
     post_effect_try!(
         owner
-            .startup_operation(&signals, async move {
+            .startup_operation(&signals, STARTUP_ATTEMPT_BUDGET, async move {
                 init_provider
                     .init()
                     .await
@@ -942,7 +961,7 @@ async fn run() -> Result<(), String> {
     let load_provider = Arc::clone(&provider);
     let loaded = post_effect_try!(
         owner
-            .startup_operation(&signals, async move {
+            .startup_operation(&signals, STARTUP_ATTEMPT_BUDGET, async move {
                 load_provider
                     .load_with_vm_config(vm_config, manifest)
                     .await
@@ -979,7 +998,7 @@ async fn run() -> Result<(), String> {
     let start_handle = handle.clone();
     post_effect_try!(
         owner
-            .startup_operation(&signals, async move {
+            .startup_operation(&signals, STARTUP_ATTEMPT_BUDGET, async move {
                 start_provider
                     .start(&start_handle)
                     .await
@@ -994,13 +1013,23 @@ async fn run() -> Result<(), String> {
     let bootstrap_provider = Arc::clone(&provider);
     let bootstrap_handle = handle.clone();
     let bootstrap_transport = owner.transport.clone();
+    let bootstrap_timeout = step_timeouts.transport_bootstrap;
     let bootstrap = post_effect_try!(
         owner
-            .startup_operation(&signals, async move {
-                bootstrap_vz_transport(bootstrap_provider, &bootstrap_handle, &bootstrap_transport)
+            .startup_operation(
+                &signals,
+                startup_step_budget(bootstrap_timeout),
+                async move {
+                    bootstrap_vz_transport(
+                        bootstrap_provider,
+                        &bootstrap_handle,
+                        &bootstrap_transport,
+                        bootstrap_timeout,
+                    )
                     .await
                     .map(StartupValue::Json)
-            })
+                }
+            )
             .await
     );
     let guest_transport_receipt = post_effect_try!(bootstrap.into_json());
@@ -1068,19 +1097,24 @@ async fn run() -> Result<(), String> {
     let open_handle = handle.clone();
     let open_request = request.clone();
     let open_paths = owner.paths.clone();
+    let page_open_timeout = step_timeouts.page_open;
     let opened = post_effect_try!(
         owner
-            .startup_operation(&signals, async move {
-                open_guest_page(
-                    open_provider,
-                    &open_handle,
-                    open_paths.control_port,
-                    &open_request,
-                    &open_paths,
-                )
-                .await
-                .map(StartupValue::Json)
-            })
+            .startup_operation(
+                &signals,
+                startup_step_budget(page_open_timeout),
+                async move {
+                    open_guest_page(
+                        open_provider,
+                        &open_handle,
+                        &open_request,
+                        &open_paths,
+                        page_open_timeout,
+                    )
+                    .await
+                    .map(StartupValue::Json)
+                }
+            )
             .await
     );
     let mut result = post_effect_try!(opened.into_json());
@@ -1105,6 +1139,7 @@ async fn run() -> Result<(), String> {
 
     let readiness = post_effect_try!(serde_json::to_string(&result));
     post_effect_try!(writeln!(std::io::stdout().lock(), "{readiness}"));
+    owner.start_deferred_rootfs_refill();
     let shutdown_reason = wait_for_shutdown_or_transport_expiry(
         &signals,
         Some(&owner.transport),
@@ -1179,34 +1214,99 @@ fn browser_vm_id(transport: &VzTransportLaunch) -> Result<String, String> {
         .ok_or_else(|| "Browser VZ transport VM identity is invalid".to_string())
 }
 
-fn startup_attempt_budget() -> Duration {
-    std::env::var(TEST_STARTUP_STEP_BUDGET_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(STARTUP_ATTEMPT_BUDGET, Duration::from_millis)
+/// Each guest startup step's own configured limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupStepTimeouts {
+    transport_bootstrap: Duration,
+    page_open: Duration,
+}
+
+impl StartupStepTimeouts {
+    fn from_env() -> Result<Self, String> {
+        let limit = |name| env_u32(name, 90_000).map(|ms| Duration::from_millis(u64::from(ms)));
+        Ok(Self {
+            transport_bootstrap: limit("ELASTOS_BROWSER_VM_TRANSPORT_BOOTSTRAP_TIMEOUT_MS")?,
+            page_open: limit("ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS")?,
+        })
+    }
+}
+
+/// How long the owner observes a guest step that has its own limit.
+fn startup_step_budget(own_timeout: Duration) -> Duration {
+    own_timeout.saturating_add(STARTUP_STEP_GRACE)
+}
+
+/// The owner's startup stages for `last-launch-trace.log`: held in memory
+/// until the state root is known, then appended as they happen.
+struct LaunchTrace {
+    pending: Vec<String>,
+    file: Option<File>,
+}
+
+static LAUNCH_TRACE: std::sync::Mutex<LaunchTrace> = std::sync::Mutex::new(LaunchTrace {
+    pending: Vec::new(),
+    file: None,
+});
+
+impl LaunchTrace {
+    fn record(&mut self, line: String) {
+        match self.file.as_mut() {
+            Some(file) => {
+                let _ = writeln!(file, "{line}");
+            }
+            None if self.pending.len() < LAUNCH_TRACE_MAX_LINES => self.pending.push(line),
+            None => {}
+        }
+    }
+
+    fn keep(&mut self, state_root: &Path) -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state_root.join(LAUNCH_TRACE_LOG))?;
+        for line in self.pending.drain(..) {
+            writeln!(file, "{line}")?;
+        }
+        self.file = Some(file);
+        Ok(())
+    }
+}
+
+fn keep_launch_trace(state_root: &Path) {
+    let kept = LAUNCH_TRACE
+        .lock()
+        .map_err(|_| "trace lock poisoned".to_string())
+        .and_then(|mut trace| trace.keep(state_root).map_err(|error| error.to_string()));
+    if let Err(error) = kept {
+        emit_stderr_line(&format!(
+            "browser-vz-engine-supervisor stage=launch_trace_unavailable error={error}"
+        ));
+    }
 }
 
 fn trace_stage(stage: &str, detail: impl AsRef<str>) {
     static START: OnceLock<Instant> = OnceLock::new();
     let started = START.get_or_init(Instant::now);
+    let elapsed_us = started.elapsed().as_micros();
     let enabled = std::env::var("ELASTOS_BROWSER_VM_TRACE")
         .map(|value| value != "0")
         .unwrap_or(false);
     if enabled {
-        emit_stderr_line(&stage_trace_line(
-            stage,
-            started.elapsed().as_micros(),
-            detail.as_ref(),
-        ));
+        emit_stderr_line(&stage_trace_line(stage, elapsed_us, detail.as_ref()));
     }
-    if let Some(path) = env_path(TEST_TRACE_FILE_ENV) {
-        let wall_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis());
-        let line = stage_trace_line(stage, started.elapsed().as_micros(), detail.as_ref());
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{wall_ms} pid={} {line}", std::process::id());
-        }
+    // Stage times only: details can name the profile and boot arguments.
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    if let Ok(mut trace) = LAUNCH_TRACE.lock() {
+        trace.record(format!(
+            "{wall_ms} pid={} {}",
+            process::id(),
+            stage_trace_line(stage, elapsed_us, "")
+        ));
     }
 }
 
@@ -3153,18 +3253,11 @@ fn rootfs_getting_ready_error(left: Option<Duration>) -> String {
     .to_string()
 }
 
-/// After this launch has its rootfs, a background copy brings the pool back
-/// to its target for the next launch.
+/// Once a launch is ready or has ended, a background copy brings the pool
+/// back to its target for the next launch.
 #[cfg(target_os = "linux")]
 fn start_rootfs_pool_refill(seed: &Path) {
     if shared_writable_rootfs() {
-        return;
-    }
-    if env_bool(TEST_NO_LAUNCH_REFILL_ENV, false) {
-        trace_stage(
-            "rootfs_pool_refill",
-            format!("held by {TEST_NO_LAUNCH_REFILL_ENV}"),
-        );
         return;
     }
     let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
@@ -3761,15 +3854,12 @@ fn validate_runtime_stream_socket_path(path: &Path) -> Result<(), String> {
 async fn open_guest_page(
     provider: Arc<VzProvider>,
     handle: &CapsuleHandle,
-    control_port: u32,
     request: &Value,
     paths: &LaunchPaths,
+    ready_timeout: Duration,
 ) -> Result<Value, String> {
+    let control_port = paths.control_port;
     let guest_request = guest_control_open_request(request);
-    let ready_timeout = Duration::from_millis(env_u32(
-        "ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS",
-        90_000,
-    )? as u64);
     let deadline = Instant::now() + ready_timeout;
     let mut last_error = String::new();
     let mut result = loop {
@@ -3988,6 +4078,7 @@ async fn bootstrap_vz_transport(
     provider: Arc<VzProvider>,
     handle: &CapsuleHandle,
     transport: &VzTransportLaunch,
+    timeout: Duration,
 ) -> Result<Value, String> {
     let port = transport
         .authority
@@ -3995,10 +4086,6 @@ async fn bootstrap_vz_transport(
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| "Browser VZ bootstrap vsock port is missing".to_string())?;
-    let timeout = Duration::from_millis(env_u32(
-        "ELASTOS_BROWSER_VM_TRANSPORT_BOOTSTRAP_TIMEOUT_MS",
-        90_000,
-    )? as u64);
     let fd = connect_vsock_with_retry(provider, handle, port, timeout).await?;
     let mut stream = File::from(fd);
     set_file_read_timeout(&stream, timeout)?;
@@ -6085,7 +6172,7 @@ mod tests {
         let dispatched = Arc::new(AtomicBool::new(false));
         let dispatched_by_task = dispatched.clone();
         assert!(owner
-            .startup_operation(&signals, async move {
+            .startup_operation(&signals, STARTUP_ATTEMPT_BUDGET, async move {
                 dispatched_by_task.store(true, Ordering::SeqCst);
                 Ok(StartupValue::Unit)
             })
@@ -6108,7 +6195,7 @@ mod tests {
             deliver_fixture_shutdown_signal(write_fd);
         });
         assert!(owner
-            .startup_operation(&signals, async move {
+            .startup_operation(&signals, STARTUP_ATTEMPT_BUDGET, async move {
                 started_tx.send(()).unwrap();
                 wait.await.unwrap();
                 Ok(StartupValue::Unit)
@@ -6125,6 +6212,93 @@ mod tests {
                 .await
         );
         assert!(owner.startup.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_steps_are_observed_for_their_own_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        let signals = local_shutdown_signal_reporter();
+        let step = || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(StartupValue::Unit)
+        };
+        match owner
+            .startup_operation(&signals, Duration::from_millis(20), step())
+            .await
+        {
+            Err(error) => assert_eq!(
+                error,
+                "Browser VZ startup operation exceeded its observation budget"
+            ),
+            Ok(_) => panic!("a step longer than its budget must be cut"),
+        }
+        assert!(
+            owner
+                .drain_startup(Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        assert!(owner
+            .startup_operation(&signals, Duration::from_secs(5), step())
+            .await
+            .is_ok());
+
+        // The Jetson page open took 33.3 s: its own limit decides, not 30 s.
+        let limits = StartupStepTimeouts {
+            transport_bootstrap: Duration::from_secs(90),
+            page_open: Duration::from_secs(120),
+        };
+        assert_eq!(
+            startup_step_budget(limits.page_open),
+            Duration::from_secs(125)
+        );
+        assert!(startup_step_budget(limits.transport_bootstrap) > STARTUP_ATTEMPT_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_starts_the_rootfs_refill_once_its_cleanup_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = cleanup_owner_fixture(root.path());
+        owner.rootfs_refill_pending = true;
+        let settlement = tokio::time::timeout(
+            Duration::from_secs(10),
+            owner.finish_cleanup("injected launch failure", None),
+        )
+        .await
+        .unwrap();
+        let settlement: Value = serde_json::from_str(&settlement).unwrap();
+        assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
+        assert!(
+            !owner.rootfs_refill_pending,
+            "the refill starts exactly once"
+        );
+    }
+
+    #[test]
+    fn launch_trace_keeps_stages_from_before_the_state_root_is_known() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(LAUNCH_TRACE_LOG);
+        let mut trace = LaunchTrace {
+            pending: Vec::new(),
+            file: None,
+        };
+        trace.record("1 early".to_string());
+        trace.keep(root.path()).unwrap();
+        trace.record("2 later".to_string());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1 early\n2 later\n");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+
+        // The next launch replaces the file; a planted link is refused.
+        let mut next = LaunchTrace {
+            pending: vec!["3 next".to_string()],
+            file: None,
+        };
+        next.keep(root.path()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "3 next\n");
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), &path).unwrap();
+        assert!(next.keep(root.path()).is_err());
+        assert!(!root.path().join("elsewhere").exists());
     }
 
     #[tokio::test]
