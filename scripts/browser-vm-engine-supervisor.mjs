@@ -944,7 +944,7 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
         root,
         fingerprints,
       })) {
-        if (!launcher && !["linux-arm64", "darwin-arm64"].includes(platform)) {
+        if (!localControlLauncherForPlatform({ dataDir, platform })) {
           throw launchError("host_unsupported", "Local Browser virtualization is unavailable on this host. Select an approved remote Browser Engine.");
         }
         throw new Error("Browser VM control socket is unavailable");
