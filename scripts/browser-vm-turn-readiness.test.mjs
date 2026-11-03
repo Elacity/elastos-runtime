@@ -413,6 +413,7 @@ test("a Linux Home starts one rootfs pool refill when its native Engine is ready
   child.emit("close", 0);
   assert.deepEqual(events.map(({ event, state, created, status }) => [event, state, created, status]),
     [["rootfs_pool_prefill_start", undefined, undefined, undefined], ["rootfs_pool_prefill", "ready", 1, 0]]);
+  assert.equal(events[1].schema, undefined, "the event keeps the service's log schema");
 });
 
 test("a Home without a Linux rootfs pool starts no refill", async () => {

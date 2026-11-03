@@ -126,7 +126,9 @@ export function rootfsPoolPrefiller({ env = process.env, spawnProgram = spawn, l
     child.once("close", (status) => {
       let summary = {};
       try { summary = JSON.parse(stdout.trim()); } catch {}
-      log("rootfs_pool_prefill", { ...summary, status, latency_ms: Date.now() - startedAt });
+      // The event keeps this service's log schema; the refill's is dropped.
+      const { schema: _refillSchema, ...result } = summary;
+      log("rootfs_pool_prefill", { ...result, status, latency_ms: Date.now() - startedAt });
     });
     log("rootfs_pool_prefill_start", { pid: child.pid ?? null });
     return child;
