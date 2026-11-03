@@ -8329,16 +8329,30 @@ pub(crate) mod tests {
                 .any(|name| name == browser_vm_image::NAME));
         }
         let platforms = &manifest.external[browser_vm_image::NAME].platforms;
-        // Linux ARM64 offers no Browser image until #90; a record names one platform.
-        assert!(!platforms.contains_key("linux-arm64") && !platforms.contains_key("linux-amd64"));
-        let info = &platforms["darwin-arm64"];
-        assert_eq!(info.strategy.as_deref(), Some(browser_vm_image::NAME));
-        assert_eq!(
-            info.install_path.as_deref(),
-            Some(browser_vm_image::INSTALL_PATH)
-        );
-        assert!(info.release_path.as_ref().unwrap().ends_with(".tar.gz"));
+        // Both ARM64 hosts install the one shared guest (#90). A capsule record names
+        // one platform, so each row has its own release_path for the same bytes.
+        assert!(!platforms.contains_key("linux-amd64"));
+        for (platform, release_path) in [
+            ("darwin-arm64", "browser-vm-image-arm64.tar.gz"),
+            ("linux-arm64", "browser-vm-image-linux-arm64.tar.gz"),
+        ] {
+            let info = &platforms[platform];
+            assert_eq!(info.strategy.as_deref(), Some(browser_vm_image::NAME));
+            assert_eq!(
+                info.install_path.as_deref(),
+                Some(browser_vm_image::INSTALL_PATH)
+            );
+            assert_eq!(info.release_path.as_deref(), Some(release_path));
+            assert_eq!(
+                browser_vm_image::component_info(&manifest, platform)
+                    .unwrap_err()
+                    .to_string(),
+                "Browser image release package requires a stamped lowercase SHA-256 checksum",
+                "{platform} resolves its own unstamped image row"
+            );
+        }
         assert!(admit_release_components(&manifest, "darwin-arm64").is_err());
+        assert!(admit_release_components(&manifest, "linux-arm64").is_err());
     }
 
     #[test]

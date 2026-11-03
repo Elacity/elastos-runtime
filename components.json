@@ -1403,6 +1403,12 @@
           "release_path": "browser-vm-image-arm64.tar.gz",
           "install_path": "browser-vm/image-set",
           "extract_path": "browser-vm-image"
+        },
+        "linux-arm64": {
+          "strategy": "browser-vm-image",
+          "release_path": "browser-vm-image-linux-arm64.tar.gz",
+          "install_path": "browser-vm/image-set",
+          "extract_path": "browser-vm-image"
         }
       }
     },

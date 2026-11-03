@@ -202,10 +202,12 @@ platform matrix. Generic provider VM archives remain a separate build path.
 Linux preparation needs tracked lockfiles for the standalone Browser helper
 projects; a missing lockfile stops preparation before a native build.
 
-The Browser guest is one ARM64 Chromium/Selkies image. Its release artifact is
-`browser-vm-image-arm64.tar.gz`, published for Mac only; Linux ARM64 offers no
-Browser image until #90. A capsule record names one platform, so
-`check-product-data.mjs` refuses two platform rows sharing one `release_path`.
+The Browser guest is one ARM64 Chromium/Selkies image, the same bytes for Mac
+and Linux ARM64 (Jetson, #90). A capsule record names one platform, so
+`check-product-data.mjs` refuses two platform rows sharing one `release_path`:
+the Mac row publishes `browser-vm-image-arm64.tar.gz` and the Linux ARM64 row
+`browser-vm-image-linux-arm64.tar.gz`. Both ARM64 release builds take the same
+`release-package.yml` image inputs (CID, SHA-256, size).
 Linux x86-64 is a remote Engine consumer.
 The guest builder defaults to a 4 GiB root disk (`--rootfs-size 4096M`). Linux
 preparation keeps one spare root image. Capacity proof includes the compressed
