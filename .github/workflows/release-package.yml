@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REPOSITORY" == Elacity/elastos-runtime ]] \
+          [[ "$GITHUB_REPOSITORY" == elastos/elastos-runtime ]] \
             || { echo 'The canonical builder repository is required' >&2; exit 1; }
           [[ "$GITHUB_REF" == refs/heads/develop ]] \
             || { echo 'The develop builder ref is required' >&2; exit 1; }

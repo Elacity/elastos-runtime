@@ -5,7 +5,7 @@
 > Read the [repository README](../README.md) and
 > [ARCHITECTURE.md](ARCHITECTURE.md) first.
 > This file narrows the Carrier concept and its placement in the runtime. It is
-> not the current shipped-behavior contract. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+> not the current shipped-behavior contract. [GitHub issues](https://github.com/elastos/elastos-runtime/issues)
 > own status and proof; [COMMAND_MATRIX.md](COMMAND_MATRIX.md) defines command expectations.
 
 ## Carrier
@@ -484,8 +484,8 @@ explicit tickets and bootstrap peers; gossip topics join those peers directly.
 `ELASTOS_CARRIER_NETWORK=public` is refused, and so is `ELASTOS_RELAY_URL`
 with the direct network.
 Relay support is planned in
-[#345](https://github.com/Elacity/elastos-runtime/issues/345) and
-[#354](https://github.com/Elacity/elastos-runtime/issues/354).
+[#345](https://github.com/elastos/elastos-runtime/issues/345) and
+[#354](https://github.com/elastos/elastos-runtime/issues/354).
 
 ### 3. Data plane (host to VM networking)
 
@@ -531,5 +531,5 @@ not an alternate compatibility path.
 This placement is an implementation choice, not a rule that all Carrier
 protocol logic belongs in the trusted core. A later adapter may move protocol
 work behind a private host contract if Runtime continues to own endpoint
-admission, routing, lifecycle, capabilities, and audit. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+admission, routing, lifecycle, capabilities, and audit. [GitHub issues](https://github.com/elastos/elastos-runtime/issues)
 own active work; [deferred work](DEFERRED_WORK.md) and [`ROADMAP.md`](../ROADMAP.md) provide research context.

@@ -14,7 +14,7 @@ later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts
-have separate identities. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+have separate identities. [Install/update acceptance](https://github.com/elastos/elastos-runtime/issues/89)
 owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
 
 The current default Home exposes Assistant, Chat (Community), System, People,

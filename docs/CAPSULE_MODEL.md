@@ -5,7 +5,7 @@
 manifest fields and supported combinations.
 
 For system context, see the [repository README](../README.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md). [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own status, acceptance and proof.
+[ARCHITECTURE.md](ARCHITECTURE.md). [GitHub issues](https://github.com/elastos/elastos-runtime/issues) own status, acceptance and proof.
 
 ## Current isolation and target boundary
 
@@ -26,12 +26,12 @@ The seed operator can read hosted data, wallet keys and recovery material.
 Passkeys control sign-in; stored data and keys remain accessible to the Runtime
 account and root while Home is locked. Protection against hosted operators and
 root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+is the target of [hosted protection](https://github.com/elastos/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/elastos/elastos-runtime/issues/210).
 An unlocked self-hosted Home trusts its owner and their host software. Recovery
 from a stolen device or profile key requires a new identity.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -94,7 +94,7 @@ reply alone does not establish working sandbox support.
 
 The [shared state contract](STORAGE_AND_ACCESS.md#shared-application-state)
 defines checkpoints and handoff when execution and durable storage are on
-different nodes. [Release acceptance](https://github.com/Elacity/elastos-runtime/issues/93) owns placement evidence;
+different nodes. [Release acceptance](https://github.com/elastos/elastos-runtime/issues/93) owns placement evidence;
 broad placement support is a target, not a claim of hardware qualification.
 
 ## Isolation boundary
@@ -133,7 +133,7 @@ adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
 The Component fixture and authoring template test this contract. Product App
-migration requires its own [isolation evidence](https://github.com/Elacity/elastos-runtime/issues/173).
+migration requires its own [isolation evidence](https://github.com/elastos/elastos-runtime/issues/173).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,

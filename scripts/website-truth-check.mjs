@@ -23,7 +23,7 @@ function check(name, run) {
 check("facts state current isolation and issue-owned evidence", () => {
   assert.equal(facts.schema, "elastos.website.claims/v2");
   assert.equal(facts.candidate.status, "source-only");
-  assert.equal(facts.candidate.evidence, "https://github.com/Elacity/elastos-runtime/issues/170");
+  assert.equal(facts.candidate.evidence, "https://github.com/elastos/elastos-runtime/issues/170");
   assert.ok(validIsolationClaims(facts.isolation), "false isolation claim");
   if (facts.hosted.status === "verified") {
     const accepted = facts.accepted_installation;
@@ -33,7 +33,7 @@ check("facts state current isolation and issue-owned evidence", () => {
       "hosted receipt is expired or mismatches accepted source or site artifacts");
   } else {
     assert.equal(facts.hosted.status, "paused");
-    assert.equal(facts.hosted.evidence, "https://github.com/Elacity/elastos-runtime/issues/174");
+    assert.equal(facts.hosted.evidence, "https://github.com/elastos/elastos-runtime/issues/174");
     assert.equal(facts.accepted_installation, undefined, "paused source does not carry accepted installed proof");
   }
 });
@@ -45,7 +45,7 @@ check("visitor content stays useful without release services", () => {
   assert.ok(installCommand, "docs/INSTALL.md states the install command");
   assert.ok(html.includes(`<code id="install-command">${installCommand}</code>`), "the site shows the install command from docs/INSTALL.md");
   assert.ok(!/aria-label="Installation command" hidden|id="copy-install" disabled/.test(html), "the install command and Copy are visible");
-  assert.ok(html.includes('href="https://github.com/Elacity/elastos-runtime/blob/develop/docs/INSTALL.md"'), "the install section links docs/INSTALL.md");
+  assert.ok(html.includes('href="https://github.com/elastos/elastos-runtime/blob/develop/docs/INSTALL.md"'), "the install section links docs/INSTALL.md");
   assert.ok(!/docs\/MAC\.md/.test(html), "the developer runbook is not an install path");
   assert.ok(!/protected video|copy-proof|sybil-proof|man-in-the-middle/i.test(html), "no unshipped protected video or absolute security claims");
   assert.ok(!/0\.1\.2|Mac download in preparation|guest access is open/.test(html));
@@ -66,8 +66,8 @@ function checkLink(value, asset = false) {
     assert.equal(asset, false, `external asset ${value}`);
     const url = new URL(value);
     assert.equal(url.hostname, "github.com");
-    assert.ok(url.pathname.startsWith("/Elacity/elastos-runtime"));
-    const pinned = url.pathname.match(/^\/Elacity\/elastos-runtime\/blob\/([a-f0-9]{40})\/(.+)$/);
+    assert.ok(url.pathname.startsWith("/elastos/elastos-runtime"));
+    const pinned = url.pathname.match(/^\/elastos\/elastos-runtime\/blob\/([a-f0-9]{40})\/(.+)$/);
     if (pinned) {
       if (!pinnedFiles.has(pinned[2])) pinnedFiles.set(pinned[2], execFileSync("git", ["show", `${pinned[1]}:${pinned[2]}`], { cwd: repo, encoding: "utf8" }));
       if (url.hash) {

@@ -93,8 +93,8 @@ port and resource limits, apart from the release and update service. In 0.8.0
 Carrier is direct-only: a Home reaches this node over a direct Carrier path,
 with no relay. Carrier owns connection policy and peer resolution through one
 connect-by-DID entry point. Relay support and cross-network acceptance are
-planned in [#345](https://github.com/Elacity/elastos-runtime/issues/345) and
-[#354](https://github.com/Elacity/elastos-runtime/issues/354).
+planned in [#345](https://github.com/elastos/elastos-runtime/issues/345) and
+[#354](https://github.com/elastos/elastos-runtime/issues/354).
 
 The release availability contract while this node is unreachable is:
 
@@ -111,7 +111,7 @@ Home has used up its repairs (#451).
 
 An address change requires the next signed network revision in a release.
 More bootstrap peers and participant Homes acting as bootstrap are tracked in
-[#324](https://github.com/Elacity/elastos-runtime/issues/324).
+[#324](https://github.com/elastos/elastos-runtime/issues/324).
 
 ### Release pin
 

@@ -5,7 +5,7 @@ not receive hosted-model credentials, provider endpoints, local model process
 access, or authority to choose a hidden alternate backend.
 
 This document defines the target contract needed by a durable Agent Host.
-Current implementation truth stays in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Current implementation truth stays in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 ## Authority boundary
 
@@ -46,7 +46,7 @@ remote-model authorization path. The destination verifies the authenticated
 source endpoint and service grant, then constructs its own local provider binding
 for the consumer principal, capsule and run. `RuntimeCreateBinding` and
 `RuntimeAccessBinding` remain local-channel authority records. Installed
-acceptance and remaining remote-service work are recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+acceptance and remaining remote-service work are recorded in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
@@ -425,7 +425,7 @@ same facts as Assistant. Discovery gives Marketplace read authority; Runtime
 retains grant and inference authority.
 
 The installed small-model journey and its exact evidence scope are recorded in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
 separate checks. A local pin establishes a retained local copy; it does not
 establish global availability or exclusive custody.
 
@@ -473,7 +473,7 @@ model and provider are ready.
 Bounded transfer and manifest/inventory limits are in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 The current execution queue and proof dependencies are in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Fresh-install acceptance must prove the compatible engine and its verified
 libraries are available, then select the real signed catalog entry with no
 pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact

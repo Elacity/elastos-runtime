@@ -25,7 +25,7 @@ work log.
 ## Where Notes Belong
 
 - Debugging findings and proof belong in the owning GitHub issue. Use
-  [#89](https://github.com/Elacity/elastos-runtime/issues/89) for install and update.
+  [#89](https://github.com/elastos/elastos-runtime/issues/89) for install and update.
 - Release history belongs in `elastos/CHANGELOG.md`.
 - Durable architecture guidance belongs in `docs/`.
 - Stable local-debugging invariants belong here.

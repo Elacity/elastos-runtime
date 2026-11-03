@@ -23,7 +23,7 @@ export function validIsolationClaims(isolation) {
     host_protection: "sign-in-controls-host-access-remains-while-locked",
     protection_target: "hosted-operators-root-locked-self-host-software-users",
     hosted_use: "public-demos-wallets-stay-on-own-device",
-    evidence: "https://github.com/Elacity/elastos-runtime/issues/173",
+    evidence: "https://github.com/elastos/elastos-runtime/issues/173",
   };
   return isolation != null && Object.keys(isolation).length === Object.keys(scope).length
     && Object.entries(scope).every(([key, value]) => isolation[key] === value);

@@ -7,7 +7,7 @@ compatibility is an optional adapter for software that cannot use typed Runtime
 resources.
 
 This is target architecture. Current implementation and proof remain in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues), with open work.
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues), with open work.
 
 ## Decision
 

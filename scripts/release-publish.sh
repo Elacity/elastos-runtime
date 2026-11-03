@@ -32,7 +32,7 @@
 set -euo pipefail
 umask 077
 
-REPO=Elacity/elastos-runtime
+REPO=elastos/elastos-runtime
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORIGIN="${RELEASE_ORIGIN:-https://elastos.elacitylabs.com}"
 WORK_ROOT="${RELEASE_WORK:-$HOME/.local/share/elastos-release}"
