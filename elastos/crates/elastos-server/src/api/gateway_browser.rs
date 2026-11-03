@@ -1012,7 +1012,10 @@ async fn execute_browser_open(
         }
         if matches!(
             code,
-            "browser_capacity_unavailable" | "resources_in_use" | "profile_recovery_required"
+            "browser_capacity_unavailable"
+                | "resources_in_use"
+                | "profile_recovery_required"
+                | "browser_getting_ready"
         ) {
             let outcome = match exact_did_not_act {
                 Some(outcome) => outcome,

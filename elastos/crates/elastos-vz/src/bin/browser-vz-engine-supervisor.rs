@@ -56,6 +56,12 @@ const CLEANUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
 const STARTUP_ATTEMPT_BUDGET: Duration = Duration::from_secs(30);
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TURN_PORT_ABSENCE_POLL: Duration = Duration::from_millis(50);
+/// Launch time kept for the VM boot after a launch waits for a prepared
+/// rootfs copy.
+const ROOTFS_WAIT_BOOT_RESERVE: Duration = Duration::from_secs(60);
+/// The control service's launch limit, as it passes it to this owner.
+const LAUNCH_TIMEOUT_ENV: &str = "ELASTOS_BROWSER_VM_LAUNCH_TIMEOUT_MS";
+const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
@@ -117,8 +123,11 @@ async fn main() {
     }
     #[cfg(target_os = "linux")]
     if std::env::args().nth(1).as_deref() == Some(rootfs_pool::REFILL_ARG) {
-        let args = std::env::args().skip(2).collect::<Vec<_>>();
-        process::exit(rootfs_pool::refill_main(&args));
+        let data_dir = browser_data_dir();
+        process::exit(rootfs_pool::refill_main(
+            &seed_rootfs_path(&data_dir),
+            &data_dir,
+        ));
     }
     init_tracing();
     if let Err(error) = run().await {
@@ -704,6 +713,7 @@ fn emit_stderr_line(line: &str) {
 }
 
 async fn run() -> Result<(), String> {
+    let launch_started = Instant::now();
     trace_stage("read_request", "");
     let (request, request_from_stdin) = read_open_request().map_err(unbound_launch_error)?;
     let launch = request
@@ -833,7 +843,14 @@ async fn run() -> Result<(), String> {
         }
     }
     trace_stage("prepare_rootfs_start", "");
-    owner.launch_rootfs = Some(post_effect_try!(prepare_launch_rootfs(&owner.paths)));
+    owner.launch_rootfs = Some({
+        let cancelled = || signals.cancellation_requested();
+        let rootfs_wait = RootfsWait {
+            deadline: RootfsWait::deadline(launch_started),
+            cancelled: &cancelled,
+        };
+        post_effect_try!(prepare_launch_rootfs(&owner.paths, &rootfs_wait))
+    });
     #[cfg(target_os = "linux")]
     start_rootfs_pool_refill(&owner.paths.rootfs_path);
     trace_stage(
@@ -2152,8 +2169,7 @@ impl LaunchPaths {
         let data_dir = browser_data_dir();
         let kernel_path =
             env_path("ELASTOS_BROWSER_VM_KERNEL").unwrap_or_else(|| data_dir.join("bin/vmlinux"));
-        let rootfs_path = env_path("ELASTOS_BROWSER_VM_ROOTFS")
-            .unwrap_or_else(|| data_dir.join("browser-vm/rootfs.ext4"));
+        let rootfs_path = seed_rootfs_path(&data_dir);
         let initramfs_path = env_path("ELASTOS_BROWSER_VM_INITRAMFS").or_else(|| {
             let default_initrd = data_dir.join("bin/initrd");
             default_initrd.is_file().then_some(default_initrd)
@@ -2898,6 +2914,11 @@ fn browser_data_dir() -> PathBuf {
     data_dir_from(env_path("ELASTOS_BROWSER_VM_DATA_DIR"))
 }
 
+/// The admitted guest image each launch copies from.
+fn seed_rootfs_path(data_dir: &Path) -> PathBuf {
+    env_path("ELASTOS_BROWSER_VM_ROOTFS").unwrap_or_else(|| data_dir.join("browser-vm/rootfs.ext4"))
+}
+
 fn data_dir_from(selected: Option<PathBuf>) -> PathBuf {
     selected.unwrap_or_else(default_data_dir)
 }
@@ -2966,7 +2987,28 @@ fn shared_writable_rootfs() -> bool {
         .unwrap_or(false)
 }
 
-fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
+/// How long a launch may wait for a prepared rootfs copy, and whether its
+/// startup was cancelled meanwhile.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct RootfsWait<'a> {
+    deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl RootfsWait<'_> {
+    /// The deadline for a launch that started at `started`: the control
+    /// service's launch limit less the boot that follows.
+    fn deadline(started: Instant) -> Instant {
+        let limit = env_u64(LAUNCH_TIMEOUT_ENV, DEFAULT_LAUNCH_TIMEOUT_MS)
+            .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS);
+        started + Duration::from_millis(limit).saturating_sub(ROOTFS_WAIT_BOOT_RESERVE)
+    }
+}
+
+fn prepare_launch_rootfs(
+    paths: &LaunchPaths,
+    wait: &RootfsWait<'_>,
+) -> Result<PreparedLaunchRootfs, String> {
     if shared_writable_rootfs() {
         return Ok(PreparedLaunchRootfs {
             path: paths.rootfs_path.clone(),
@@ -2979,9 +3021,12 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
 
     let launch_rootfs = paths.session_dir.join("rootfs.ext4");
     #[cfg(target_os = "linux")]
-    let pooled = take_pooled_rootfs(&paths.rootfs_path, &launch_rootfs);
+    let pooled = take_pooled_rootfs(&paths.rootfs_path, &launch_rootfs, wait)?;
     #[cfg(not(target_os = "linux"))]
-    let pooled = false;
+    let pooled = {
+        let _ = wait;
+        false
+    };
     if !pooled {
         clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
             format!(
@@ -3003,19 +3048,41 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     })
 }
 
-/// Linux boots a prepared pool copy of the admitted image when one is ready;
-/// the caller copies the seed only when none is (#90, Jetson SD card).
+/// Linux boots a prepared pool copy of the admitted image when one is ready,
+/// or waits for the copy a running refill makes when it can finish in time.
+/// The caller copies the seed only when no copy is ready or coming (#90,
+/// Jetson SD card).
 #[cfg(target_os = "linux")]
-fn take_pooled_rootfs(seed: &Path, launch_rootfs: &Path) -> bool {
+fn take_pooled_rootfs(
+    seed: &Path,
+    launch_rootfs: &Path,
+    wait: &RootfsWait<'_>,
+) -> Result<bool, String> {
     let pool = match rootfs_pool::Pool::from_env(seed, &browser_data_dir()) {
         Ok(Some(pool)) => pool,
-        Ok(None) => return false,
+        Ok(None) => return Ok(false),
         Err(error) => {
             trace_stage("rootfs_pool_unavailable", error);
-            return false;
+            return Ok(false);
         }
     };
-    let take = pool.take(launch_rootfs);
+    let take = match pool.take_or_wait(launch_rootfs, wait.deadline, wait.cancelled) {
+        rootfs_pool::Waited::Done(take) => take,
+        rootfs_pool::Waited::GettingReady(left) => {
+            trace_stage(
+                "rootfs_pool_getting_ready",
+                format!(
+                    "left_ms={}",
+                    left.map_or_else(
+                        || "unknown".to_string(),
+                        |left| left.as_millis().to_string()
+                    )
+                ),
+            );
+            return Err(rootfs_getting_ready_error(left));
+        }
+        rootfs_pool::Waited::Cancelled => return Err("Browser VZ startup cancelled".to_string()),
+    };
     for (name, reason) in &take.refused {
         trace_stage(
             "rootfs_pool_refused",
@@ -3024,14 +3091,40 @@ fn take_pooled_rootfs(seed: &Path, launch_rootfs: &Path) -> bool {
     }
     match take.taken {
         Some(entry) => {
-            trace_stage("rootfs_pool_taken", format!("entry={}", entry.display()));
-            true
+            trace_stage(
+                "rootfs_pool_taken",
+                format!(
+                    "entry={} waited_ms={}",
+                    entry.display(),
+                    take.waited.as_millis()
+                ),
+            );
+            Ok(true)
         }
         None => {
             trace_stage("rootfs_pool_empty", "mode=copy");
-            false
+            Ok(false)
         }
     }
+}
+
+/// The typed launch error while the next rootfs copy is still being made and
+/// cannot finish within this launch.
+#[cfg(any(target_os = "linux", test))]
+fn rootfs_getting_ready_error(left: Option<Duration>) -> String {
+    let when = match left {
+        Some(left) => match left.as_secs().div_ceil(60).max(1) {
+            1 => "in about a minute".to_string(),
+            minutes => format!("in about {minutes} minutes"),
+        },
+        None => "in a few minutes".to_string(),
+    };
+    json!({
+        "schema": "elastos.browser.engine.launch-error/v1",
+        "code": "browser_getting_ready",
+        "message": format!("Browser is still getting ready on this computer. Open it again {when}."),
+    })
+    .to_string()
 }
 
 /// After this launch has its rootfs, a background copy brings the pool back
@@ -7569,6 +7662,35 @@ mod tests {
         assert_eq!(fs::read(&seed).unwrap(), b"immutable guest image");
     }
 
+    static NEVER_CANCELLED: fn() -> bool = || false;
+
+    fn test_rootfs_wait() -> RootfsWait<'static> {
+        RootfsWait {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancelled: &NEVER_CANCELLED,
+        }
+    }
+
+    #[test]
+    fn rootfs_getting_ready_is_a_typed_launch_error_with_the_time_left() {
+        for (left, when) in [
+            (Some(Duration::from_secs(20)), "in about a minute."),
+            (Some(Duration::from_secs(290)), "in about 5 minutes."),
+            (None, "in a few minutes."),
+        ] {
+            let error: Value = serde_json::from_str(&rootfs_getting_ready_error(left)).unwrap();
+            assert_eq!(error["schema"], "elastos.browser.engine.launch-error/v1");
+            assert_eq!(error["code"], "browser_getting_ready");
+            let message = error["message"].as_str().unwrap();
+            assert!(
+                message.starts_with("Browser is still getting ready"),
+                "{message}"
+            );
+            assert!(message.ends_with(when), "{message}");
+            assert_eq!(error.as_object().unwrap().len(), 3);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn launch_takes_a_pooled_rootfs_and_copies_the_seed_only_without_one() {
@@ -7609,7 +7731,7 @@ mod tests {
         let ready = pool.join(format!("rootfs-{image}-a.ext4"));
         fs::write(&ready, b"pooled copy bytes!!").unwrap();
         fs::set_permissions(&ready, fs::Permissions::from_mode(0o600)).unwrap();
-        let taken = prepare_launch_rootfs(&paths).unwrap();
+        let taken = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
         assert_eq!(fs::read(&taken.path).unwrap(), b"pooled copy bytes!!");
         assert!(!ready.exists());
         fs::remove_file(&taken.path).unwrap();
@@ -7619,7 +7741,7 @@ mod tests {
         let stale = pool.join(format!("rootfs-{}-b.ext4", "0".repeat(64)));
         fs::write(&stale, b"other image copy!!!").unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
-        let copied = prepare_launch_rootfs(&paths).unwrap();
+        let copied = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
         assert_eq!(fs::read(&copied.path).unwrap(), b"admitted seed bytes");
         assert_eq!(fs::read(&stale).unwrap(), b"other image copy!!!");
         assert_eq!(fs::read(&seed).unwrap(), b"admitted seed bytes");
@@ -7647,7 +7769,7 @@ mod tests {
             memory_mib: 2048,
             vcpu_count: 2,
         };
-        let owner = prepare_launch_rootfs(&paths).unwrap();
+        let owner = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
         let lock_path = disk_lifetime_lock_path(&paths.rootfs_path);
         assert_eq!(
             lock_path,
@@ -7660,14 +7782,14 @@ mod tests {
         assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
         assert_disk_inode_is_unlocked(&paths.rootfs_path);
 
-        let error = prepare_launch_rootfs(&paths).unwrap_err();
+        let error = prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap_err();
         let typed: Value = serde_json::from_str(&error).unwrap();
         assert_eq!(typed["code"], "resources_in_use");
         assert_eq!(typed["resource"], "shared writable Browser VZ rootfs");
         assert_eq!(typed["path"], paths.rootfs_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_launch_rootfs(&paths).unwrap();
+        prepare_launch_rootfs(&paths, &test_rootfs_wait()).unwrap();
     }
 
     fn assert_disk_inode_is_unlocked(disk_path: &Path) {

@@ -375,3 +375,54 @@ test("remote VZ readiness remains unsupported without a local probe", async t =>
   assert.equal(c.probes.length, 0);
   assert.equal(c.stats.length, 0);
 });
+
+test("a Linux Home starts one rootfs pool refill when its native Engine is ready", async () => {
+  const { rootfsPoolPrefiller } = await import("./browser-vm-control-service.mjs");
+  const { EventEmitter } = await import("node:events");
+  const spawns = [], events = [];
+  const env = {
+    ELASTOS_BROWSER_VM_PLATFORM: "linux-arm64", ELASTOS_BROWSER_VM_DATA_DIR: "/home/a/.local/share/elastos",
+    ELASTOS_BROWSER_VM_ROOTFS: "/d/browser-vm/image-set/rootfs.ext4",
+    ELASTOS_BROWSER_VM_ROOTFS_MANIFEST: "/d/browser-vm/image-set/browser-vm-rootfs-manifest.json",
+    ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR: "/d/browser-vm/rootfs-pool",
+    ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT: "1",
+    ELASTOS_BROWSER_VM_OPEN_REQUEST: "launch secret", PATH: "/usr/bin",
+  };
+  const prefill = rootfsPoolPrefiller({
+    env,
+    log: (event, fields) => events.push({ event, ...fields }),
+    spawnProgram(program, args, options) {
+      const child = Object.assign(new EventEmitter(), { pid: 4242, stdout: new EventEmitter() });
+      spawns.push({ program, args, options, child });
+      return child;
+    },
+  });
+  const config = { launcher_program: "/d/bin/browser-vz-engine-supervisor" };
+
+  assert.equal(prefill(config, unavailable()), null, "not before the Engine is ready");
+  const child = prefill(config, ready);
+  assert.equal(prefill(config, ready), null, "the first open's readiness starts no second refill");
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0].program, config.launcher_program);
+  assert.deepEqual(spawns[0].args, ["--refill-rootfs-pool"]);
+  const { ELASTOS_BROWSER_VM_PLATFORM, ELASTOS_BROWSER_VM_OPEN_REQUEST, PATH, ...poolEnv } = env;
+  assert.deepEqual(spawns[0].options.env, poolEnv, "only the pool inputs reach the refill");
+  assert.deepEqual(spawns[0].options.stdio, ["ignore", "pipe", "ignore"]);
+  child.stdout.emit("data", '{"schema":"elastos.browser.vm-rootfs-pool-refill/v1","state":"ready","created":1,"ready":1}\n');
+  child.emit("close", 0);
+  assert.deepEqual(events.map(({ event, state, created, status }) => [event, state, created, status]),
+    [["rootfs_pool_prefill_start", undefined, undefined, undefined], ["rootfs_pool_prefill", "ready", 1, 0]]);
+});
+
+test("a Home without a Linux rootfs pool starts no refill", async () => {
+  const { rootfsPoolPrefiller } = await import("./browser-vm-control-service.mjs");
+  const spawnProgram = () => assert.fail("no refill expected");
+  const config = { launcher_program: "/d/bin/browser-vz-engine-supervisor" };
+  for (const env of [
+    { ELASTOS_BROWSER_VM_PLATFORM: "linux-arm64" },
+    { ELASTOS_BROWSER_VM_PLATFORM: "darwin-arm64", ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR: "/d/pool" },
+  ]) {
+    assert.equal(rootfsPoolPrefiller({ env, spawnProgram, log: () => {} })(config, ready), null);
+  }
+});

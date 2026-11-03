@@ -81,6 +81,24 @@ test("interrupted profile setup gives reset guidance after terminal cleanup", ()
   }
 });
 
+test("a Browser still getting ready says how long after terminal cleanup", () => {
+  const message = "Browser is still getting ready on this computer. Open it again in about 4 minutes.";
+  for (const state of ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"]) {
+    const error = openError(state);
+    error.message = message;
+    error.payload.code = "browser_getting_ready";
+    error.payload.message = message;
+    assert.equal(friendlyOpenError(error), message);
+    error.message = "browser engine detail";
+    assert.equal(friendlyOpenError(error),
+      "Browser is still getting ready on this computer. Open it again in a few minutes.");
+  }
+  const acquired = openError("terminal_post_effect_cleanup", { page_acquired: true, vm_acquired: true });
+  acquired.message = message;
+  acquired.payload.code = "browser_getting_ready";
+  assert.doesNotMatch(friendlyOpenError(acquired), /getting ready/);
+});
+
 test("profile recovery guidance keeps pending or acquired ownership visible", () => {
   for (const error of [
     openError("cleanup_pending"),

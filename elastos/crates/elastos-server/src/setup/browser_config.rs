@@ -352,6 +352,7 @@ pub(super) async fn prepare_home(
         if !browser_available(platform) {
             return retire_host(data, manifest);
         }
+        let mut image_prepared = false;
         if browser_selected && manifest.profiles.contains_key("browser-host") {
             println!("Preparing Browser Engine helpers...");
             ensure_host_components(
@@ -377,6 +378,7 @@ pub(super) async fn prepare_home(
                     super::FirstPartyCarrierContext::Setup,
                 )
                 .await?;
+                image_prepared = true;
             }
         }
         configure(
@@ -385,12 +387,84 @@ pub(super) async fn prepare_home(
             manifest
                 .external
                 .contains_key(super::browser_vm_image::NAME),
-        )
+        )?;
+        if image_prepared && platform == "linux-arm64" {
+            let data = data.to_path_buf();
+            tokio::task::spawn_blocking(move || prefill_rootfs_pool(&data)).await??;
+        }
+        Ok(())
     }
     .await;
     if let Err(error) = result {
         println!("Browser preparation is incomplete: {error}. Home setup continues. Repair Browser with elastos setup, or select another approved Engine.");
     }
+}
+
+/// Inputs of the native owner's rootfs pool refill, as the Browser control
+/// service passes them.
+const ROOTFS_POOL_ENV: [&str; 5] = [
+    "ELASTOS_BROWSER_VM_DATA_DIR",
+    "ELASTOS_BROWSER_VM_ROOTFS",
+    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+    "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR",
+    "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT",
+];
+
+/// Makes the prepared rootfs copy the first Browser open takes, so it does
+/// not wait for a whole-image copy (minutes on an SD card, #90). The native
+/// owner's refill does the copy with the selected Engine's pool settings and
+/// stops if setup stops.
+fn prefill_rootfs_pool(data: &Path) -> anyhow::Result<()> {
+    let inline = std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").ok();
+    let Some(config) = read_engine_selection(data, inline.as_deref())? else {
+        return Ok(());
+    };
+    let program = data.join("bin/browser-vz-engine-supervisor");
+    let Some(env) = config["adapters"].as_array().and_then(|adapters| {
+        adapters.iter().find_map(|adapter| {
+            let env = &adapter["supervisor"]["env"];
+            (adapter["kind"] == "chromium_microvm"
+                && env["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"].as_str() == program.to_str()
+                && env["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR"].is_string())
+            .then_some(env)
+        })
+    }) else {
+        return Ok(());
+    };
+    println!("Preparing Browser's first start (copies the Browser image; several minutes on slow storage)...");
+    let mut command = Command::new(&program);
+    command
+        .arg("--refill-rootfs-pool")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    for key in ROOTFS_POOL_ENV {
+        if let Some(value) = env[key].as_str() {
+            command.env(key, value);
+        }
+    }
+    let output = command.output()?;
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("Browser first-start copy returned no result"))?;
+    anyhow::ensure!(
+        summary["schema"] == "elastos.browser.vm-rootfs-pool-refill/v1",
+        "Browser first-start copy returned an unknown result"
+    );
+    let seconds = summary["elapsed_ms"].as_u64().unwrap_or(0).div_ceil(1000);
+    match summary["state"].as_str() {
+        Some("ready") => println!("Browser's first start is prepared ({seconds} s)."),
+        Some("busy") => println!("Browser's first start is being prepared by the running Home."),
+        Some("low_space") => println!(
+            "Browser's first start is not prepared: this computer needs {} GB free for it. Browser copies its image when it opens instead, which can take minutes.",
+            summary["required_bytes"].as_u64().unwrap_or(0).div_ceil(1_000_000_000)
+        ),
+        Some("off") => {}
+        _ => anyhow::bail!(
+            "Browser first-start copy failed: {}",
+            summary["error"].as_str().unwrap_or("unknown error")
+        ),
+    }
+    Ok(())
 }
 
 /// Signed bytes [`prepare_home`] downloads for Browser in this state: missing
@@ -732,6 +806,100 @@ mod tests {
             Some(&remote),
             || false
         ));
+    }
+
+    #[test]
+    fn setup_prefills_the_rootfs_pool_through_the_selected_native_owner() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        fs::create_dir_all(data.join("bin")).unwrap();
+        fs::create_dir_all(data.join("config")).unwrap();
+        let owner = data.join("bin/browser-vz-engine-supervisor");
+        let seen = data.join("owner-call");
+        let select = |pool: bool| {
+            let mut env = json!({
+                "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER": owner,
+                "ELASTOS_BROWSER_VM_DATA_DIR": data,
+                "ELASTOS_BROWSER_VM_ROOTFS": data.join("browser-vm/image-set/rootfs.ext4"),
+                "ELASTOS_BROWSER_VM_CONTROL_LAUNCH_TIMEOUT_MS": "210000",
+            });
+            if pool {
+                env["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR"] =
+                    json!(data.join("browser-vm/rootfs-pool"));
+                env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"] = json!("1");
+            }
+            fs::write(
+                data.join("config/browser-engine-adapter.json"),
+                json!({"adapters": [{"kind": "chromium_microvm", "supervisor": {"env": env}}]})
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        let fake = |summary: &str| {
+            fs::write(
+                &owner,
+                format!(
+                    "#!/bin/sh\n{{ printf '%s\\n' \"$*\"; env | LC_ALL=C sort; }} > '{}'\nprintf '%s\\n' '{summary}'\n",
+                    seen.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
+        };
+
+        select(true);
+        fake(
+            r#"{"schema":"elastos.browser.vm-rootfs-pool-refill/v1","state":"ready","created":1,"ready":1,"elapsed_ms":372000}"#,
+        );
+        prefill_rootfs_pool(data).unwrap();
+        let call = fs::read_to_string(&seen).unwrap();
+        let mut lines = call.lines();
+        assert_eq!(lines.next(), Some("--refill-rootfs-pool"));
+        let env: Vec<_> = lines.filter(|line| line.starts_with("ELASTOS_")).collect();
+        assert_eq!(
+            env,
+            [
+                format!("ELASTOS_BROWSER_VM_DATA_DIR={}", data.display()),
+                format!(
+                    "ELASTOS_BROWSER_VM_ROOTFS={}",
+                    data.join("browser-vm/image-set/rootfs.ext4").display()
+                ),
+                format!(
+                    "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR={}",
+                    data.join("browser-vm/rootfs-pool").display()
+                ),
+                "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT=1".to_string(),
+            ],
+            "only the pool inputs reach the refill"
+        );
+
+        for (summary, ok) in [
+            (
+                r#"{"schema":"elastos.browser.vm-rootfs-pool-refill/v1","state":"busy"}"#,
+                true,
+            ),
+            (
+                r#"{"schema":"elastos.browser.vm-rootfs-pool-refill/v1","state":"low_space","required_bytes":8589934592}"#,
+                true,
+            ),
+            (
+                r#"{"schema":"elastos.browser.vm-rootfs-pool-refill/v1","state":"failed","error":"copy failed"}"#,
+                false,
+            ),
+            (r#"{"schema":"other","state":"ready"}"#, false),
+            ("not json", false),
+        ] {
+            fake(summary);
+            assert_eq!(prefill_rootfs_pool(data).is_ok(), ok, "{summary}");
+        }
+
+        // A selection without a pool runs no owner.
+        fs::remove_file(&seen).unwrap();
+        select(false);
+        prefill_rootfs_pool(data).unwrap();
+        assert!(!seen.exists());
     }
 
     #[test]

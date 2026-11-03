@@ -23,8 +23,13 @@ use serde_json::{json, Value};
 pub(crate) const POOL_DIR_ENV: &str = "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR";
 pub(crate) const POOL_COUNT_ENV: &str = "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT";
 pub(crate) const MANIFEST_ENV: &str = "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST";
-/// The supervisor binary re-entered as the background refill.
+pub(crate) const ROOTFS_ENV: &str = "ELASTOS_BROWSER_VM_ROOTFS";
+/// The process whose life bounds a refill; the refill's parent when unset.
+pub(crate) const ANCHOR_ENV: &str = "ELASTOS_BROWSER_VM_ROOTFS_POOL_ANCHOR_PID";
+/// The supervisor binary re-entered as a refill. Its pool comes from the
+/// environment above; it prints one JSON summary line on stdout.
 pub(crate) const REFILL_ARG: &str = "--refill-rootfs-pool";
+const REFILL_SCHEMA: &str = "elastos.browser.vm-rootfs-pool-refill/v1";
 const MAX_POOL_COUNT: u32 = 8;
 /// Free space a refill leaves for update staging, as the earlier pool kept.
 const REFILL_RESERVE_BYTES: u64 = 4096 * 1024 * 1024;
@@ -32,6 +37,13 @@ const REFILL_LOCK: &str = ".refill.lock";
 const REFILL_LOG: &str = "refill.log";
 const ANCHOR_POLL: Duration = Duration::from_millis(500);
 const COPY_STOP_GRACE: Duration = Duration::from_secs(2);
+/// A launch's busy-probe holds the lock shared for an instant; a refill
+/// retries before it reports another refill.
+const LOCK_ATTEMPTS: u32 = 4;
+const LOCK_RETRY: Duration = Duration::from_millis(50);
+const WAIT_POLL: Duration = Duration::from_secs(1);
+/// A running copy's rate is estimated only after this much of it.
+const MIN_ESTIMATE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Pool {
@@ -50,6 +62,53 @@ pub(crate) struct Pool {
 pub(crate) struct Take {
     pub(crate) taken: Option<PathBuf>,
     pub(crate) refused: Vec<(String, &'static str)>,
+    /// How long the launch waited for a running refill's copy.
+    pub(crate) waited: Duration,
+}
+
+/// A launch that found no ready copy while a refill was copying one.
+#[derive(Debug)]
+pub(crate) enum Waited {
+    /// A copy was moved in, or no refill is running and the caller copies.
+    Done(Take),
+    /// The running refill cannot finish before the launch deadline: its
+    /// estimated time left, or `None` while its rate is not known yet.
+    GettingReady(Option<Duration>),
+    Cancelled,
+}
+
+/// What one refill did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refilled {
+    /// Another refill owns the pool.
+    Busy,
+    /// The pool holds its target; `created` copies were made now.
+    Full { created: usize },
+    /// Too little free space for another copy.
+    LowSpace {
+        created: usize,
+        available: u64,
+        required: u64,
+    },
+}
+
+impl Refilled {
+    fn summary(&self) -> Value {
+        match self {
+            Self::Busy => json!({"state": "busy"}),
+            Self::Full { created } => json!({"state": "ready", "created": created}),
+            Self::LowSpace {
+                created,
+                available,
+                required,
+            } => json!({
+                "state": "low_space",
+                "created": created,
+                "available_bytes": available,
+                "required_bytes": required,
+            }),
+        }
+    }
 }
 
 impl Pool {
@@ -193,6 +252,120 @@ impl Pool {
             .unwrap_or(0)
     }
 
+    /// Takes a ready copy. When none is ready but a refill is copying one,
+    /// waits for that copy while its estimate finishes before `deadline`.
+    pub(crate) fn take_or_wait(
+        &self,
+        launch_rootfs: &Path,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Waited {
+        let first = self.take(launch_rootfs);
+        if first.taken.is_some() || !self.refill_running() {
+            return Waited::Done(first);
+        }
+        let started = Instant::now();
+        let refused = first.refused;
+        loop {
+            let now = Instant::now();
+            match self.refill_remaining() {
+                Some(left) if now + left > deadline => return Waited::GettingReady(Some(left)),
+                None if now >= deadline => return Waited::GettingReady(None),
+                _ => {}
+            }
+            if cancelled() {
+                return Waited::Cancelled;
+            }
+            thread::sleep(WAIT_POLL.min(deadline.saturating_duration_since(now)));
+            let mut take = self.take(launch_rootfs);
+            if take.taken.is_none() && !self.refill_running() {
+                // The copy may have been renamed just before its refill ended.
+                take = self.take(launch_rootfs);
+            }
+            if take.taken.is_some() || !self.refill_running() {
+                return Waited::Done(Take {
+                    taken: take.taken,
+                    refused,
+                    waited: started.elapsed(),
+                });
+            }
+        }
+    }
+
+    /// Whether a refill holds the pool lock. The probe holds the lock shared
+    /// only while it asks; a starting refill retries past it.
+    fn refill_running(&self) -> bool {
+        let Ok(lock) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.dir.join(REFILL_LOCK))
+        else {
+            return false;
+        };
+        // SAFETY: a valid descriptor; closing it releases a granted lock.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+    }
+
+    /// Estimated time until the running refill's copy is ready, from how far
+    /// its copier has read the seed; `None` until a rate is known.
+    fn refill_remaining(&self) -> Option<Duration> {
+        let log = fs::read_to_string(self.dir.join(REFILL_LOG)).ok()?;
+        let mut copy = None;
+        for line in log.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match value["event"].as_str() {
+                Some("copy_start") => copy = Some(value),
+                Some("discarded" | "kept") | None => {}
+                Some(_) => copy = None,
+            }
+        }
+        let copy = copy?;
+        let elapsed = u64::try_from(unix_ms())
+            .ok()?
+            .checked_sub(copy["at_unix_ms"].as_u64()?)?;
+        if u128::from(elapsed) < MIN_ESTIMATE.as_millis() {
+            return None;
+        }
+        let copied = copy["copier_pid"]
+            .as_i64()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(|pid| self.copier_position(pid))
+            .or_else(|| {
+                copy["partial"]
+                    .as_str()
+                    .and_then(|partial| fs::metadata(partial).ok())
+                    .map(|metadata| metadata.len())
+            })?
+            .min(self.seed_size);
+        if copied == 0 {
+            return None;
+        }
+        let left = u128::from(elapsed) * u128::from(self.seed_size - copied) / u128::from(copied);
+        Some(Duration::from_millis(
+            u64::try_from(left).unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// The copier's read offset in the seed, from its open descriptor.
+    fn copier_position(&self, pid: i32) -> Option<u64> {
+        let seed = fs::canonicalize(&self.seed).ok()?;
+        for entry in fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
+            if fs::read_link(entry.path()).ok().as_ref() != Some(&seed) {
+                continue;
+            }
+            let fd = entry.file_name();
+            let info =
+                fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd.to_string_lossy())).ok()?;
+            return info
+                .lines()
+                .find_map(|line| line.strip_prefix("pos:"))
+                .and_then(|pos| pos.trim().parse().ok());
+        }
+        None
+    }
+
     /// Starts the background refill when fewer than `count` copies are ready.
     /// It outlives this launch and stops with this process's parent, the
     /// Browser control service, so Home stop ends it.
@@ -205,14 +378,14 @@ impl Pool {
         let anchor = unsafe { libc::getppid() };
         let child = Command::new(program)
             .arg(REFILL_ARG)
-            .arg(&self.dir)
-            .arg(&self.seed)
-            .arg(&self.manifest)
-            .arg(self.count.to_string())
-            .arg(anchor.to_string())
-            // The launch secrets stay with the launch: no inherited
-            // environment and no private stdin.
+            // The launch secrets stay with the launch: only the pool's
+            // inputs, and no private stdin.
             .env_clear()
+            .env(POOL_DIR_ENV, &self.dir)
+            .env(ROOTFS_ENV, &self.seed)
+            .env(MANIFEST_ENV, &self.manifest)
+            .env(POOL_COUNT_ENV, self.count.to_string())
+            .env(ANCHOR_ENV, anchor.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -229,7 +402,7 @@ impl Pool {
 
     /// Copies the seed until `count` copies are ready. One refill runs at a
     /// time; its events go to refill.log in the pool directory.
-    pub(crate) fn refill(&self, anchor: &Anchor) -> Result<usize, String> {
+    pub(crate) fn refill(&self, anchor: &Anchor) -> Result<Refilled, String> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -244,9 +417,14 @@ impl Pool {
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.dir.join(REFILL_LOCK))
             .map_err(|error| format!("Browser rootfs pool lock: {error}"))?;
+        let mut attempts = 0;
         // SAFETY: the descriptor stays open for the whole refill.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(0); // Another refill owns the pool.
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            attempts += 1;
+            if attempts == LOCK_ATTEMPTS {
+                return Ok(Refilled::Busy);
+            }
+            thread::sleep(LOCK_RETRY);
         }
         let mut log = OpenOptions::new()
             .write(true)
@@ -258,16 +436,16 @@ impl Pool {
             .map_err(|error| format!("Browser rootfs pool log: {error}"))?;
         let outcome = self.refill_locked(anchor, &mut log);
         match &outcome {
-            Ok(created) => event(
+            Ok(refilled) => event(
                 &mut log,
-                json!({"event": "refill_done", "created": created}),
+                json!({"event": "refill_done", "summary": refilled.summary()}),
             ),
             Err(error) => event(&mut log, json!({"event": "refill_stopped", "error": error})),
         }
         outcome
     }
 
-    fn refill_locked(&self, anchor: &Anchor, log: &mut File) -> Result<usize, String> {
+    fn refill_locked(&self, anchor: &Anchor, log: &mut File) -> Result<Refilled, String> {
         self.discard_stale(log);
         let mut created = 0;
         while self.ready_count() < self.count as usize {
@@ -278,7 +456,11 @@ impl Pool {
                     log,
                     json!({"event": "refill_skipped", "available_bytes": available, "required_bytes": required}),
                 );
-                return Ok(created);
+                return Ok(Refilled::LowSpace {
+                    created,
+                    available,
+                    required,
+                });
             }
             let before = seed_identity(&self.seed)?;
             let id = format!(
@@ -292,12 +474,8 @@ impl Pool {
             let partial = self
                 .dir
                 .join(format!("rootfs-{}-{id}.ext4.partial", self.image_sha256));
-            event(
-                log,
-                json!({"event": "copy_start", "partial": partial.display().to_string()}),
-            );
             let started = Instant::now();
-            let copied = copy_while_anchored(&self.seed, &partial, anchor).and_then(|()| {
+            let copied = copy_while_anchored(&self.seed, &partial, anchor, log).and_then(|()| {
                 // An update or Undo during the copy discards it.
                 let (image, _) = admitted_image(&self.manifest, &self.seed)?;
                 if image != self.image_sha256 || seed_identity(&self.seed)? != before {
@@ -321,7 +499,7 @@ impl Pool {
                 }),
             );
         }
-        Ok(created)
+        Ok(Refilled::Full { created })
     }
 
     /// Copies of another image and unfinished copies free their space. Only
@@ -355,19 +533,32 @@ impl Pool {
     }
 }
 
-/// The refill process: `REFILL_ARG DIR SEED MANIFEST COUNT ANCHOR_PID`.
-pub(crate) fn refill_main(args: &[String]) -> i32 {
-    let [dir, seed, manifest, count, anchor] = args else {
-        return 2;
-    };
-    let outcome = parse_count(count).and_then(|count| {
-        let anchor = anchor
-            .parse::<i32>()
-            .map_err(|_| "Browser rootfs pool anchor is invalid".to_string())
-            .and_then(Anchor::of)?;
-        Pool::new(dir.into(), seed.into(), manifest.into(), count)?.refill(&anchor)
+/// The refill process, `REFILL_ARG`, for the pool its environment names.
+/// `seed` and `data_dir` resolve as for a launch. Prints one JSON summary.
+pub(crate) fn refill_main(seed: &Path, data_dir: &Path) -> i32 {
+    let started = Instant::now();
+    let outcome = Pool::from_env(seed, data_dir).and_then(|pool| {
+        let Some(pool) = pool else {
+            return Ok(json!({"state": "off"}));
+        };
+        let anchor = match std::env::var(ANCHOR_ENV) {
+            Ok(pid) => pid
+                .parse::<i32>()
+                .map_err(|_| "Browser rootfs pool anchor is invalid".to_string())?,
+            // SAFETY: getppid has no preconditions.
+            Err(_) => unsafe { libc::getppid() },
+        };
+        let mut summary = pool.refill(&Anchor::of(anchor)?)?.summary();
+        summary["ready"] = json!(pool.ready_count());
+        Ok(summary)
     });
-    i32::from(outcome.is_err())
+    let failed = outcome.is_err();
+    let mut summary = outcome.unwrap_or_else(|error| json!({"state": "failed", "error": error}));
+    summary["schema"] = json!(REFILL_SCHEMA);
+    summary["elapsed_ms"] = json!(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    // The caller may be gone; the pool state is on disk either way.
+    let _ = writeln!(std::io::stdout().lock(), "{summary}");
+    i32::from(failed)
 }
 
 /// The process whose life bounds a refill, identified by pid and start time
@@ -404,8 +595,14 @@ fn process_start(pid: i32) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
-fn copy_while_anchored(seed: &Path, partial: &Path, anchor: &Anchor) -> Result<(), String> {
-    let stopped = || "the Browser control service stopped".to_string();
+fn copy_while_anchored(
+    seed: &Path,
+    partial: &Path,
+    anchor: &Anchor,
+    log: &mut File,
+) -> Result<(), String> {
+    // The control service at Home start or launch, or setup.
+    let stopped = || "the process that owns this rootfs pool copy stopped".to_string();
     if !anchor.alive() {
         return Err(stopped());
     }
@@ -418,6 +615,11 @@ fn copy_while_anchored(seed: &Path, partial: &Path, anchor: &Anchor) -> Result<(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("Browser rootfs pool copy did not start: {error}"))?;
+    // A waiting launch estimates the time left from the copier's offset.
+    event(
+        log,
+        json!({"event": "copy_start", "partial": partial.display().to_string(), "copier_pid": child.id()}),
+    );
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
@@ -680,12 +882,15 @@ mod tests {
         );
         let anchor = Anchor::of(i32::try_from(std::process::id()).unwrap()).unwrap();
 
-        assert_eq!(f.pool.refill(&anchor).unwrap(), 1);
+        assert_eq!(
+            f.pool.refill(&anchor).unwrap(),
+            Refilled::Full { created: 1 }
+        );
         let log = fs::read_to_string(f.pool.dir.join(REFILL_LOG)).unwrap();
         assert!(log.contains("\"copy_ready\""), "{log}");
         assert_eq!(
             f.pool.refill(&anchor).unwrap(),
-            0,
+            Refilled::Full { created: 0 },
             "a full pool copies nothing"
         );
 
@@ -710,7 +915,10 @@ mod tests {
 
         let error = f.pool.refill(&anchor).unwrap_err();
 
-        assert!(error.contains("control service stopped"), "{error}");
+        assert!(
+            error.contains("owns this rootfs pool copy stopped"),
+            "{error}"
+        );
         let left: Vec<_> = fs::read_dir(&f.pool.dir)
             .unwrap()
             .flatten()
@@ -718,6 +926,131 @@ mod tests {
             .filter(|name| name.starts_with("rootfs-"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Holds the pool lock as a running refill does.
+    fn hold_refill_lock(pool: &Pool) -> File {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(pool.dir.join(REFILL_LOCK))
+            .unwrap();
+        // SAFETY: a valid descriptor owned by the test.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock
+    }
+
+    /// A refill's log and unfinished copy, started `ago_ms` before now.
+    fn running_copy(pool: &Pool, ago_ms: u64, copied: &[u8]) -> PathBuf {
+        let partial = entry(
+            pool,
+            &format!("rootfs-{IMAGE}-run.ext4.partial"),
+            copied,
+            0o600,
+        );
+        let started = u64::try_from(unix_ms()).unwrap() - ago_ms;
+        fs::write(
+            pool.dir.join(REFILL_LOG),
+            format!(
+                "{}\n",
+                json!({"event": "copy_start", "partial": partial, "at_unix_ms": started})
+            ),
+        )
+        .unwrap();
+        partial
+    }
+
+    #[test]
+    fn a_second_refill_reports_the_running_one() {
+        let f = fixture();
+        let _running = hold_refill_lock(&f.pool);
+        let anchor = Anchor::of(i32::try_from(std::process::id()).unwrap()).unwrap();
+
+        assert_eq!(f.pool.refill(&anchor).unwrap(), Refilled::Busy);
+        assert_eq!(f.pool.ready_count(), 0);
+    }
+
+    #[test]
+    fn a_launch_takes_the_copy_a_running_refill_finishes() {
+        let f = fixture();
+        let running = hold_refill_lock(&f.pool);
+        // About half copied in 4 s: some 4 s left, well inside the deadline.
+        let partial = running_copy(&f.pool, 4000, b"admitted s");
+        let ready = f.pool.dir.join(format!("rootfs-{IMAGE}-run.ext4"));
+        let finish = {
+            let ready = ready.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                fs::write(&partial, b"admitted seed bytes").unwrap();
+                fs::rename(&partial, &ready).unwrap();
+                drop(running);
+            })
+        };
+
+        let started = Instant::now();
+        let Waited::Done(take) =
+            f.pool
+                .take_or_wait(&f.launch, started + Duration::from_secs(30), &|| false)
+        else {
+            panic!("the launch did not wait for the running copy");
+        };
+        finish.join().unwrap();
+
+        assert_eq!(take.taken, Some(ready.clone()));
+        assert!(
+            take.waited >= Duration::from_millis(300),
+            "{:?}",
+            take.waited
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(fs::read(&f.launch).unwrap(), b"admitted seed bytes");
+        assert!(!ready.exists());
+    }
+
+    #[test]
+    fn a_launch_fails_fast_when_the_running_refill_cannot_finish_in_time() {
+        let f = fixture();
+        let _running = hold_refill_lock(&f.pool);
+        // 2 of 19 bytes in 10 s: some 85 s left, past a 5 s deadline.
+        running_copy(&f.pool, 10_000, b"ad");
+
+        let started = Instant::now();
+        let waited = f
+            .pool
+            .take_or_wait(&f.launch, started + Duration::from_secs(5), &|| false);
+
+        let Waited::GettingReady(Some(left)) = &waited else {
+            panic!("expected getting ready, got {waited:?}");
+        };
+        assert!(
+            (Duration::from_secs(80)..Duration::from_secs(90)).contains(left),
+            "{left:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!f.launch.exists());
+    }
+
+    #[test]
+    fn a_launch_waits_only_for_a_running_refill() {
+        let f = fixture();
+        // A stale log and unfinished copy without a refill holding the pool.
+        running_copy(&f.pool, 4000, b"admitted s");
+
+        let started = Instant::now();
+        let waited = f
+            .pool
+            .take_or_wait(&f.launch, started + Duration::from_secs(30), &|| false);
+
+        assert!(
+            matches!(&waited, Waited::Done(take) if take.taken.is_none()),
+            "{waited:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

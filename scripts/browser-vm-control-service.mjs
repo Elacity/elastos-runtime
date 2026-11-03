@@ -97,6 +97,42 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
   };
 }
 
+// Inputs of the native owner's rootfs pool refill; nothing else is passed.
+const ROOTFS_POOL_ENV = [
+  "ELASTOS_BROWSER_VM_DATA_DIR", "ELASTOS_BROWSER_VM_ROOTFS", "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+  "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR", "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT",
+];
+
+// A Linux Home copies the next Browser rootfs once its native Engine is ready,
+// off the first open's path (#90: a 4 GiB copy takes minutes on an SD card).
+// One refill per service; it stops when this service, its parent, stops.
+export function rootfsPoolPrefiller({ env = process.env, spawnProgram = spawn, log = logEvent } = {}) {
+  let started = false;
+  return (config, readiness) => {
+    const linux = env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
+    if (started || !linux || !env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR ||
+        readiness?.readiness?.state !== "ready") {
+      return null;
+    }
+    started = true;
+    const startedAt = Date.now();
+    const child = spawnProgram(config.launcher_program, ["--refill-rootfs-pool"], {
+      env: Object.fromEntries(ROOTFS_POOL_ENV.filter((key) => env[key]).map((key) => [key, env[key]])),
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let stdout = "";
+    child.stdout?.on("data", (chunk) => { if (stdout.length < 4096) stdout += chunk; });
+    child.once("error", (error) => log("rootfs_pool_prefill", { state: "failed", error: error.message }));
+    child.once("close", (status) => {
+      let summary = {};
+      try { summary = JSON.parse(stdout.trim()); } catch {}
+      log("rootfs_pool_prefill", { ...summary, status, latency_ms: Date.now() - startedAt });
+    });
+    log("rootfs_pool_prefill_start", { pid: child.pid ?? null });
+    return child;
+  };
+}
+
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
@@ -3923,16 +3959,18 @@ async function openPage(
   };
   const processOwnershipId = newHostProcessOwnershipId();
   const serialized = JSON.stringify(request);
+  const timeoutMs = Number(config.launch_timeout_ms ?? 120000);
   const launcherEnvironment = {
     ...process.env,
     ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS: String(config.shutdown_timeout_ms ?? 30000),
+    // The native owner waits for a prepared rootfs copy only within this.
+    ELASTOS_BROWSER_VM_LAUNCH_TIMEOUT_MS: String(timeoutMs),
   };
   if (launch.transport_authority) {
     delete launcherEnvironment[OPEN_REQUEST_ENV];
   } else {
     launcherEnvironment[OPEN_REQUEST_ENV] = serialized;
   }
-  const timeoutMs = Number(config.launch_timeout_ms ?? 120000);
   const startedAt = Date.now();
   const requestId = request.control_plane.request_id;
   let launcher;
@@ -4738,6 +4776,7 @@ function main() {
   const controlServiceIdentity = loadOrCreateControlServiceIdentity(config);
   const serviceStartedAtMs = Date.now();
   const serviceStartedAt = new Date(serviceStartedAtMs).toISOString();
+  const prefillRootfsPool = rootfsPoolPrefiller();
   const activePages = new Map();
   const activeVms = new Map();
   const pendingLaunches = new Map();
@@ -4760,7 +4799,9 @@ function main() {
     try {
       const url = new URL(req.url || "/", "http://browser-vm-control");
       if (req.method === "GET" && url.pathname === "/readiness") {
-        sendJson(200, await engineReadiness(config));
+        const readiness = await engineReadiness(config);
+        prefillRootfsPool(config, readiness);
+        sendJson(200, readiness);
         return;
       }
       if (req.method === "GET" && url.pathname === "/status") {
@@ -5104,8 +5145,9 @@ function main() {
       network_mode: "runtime_net_only",
       direct_network: false,
     })}\n`);
-    // Verify the image now, off the first open's path.
-    engineReadiness(config).catch(() => {});
+    // Verify the image now, off the first open's path; then copy the next
+    // Browser rootfs when the native Engine is ready.
+    engineReadiness(config).then((readiness) => prefillRootfsPool(config, readiness)).catch(() => {});
   });
 }
 
