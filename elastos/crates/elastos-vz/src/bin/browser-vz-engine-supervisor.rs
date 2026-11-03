@@ -3721,6 +3721,14 @@ fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, St
             }
             let mut header = vec![0; marker.len()];
             match file.read_exact(&mut header) {
+                // The guest erases the marker and syncs before its only
+                // format attempt, and the marker is the only data this owner
+                // wrote. Marker intact and nothing else allocated: no guest
+                // ever wrote this disk (a launch failed before the profile
+                // mount), so the same creation intent is still the only one.
+                Ok(()) if header == marker.as_bytes() && profile_disk_unwritten(&opened) => {
+                    return Ok(true);
+                }
                 Ok(()) if header == marker.as_bytes() => {
                     return Err(json!({
                         "schema": "elastos.browser.engine.launch-error/v1",
@@ -3735,7 +3743,8 @@ fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, St
                     return Err(format!("read Browser profile disk intent failed: {error}"));
                 }
             }
-            // Existing bytes, including incomplete creation, never renew intent.
+            // Other existing bytes, including incomplete creation, never
+            // renew intent.
             return Ok(false);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -3770,6 +3779,14 @@ fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, St
         .and_then(|()| file.sync_all())
         .map_err(|err| format!("initialize Browser profile disk intent failed: {err}"))?;
     Ok(true)
+}
+
+/// A sparse profile disk holding only the creation marker has at most a few
+/// filesystem blocks allocated; a formatted one has megabytes of metadata.
+const UNWRITTEN_PROFILE_DISK_MAX_ALLOCATED: u64 = 1024 * 1024;
+
+fn profile_disk_unwritten(metadata: &fs::Metadata) -> bool {
+    metadata.blocks().saturating_mul(512) <= UNWRITTEN_PROFILE_DISK_MAX_ALLOCATED
 }
 
 fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
@@ -7021,11 +7038,12 @@ mod tests {
         assert_eq!(header.as_slice(), marker);
         assert_eq!(fs::metadata(&disk_path).unwrap().mode() & 0o777, 0o600);
 
-        // A retained, unformatted disk requires explicit recovery instead of
-        // another boot or renewed initialization authority.
-        let error = attach_browser_profile_disk(&mut vm_config, &request).unwrap_err();
-        let typed: Value = serde_json::from_str(&error).unwrap();
-        assert_eq!(typed["code"], "profile_recovery_required");
+        // A launch that failed before the guest mounted the disk leaves only
+        // the marker: the next open boots the same disk as new, bytes kept.
+        attach_browser_profile_disk(&mut vm_config, &request).unwrap();
+        assert!(vm_config
+            .boot_args
+            .contains("elastos.browser_profile_initialize=new"));
         File::open(&disk_path)
             .unwrap()
             .read_exact(&mut header)
@@ -7099,20 +7117,20 @@ mod tests {
         assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
 
         drop(owner);
-        let error = prepare_browser_profile_disk(&request).unwrap_err();
-        let typed: Value = serde_json::from_str(&error).unwrap();
-        assert_eq!(typed["code"], "profile_recovery_required");
+        // The unused disk of a failed launch opens again as a new profile.
+        assert!(prepare_browser_profile_disk(&request).unwrap().initialize);
         fs::write(&disk_path, b"initialized profile bytes").unwrap();
         assert!(!prepare_browser_profile_disk(&request).unwrap().initialize);
     }
 
     #[test]
-    fn retained_profile_initialization_marker_requires_recovery_and_preserves_bytes() {
+    fn profile_marker_beside_written_data_requires_recovery_and_preserves_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let disk = tmp.path().join("profile.ext4");
         let key = format!("profile-{}", "a".repeat(64));
         let marker = format!("ELASTOS_BROWSER_PROFILE_NEW_V1:{key}");
-        let mut bytes = vec![0; 8192];
+        // More data than an unwritten sparse disk can hold: a guest wrote it.
+        let mut bytes = vec![0x5a; 2 * UNWRITTEN_PROFILE_DISK_MAX_ALLOCATED as usize];
         bytes[..marker.len()].copy_from_slice(marker.as_bytes());
         fs::write(&disk, &bytes).unwrap();
         fs::set_permissions(&disk, fs::Permissions::from_mode(0o600)).unwrap();
