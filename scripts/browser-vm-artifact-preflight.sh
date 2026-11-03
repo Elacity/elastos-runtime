@@ -243,6 +243,42 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+VERIFIED_IDENTITY = ".elastos-verified-identity.json"
+
+
+def recorded_sha256(path):
+    # Host readiness trusts the digest that Runtime setup or a Browser open
+    # recorded for this exact file identity in the image set, instead of
+    # hashing the 4 GiB root disk again (#90: 45-80 s on an SD card). Any
+    # write or replacement changes the inode or change time. Other modes
+    # (setup, packaging) always hash.
+    if mode != "--host-readiness":
+        return None
+    try:
+        real = os.path.realpath(path)
+        info = os.stat(real)
+        record_path = os.path.join(os.path.dirname(real), VERIFIED_IDENTITY)
+        record_info = os.lstat(record_path)
+        if not stat_mod.S_ISREG(record_info.st_mode) or record_info.st_size > 64 * 1024:
+            return None
+        with open(record_path, "rb") as handle:
+            record = json.loads(handle.read())
+        if record.get("schema") != "elastos.browser.vm-image-verified-identity/v1":
+            return None
+        entry = record["files"][os.path.basename(real)]
+        identity = {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
+        if entry.get("identity") == identity and isinstance(entry.get("sha256"), str):
+            return entry["sha256"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def verified_sha256(path):
+    return recorded_sha256(path) or sha256_file(path)
+
+
 def ext4_has(image, guest_path):
     code, stdout, stderr = debugfs(f"stat {guest_path}", image)
     if code != 0:
@@ -343,7 +379,7 @@ def inspect_ext4_sidecar_manifest(image):
         result["errors"].append("rootfs manifest sidecar requires a lowercase SHA-256 digest")
     else:
         try:
-            actual_sha256 = sha256_file(image)
+            actual_sha256 = verified_sha256(image)
             result["image_identity"] = {"size": actual_size, "sha256": actual_sha256}
             if actual_sha256 != expected_sha256:
                 result["errors"].append("rootfs image sha256 does not match sidecar manifest")
@@ -474,7 +510,7 @@ def verify_image_set():
                 return "preparation_required"
             if (not isinstance(entry, dict) or type(entry.get("size")) is not int
                     or entry["size"] != actual.stat().st_size
-                    or entry.get("sha256") != sha256_file(artifact)):
+                    or entry.get("sha256") != verified_sha256(artifact)):
                 return "artifact_invalid"
     except OSError:
         return "artifact_invalid"

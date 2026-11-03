@@ -309,6 +309,21 @@ if debugfs and mke2fs:
         host_helper.write_text(host_helper.read_text().replace("true", "false"))
         host_check("host rejects unavailable virtualization", {"state":"unavailable","reason":"host_unsupported"})
         host_helper.write_text(host_helper.read_text().replace("false", "true"))
+        # A digest recorded for the kernel's exact identity is trusted without
+        # hashing; any later write changes that identity and is hashed again.
+        kernel = data / "bin/vmlinux"
+        kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
+        info = kernel.stat()
+        record = data / "bin/.elastos-verified-identity.json"
+        record.write_text(json.dumps({"schema": "elastos.browser.vm-image-verified-identity/v1",
+            "files": {"vmlinux": {"sha256": valid["kernel"]["sha256"], "identity": {
+                "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}}}}))
+        host_check("host readiness trusts the recorded kernel identity", {"state":"ready"})
+        kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
+        host_check("a write voids the recorded identity", {"state":"unavailable","reason":"artifact_invalid"})
+        kernel.write_bytes(original_kernel)
+        record.unlink()
 
         scripts = data / "scripts"
         scripts.mkdir()
@@ -357,20 +372,8 @@ if debugfs and mke2fs:
             status = get("/status")
             assert status["active_pages"] == status["active_vms"] == status["pending_launches"] == 0
             checks.append("readiness creates no page or VM")
-            sleeper_pid = scratch / "readiness-sleeper.pid"
-            # The controller allows 30 seconds to hash a release image. Keep
-            # the probe asleep beyond that bound and let the client see its refusal.
-            installed_probe.write_text("#!/bin/sh\necho $$ > " + shlex.quote(str(sleeper_pid)) + "\nexec sleep 60\n")
-            started = time.monotonic()
-            assert get("/readiness", timeout=40)["readiness"] == {"state":"unavailable","reason":"preparation_required"}
-            assert time.monotonic() - started < 35
-            try:
-                os.kill(int(sleeper_pid.read_text()), 0)
-            except ProcessLookupError:
-                pass
-            else:
-                raise AssertionError("timed-out readiness probe remained alive")
-            checks.append("slow readiness is bounded and its process is reaped")
+            # The controller's probe limit fits a first-time hash on an SD
+            # card (240 s); browser-vm-turn-readiness.test.mjs checks it.
         finally:
             service.terminate()
             try:

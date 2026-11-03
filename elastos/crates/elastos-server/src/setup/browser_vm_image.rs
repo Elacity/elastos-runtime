@@ -342,6 +342,7 @@ fn verify_payload_paths_with_cancel(
         receipt["target_platform"] == target,
         "Browser image architecture does not match {platform}"
     );
+    let mut verified = Vec::with_capacity(3);
     for (path, name, entry) in [
         (&paths[1], "rootfs.ext4", &receipt),
         (&paths[2], "vmlinux", &receipt["kernel"]),
@@ -356,14 +357,21 @@ fn verify_payload_paths_with_cancel(
                 && entry["size"].as_u64() == Some(meta.len()),
             "Browser image {name} size or file type is invalid"
         );
+        // The identity is taken before the bytes are read, so a write during
+        // hashing cannot bind its new identity to the old digest.
+        let identity = VerifiedArtifact::observe(path);
         ensure!(
             hash.len() == 64
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                && hash_reader(&mut fs::File::open(path)?, cancelled)? == hash,
+                && (identity
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.recorded_digest().as_deref() == Some(hash))
+                    || hash_reader(&mut fs::File::open(path)?, cancelled)? == hash),
             "Browser image {name} checksum mismatch"
         );
+        verified.push((path, hash, identity));
     }
     let preflight = &receipt["preflight"];
     ensure!(
@@ -402,6 +410,7 @@ fn verify_payload_paths_with_cancel(
         ),
         "Browser image transport contract is incompatible"
     );
+    record_verified_identities(&verified);
     Ok(())
 }
 
@@ -426,6 +435,106 @@ pub(super) fn verify_installed(
     verify_cached_payload(&paths, platform, &serde_json::to_string(info)?, || {
         verify_payload(&dest, platform)
     })
+}
+
+/// Image artifacts whose bytes matched the receipt, by file identity, kept in
+/// the image set. A later verifier (the Runtime at a Browser open, the
+/// Engine's host readiness) then trusts them without hashing the 4 GiB root
+/// disk again: 45-80 s on an SD card (#90). Any write or replacement changes
+/// the inode or the change time, which an unprivileged process cannot set back.
+const VERIFIED_IDENTITY: &str = ".elastos-verified-identity.json";
+const VERIFIED_IDENTITY_SCHEMA: &str = "elastos.browser.vm-image-verified-identity/v1";
+const VERIFIED_IDENTITY_MAX_BYTES: u64 = 64 * 1024;
+
+/// One artifact's record location and identity, observed before its bytes
+/// are read.
+#[derive(PartialEq, Eq)]
+struct VerifiedArtifact {
+    record: PathBuf,
+    name: String,
+    identity: Value,
+}
+
+impl VerifiedArtifact {
+    #[cfg(unix)]
+    fn observe(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let real = fs::canonicalize(path).ok()?;
+        let meta = fs::metadata(&real).ok()?;
+        let nanos = |secs: i64, nsec: i64| secs.checked_mul(1_000_000_000)?.checked_add(nsec);
+        Some(Self {
+            record: real.parent()?.join(VERIFIED_IDENTITY),
+            name: real.file_name()?.to_str()?.to_owned(),
+            identity: json!({
+                "dev": meta.dev(),
+                "ino": meta.ino(),
+                "size": meta.len(),
+                "mtime_ns": nanos(meta.mtime(), meta.mtime_nsec())?,
+                "ctime_ns": nanos(meta.ctime(), meta.ctime_nsec())?,
+            }),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn observe(_path: &Path) -> Option<Self> {
+        None
+    }
+
+    fn recorded_digest(&self) -> Option<String> {
+        let entry = &read_verified_record(&self.record)?["files"][&self.name];
+        (entry["identity"] == self.identity)
+            .then(|| entry["sha256"].as_str().map(str::to_owned))
+            .flatten()
+    }
+}
+
+fn read_verified_record(record: &Path) -> Option<Value> {
+    let meta = fs::symlink_metadata(record).ok()?;
+    if !meta.file_type().is_file() || meta.len() > VERIFIED_IDENTITY_MAX_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&fs::read(record).ok()?).ok()?;
+    (value["schema"] == VERIFIED_IDENTITY_SCHEMA).then_some(value)
+}
+
+/// Records the verified artifacts when they share one image-set directory and
+/// none changed since its identity was observed. Best effort: without a
+/// record the next verifier hashes again.
+fn record_verified_identities(verified: &[(&PathBuf, &str, Option<VerifiedArtifact>)]) {
+    let mut record = None;
+    let mut files = serde_json::Map::new();
+    for (path, sha256, observed) in verified {
+        let Some(observed) = observed else { return };
+        if VerifiedArtifact::observe(path).as_ref() != Some(observed)
+            || record.get_or_insert_with(|| observed.record.clone()) != &observed.record
+        {
+            return;
+        }
+        files.insert(
+            observed.name.clone(),
+            json!({"identity": observed.identity, "sha256": sha256}),
+        );
+    }
+    let Some(record) = record else { return };
+    let value = json!({"schema": VERIFIED_IDENTITY_SCHEMA, "files": files});
+    if read_verified_record(&record).as_ref() == Some(&value) {
+        return;
+    }
+    let partial = record.with_file_name(format!("{VERIFIED_IDENTITY}.{}", std::process::id()));
+    let _ = fs::remove_file(&partial);
+    let written = (|| -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&partial)?;
+        std::io::Write::write_all(&mut file, &serde_json::to_vec(&value)?)?;
+        file.sync_all()?;
+        fs::rename(&partial, &record)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
@@ -903,6 +1012,50 @@ mod tests {
             4,
             "only image-set, install lock and two aliases remain"
         );
+    }
+
+    #[test]
+    fn browser_image_verified_identity_record_skips_the_hash_until_a_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let (bytes, info) = archive(&fixture(b"recorded-image"));
+        install_archive(data, &bytes, &info, "darwin-arm64").unwrap();
+        let dest = data.join(INSTALL_PATH);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(dest.join(VERIFIED_IDENTITY)).unwrap()).unwrap();
+        assert_eq!(record["files"].as_object().unwrap().len(), 3);
+        assert_eq!(
+            record["files"]["rootfs.ext4"]["sha256"],
+            sha(b"recorded-image")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dest.join(VERIFIED_IDENTITY))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // A digest recorded for this exact identity admits the file without
+        // reading it: the receipt now names a digest the bytes do not have.
+        let paths = FILES.map(|name| dest.join(name));
+        let claimed = "0".repeat(64);
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+        receipt["sha256"] = json!(claimed);
+        fs::write(&paths[0], serde_json::to_vec(&receipt).unwrap()).unwrap();
+        record["files"]["rootfs.ext4"]["sha256"] = json!(claimed);
+        fs::write(
+            dest.join(VERIFIED_IDENTITY),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        verify_payload_paths(&paths, "darwin-arm64").unwrap();
+
+        // Any write changes the identity, so the bytes are hashed and refused.
+        fs::write(&paths[1], b"recorded-image").unwrap();
+        assert!(verify_payload_paths(&paths, "darwin-arm64").is_err());
     }
 
     #[test]
