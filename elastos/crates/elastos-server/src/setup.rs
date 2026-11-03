@@ -8345,7 +8345,8 @@ pub(crate) mod tests {
             assert_eq!(info.release_path.as_deref(), Some(release_path));
             assert_eq!(
                 browser_vm_image::component_info(&manifest, platform)
-                    .unwrap_err()
+                    .err()
+                    .expect("an unstamped image row is refused")
                     .to_string(),
                 "Browser image release package requires a stamped lowercase SHA-256 checksum",
                 "{platform} resolves its own unstamped image row"
