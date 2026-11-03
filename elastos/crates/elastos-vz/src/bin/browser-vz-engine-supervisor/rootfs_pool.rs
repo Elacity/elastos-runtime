@@ -54,6 +54,8 @@ pub(crate) struct Pool {
     seed_size: u64,
     count: u32,
     reserve_bytes: u64,
+    /// Free bytes on the pool's filesystem (statvfs; a fixture in tests).
+    free_space: fn(&Path) -> Result<u64, String>,
 }
 
 /// One launch's attempt: the copy it moved into its session, if any, and the
@@ -160,6 +162,7 @@ impl Pool {
             seed_size,
             count,
             reserve_bytes: REFILL_RESERVE_BYTES,
+            free_space: available_bytes,
         })
     }
 
@@ -449,7 +452,7 @@ impl Pool {
         self.discard_stale(log);
         let mut created = 0;
         while self.ready_count() < self.count as usize {
-            let available = available_bytes(&self.dir)?;
+            let available = (self.free_space)(&self.dir)?;
             let required = self.seed_size.saturating_add(self.reserve_bytes);
             if available < required {
                 event(
@@ -905,6 +908,48 @@ mod tests {
         assert_eq!(fs::read(&ready[0]).unwrap(), b"admitted seed bytes");
         assert_eq!(fs::metadata(&ready[0]).unwrap().mode() & 0o777, 0o600);
         assert_eq!(f.pool.take(&f.launch).taken, Some(ready[0].clone()));
+    }
+
+    /// Room for exactly one copy: plenty while the pool is empty, none after.
+    fn room_for_one(dir: &Path) -> Result<u64, String> {
+        let empty = fs::read_dir(dir)
+            .map_err(|error| error.to_string())?
+            .flatten()
+            .all(|entry| entry.file_name().to_str().and_then(copy_image).is_none());
+        Ok(if empty { u64::MAX } else { 0 })
+    }
+
+    #[test]
+    fn a_two_copy_pool_keeps_a_spare_for_a_reopen() {
+        let mut f = fixture();
+        f.pool.count = 2;
+        let anchor = Anchor::of(i32::try_from(std::process::id()).unwrap()).unwrap();
+        assert_eq!(
+            f.pool.refill(&anchor).unwrap(),
+            Refilled::Full { created: 2 }
+        );
+        // The first open takes one copy; a reopen right after Close takes the
+        // spare before the refill after that Close has made a new one.
+        assert!(f.pool.take(&f.launch).taken.is_some());
+        assert_eq!(f.pool.ready_count(), 1);
+        fs::remove_file(&f.launch).unwrap();
+        assert!(f.pool.take(&f.launch).taken.is_some());
+        assert_eq!(f.pool.ready_count(), 0);
+    }
+
+    #[test]
+    fn a_two_copy_pool_keeps_one_copy_and_logs_it_when_space_is_short() {
+        let mut f = fixture();
+        f.pool.count = 2;
+        f.pool.free_space = room_for_one;
+        let anchor = Anchor::of(i32::try_from(std::process::id()).unwrap()).unwrap();
+        assert!(matches!(
+            f.pool.refill(&anchor).unwrap(),
+            Refilled::LowSpace { created: 1, .. }
+        ));
+        assert_eq!(f.pool.ready_count(), 1);
+        let log = fs::read_to_string(f.pool.dir.join(REFILL_LOG)).unwrap();
+        assert!(log.contains("\"refill_skipped\""), "{log}");
     }
 
     #[test]

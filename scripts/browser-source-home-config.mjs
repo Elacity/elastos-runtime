@@ -669,10 +669,12 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
   }
   if (args.platform.startsWith("linux-") && !remoteVzControlLauncher) {
     // A launch takes a prepared copy instead of copying the whole image on
-    // storage without reflink (SD cards: minutes). Keep one spare image so a
-    // closed Browser leaves room for update staging.
+    // storage without reflink (SD cards: minutes). Two copies let a reopen
+    // right after Close take the spare while the refill after that Close
+    // tops the pool up; the refill keeps 4 GiB free (update staging) and
+    // keeps one copy when there is no room for two.
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR = path.join(args.dataDir, "browser-vm/rootfs-pool");
-    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "1";
+    env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "2";
     if (!vzTransport) {
       env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
       env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");

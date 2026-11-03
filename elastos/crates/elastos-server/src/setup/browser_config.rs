@@ -443,6 +443,9 @@ fn prefill_rootfs_pool(data: &Path) -> anyhow::Result<()> {
             command.env(key, value);
         }
     }
+    // Setup prepares the copy the first open takes; the Home makes the spare
+    // when no Browser runs, so first-time setup does not copy twice.
+    command.env("ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT", "1");
     let output = command.output()?;
     let summary: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|_| anyhow::anyhow!("Browser first-start copy returned no result"))?;
@@ -828,7 +831,7 @@ mod tests {
             if pool {
                 env["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR"] =
                     json!(data.join("browser-vm/rootfs-pool"));
-                env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"] = json!("1");
+                env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"] = json!("2");
             }
             fs::write(
                 data.join("config/browser-engine-adapter.json"),
@@ -1527,7 +1530,7 @@ mod tests {
             env["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR"],
             data.join("browser-vm/rootfs-pool").to_str().unwrap()
         );
-        assert_eq!(env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"], "1");
+        assert_eq!(env["ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT"], "2");
         assert!(env
             .get("ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT")
             .is_none());
