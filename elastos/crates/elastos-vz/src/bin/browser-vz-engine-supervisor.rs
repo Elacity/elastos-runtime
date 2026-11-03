@@ -282,6 +282,9 @@ struct VzLaunchOwner {
     /// This launch took a prepared rootfs; the pool's next copy waits until
     /// the launch has ended.
     rootfs_refill_pending: bool,
+    /// The pool's launch lock, held until this launch has ended: a refill
+    /// stops its copy while a launch runs.
+    rootfs_pool_launch: Option<std::fs::File>,
 }
 
 #[expect(
@@ -352,6 +355,7 @@ impl VzLaunchOwner {
             launch_rootfs: None,
             profile_disk: None,
             rootfs_refill_pending: false,
+            rootfs_pool_launch: None,
         }
     }
 
@@ -642,7 +646,9 @@ impl VzLaunchOwner {
     /// cleanup is complete). On an SD card a copy keeps the disk busy for
     /// minutes: during the boot it starved the page open, and after ready it
     /// starved the running guest until its input timed out (#90, Jetson).
+    /// The launch lock is released first, or the refill would yield to it.
     fn start_deferred_rootfs_refill(&mut self) {
+        self.rootfs_pool_launch.take();
         if std::mem::take(&mut self.rootfs_refill_pending) {
             #[cfg(target_os = "linux")]
             start_rootfs_pool_refill(&self.paths.rootfs_path);
@@ -883,6 +889,10 @@ async fn run() -> Result<(), String> {
         post_effect_try!(prepare_launch_rootfs(&owner.paths, &rootfs_wait))
     });
     owner.rootfs_refill_pending = cfg!(target_os = "linux");
+    #[cfg(target_os = "linux")]
+    {
+        owner.rootfs_pool_launch = hold_rootfs_pool_launch(&owner.paths.rootfs_path);
+    }
     trace_stage(
         "prepared_rootfs",
         format!(
@@ -3273,6 +3283,23 @@ fn start_rootfs_pool_refill(seed: &Path) {
         Ok(Some(pid)) => trace_stage("rootfs_pool_refill", format!("started pid={pid}")),
         Ok(None) => trace_stage("rootfs_pool_refill", "full"),
         Err(error) => trace_stage("rootfs_pool_refill", format!("not started: {error}")),
+    }
+}
+
+/// The pool's launch lock for this launch; a running refill stops its copy
+/// and leaves the disk to the guest (#90, Jetson reopen after Close).
+#[cfg(target_os = "linux")]
+fn hold_rootfs_pool_launch(seed: &Path) -> Option<std::fs::File> {
+    if shared_writable_rootfs() {
+        return None;
+    }
+    let pool = rootfs_pool::Pool::from_env(seed, &browser_data_dir()).ok()??;
+    match pool.hold_launch() {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            trace_stage("rootfs_pool_launch_unheld", error);
+            None
+        }
     }
 }
 
@@ -6278,6 +6305,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut owner = cleanup_owner_fixture(root.path());
         owner.rootfs_refill_pending = true;
+        owner.rootfs_pool_launch = Some(tempfile::tempfile().unwrap());
         let settlement = tokio::time::timeout(
             Duration::from_secs(10),
             owner.finish_cleanup("injected launch failure", None),
@@ -6289,6 +6317,10 @@ mod tests {
         assert!(
             !owner.rootfs_refill_pending,
             "the refill starts exactly once"
+        );
+        assert!(
+            owner.rootfs_pool_launch.is_none(),
+            "the launch lock is released before the refill starts"
         );
     }
 

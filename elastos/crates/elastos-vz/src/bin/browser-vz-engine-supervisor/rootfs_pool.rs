@@ -35,6 +35,10 @@ const MAX_POOL_COUNT: u32 = 8;
 const REFILL_RESERVE_BYTES: u64 = 4096 * 1024 * 1024;
 const REFILL_LOCK: &str = ".refill.lock";
 const REFILL_LOG: &str = "refill.log";
+/// Held shared by every running launch, from its rootfs until its end. A
+/// refill yields the disk to it: on an SD card a copy beside a booting guest
+/// starved its bootstrap until the launch failed (#90, Jetson reopen).
+const LAUNCH_LOCK: &str = ".launch.lock";
 const ANCHOR_POLL: Duration = Duration::from_millis(500);
 const COPY_STOP_GRACE: Duration = Duration::from_secs(2);
 /// A launch's busy-probe holds the lock shared for an instant; a refill
@@ -86,6 +90,9 @@ pub(crate) enum Refilled {
     Busy,
     /// The pool holds its target; `created` copies were made now.
     Full { created: usize },
+    /// A launch started: the copy in progress was stopped and removed. The
+    /// refill after that launch's end makes it again.
+    Yielded { created: usize },
     /// Too little free space for another copy.
     LowSpace {
         created: usize,
@@ -99,6 +106,7 @@ impl Refilled {
         match self {
             Self::Busy => json!({"state": "busy"}),
             Self::Full { created } => json!({"state": "ready", "created": created}),
+            Self::Yielded { created } => json!({"state": "yielded", "created": created}),
             Self::LowSpace {
                 created,
                 available,
@@ -369,6 +377,28 @@ impl Pool {
         None
     }
 
+    /// Marks a running launch until the returned lock is dropped. A refill
+    /// copies only while no launch holds it.
+    pub(crate) fn hold_launch(&self) -> Result<File, String> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.dir.join(LAUNCH_LOCK))
+            .map_err(|error| format!("Browser rootfs pool launch lock: {error}"))?;
+        // SAFETY: a valid descriptor; the lock lives as long as the file.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) } != 0 {
+            return Err(format!(
+                "Browser rootfs pool launch lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(lock)
+    }
+
     /// Starts the background refill when fewer than `count` copies are ready.
     /// It outlives this launch and stops with this process's parent, the
     /// Browser control service, so Home stop ends it.
@@ -452,6 +482,10 @@ impl Pool {
         self.discard_stale(log);
         let mut created = 0;
         while self.ready_count() < self.count as usize {
+            if launch_running(&self.dir) {
+                event(log, json!({"event": "copy_yielded", "copying": false}));
+                return Ok(Refilled::Yielded { created });
+            }
             let available = (self.free_space)(&self.dir)?;
             let required = self.seed_size.saturating_add(self.reserve_bytes);
             if available < required {
@@ -478,19 +512,32 @@ impl Pool {
                 .dir
                 .join(format!("rootfs-{}-{id}.ext4.partial", self.image_sha256));
             let started = Instant::now();
-            let copied = copy_while_anchored(&self.seed, &partial, anchor, log).and_then(|()| {
-                // An update or Undo during the copy discards it.
-                let (image, _) = admitted_image(&self.manifest, &self.seed)?;
-                if image != self.image_sha256 || seed_identity(&self.seed)? != before {
-                    return Err("Browser image changed during the rootfs pool copy".to_string());
+            let copied = copy_while_anchored(&self.seed, &partial, &self.dir, anchor, log)
+                .and_then(|done| {
+                    if !done {
+                        return Ok(false);
+                    }
+                    // An update or Undo during the copy discards it.
+                    let (image, _) = admitted_image(&self.manifest, &self.seed)?;
+                    if image != self.image_sha256 || seed_identity(&self.seed)? != before {
+                        return Err("Browser image changed during the rootfs pool copy".to_string());
+                    }
+                    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))
+                        .and_then(|()| fs::rename(&partial, &ready))
+                        .map(|()| true)
+                        .map_err(|error| error.to_string())
+                });
+            match copied {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = fs::remove_file(&partial);
+                    event(log, json!({"event": "copy_yielded", "copying": true}));
+                    return Ok(Refilled::Yielded { created });
                 }
-                fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))
-                    .and_then(|()| fs::rename(&partial, &ready))
-                    .map_err(|error| error.to_string())
-            });
-            if let Err(error) = copied {
-                let _ = fs::remove_file(&partial);
-                return Err(error);
+                Err(error) => {
+                    let _ = fs::remove_file(&partial);
+                    return Err(error);
+                }
             }
             created += 1;
             event(
@@ -598,12 +645,29 @@ fn process_start(pid: i32) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
+/// Whether a launch holds the launch lock. The probe takes it exclusively
+/// for an instant; a launch starting at that instant waits that long.
+fn launch_running(dir: &Path) -> bool {
+    let Ok(lock) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(LAUNCH_LOCK))
+    else {
+        return false;
+    };
+    // SAFETY: a valid descriptor; closing it releases a granted lock.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// Copies `seed` to `partial`. `Ok(false)`: a launch started, so the copy
+/// was stopped to leave the disk to it.
 fn copy_while_anchored(
     seed: &Path,
     partial: &Path,
+    pool_dir: &Path,
     anchor: &Anchor,
     log: &mut File,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // The control service at Home start or launch, or setup.
     let stopped = || "the process that owns this rootfs pool copy stopped".to_string();
     if !anchor.alive() {
@@ -625,7 +689,7 @@ fn copy_while_anchored(
     );
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => return Ok(true),
             Ok(Some(status)) => return Err(format!("Browser rootfs pool copy failed: {status}")),
             Ok(None) => {}
             Err(error) => {
@@ -636,6 +700,10 @@ fn copy_while_anchored(
         if !anchor.alive() {
             stop_child(&mut child);
             return Err(stopped());
+        }
+        if launch_running(pool_dir) {
+            stop_child(&mut child);
+            return Ok(false);
         }
         thread::sleep(ANCHOR_POLL);
     }
@@ -971,6 +1039,33 @@ mod tests {
             .filter(|name| name.starts_with("rootfs-"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_refill_yields_the_disk_to_a_running_launch() {
+        let f = fixture();
+        let anchor = Anchor::of(i32::try_from(std::process::id()).unwrap()).unwrap();
+        let launch = f.pool.hold_launch().unwrap();
+        assert_eq!(
+            f.pool.refill(&anchor).unwrap(),
+            Refilled::Yielded { created: 0 }
+        );
+        let log = fs::read_to_string(f.pool.dir.join(REFILL_LOG)).unwrap();
+        assert!(log.contains("\"copy_yielded\""), "{log}");
+        assert!(
+            fs::read_dir(&f.pool.dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("rootfs-")),
+            "no copy or partial is left while the launch runs"
+        );
+        // A second launch shares the lock; the refill after the end copies.
+        let other = f.pool.hold_launch().unwrap();
+        drop((launch, other));
+        assert_eq!(
+            f.pool.refill(&anchor).unwrap(),
+            Refilled::Full { created: 1 }
+        );
     }
 
     /// Holds the pool lock as a running refill does.
