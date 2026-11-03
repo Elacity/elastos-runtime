@@ -68,11 +68,11 @@ h1 { font-size: clamp(64px, 7vw, 88px); line-height: 1.08; letter-spacing: -.065
 .text-link span { margin-left: 8px; }
 .action-note { font-size: 12px; color: var(--soft); margin-top: 14px; }
 .install-section { max-width: 790px; margin: 0 auto 64px; scroll-margin-top: 24px; }
-.install-heading { display: flex; align-items: center; justify-content: space-between; margin: 0 3px 14px; }
+.install-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; padding: 22px 24px 0; }
 .install-heading h2 { font-size: 16px; letter-spacing: 0; }
-.install-version { font-size: 12px; color: var(--soft); }
+.install-version { font-size: 12px; color: var(--soft); white-space: nowrap; }
 .install-card { overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(145deg, #17191d, #101114); box-shadow: 0 14px 50px #0005; }
-.install-body { padding: 24px; }
+.install-body { padding: 14px 24px 24px; }
 .install-caption { font-size: 14px; margin-bottom: 14px; color: #c4c7cd; }
 .command-box { display: flex; align-items: center; gap: 12px; padding: 14px 14px 14px 18px; background: #050608; border: 1px solid #35373c; border-radius: 10px; }
 .prompt { color: var(--soft); font: 14px ui-monospace, monospace; }
@@ -113,7 +113,8 @@ footer > div a { color: var(--muted); font-size: 12px; text-decoration: none; }
   .hero { padding-top: 48px; }
   .release-badge { margin-left: auto; }
   .header-home { display: none; }
-  .install-body { padding: 18px; }
+  .install-heading { padding: 18px 18px 0; }
+  .install-body { padding: 12px 18px 18px; }
   .command-box { flex-wrap: wrap; gap: 8px; padding: 12px; }
   .command-box pre { font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .copy-button { margin-left: auto; }
