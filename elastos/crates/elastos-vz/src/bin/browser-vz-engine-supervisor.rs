@@ -7,7 +7,10 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process;
+// On Linux only the linux module runs host programs (crosvm, its backend).
+#[cfg(any(not(target_os = "linux"), test))]
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Once, OnceLock,
