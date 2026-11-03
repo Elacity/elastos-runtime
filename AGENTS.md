@@ -107,7 +107,8 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
 - Milestones: `2.0.0` (the five first-release goals, phones, isolation S0-S2 and
   the release gates in #93) and `After 2.0.0`. There are no weekly milestones.
 - `main` changes only when a stable release is tagged: a release PR from the
-  accepted `develop` commit, then `vX.Y.Z` on the merge commit, then `main`
+  accepted `develop` commit, then `vX.Y.Z` on that accepted commit (release
+  publication refuses a tag that does not name the source commit), then `main`
   merges back into `develop`.
 - 2.0.0 ships when every result in the 2.0.0 milestone meets its Done means.
 
