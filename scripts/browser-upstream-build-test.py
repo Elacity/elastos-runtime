@@ -31,7 +31,50 @@ assets = module('release-upstream-assets')
 platform_input = module('release-platform-input')
 
 
+def crosvm_sources():
+    with tarfile.open(ROOT / 'scripts/build/crosvm-lifecycle-source-fixture.tar.gz') as archive:
+        provenance = json.load(archive.extractfile('SOURCE.json'))
+        assert provenance['revision'] == '2ac141082d171e76a39cdabf98f6e48a377a126b'
+        files = {name: archive.extractfile(name).read() for name in provenance['files']}
+        for name, data in files.items():
+            assert hashlib.sha256(data).hexdigest() == provenance['files'][name]['sha256']
+        return files
+
+
 class BrowserUpstreamBuildTest(unittest.TestCase):
+    def test_crosvm_lifecycle_recipe_changes_the_installed_identity(self):
+        recipe = next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == 'crosvm')
+        component = json.loads((ROOT / 'components.json').read_bytes())['external']['crosvm']
+        self.assertEqual(recipe['version'], '0.1.0-2ac141082d17.elastos.1')
+        self.assertEqual(component['version'], recipe['version'])
+        self.assertEqual(recipe['install_path'], 'libexec/browser/crosvm/' + recipe['version'] + '/linux-arm64')
+        self.assertEqual(component['platforms']['linux-arm64']['install_path'], recipe['install_path'])
+        self.assertNotEqual(recipe['install_path'], 'libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64')
+
+    def test_crosvm_patch_applies_to_pinned_source_and_refuses_changed_context(self):
+        recipe = assets.resolved_recipe(next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == 'crosvm'))
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            original = crosvm_sources()
+            for name, data in original.items():
+                path = root / 'src' / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            builder.apply_crosvm_patch(root / 'src', recipe, root / 'cache', upstream)
+            self.assertIn('pub lifecycle_fds:', (root / 'src' / builder.CROSVM_PATCHED_FILES[0]).read_text())
+            for name, data in original.items():
+                (root / 'src' / name).write_bytes(data)
+            changed = root / 'src' / builder.CROSVM_PATCHED_FILES[0]
+            changed.write_text(changed.read_text().replace('pub lock: bool,', 'pub incompatible_lock: bool,'))
+            before = {name: (root / 'src' / name).read_bytes() for name in original}
+            with self.assertRaises(subprocess.CalledProcessError):
+                builder.apply_crosvm_patch(root / 'src', recipe, root / 'cache', upstream)
+            self.assertEqual(before, {name: (root / 'src' / name).read_bytes() for name in original})
+        missing = copy.deepcopy(recipe)
+        missing['notices'] = [n for n in missing['notices'] if n['name'] != builder.CROSVM_PATCH]
+        with self.assertRaisesRegex(ValueError, 'pinned block lifecycle patch'):
+            builder.validate(missing, upstream)
+
     def test_source_extraction_accepts_git_comment_and_empty_files_only_for_sources(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -353,7 +396,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                         self.assertEqual(json.load(archive.extractfile('python/PYTHON-BUILD.json')), base)
 
     def test_native_browser_build_refuses_wrong_host_before_compilation(self):
-        for component in ('debugfs', 'crosvm'):
+        for component in ('debugfs', 'crosvm', 'vhost-device-vsock'):
             recipe = assets.resolved_recipe(next(r for r in assets.selected_recipes('linux-arm64') if r['component'] == component))
             upstream.validate_recipe(recipe)
             with self.subTest(component=component), patch.object(builder.platform, 'system', return_value='Darwin'), \
@@ -361,6 +404,152 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'native platform runner'):
                     builder.build(recipe, Path('unused'), Path('unused'), upstream)
                 run.assert_not_called()
+
+    def test_vsock_recipe_pins_sources_licenses_platform_and_profile(self):
+        recipes = assets.selected_recipes('linux-arm64')
+        recipe = next(r for r in recipes if r['component'] == 'vhost-device-vsock')
+        commit = '4fe41e353a005b1b7163f3f38efde3523f3b160c'
+        self.assertEqual(recipe['source']['url'], 'https://codeload.github.com/rust-vmm/vhost-device/tar.gz/' + commit)
+        self.assertEqual(recipe['source']['checksum'], 'sha256:be673089defc9c9af5c873f0d71fea655ca512b5cf9e251fb9867c1ff5008b5e')
+        self.assertEqual(recipe['version'], '0.3.0')
+        self.assertEqual(recipe['root'], 'vhost-device-' + commit)
+        self.assertEqual(recipe['build'], {'kind': 'vhost-device-vsock-static-v1', 'dependencies': []})
+        self.assertEqual({f['name']: f['source']['checksum'] for f in recipe['license']['files']}, {
+            'LICENSE': 'sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
+            'LICENSE-APACHE': 'sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30',
+            'LICENSE-BSD-3-Clause': 'sha256:a408ca693a3359c5d56de80ee73db9b62ca4a179adb12e131230c10e915b05f2'})
+        for item in recipe['license']['files']:
+            self.assertIn('/' + commit + '/', item['source']['url'])
+        manifest = json.loads((ROOT / 'components.json').read_text())
+        component = manifest['external']['vhost-device-vsock']
+        self.assertEqual(set(component['platforms']), {'linux-arm64'})
+        self.assertEqual(component['version'], recipe['version'])
+        for field in ('extract_path', 'install_path', 'binary_path'):
+            self.assertEqual(component['platforms']['linux-arm64'][field], recipe[field])
+        self.assertEqual(manifest['profiles']['browser-host']['components'].count('vhost-device-vsock'), 1)
+        for target in ('darwin-arm64', 'linux-amd64'):
+            self.assertNotIn('vhost-device-vsock', [r['component'] for r in assets.selected_recipes(target)])
+        actual = 'sha256:' + hashlib.sha256((ROOT / 'scripts/browser-upstream-build.py').read_bytes()).hexdigest()
+        for entry in json.loads(assets.RECIPE_FILE.read_text())['recipes']:
+            for notice in entry.get('notices', []):
+                if notice.get('source', {}).get('path') == 'scripts/browser-upstream-build.py':
+                    self.assertEqual(notice['source']['checksum'], actual)
+        upstream.validate_recipe(assets.resolved_recipe(recipe))
+
+    def test_vsock_refuses_wrong_recipe_and_native_runner_before_tools(self):
+        recipe = assets.resolved_recipe(next(r for r in assets.selected_recipes('linux-arm64')
+                                             if r['component'] == 'vhost-device-vsock'))
+        for system, machine in [('Darwin', 'arm64'), ('Windows', 'arm64'), ('Linux', 'x86_64')]:
+            with self.subTest(system=system, machine=machine), \
+                    patch.object(builder.platform, 'system', return_value=system), \
+                    patch.object(builder.platform, 'machine', return_value=machine), \
+                    patch.object(builder.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'native platform runner'):
+                    builder.build(recipe, Path('unused'), Path('unused'), upstream)
+                run.assert_not_called()
+        for change in ({'platform': 'linux-amd64'}, {'platform': 'darwin-arm64'},
+                       {'component': 'crosvm'}, {'license': {'files': []}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                builder.validate({**recipe, **change}, upstream)
+
+    def test_vsock_build_admits_static_binary_and_retains_locked_source_closure(self):
+        self.vsock_build()
+
+    def test_vsock_build_refuses_dynamic_linkage_and_bad_relocation(self):
+        with self.assertRaisesRegex(ValueError, 'statically link'):
+            self.vsock_build(linkage='libc.so.6 => /lib/libc.so.6 (0x01)\n')
+        with self.assertRaisesRegex(ValueError, 'relocation probe failed'):
+            self.vsock_build(probe_status=1)
+
+    def vsock_build(self, linkage='not a dynamic executable\n', probe_status=0):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            recipe = assets.resolved_recipe(next(r for r in assets.selected_recipes('linux-arm64')
+                                                 if r['component'] == 'vhost-device-vsock'))
+            source = root / 'source.tar.gz'
+            lock = b'locked vsock dependency fixture\n'
+            files = {'Cargo.lock': lock, 'Cargo.toml': b'[workspace]\nmembers=["vhost-device-vsock"]\n',
+                     '.cargo/config.toml': b'[alias]\nxtask="run --package xtask --"\n',
+                     'vhost-device-vsock/Cargo.toml': b'[features]\ndefault=["backend_vsock"]\n'}
+            with tarfile.open(source, 'w:gz', format=tarfile.GNU_FORMAT) as archive:
+                for relative, data in files.items():
+                    item = tarfile.TarInfo(recipe['root'] + '/' + relative)
+                    item.size = len(data)
+                    archive.addfile(item, io.BytesIO(data))
+            recipe['source'] = {'path': str(source), 'checksum': 'sha256:' + upstream.digest(source),
+                                'max_bytes': source.stat().st_size}
+            for item in recipe['license']['files']:
+                file = root / item['name']
+                file.write_bytes(b'fixture licence ' + item['name'].encode())
+                item['source'] = {'path': str(file), 'checksum': 'sha256:' + upstream.digest(file),
+                                  'max_bytes': file.stat().st_size}
+            calls = []
+            ambient = {key: 'foreign-fixture' for key in ('CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_DIR',
+                       'CARGO_BUILD_BUILD_DIR', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+                       'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS')}
+            ambient['RUSTFLAGS'] = 'foreign-fixture'
+            def run(args, **kwargs):
+                calls.append(args)
+                if args[:2] == ['cargo', '+1.91.0']:
+                    env = kwargs['env']
+                    self.assertTrue(all(key not in env for key in ambient if key != 'RUSTFLAGS'))
+                    self.assertIn('target-feature=+crt-static', env['RUSTFLAGS'])
+                    self.assertNotIn('foreign-fixture', env['RUSTFLAGS'])
+                    self.assertEqual(env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER'], 'musl-gcc')
+                    self.assertEqual(env['CC_aarch64_unknown_linux_musl'], 'musl-gcc')
+                if args[:3] == ['cargo', '+1.91.0', 'vendor']:
+                    self.assertEqual(args[3:], ['--locked', '--versioned-dirs', 'registry-vendor'])
+                    vendor = kwargs['cwd'] / 'registry-vendor/fixture-1.0.0'
+                    vendor.mkdir(parents=True)
+                    (vendor / 'LICENSE').write_bytes(b'locked dependency licence')
+                    (vendor / 'lib.rs').write_bytes(b'locked dependency source')
+                    return subprocess.CompletedProcess(args, 0,
+                        '[source.crates-io]\nreplace-with="vendored-sources"\n'
+                        '[source.vendored-sources]\ndirectory="registry-vendor"\n', '')
+                if args[:3] == ['cargo', '+1.91.0', 'build']:
+                    self.assertEqual(args[3:-2], ['--locked', '--offline', '--release', '--target',
+                        'aarch64-unknown-linux-musl', '-p', 'vhost-device-vsock'])
+                    src = kwargs['cwd']
+                    self.assertEqual((src / 'Cargo.lock').read_bytes(), lock)
+                    config = (src / '.cargo/config.toml').read_text()
+                    self.assertIn('[alias]', config)
+                    self.assertIn('directory="registry-vendor"', config)
+                    binary = src / 'target/aarch64-unknown-linux-musl/release/vhost-device-vsock'
+                    binary.parent.mkdir(parents=True)
+                    header = bytearray(64)
+                    header[:7] = b'\x7fELF\x02\x01\x01'
+                    struct.pack_into('<HH', header, 16, 2, 183)
+                    binary.write_bytes(header)
+                    binary.chmod(0o755)
+                    (binary.parent / 'deps').mkdir()
+                    os.link(binary, binary.parent / 'deps/vhost-device-vsock-fixture')
+                if args[0] == 'ldd':
+                    return subprocess.CompletedProcess(args, 1, '', linkage)
+                if args[-1] == '--help':
+                    self.assertEqual(kwargs['env']['PATH'], '')
+                    self.assertEqual(Path(args[0]).name, 'vhost-device-vsock')
+                    return subprocess.CompletedProcess(args, probe_status, 'vhost-device-vsock help\n', '')
+                return subprocess.CompletedProcess(args, 0, '', '')
+            with patch.object(builder.platform, 'system', return_value='Linux'), \
+                    patch.object(builder.platform, 'machine', return_value='aarch64'), \
+                    patch.dict(os.environ, ambient), patch.object(builder.subprocess, 'run', side_effect=run), \
+                    patch.object(builder, 'linux_uapi_headers') as uapi, \
+                    patch.object(upstream, 'builder_module', return_value=builder):
+                receipt = upstream.package(recipe, root / 'cache', root / 'output')
+                uapi.assert_not_called()
+            output = root / 'output' / receipt['release_path']
+            platform_input.check_upstream_archive(output, recipe, receipt, 'aarch64-linux')
+            self.assertEqual([args[2] for args in calls if args[0] == 'cargo'], ['vendor', 'build'])
+            with tarfile.open(output) as archive:
+                prefix = recipe['root']
+                self.assertEqual(archive.extractfile(prefix + '/sources/Cargo.lock').read(), lock)
+                self.assertEqual(archive.extractfile(prefix + '/sources/' + prefix + '.tar.gz').read(), source.read_bytes())
+                for name in ('LICENSE', 'LICENSE-APACHE', 'LICENSE-BSD-3-Clause'):
+                    self.assertEqual(archive.extractfile(prefix + '/' + name).read(), b'fixture licence ' + name.encode())
+                with tarfile.open(fileobj=archive.extractfile(prefix + '/sources/cargo-vendor.tar.gz'), mode='r:gz') as vendor:
+                    self.assertEqual(vendor.extractfile('registry-vendor/fixture-1.0.0/LICENSE').read(), b'locked dependency licence')
+                    self.assertEqual(vendor.extractfile('registry-vendor/fixture-1.0.0/lib.rs').read(), b'locked dependency source')
+                    self.assertTrue(all(m.uid == m.gid == 0 and m.uname == m.gname == '' for m in vendor.getmembers()))
 
     def test_crosvm_preserves_workspace_and_uses_pinned_static_policy_inputs(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -375,6 +564,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                         archive.addfile(item, io.BytesIO(data))
                 return {'path':str(path), 'checksum':'sha256:'+upstream.digest(path), 'max_bytes':path.stat().st_size}
             recipe['source'] = source(recipe['root'], {
+                **crosvm_sources(),
                 'Cargo.lock': b'pinned lock fixture',
                 'vendor/generic/crypto/Cargo.toml': b'workspace path crate'})
             recipe['build']['dependencies'][0]['source'] = source(recipe['build']['dependencies'][0]['root'], {
@@ -390,8 +580,13 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                 file.write_bytes(b'fixture licence ' + item['name'].encode())
                 item['source'] = {'path':str(file), 'checksum':'sha256:'+upstream.digest(file), 'max_bytes':file.stat().st_size}
             calls = []
+            real_run = subprocess.run
+            last_build = {}
+            fail_lifecycle = False
             def run(args, **kwargs):
                 calls.append(args)
+                if args[:2] == ['git', 'apply']:
+                    return real_run(args, **kwargs)
                 if args[:3] == ['cargo', '+1.91.0', 'vendor']:
                     directory = kwargs['cwd'] / args[-1]
                     if directory.exists():
@@ -402,12 +597,15 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, '[source.vendored-sources]\ndirectory="registry-vendor"\n', '')
                 if args[:3] == ['cargo', '+1.91.0', 'build']:
                     src, env = kwargs['cwd'], kwargs['env']
+                    last_build.update(cwd=src, env=env.copy(), jobs=args[args.index('-j') + 1])
                     self.assertEqual((src / 'vendor/generic/crypto/Cargo.toml').read_bytes(), b'workspace path crate')
                     self.assertNotIn('MINIJAIL_DEFAULT_RET_LOG', env)
                     self.assertNotIn('MINIJAIL_DO_NOT_BUILD', env)
                     self.assertEqual(env['MINIJAIL_DIR'], str(src / 'third_party/minijail'))
                     self.assertIn('CC_STATIC_LIBRARY(libminijail.pic.a)', (src / 'third_party/minijail/rust/minijail-sys/build.rs').read_text())
                     self.assertIn('--offline', args)
+                    self.assertIn('let _lifecycle_fds = lifecycle_fds;',
+                                  (src / 'devices/device_virtio_block/src/asynchronous.rs').read_text())
                     binary = src / 'target/aarch64-unknown-linux-musl/release/crosvm'
                     binary.parent.mkdir(parents=True)
                     header = bytearray(64)
@@ -418,6 +616,15 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                     # Cargo hard-links each release binary into deps/.
                     (binary.parent / 'deps').mkdir()
                     os.link(binary, binary.parent / 'deps/crosvm-0123456789abcdef')
+                if args[:3] == ['cargo', '+1.91.0', 'test']:
+                    self.assertEqual(args, ['cargo', '+1.91.0', 'test', '--locked', '--offline', '--release',
+                        '--target', 'aarch64-unknown-linux-musl', '-p', 'device_virtio_block', '--features',
+                        'devices/test-util', '--lib', 'lifecycle_', '-j', last_build['jobs'], '--', '--nocapture'])
+                    self.assertEqual(kwargs['cwd'], last_build['cwd'])
+                    self.assertEqual(kwargs['env'], last_build['env'])
+                    self.assertTrue(kwargs['check'])
+                    if fail_lifecycle:
+                        raise subprocess.CalledProcessError(101, args, stderr='lifecycle test failed')
                 return subprocess.CompletedProcess(args, 0, 'crosvm fixture\n' if args[-1] == 'version' else '',
                                                    'not a dynamic executable\n' if args[0] == 'ldd' else '')
             with patch.object(builder.platform, 'system', return_value='Linux'), \
@@ -428,6 +635,14 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                  patch.object(builder.subprocess, 'run', side_effect=run), \
                  patch.object(upstream, 'builder_module', return_value=builder):
                 receipt = upstream.package(recipe, root / 'cache', root / 'output')
+                self.assertEqual([args[2] for args in calls if args[0] == 'cargo'], ['vendor', 'build', 'test'])
+                fail_lifecycle = True
+                calls.clear()
+                with self.assertRaises(subprocess.CalledProcessError):
+                    upstream.package(recipe, root / 'failure-cache', root / 'failure-output')
+                self.assertFalse((root / 'failure-cache/crosvm-built-linux-arm64.tar.gz').exists())
+                self.assertFalse(list((root / 'failure-output').glob('*.tar.gz')))
+                self.assertFalse(any(args[0] == 'ldd' for args in calls))
             platform_input.check_upstream_archive(root / 'output' / receipt['release_path'], recipe, receipt, 'aarch64-linux')
             self.assertTrue(any('libcap.a' in call and 'SHARED=no' in call for call in calls))
             with tarfile.open(root / 'output' / receipt['release_path']) as archive:
@@ -437,6 +652,22 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                     self.assertTrue(all(m.uid == m.gid == 0 and m.uname == m.gname == '' for m in locked.getmembers()))
                 with tarfile.open(fileobj=archive.extractfile(recipe['root'] + '/sources/linux-uapi.tar.gz'), mode='r:gz') as uapi:
                     self.assertEqual(uapi.extractfile('linux-uapi/linux/fixture.h').read(), b'build header fixture')
+                patch_bytes = archive.extractfile(recipe['root'] + '/' + builder.CROSVM_PATCH).read()
+                self.assertEqual(patch_bytes, (ROOT / 'scripts/build/crosvm-lifecycle-fds.patch').read_bytes())
+                with tarfile.open(fileobj=archive.extractfile(recipe['root'] + '/sources/patched-source-overlay.tar.gz'), mode='r:gz') as overlay:
+                    provenance = json.load(overlay.extractfile(recipe['root'] + '/PATCHED-SOURCE.json'))
+                    self.assertEqual(provenance['source'], recipe['source']['checksum'])
+                    self.assertEqual(provenance['patch'], 'sha256:' + hashlib.sha256(patch_bytes).hexdigest())
+                    for name, checksum in provenance['files'].items():
+                        data = overlay.extractfile(recipe['root'] + '/' + name).read()
+                        self.assertEqual('sha256:' + hashlib.sha256(data).hexdigest(), checksum)
+                    self.assertIn(b'let _lifecycle_fds = lifecycle_fds;', overlay.extractfile(
+                        recipe['root'] + '/devices/device_virtio_block/src/asynchronous.rs').read())
+            # The same install/version name cannot admit the old producer recipe.
+            old_recipe = copy.deepcopy(recipe)
+            old_recipe['notices'] = [n for n in old_recipe['notices'] if n['name'] != builder.CROSVM_PATCH]
+            with self.assertRaisesRegex(ValueError, 'provenance differs'):
+                platform_input.check_upstream_archive(root / 'output' / receipt['release_path'], old_recipe, receipt, 'aarch64-linux')
 
 
 if __name__ == '__main__':

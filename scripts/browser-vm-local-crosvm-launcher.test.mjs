@@ -49,9 +49,11 @@ test("a failed helper command names the root-owned repair copy", () => {
 
 test("existing Browser CI step runs the Linux network tests", () => {
   const ci = fs.readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
-  const step = ci.slice(ci.indexOf("- name: JavaScript behavior tests"), ci.indexOf("\n  # One input for every ARM consumer"));
-  assert.match(step, /python3 scripts\/browser-vm-linux-network\.test\.py/);
-  assert.match(step, /\.\/scripts\/test-behaviour\.sh/);
+  const sourceGate = fs.readFileSync(new URL("./test-source-gate.sh", import.meta.url), "utf8");
+  assert.match(ci, /run: \.\/scripts\/test-source-gate\.sh release/);
+  assert.match(sourceGate, /python3 scripts\/browser-vm-linux-network\.test\.py/);
+  assert.doesNotMatch(ci, /python3 scripts\/browser-vm-linux-network\.test\.py/);
+  assert.match(ci, /run: \.\/scripts\/test-behaviour\.sh/);
 });
 
 test("crosvm command consumes the prepared TAP and addresses", () => {

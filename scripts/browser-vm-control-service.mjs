@@ -120,13 +120,13 @@ function readinessInputStamps(dataDir, launcher) {
     artifact("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
     artifact("ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "browser-vm/browser-vm-rootfs-manifest.json"),
     artifact("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
-    linux ? artifact("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
-      : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
+    artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
     path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
   ];
   if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
-  } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
+  }
+  if (linux || (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")) {
     const turnProgram = process.env.ELASTOS_BROWSER_VM_TURN_PROGRAM;
     if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
     files.push(turnProgram);
@@ -185,15 +185,21 @@ async function engineReadiness(config) {
   if (!dataDir || !path.isAbsolute(dataDir)) return unavailable("preparation_required");
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
   if (linux) {
-    // Device access and the root-owned pool can change while images stay fixed.
-    // Check live state before returning a cached image-readiness result.
+    const platform = process.env.ELASTOS_BROWSER_VM_PLATFORM || `linux-${process.arch === "arm64" ? "arm64" : "amd64"}`;
+    if (platform !== "linux-arm64") return unavailable("host_unsupported");
+    if (config.launcher_program !== path.join(dataDir, "bin/browser-vz-engine-supervisor")) {
+      return unavailable("readiness_unsupported");
+    }
+    // The admitted native owner checks live KVM access and the selected transport
+    // before an image-readiness result can be reused.
     try {
-      execFileSync("python3", [path.join(dataDir, "scripts/browser-vm-linux-network.py"), "check"],
-        { timeout: 5000, stdio: ["ignore", "pipe", "pipe"] });
+      const result = JSON.parse(execFileSync(config.launcher_program, ["--host-capabilities"],
+        { timeout: 5000, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
+      if (result.schema !== "elastos.browser.vm-host-capabilities/v1" || result.available !== true) {
+        return unavailable("preparation_required");
+      }
     } catch (error) {
-      // Keep private host paths in the local operator log. Engine readiness
-      // has a strict state/reason contract.
-      process.stderr.write(`${error.stderr?.toString().trim() || "Linux Browser network check failed"}\n`);
+      process.stderr.write(`${error.stderr?.toString().trim() || "Linux Browser native host check failed"}\n`);
       return unavailable("preparation_required");
     }
   }
@@ -226,8 +232,7 @@ function probeHostReadiness(config, dataDir, stamps) {
       timeout: 30000, maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
-        ...((process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")
-          ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
+        ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program,
       },
     }, (error, stdout) => {
       if (error) return resolve(finish(unavailable("preparation_required")));

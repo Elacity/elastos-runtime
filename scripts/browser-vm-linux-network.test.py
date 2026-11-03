@@ -411,12 +411,25 @@ class NetworkTest(unittest.TestCase):
     def test_userspace_setup_and_removal_use_kvm_only(self):
         self.assert_setup_and_removal('userspace-vsock', True)
 
-    def assert_setup_and_removal(self, transport, missing_vsock):
+    def test_legacy_kvm_acl_setup_persists_transport_before_restore(self):
+        self.assert_setup_and_removal('kernel-vsock', False,
+                                      {'previous_kvm_acl': 'user:1001:r--'})
+
+    def test_legacy_kvm_and_vsock_acl_setup_persists_transport_before_restore(self):
+        self.assert_setup_and_removal('kernel-vsock', False,
+                                      {'previous_kvm_acl': 'user:1001:r--',
+                                       'previous_vsock_acl': 'user:1001:-w-'})
+
+    def assert_setup_and_removal(self, transport, missing_vsock, legacy_state=None):
         root = network.RUN.parent
         unit_dir, udev_dir = root / 'systemd', root / 'udev'
         unit_dir.mkdir()
         udev_dir.mkdir()
         state_dir, helper = root / 'state', root / 'lib/network.py'
+        state = state_dir / f'{self.uid}.json'
+        if legacy_state is not None:
+            state_dir.mkdir()
+            state.write_text(json.dumps(legacy_state))
         user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid, pw_name='elastos-agent')
         legacy_rule = udev_dir / '70-elastos-browser-kvm-1001.rules'
         legacy_rule.write_text('KERNEL=="kvm", RUN+="/usr/bin/setfacl -m u:1001:rw /dev/kvm"\n')
@@ -437,10 +450,15 @@ class NetworkTest(unittest.TestCase):
                 patch.object(network, 'Path', side_effect=local_path), patch.object(network, 'trusted_path'), \
                 patch.object(network.os, 'chown'), \
                 patch.object(network.shutil, 'which', side_effect=lambda command: f'/usr/bin/{command}'), \
-                patch.object(network, 'restore') as restore, \
                 patch.object(network, 'trusted_json', side_effect=lambda file: json.loads(file.read_text())):
+            if legacy_state is not None:
+                before = state.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, 'before changing transport'):
+                    network.configure(user, transport='userspace-vsock')
+                self.assertEqual(state.read_bytes(), before)
+                self.assertFalse(helper.exists())
+                self.assertFalse(list(unit_dir.iterdir()))
             network.configure(user, transport=transport)
-            restore.assert_not_called()
             self.assertIn(('systemctl', 'restart', 'elastos-browser-network-1001.service'), self.calls)
             unit = unit_dir / 'elastos-browser-network-1001.service'
             self.assertIn('restore --user elastos-agent', unit.read_text())
@@ -460,10 +478,22 @@ class NetworkTest(unittest.TestCase):
             self.assertGreater(rule.name, '73-seat-late.rules')
             self.assertFalse(legacy_rule.exists())
             self.assertEqual(other_rule.read_text(), 'other Home rule\n')
-            expected = {'previous_kvm_acl': None, 'transport': transport}
+            expected = {'previous_kvm_acl': None, **(legacy_state or {}), 'transport': transport}
             if transport == 'kernel-vsock':
-                expected['previous_vsock_acl'] = None
-            self.assertEqual(json.loads((state_dir / '1001.json').read_text()), expected)
+                expected.setdefault('previous_vsock_acl', None)
+            # Exercise the real setup -> boot restore handoff using the saved
+            # state, rather than supplying the expected receipt to restore.
+            network.restore(user)
+            saved = json.loads(state.read_text())
+            receipt = network.RUN / f'{self.uid}.json'
+            live = json.loads(receipt.read_text())
+            self.assertEqual(saved.get('transport'), live['transport'])
+            self.assertEqual(saved, expected)
+            self.assertEqual(live, {**self.receipt, 'transport': transport})
+            before = (state.read_bytes(), receipt.read_bytes(), unit.read_bytes(), rule.read_bytes())
+            with self.assertRaisesRegex(RuntimeError, 'before changing transport'):
+                network.configure(user, transport='userspace-vsock' if transport == 'kernel-vsock' else 'kernel-vsock')
+            self.assertEqual((state.read_bytes(), receipt.read_bytes(), unit.read_bytes(), rule.read_bytes()), before)
             self.assertNotIn(('modprobe', 'vhost_vsock'), self.calls)
             # Model setup failing after its state write but before unit write.
             unit.unlink()
@@ -487,9 +517,15 @@ class NetworkTest(unittest.TestCase):
                 return read_text(file, *args, **kwargs)
             with patch.object(network, 'run', side_effect=missing_unit), patch.object(Path, 'read_text', down_tap):
                 network.configure(user, remove=True)
-            self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
+            if expected['previous_kvm_acl'] is None:
+                self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
+            else:
+                self.assertIn(('setfacl', '-m', expected['previous_kvm_acl'], '/dev/kvm'), self.calls)
             if transport == 'kernel-vsock' and not missing_vsock:
-                self.assertIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
+                if expected['previous_vsock_acl'] is None:
+                    self.assertIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
+                else:
+                    self.assertIn(('setfacl', '-m', expected['previous_vsock_acl'], '/dev/vhost-vsock'), self.calls)
             else:
                 self.assertNotIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
             self.assertFalse(unit.exists())

@@ -384,10 +384,11 @@ def configure(user, remove=False, transport='kernel-vsock'):
         # vhost-vsock belongs to the installer step. Runtime only opens the
         # admitted device as the Home user, and removal restores this UID's ACL.
         saved = trusted_json(state)
+        saved['transport'] = transport
         if transport == 'kernel-vsock' and 'previous_vsock_acl' not in saved:
             acl = run('getfacl', '-cpn', '/dev/vhost-vsock').stdout.splitlines()
             saved['previous_vsock_acl'] = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
-            write_json(state, saved)
+        write_json(state, saved)
         HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         trusted_path(HELPER.parent)
         if HELPER.exists() or HELPER.is_symlink():

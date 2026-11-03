@@ -81,6 +81,38 @@ class BrowserHostReleaseTest(unittest.TestCase):
         self.assertEqual(result["external"]["module"]["platforms"]["darwin-arm64"]["install_path"], "scripts/control.mjs")
         self.assertEqual((self.output / "keep").read_bytes(), b"existing release input")
 
+    def test_repository_inventory_releases_only_current_browser_helpers(self):
+        template = json.loads((SOURCE.parent / "components.json").read_text())
+        retired = {
+            "browser-vm-local-crosvm-launcher", "browser-vm-local-crosvm-launcher-module",
+            "browser-vm-prepare-rootfs-pool", "browser-vm-prepare-rootfs-pool-module",
+        }
+        names = template["profiles"]["browser-host"]["components"]
+        self.assertTrue(retired.isdisjoint(names))
+        self.assertTrue(retired.isdisjoint(template["external"]))
+        shared = {"browser-vm-engine-supervisor", "browser-vm-engine-supervisor-module",
+                  "browser-vm-control-service", "browser-vm-control-service-module",
+                  "browser-vm-artifact-preflight"}
+        for platform, expected in [
+            ("darwin-arm64", shared | {"browser-selkies-control-service"}),
+            ("linux-arm64", shared | {"browser-vm-linux-network"}),
+            ("linux-amd64", set()),
+        ]:
+            with self.subTest(platform=platform):
+                native = [name for name in names
+                          if platform in template["external"][name]["platforms"]
+                          and "source" not in template["external"][name]["platforms"][platform]]
+                self.assertEqual("browser-vz-engine-supervisor" in native,
+                                 platform in {"darwin-arm64", "linux-arm64"})
+                output = self.output / platform
+                result = producer.stage(SOURCE.parent, platform, output, native)
+                self.assertEqual(set(result["external"]), expected)
+                for name, component in result["external"].items():
+                    info = component["platforms"][platform]
+                    source = template["external"][name]["platforms"][platform]["source"]
+                    self.assertEqual((output / info["release_path"]).read_bytes(),
+                                     (SOURCE.parent / source).read_bytes())
+
     def test_supported_platforms_remain_distinct(self):
         for platform in producer.PLATFORMS:
             with self.subTest(platform=platform):

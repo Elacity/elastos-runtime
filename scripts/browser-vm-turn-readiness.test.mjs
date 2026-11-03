@@ -95,13 +95,11 @@ test("TURN readiness does not replace image integrity or host compatibility chec
 
 // The probe mock below reports ready unless the TURN or host checks refuse, so
 // the cache tests prove probe sharing and keying mechanics, not image admission.
-function controller(t, { linux = false, delayed = false } = {}) {
+function controller(t, { platform = "darwin-arm64", delayed = false } = {}) {
+  const linux = platform.startsWith("linux-");
   const f = fixture(t);
-  if (linux) {
-    f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
-    delete f.env[turnKey];
-  }
-  const probes = [], stats = [], networkChecks = [], messages = [], events = [];
+  f.env.ELASTOS_BROWSER_VM_PLATFORM = platform;
+  const probes = [], stats = [], capabilityChecks = [], messages = [], events = [];
   const proc = { env: f.env, platform: linux ? "linux" : "darwin", arch: process.arch,
     stderr: { write: message => messages.push(message) } };
   const context = vm.createContext({ path, os, process: proc,
@@ -110,23 +108,29 @@ function controller(t, { linux = false, delayed = false } = {}) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
     }, accessSync: fs.accessSync, constants: fs.constants },
-    execFileSync(command, args) {
-      assert.equal(command, "python3");
-      assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
-      networkChecks.push(args);
-      if (f.env.fixtureNetworkMissing) throw { stderr: Buffer.from("As root, run: python3 /fixture/browser-vm-linux-network.py setup --user fixture") };
+    execFileSync(command, args, options) {
+      assert.equal(command, f.launcher);
+      assert.deepEqual(Array.from(args), ["--host-capabilities"]);
+      assert.ok(options.timeout > 0 && options.timeout <= 5000);
+      capabilityChecks.push(args);
+      if (f.env.fixtureHostFailure) throw { stderr: Buffer.from("selected Linux transport requires repair") };
+      return f.env.fixtureHostCapabilities || JSON.stringify({
+        schema: "elastos.browser.vm-host-capabilities/v1", available: true,
+      });
     },
     execFile(script, args, options, done) {
       assert.equal(script, path.join(f.root, "scripts/browser-vm-artifact-preflight.sh"));
       assert.equal(args.join(), "--host-readiness");
-      const result = linux ? ready : probe(options.env);
+      assert.equal(options.env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR, f.launcher);
+      const turn = options.env[turnKey];
+      const result = linux ? (turn && fs.existsSync(turn) ? ready : unavailable()) : probe(options.env);
       const finish = () => done(null, JSON.stringify(result));
       probes.push({ finish });
       if (!delayed) finish();
     },
   });
   const api = vm.runInContext(`${readiness}\n({engineReadiness})`, context);
-  return { ...f, proc, probes, stats, networkChecks, messages, events,
+  return { ...f, proc, probes, stats, capabilityChecks, messages, events,
     read: async (launcher = f.launcher) => JSON.parse(JSON.stringify(await api.engineReadiness({ launcher_program: launcher }))),
   };
 }
@@ -319,27 +323,49 @@ test("TURN removal during a successful probe prevents publishing or caching read
   assert.equal(c.probes.length, 2);
 });
 
-test("Linux readiness retains KVM/crosvm identity and does not require VZ TURN", async t => {
-  const c = controller(t, { linux: true });
+test("ARM Linux readiness uses its native capability contract before cached image readiness", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
   assert.deepEqual(await c.read(), ready);
-  c.env[turnKey] = path.join(c.root, "absent");
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 1);
-  assert.equal(c.networkChecks.length, 2);
+  assert.equal(c.capabilityChecks.length, 2);
   assert.ok(c.stats.includes("/dev/kvm"));
   assert.ok(c.stats.includes(path.join(c.root, "bin/crosvm")));
+  assert.ok(c.stats.includes(path.join(c.root, "bin/initrd")));
+  assert.ok(c.stats.includes(c.turn));
+  delete c.env[turnKey];
+  assert.deepEqual(await c.read(), unavailable());
+  assert.equal(c.probes.length, 2);
 });
 
-test("Linux cached image readiness refuses missing network setup with its repair command", async t => {
-  const c = controller(t, { linux: true });
-  assert.deepEqual(await c.read(), ready);
-  c.env.fixtureNetworkMissing = "1";
-  const result = await c.read();
-  assert.equal(result.readiness.state, "unavailable");
-  assert.equal(result.readiness.reason, "preparation_required");
-  assert.match(c.messages[0], /As root, run: python3 .* setup --user fixture/);
-  assert.deepEqual(result, unavailable(), "host repair paths stay outside the strict Engine contract");
-  assert.equal(c.probes.length, 1);
+for (const capabilities of ["failure", "{", '{"available":true}',
+  '{"schema":"elastos.browser.vm-host-capabilities/v1","available":false}']) {
+  test(`ARM Linux cached readiness observes native capability loss: ${capabilities}`, async t => {
+    const c = controller(t, { platform: "linux-arm64" });
+    assert.deepEqual(await c.read(), ready);
+    if (capabilities === "failure") c.env.fixtureHostFailure = "1";
+    else c.env.fixtureHostCapabilities = capabilities;
+    assert.deepEqual(await c.read(), unavailable());
+    assert.equal(c.probes.length, 1);
+    assert.equal(c.capabilityChecks.length, 2);
+  });
+}
+
+test("ARM Linux readiness rejects retired and unowned local launchers before probing", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  for (const launcher of [path.join(c.root, "bin/browser-vm-local-crosvm-launcher"),
+    "/other-home/bin/browser-vz-engine-supervisor"]) {
+    assert.deepEqual(await c.read(launcher), unavailable("readiness_unsupported"));
+  }
+  assert.equal(c.probes.length, 0);
+  assert.equal(c.capabilityChecks.length, 0);
+});
+
+test("Linux amd64 readiness stays hidden on the ARM qualification candidate", async t => {
+  const c = controller(t, { platform: "linux-amd64" });
+  assert.deepEqual(await c.read(), unavailable("host_unsupported"));
+  assert.equal(c.probes.length, 0);
+  assert.equal(c.capabilityChecks.length, 0);
 });
 
 test("remote VZ readiness remains unsupported without a local probe", async t => {
