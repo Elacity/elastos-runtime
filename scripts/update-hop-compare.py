@@ -1211,7 +1211,9 @@ def cli_build_hop(root, runtime, previous, local_rehearsal=None):
         for name, label, version in (("new", "build-next", new_version), ("next", "build-system", cli_next_version(new_version))):
             env = dict(os.environ)
             env["ELASTOS_RELEASE_VERSION"] = version
-            built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", label, timeout=900)
+            build_timeout = 1800
+            built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", label, timeout=build_timeout)
+            need(not built.get("timed_out"), f"{name} Runtime build timed out after {build_timeout} s")
             need(built["exit"] == 0, name + " Runtime build failed")
             binary = root / ("elastos-new" if name == "new" else "elastos-system")
             shutil.copyfile(runtime, binary)
@@ -2409,13 +2411,15 @@ class CliProcesses:
     def command(self, argv, env, cwd, label, timeout=90, umask=-1):
         started = time.monotonic()
         proc = self.spawn(argv, env, cwd, label, umask)
+        timed_out = False
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
             code = 124
-        return {"exit": code, "pid": proc.pid, "elapsed_ms": round((time.monotonic() - started) * 1000),
+        return {"exit": code, "timed_out": timed_out, "pid": proc.pid, "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "stdout_sha256": digest(self.output / (label + ".stdout")),
                 "stderr_sha256": digest(self.output / (label + ".stderr"))}
 
