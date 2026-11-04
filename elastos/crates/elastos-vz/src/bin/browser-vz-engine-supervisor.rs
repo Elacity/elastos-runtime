@@ -66,7 +66,10 @@ impl SpawnGated for process::Command {
 struct LockFile(Option<File>);
 
 impl LockFile {
+    #[cfg_attr(test, track_caller)]
     fn new(file: File) -> Self {
+        #[cfg(all(test, target_os = "linux"))]
+        linux::tests::record_lock_open(&file, std::panic::Location::caller());
         Self(Some(file))
     }
 
@@ -97,6 +100,8 @@ impl AsRawFd for LockFile {
 impl Drop for LockFile {
     fn drop(&mut self) {
         let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(all(test, target_os = "linux"))]
+        linux::tests::record_lock_drop(self);
         drop(self.0.take());
     }
 }
@@ -5478,6 +5483,10 @@ mod tests {
     }
 
     fn transport_fixture(suffix: char) -> VzTransportLaunch {
+        transport_fixture_on_port(suffix, 49160)
+    }
+
+    fn transport_fixture_on_port(suffix: char, turn_port: u16) -> VzTransportLaunch {
         let expires_at = (current_unix_millis().unwrap() / 1_000 + 300) * 1_000;
         let generation = format!("sha256:{}", suffix.to_string().repeat(64));
         let username = format!("{}:{}", expires_at / 1_000, suffix.to_string().repeat(16));
@@ -5502,7 +5511,7 @@ mod tests {
             "media": {
                 "schema": "elastos.browser.vz-transport-stream/v1",
                 "stream_id": format!("stream:media-{suffix}"),
-                "target": "tcp://127.0.0.1:49160",
+                "target": format!("tcp://127.0.0.1:{turn_port}"),
                 "runtime_socket_path": format!("/tmp/vz-media-{suffix}.sock"),
                 "vsock_port": 19094,
             },
@@ -5512,7 +5521,7 @@ mod tests {
                 "guest_host": "127.0.0.1",
                 "guest_port": 3478,
                 "listen_host": "127.0.0.1",
-                "listen_port": 49160,
+                "listen_port": turn_port,
                 "advertised_host": "192.0.2.10",
                 "relay_host": "192.0.2.10",
                 "relay_port_min": 55000,
@@ -5704,7 +5713,7 @@ mod tests {
 
     #[test]
     fn legacy_hibernation_limits_fail_preflight_before_any_path_effect() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _restore = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
         std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES", "4");
         let root = tempfile::tempdir().unwrap();
@@ -6755,7 +6764,7 @@ mod tests {
 
     #[test]
     fn launch_owned_turn_failure_is_typed_and_retires_private_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _turn_program = EnvVarRestore::capture("ELASTOS_BROWSER_VM_TURN_PROGRAM");
         let _turn_capture = EnvVarRestore::capture("ELASTOS_TEST_TURN_CONFIG_CAPTURE");
         let root = tempfile::tempdir().unwrap();
@@ -6785,7 +6794,10 @@ mod tests {
             memory_mib: 2048,
             vcpu_count: 2,
         };
-        let error = match LaunchTurn::start(&paths, &transport_fixture('c')) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = transport_fixture_on_port('c', listener.local_addr().unwrap().port());
+        drop(listener);
+        let error = match LaunchTurn::start(&paths, &transport) {
             Ok(_) => panic!("failing TURN fixture unexpectedly started"),
             Err(error) => error,
         };
@@ -7809,7 +7821,7 @@ mod tests {
 
     #[test]
     fn overlay_guest_control_fails_closed_without_debugfs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _debugfs = EnvVarRestore::capture("ELASTOS_DEBUGFS_BIN");
         let _source = EnvVarRestore::capture("ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE");
         let tmp = tempfile::tempdir().unwrap();
@@ -7832,7 +7844,7 @@ mod tests {
 
     #[test]
     fn overlay_webrtc_send_is_noop_without_opt_in() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _overlay = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY");
         let _gst = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC");
         let _start = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START");
@@ -7851,7 +7863,7 @@ mod tests {
 
     #[test]
     fn overlay_webrtc_send_fails_closed_without_bound_hashes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _overlay = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_OVERLAY");
         let _gst = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_GSTWEBRTC");
         let _start = EnvVarRestore::capture("ELASTOS_BROWSER_WEBRTC_SEND_SELKIES_START");
@@ -7931,7 +7943,7 @@ mod tests {
         // ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH=0 selects the shared writable
         // seed on macOS only; a Linux launch still boots its own overlay.
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
         let _crosvm = EnvVarRestore::capture("ELASTOS_BROWSER_VM_CROSVM_BIN");
         std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", "0");
@@ -7978,7 +7990,7 @@ mod tests {
     #[test]
     fn linux_launch_boots_an_overlay_of_the_untouched_seed_and_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
         let _crosvm = EnvVarRestore::capture("ELASTOS_BROWSER_VM_CROSVM_BIN");
         std::env::remove_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
@@ -8111,7 +8123,7 @@ mod tests {
     #[test]
     fn shared_writable_rootfs_rejects_a_second_vm_owner() {
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _restore = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
         std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", "0");
         let rootfs_path = tmp.path().join("rootfs.ext4");

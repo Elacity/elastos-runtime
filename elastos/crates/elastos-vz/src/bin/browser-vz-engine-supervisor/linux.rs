@@ -1369,6 +1369,36 @@ pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    fn lock_objects() -> &'static Mutex<std::collections::BTreeMap<i32, String>> {
+        static OBJECTS: std::sync::OnceLock<Mutex<std::collections::BTreeMap<i32, String>>> =
+            std::sync::OnceLock::new();
+        OBJECTS.get_or_init(Mutex::default)
+    }
+
+    pub(crate) fn record_lock_open(file: &File, caller: &std::panic::Location<'_>) {
+        let fd = file.as_raw_fd();
+        let mut owner = format!("LockFile opened at {caller}");
+        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_some() {
+            owner.push_str(&format!("\n{}", std::backtrace::Backtrace::force_capture()));
+            eprintln!("LockFile open pid={} fd={fd} {owner}", std::process::id());
+        }
+        lock_objects()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(fd, owner);
+    }
+
+    pub(crate) fn record_lock_drop(file: &File) {
+        let fd = file.as_raw_fd();
+        let owner = lock_objects()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&fd);
+        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_some() {
+            eprintln!("LockFile drop pid={} fd={fd} {owner:?}", std::process::id());
+        }
+    }
+
     pub(crate) fn slot_lock_holders(slot: &File) -> String {
         fn process_identity(pid: i32) -> String {
             let root = PathBuf::from(format!("/proc/{pid}"));
@@ -1411,6 +1441,26 @@ pub(super) mod tests {
                         fd.file_name().to_string_lossy(),
                         process_identity(pid)
                     ));
+                    if pid == std::process::id() as i32 {
+                        let objects = lock_objects()
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let fd_number = fd.file_name().to_string_lossy().parse::<i32>().unwrap();
+                        report.push_str(&format!(
+                            "slot object fd={fd_number} owner={:?}\n",
+                            objects.get(&fd_number)
+                        ));
+                    }
+                    if let Ok(info) =
+                        fs::read_to_string(process.path().join("fdinfo").join(fd.file_name()))
+                    {
+                        for line in info.lines().filter(|line| line.starts_with("lock:")) {
+                            report.push_str(&format!(
+                                "slot fdinfo pid={pid} fd={} {line}\n",
+                                fd.file_name().to_string_lossy()
+                            ));
+                        }
+                    }
                 }
             }
         }
