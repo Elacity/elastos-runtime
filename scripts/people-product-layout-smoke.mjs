@@ -265,7 +265,7 @@ function startServer() {
         return;
       }
 
-      if (["/apps/home/home-clipboard-client.js", "/apps/home/home-clipboard-protocol.js"].includes(url.pathname)) {
+      if (["/apps/home/home-navigation-client.js", "/apps/home/home-clipboard-client.js", "/apps/home/home-clipboard-protocol.js"].includes(url.pathname)) {
         const body = await readFile(join(repoRoot, "capsules/home/browser", url.pathname.split("/").at(-1)));
         response.writeHead(200, { "access-control-allow-origin": "null", "content-type": "text/javascript" });
         response.end(body);

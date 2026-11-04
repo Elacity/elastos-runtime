@@ -2009,11 +2009,11 @@ async function runScenario(scenario) {
         "initial Direct401 performed automatic recovery work", trace);
       assert(await page.evaluate(() => window.fixtureReconnects) === 0, "initial Direct401 reopened itself");
       const selectedByUser = scenario === "direct-initial-401-user-selection";
-      if (selectedByUser) await clickSharedChoice(frame);
       await frame.locator("#error-text").waitFor({ state: "visible" });
       assert((await frame.locator("#error-text").innerText()).trim(),
         "Reconnect lost its visible recovery explanation");
-      await frame.locator("#reconnect-button").click();
+      if (selectedByUser) await clickSharedChoice(frame);
+      else await frame.locator("#reconnect-button").click();
       await frame.waitForFunction((shared) => document.body.dataset.roomSessionActive === "true"
         && document.querySelector("#reconnect-button")?.hidden === true
         && document.querySelector("[data-conversation-choice].active")?.dataset.conversationChoice
