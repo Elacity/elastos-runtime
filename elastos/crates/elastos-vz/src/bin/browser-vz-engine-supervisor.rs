@@ -7834,6 +7834,54 @@ mod tests {
         assert_eq!(fs::read(&seed).unwrap(), b"immutable guest image");
     }
 
+    #[test]
+    fn the_shared_seed_setting_never_hands_a_linux_guest_the_seed() {
+        // ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH=0 selects the shared writable
+        // seed on macOS only; a Linux launch still boots its own overlay.
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
+        let _crosvm = EnvVarRestore::capture("ELASTOS_BROWSER_VM_CROSVM_BIN");
+        std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", "0");
+        let crosvm = tmp.path().join("crosvm");
+        fs::write(
+            &crosvm,
+            "#!/bin/sh\nprintf 'QFI\\373\\000\\000\\000\\003' > \"$4\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&crosvm, fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("ELASTOS_BROWSER_VM_CROSVM_BIN", &crosvm);
+        let seed = tmp.path().join("rootfs.ext4");
+        fs::write(&seed, vec![0x5a; 64 * 1024]).unwrap();
+        let paths = LaunchPaths {
+            kernel_path: tmp.path().join("kernel"),
+            rootfs_path: seed.clone(),
+            initramfs_path: None,
+            state_dir: tmp.path().join("state"),
+            rootfs_cache_dir: tmp.path().join("rootfs-cache"),
+            session_dir: tmp.path().join("bvm/vz-launch"),
+            socket_dir: tmp.path().join("socket"),
+            control_socket_path: tmp.path().join("socket/c.sock"),
+            runtime_stream_path: tmp.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        fs::create_dir_all(&paths.session_dir).unwrap();
+
+        let prepared = prepare_launch_rootfs(&paths).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(prepared.path, paths.session_dir.join(ROOTFS_OVERLAY_NAME));
+            assert!(prepared.overlay);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(prepared.path, seed, "macOS keeps the shared seed setting");
+            assert!(!prepared.overlay);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_launch_boots_an_overlay_of_the_untouched_seed_and_removes_it() {
