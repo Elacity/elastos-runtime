@@ -1515,6 +1515,20 @@ if (process.env.PHASE === "binding-equality") {
     );
   }
   await new Promise((resolve) => unexpectedUdpRelay.close(resolve));
+  // TURN relays are UDP only (no-tcp-relay): a TCP socket on a relay port,
+  // such as a loopback connection's ephemeral port, must not hold Close.
+  const tcpOnRelayPort = net.createServer();
+  await new Promise((resolve, reject) => {
+    tcpOnRelayPort.once("error", reject);
+    tcpOnRelayPort.listen(
+      {
+        host: page.transport_authority.turn.relay_host,
+        port: page.transport_authority.turn.relay_port_min,
+        exclusive: true,
+      },
+      resolve,
+    );
+  });
 
   const listenUnix = (path) =>
     new Promise((resolve, reject) => {
@@ -1556,6 +1570,7 @@ if (process.env.PHASE === "binding-equality") {
       `transport cleanup was not terminal: ${JSON.stringify(terminal)}`,
     );
   }
+  await new Promise((resolve) => tcpOnRelayPort.close(resolve));
   const durable = await reconcile(streamId);
   if (
     durable.state !== "terminal_post_effect_cleanup" ||
