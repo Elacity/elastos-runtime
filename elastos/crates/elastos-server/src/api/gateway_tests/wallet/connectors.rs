@@ -65,13 +65,26 @@ async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wall
         &authority,
     );
     let token_for = |context: HomeLaunchTokenContext| {
-        issue_home_projection_launch_token_with_context(
-            dir.path(),
-            WALLET_METAMASK_CAPSULE_ID,
-            WALLET_METAMASK_CAPSULE_ID,
-            &context,
-        )
-        .unwrap()
+        // Issuance rejects these bindings; sign isolated malformed fixtures to
+        // retain coverage of the bridge's verification before provider calls.
+        let codec = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&codec.decode(&valid_connector_token).unwrap()).unwrap();
+        envelope["payload"]["principal_id"] = json!(context.principal_id);
+        envelope["payload"]["session_id"] = json!(context.session_id);
+        envelope["payload"]["proof_binding_id"] = json!(context.proof_binding_id);
+        envelope["payload"]["grant_id"] = json!(context.grant_id);
+        let (key, _) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+        let (signature, signer) = crate::crypto::domain_separated_sign(
+            &key,
+            HOME_LAUNCH_TOKEN_DOMAIN,
+            serde_json::to_string(&envelope["payload"])
+                .unwrap()
+                .as_bytes(),
+        );
+        envelope["signature"] = json!(signature);
+        envelope["signer_did"] = json!(signer);
+        codec.encode(serde_json::to_vec(&envelope).unwrap())
     };
     let wrong_principal = token_for(HomeLaunchTokenContext {
         principal_id: "principal:wrong".to_string(),
