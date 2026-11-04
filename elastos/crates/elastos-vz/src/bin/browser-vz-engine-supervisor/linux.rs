@@ -571,6 +571,7 @@ impl CrosvmBrowserProvider {
         locks: Vec<LockFile>,
     ) -> Result<(), String> {
         let vm = self.vm(handle)?;
+        let _worker = vm.worker.lock().map_err(|e| e.to_string())?;
         if vm.state.load(Ordering::Acquire) != LOADED {
             return Err("Browser writer locks must precede crosvm start".into());
         }

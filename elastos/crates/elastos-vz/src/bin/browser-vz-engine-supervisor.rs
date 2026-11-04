@@ -6813,9 +6813,10 @@ mod tests {
                 assert!(Instant::now() < deadline, "TURN log readers did not end");
                 thread::sleep(Duration::from_millis(1));
             }
-            error.child_absent = true;
+            assert!(turn.child.try_wait().unwrap().is_some());
+        } else {
+            assert!(error.child_absent);
         }
-        assert!(error.child_absent);
         assert!(!session_dir.join("turnserver.conf").exists());
         let captured = fs::read_to_string(capture).unwrap();
         // The fixture's relay host is not loopback, so loopback peers stay denied.
