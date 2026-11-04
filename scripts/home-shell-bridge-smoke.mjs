@@ -2719,7 +2719,7 @@ await new Promise(resolve => setTimeout(resolve, 0));
 assert(allLaunches() === beforeAllWrongChatMessages, "Chat recovery accepted a wrong source/token/origin/target/query", requests);
 async function waitForChatPrepare(requestId) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
-    const command = shellMessages.find(m => m.payload?.command === "renew-chat-authority"
+    const command = shellMessages.find(m => m.payload?.command === "renew-frame-authority"
       && m.payload?.phase === "prepare" && m.payload?.requestId === requestId)?.payload;
     if (command) return command;
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -2728,7 +2728,7 @@ async function waitForChatPrepare(requestId) {
 }
 function acknowledgeChat(command, ok, source = shellFrameWindow, extra = {}) {
   const freshHomeToken = new URL(command.launched.route, window.location.origin).hash.split("home_token=")[1];
-  sendChildMessage("null", source, { type: "home:chat-authority-renewed", requestId: command.requestId,
+  sendChildMessage("null", source, { type: "home:frame-authority-renewed", requestId: command.requestId,
     oldHomeToken: command.homeToken, freshHomeToken, ok, homeToken: "gui-token", ...extra });
   return freshHomeToken;
 }
@@ -2775,8 +2775,7 @@ assert(unavailableReply.payload.error && chatReconnectTimers.size === 0,
   "GUI failure leaked fresh authority or recovery timer", chatReplies);
 assertChatTokenRetired(`chat-token-${chatLaunchCount}`);
 
-// Reconnect: Chat's link request under its old authority closes when the
-// reconnect retires that authority; the fresh authority can ask again.
+// Renewal keeps Chat's pending link in the same document.
 window.open = recordLinkOpen;
 askLink(chatFrameWindow, "chat-token-1", "https://example.com/chat-old");
 await settleLinks();
@@ -2786,9 +2785,9 @@ sendChildMessage("null", chatFrameWindow, reconnect("chat-success"));
 const successfulPrepare = await waitForChatPrepare("chat-success");
 const freshChatToken = acknowledgeChat(successfulPrepare, true);
 const chatSuccess = await waitForShellResponse(chatReplies, "chat-success");
-assert(linkSheet().hidden, "reconnect left the old Chat link request open", linkSheet());
+assert(!linkSheet().hidden, "renewal closed the pending Chat link", linkSheet());
 pressLink("open");
-assertOpenedLinks([], "the retired Chat authority's link opened");
+assertOpenedLinks(["https://example.com/chat-old"], "renewal lost the confirmed Chat link", "browser");
 askLink(chatFrameWindow, freshChatToken, "https://example.com/chat-new");
 await settleLinks();
 assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-new"),
@@ -2798,10 +2797,10 @@ assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link d
 window.open = strictWindowOpen;
 assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && chatReconnectTimers.size === 0,
   "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
-assert(shellMessages.some(m => m.payload?.command === "renew-chat-authority"
+assert(shellMessages.some(m => m.payload?.command === "renew-frame-authority"
   && m.payload.phase === "commit" && m.payload.requestId === "chat-success"), "Home omitted the same-frame metadata commit", shellMessages);
 function acknowledgeChatCommit(command, ok, source = shellFrameWindow) {
-  sendChildMessage("null", source, { type: "home:chat-authority-committed", requestId: command.requestId,
+  sendChildMessage("null", source, { type: "home:frame-authority-committed", requestId: command.requestId,
     oldHomeToken: command.homeToken,
     freshHomeToken: new URL(command.launched.route, window.location.origin).hash.split("home_token=")[1],
     ok, homeToken: "gui-token" });
@@ -2849,9 +2848,8 @@ for (const did of [contactDid, `did:key:z${"1".repeat(503)}`]) {
     "Home dropped the Chat DID before it reached People", opened);
 }
 assert(openCommands() === beforeDidActions + 2, "Home did not forward each valid DID once");
-// Stale result inside one app: the old authority's Runtime check is still in
-// flight when the reconnect retires it and the new authority asks. The old
-// result arrives first and is dropped; only the new request shows and opens.
+// A Runtime link check in flight stays bound to the same document through
+// renewal. The occupied prompt slot still prevents a second request.
 window.open = recordLinkOpen;
 externalLinkGate = deferred();
 askLink(chatFrameWindow, freshChatToken, "https://example.com/chat-stale");
@@ -2863,17 +2861,16 @@ await waitForShellResponse(chatReplies, "chat-commit-refused");
 askLink(chatFrameWindow, refusedCommitToken, "https://example.com/chat-current");
 await settleLinks();
 assert(linkSheet().hidden, "a link sheet showed before either Runtime check returned", linkSheet());
-const staleAndCurrentChecks = requests.filter((request) => request.url === "/api/apps/home/external-link").slice(-2);
-assert(JSON.stringify(staleAndCurrentChecks.map((request) => request.body.app_token)) ===
-  JSON.stringify([freshChatToken, refusedCommitToken]),
-"the new Chat authority could not ask while the old check was in flight", staleAndCurrentChecks);
+const pendingLinkCheck = requests.filter((request) => request.url === "/api/apps/home/external-link").at(-1);
+assert(pendingLinkCheck.body.app_token === freshChatToken && pendingLinkCheck.body.url === "https://example.com/chat-stale",
+  "renewal replaced the pending link check", pendingLinkCheck);
 externalLinkGate.resolve();
 externalLinkGate = null;
 await settleLinks();
-assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-current"),
-  "the old authority's late result replaced or hid the current request", linkSheet());
+assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-stale"),
+  "renewal lost the pending Runtime result", linkSheet());
 pressLink("open");
-assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one", "browser");
+assertOpenedLinks(["https://example.com/chat-stale"], "the renewed Chat request did not open", "browser");
 window.open = strictWindowOpen;
 acknowledgeChatCommit(refusedCommitPrepare, false, {});
 const beforeWrongCommitReceipt = openCommands();
