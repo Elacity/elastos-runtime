@@ -1097,6 +1097,7 @@ mod tests {
         manifest.profiles.insert(
             "other".into(),
             super::super::Profile {
+                extra: Default::default(),
                 description: None,
                 components: vec!["browser-vm-artifact-preflight".into()],
             },

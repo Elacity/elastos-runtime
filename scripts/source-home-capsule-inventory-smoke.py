@@ -337,11 +337,12 @@ def assert_setup_order():
         main.index("install_app_capsules\n"),
         main.index("install_browser_runtime_helpers\n"),
         main.index("stamp_source_home_capsule_artifacts_manifest\n"),
+        main.index("prepare_source_home_setup\n"),
         main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
     ]
     if positions != sorted(positions):
         raise AssertionError(
-            "components.json mutators must finish before the final capsule stamp and integrity check"
+            "source-home component, capsule and Runtime setup must finish before the integrity check"
         )
     install_function = setup.split("install_content_publish_backend() {", 1)[1].split(
         "\n}\n\necho \"[setup-source-home] repo:", 1

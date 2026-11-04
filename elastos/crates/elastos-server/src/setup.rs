@@ -32,6 +32,8 @@ const PROVIDER_ICON_SIZES: [u16; 4] = [32, 64, 128, 256];
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ComponentsManifest {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Setup-materialized artifacts: external tools, provider binaries, and
     /// first-party app bundles installed into the runtime data directory.
     pub external: HashMap<String, Component>,
@@ -93,14 +95,17 @@ where
 /// and local-copy strategies.
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Component {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_mb: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_runtime: Option<ProviderRuntime>,
@@ -111,7 +116,9 @@ pub struct Component {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ComponentCapsuleMetadata {
-    #[serde(default)]
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_path: Option<String>,
     pub platforms: HashMap<String, PlatformInfo>,
 }
@@ -156,6 +163,8 @@ pub enum ProviderRuntimeExecution {
 /// Consumed by supervisor in M2+ (ensure_capsule, launch_capsule).
 #[derive(Deserialize, Serialize, Clone)]
 pub struct CapsuleEntry {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub cid: String,
     pub sha256: String,
     #[serde(default)]
@@ -168,6 +177,8 @@ pub struct CapsuleEntry {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PlatformInfo {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Legacy artifact hint; setup never fetches this URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -198,6 +209,9 @@ pub struct PlatformInfo {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Profile {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub components: Vec<String>,
 }
@@ -6306,6 +6320,7 @@ pub(crate) mod tests {
     fn test_component_install_state() {
         let tmp = tempfile::tempdir().unwrap();
         let comp = Component {
+            extra: Default::default(),
             version: None,
             install_path: Some("bin/test".to_string()),
             repository: None,
@@ -6342,6 +6357,7 @@ pub(crate) mod tests {
         platforms.insert(
             "x86_64-linux".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: Some("QmSiteProvider".to_string()),
                 release_path: Some("site-provider-linux-amd64".to_string()),
@@ -6359,6 +6375,7 @@ pub(crate) mod tests {
             },
         );
         let comp = Component {
+            extra: Default::default(),
             version: Some("0.20.0-rc30".to_string()),
             install_path: Some("bin/site-provider".to_string()),
             repository: None,
@@ -6388,6 +6405,7 @@ pub(crate) mod tests {
         let binary = bundle.join("llama-server");
         fs::write(&binary, b"llama-server").unwrap();
         let platform_info = PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: None,
             release_path: None,
@@ -6801,6 +6819,7 @@ pub(crate) mod tests {
         platforms.insert(
             "linux-amd64".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: Some("QmNewHomeCli".to_string()),
                 release_path: Some("home-cli.tar.gz".to_string()),
@@ -6815,6 +6834,7 @@ pub(crate) mod tests {
             },
         );
         let component = Component {
+            extra: Default::default(),
             version: Some("0.1.0".to_string()),
             install_path: Some("capsules/home-cli".to_string()),
             repository: None,
@@ -6862,6 +6882,7 @@ pub(crate) mod tests {
         platforms.insert(
             "linux-amd64".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: None,
                 release_path: Some("object-provider-linux-amd64".to_string()),
@@ -6879,6 +6900,7 @@ pub(crate) mod tests {
         capsule_platforms.insert(
             "*".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: Some(
                     "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
@@ -6898,6 +6920,7 @@ pub(crate) mod tests {
             },
         );
         Component {
+            extra: Default::default(),
             version: None,
             install_path: Some("bin/object-provider".to_string()),
             repository: None,
@@ -6912,6 +6935,7 @@ pub(crate) mod tests {
                 runtime_only: false,
             }),
             capsule_metadata: Some(ComponentCapsuleMetadata {
+                extra: Default::default(),
                 install_path: Some("capsules/object-provider".to_string()),
                 platforms: capsule_platforms,
             }),
@@ -7037,6 +7061,7 @@ pub(crate) mod tests {
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"object-provider").unwrap();
         let manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::new(),
@@ -7127,6 +7152,7 @@ pub(crate) mod tests {
         ));
 
         let old_manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
@@ -7134,6 +7160,7 @@ pub(crate) mod tests {
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
@@ -7160,6 +7187,7 @@ pub(crate) mod tests {
         let mut old_component = new_component.clone();
         old_component.capsule_metadata = None;
         let old_manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), old_component)]),
@@ -7167,6 +7195,7 @@ pub(crate) mod tests {
             profiles: HashMap::new(),
         };
         let new_manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::from([("object-provider".to_string(), new_component)]),
@@ -7378,6 +7407,7 @@ pub(crate) mod tests {
         platforms.insert(
             "*".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: None,
                 release_path: Some("marketplace.tar.gz".to_string()),
@@ -7392,6 +7422,7 @@ pub(crate) mod tests {
             },
         );
         let component = Component {
+            extra: Default::default(),
             version: None,
             install_path: Some("capsules/marketplace".to_string()),
             repository: None,
@@ -7402,6 +7433,7 @@ pub(crate) mod tests {
             platforms,
         };
         let manifest = ComponentsManifest {
+            extra: Default::default(),
             model_catalog: None,
             collaboration_network: None,
             external: HashMap::new(),
@@ -7459,6 +7491,7 @@ pub(crate) mod tests {
     #[test]
     fn validate_capsule_package_identity_accepts_direct_asset_metadata() {
         let platform_info = PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: Some("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string()),
             release_path: Some("marketplace.tar.gz".to_string()),
@@ -7806,6 +7839,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_write_installed_manifest_preserves_source_home_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let platform = "darwin-arm64";
+        let binary = tmp.path().join("bin/vmlinux");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"local-kernel").unwrap();
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../components.json")).unwrap();
+        let mut kubo = source["external"]["kubo"].clone();
+        kubo["platforms"][platform]["checksum"] =
+            serde_json::json!(format!("sha256:{}", "a".repeat(64)));
+        kubo["platforms"][platform]["size"] = serde_json::json!(12345);
+        kubo["platforms"][platform]["build_receipt"] = serde_json::json!({"verified": true});
+        kubo["content_backend"] = serde_json::json!({"name": "ipfs"});
+        kubo["capsule_metadata"] = serde_json::json!({
+            "role": "content",
+            "type": "data",
+            "install_path": "capsules/kubo",
+            "platforms": {platform: {
+                "checksum": format!("sha256:{}", "b".repeat(64)),
+                "extract_path": "kubo",
+                "install_path": "capsules/kubo",
+                "release_path": "kubo-darwin-arm64.tar.gz",
+                "size": 37212060,
+                "build_receipt": {"verified": true}
+            }}
+        });
+        let input = serde_json::json!({
+            "schema": source["schema"],
+            "external": {
+                "kubo": kubo,
+                "vmlinux": {"platforms": {platform: {
+                    "strategy": "local-copy",
+                    "source": "source/Image",
+                    "install_path": "bin/vmlinux",
+                    "checksum": "sha256:stale",
+                    "size": 1
+                }}}
+            },
+            "capsules": {"fixture": {
+                "cid": "fixture-cid",
+                "sha256": "fixture-sha256",
+                "size": 1,
+                "platforms": [platform],
+                "receipt": {"verified": true}
+            }},
+            "profiles": {"source-home": {
+                "components": ["kubo", "vmlinux"],
+                "receipt": {"verified": true}
+            }}
+        });
+        let manifest: ComponentsManifest = serde_json::from_value(input.clone()).unwrap();
+        let stamped = write_installed_manifest(tmp.path(), &manifest, platform).unwrap();
+        assert_eq!(stamped, vec!["vmlinux"]);
+        let installed: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join("components.json")).unwrap()).unwrap();
+        let mut expected = input;
+        expected["external"]["vmlinux"]["platforms"][platform]["checksum"] =
+            serde_json::json!(compute_sha256_checksum(&binary).unwrap());
+        expected["external"]["vmlinux"]["platforms"][platform]["size"] =
+            serde_json::json!(b"local-kernel".len());
+        assert_eq!(installed, expected);
+    }
+
+    #[test]
     fn test_write_installed_manifest_preserves_kubo_receipt_platform_fields() {
         let receipt = serde_json::json!({
             "checksum": format!("sha256:{}", "a".repeat(64)),
@@ -7916,6 +8014,7 @@ pub(crate) mod tests {
         platforms.insert(
             "linux-amd64".to_string(),
             PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: None,
                 release_path: None,
@@ -7933,6 +8032,7 @@ pub(crate) mod tests {
             },
         );
         let comp = Component {
+            extra: Default::default(),
             version: None,
             install_path: Some("bin/vmlinux".to_string()),
             repository: None,
@@ -8460,6 +8560,7 @@ pub(crate) mod tests {
     #[test]
     fn verify_checksum_requires_release_artifact_checksum() {
         let info = PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: None,
             release_path: Some("shell-linux-amd64".to_string()),
@@ -8481,6 +8582,7 @@ pub(crate) mod tests {
     fn verify_checksum_accepts_stamped_release_artifact_checksum() {
         let bytes = b"shell-bytes";
         let info = PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: None,
             release_path: Some("shell-linux-amd64".to_string()),
@@ -8504,6 +8606,7 @@ pub(crate) mod tests {
     fn release_bytes_must_also_match_the_signed_size() {
         let bytes = b"shell-bytes";
         let info = |size| PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: None,
             release_path: Some("shell-linux-amd64".to_string()),
@@ -8529,6 +8632,7 @@ pub(crate) mod tests {
     fn release_artifact_checksum_requirement_keeps_dev_escape_hatches() {
         for strategy in ["source-build", "local-copy"] {
             let info = PlatformInfo {
+                extra: Default::default(),
                 url: None,
                 cid: None,
                 release_path: Some("shell-linux-amd64".to_string()),
@@ -8551,6 +8655,7 @@ pub(crate) mod tests {
     async fn download_component_rejects_unstamped_release_artifact_before_fetch() {
         let tmp = tempfile::tempdir().unwrap();
         let info = PlatformInfo {
+            extra: Default::default(),
             url: None,
             cid: None,
             release_path: Some("shell-linux-amd64".to_string()),

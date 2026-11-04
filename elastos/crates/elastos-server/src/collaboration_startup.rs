@@ -1677,6 +1677,7 @@ mod tests {
         let mut supervisor = crate::supervisor::Supervisor::new(
             temp.path().to_path_buf(),
             crate::setup::ComponentsManifest {
+                extra: Default::default(),
                 model_catalog: None,
                 collaboration_network: None,
                 external: std::collections::HashMap::new(),
