@@ -6603,6 +6603,9 @@ mod tests {
 
     #[test]
     fn turn_port_proof_matches_udp_relays_and_tcp_control() {
+        // This fixture closes and immediately rebinds sockets. Keep sibling
+        // pre_exec fixtures from temporarily inheriting those socket fds.
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let relay_tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let relay_port = relay_tcp.local_addr().unwrap().port();
         let relay_udp = std::net::UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
@@ -6797,11 +6800,21 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let transport = transport_fixture_on_port('c', listener.local_addr().unwrap().port());
         drop(listener);
-        let error = match LaunchTurn::start(&paths, &transport) {
+        let mut error = match LaunchTurn::start(&paths, &transport) {
             Ok(_) => panic!("failing TURN fixture unexpectedly started"),
             Err(error) => error,
         };
         assert!(error.message.contains("exited before readiness"));
+        if let Some(mut turn) = error.retained_turn.take() {
+            // Process exit can precede log-reader completion. Exercise the
+            // retained cleanup owner until it proves both readers have ended.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !turn.terminate_and_reap_until(deadline) {
+                assert!(Instant::now() < deadline, "TURN log readers did not end");
+                thread::sleep(Duration::from_millis(1));
+            }
+            error.child_absent = true;
+        }
         assert!(error.child_absent);
         assert!(!session_dir.join("turnserver.conf").exists());
         let captured = fs::read_to_string(capture).unwrap();
