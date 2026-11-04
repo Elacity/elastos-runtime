@@ -17,18 +17,17 @@ function close(handle) {
   return new Promise((resolve) => handle.close(() => resolve()));
 }
 
-// A free two-port relay range: both ports free for TCP and UDP at selection time.
-async function relayRange(t) {
+// A one-port relay range that was just free for TCP and is free for UDP.
+async function relayRange() {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const server = net.createServer();
     await new Promise((resolve) => server.listen({ host, port: 0 }, resolve));
     const port = server.address().port;
     await close(server);
-    if (port >= 65535) continue;
-    const turn = { relay_host: host, relay_port_min: port, relay_port_max: port + 1 };
+    const turn = { relay_host: host, relay_port_min: port, relay_port_max: port };
     if (await context.turnRelayPortsAbsent(turn)) return turn;
   }
-  t.skip("no free relay range");
+  throw new Error("no free relay port on 127.0.0.1");
 }
 
 function listenTcp(port) {
@@ -48,19 +47,19 @@ function bindUdp(port) {
 }
 
 test("free relay ports are absent", async (t) => {
-  const turn = await relayRange(t);
+  const turn = await relayRange();
   assert.equal(await context.turnRelayPortsAbsent(turn), true);
 });
 
 test("a TCP socket on a relay port does not hold Close (no-tcp-relay)", async (t) => {
-  const turn = await relayRange(t);
+  const turn = await relayRange();
   const server = await listenTcp(turn.relay_port_max);
   t.after(() => close(server));
   assert.equal(await context.turnRelayPortsAbsent(turn), true);
 });
 
 test("a UDP socket on a relay port is a held relay", async (t) => {
-  const turn = await relayRange(t);
+  const turn = await relayRange();
   const socket = await bindUdp(turn.relay_port_max);
   t.after(() => close(socket));
   assert.equal(await context.turnRelayPortsAbsent(turn), false);
