@@ -1366,6 +1366,33 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn run_lock_test_in_subprocess() -> bool {
+        let current = thread::current();
+        let name = current.name().expect("named test thread");
+        const ISOLATED_TEST: &str = "ELASTOS_TEST_ISOLATED_CROSVM_LOCK_TEST";
+        if std::env::var(ISOLATED_TEST).as_deref() == Ok(name) {
+            return false;
+        }
+        // CLOEXEC closes a sibling's inherited lock fds at exec, not fork.
+        // Other tests can fork during our last close and keep its flock alive
+        // until they exec. A separate process gives this test the production
+        // supervisor's single-launch ownership, while keeping parallel tests.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_TEST, name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated {name} failed ({}):\n{}\n{}",
+            output.status,
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
     fn fixture(root: &std::path::Path) -> (CrosvmBrowserProvider, VmConfig) {
         let config = VzConfig {
             state_dir: root.join("state"),
@@ -1489,6 +1516,9 @@ mod tests {
 
     #[tokio::test]
     async fn owned_crosvm_exit_reaps_worker_before_releasing_writer_lock() {
+        if run_lock_test_in_subprocess() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let (provider, config) = fixture(root.path());
         fs::write(&provider.binary, "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > \"$3.child\"\nprintf '%s' \"$$\" > \"$3.pid\"\nwait\n").unwrap();
@@ -1538,6 +1568,69 @@ mod tests {
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
         assert!(super::super::try_lock_exclusive(&contender).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sibling_fork_keeps_cloexec_leases_until_exec_after_vm_release() {
+        if run_lock_test_in_subprocess() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        let handle = load_fixture(&provider, config);
+        let lease_fd = provider.vm(&handle).unwrap().writer_locks.lock().unwrap()[0].as_raw_fd();
+        let contender =
+            super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+                .unwrap();
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        let parent_fd = parent.as_raw_fd();
+        let child_fd = child.as_raw_fd();
+        let spawn = thread::spawn(move || {
+            let mut command = Command::new("/bin/cat");
+            command.stdin(Stdio::piped()).stdout(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    // Only async-signal-safe calls between fork and exec.
+                    // Close the parent's endpoint so a failed assertion in the
+                    // parent also releases this child's blocking read.
+                    libc::close(parent_fd);
+                    let flags = libc::fcntl(lease_fd, libc::F_GETFD);
+                    let inherited = (flags >= 0 && flags & libc::FD_CLOEXEC != 0) as u8;
+                    if libc::write(child_fd, (&inherited as *const u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let mut proceed = 0u8;
+                    if libc::read(child_fd, (&mut proceed as *mut u8).cast(), 1) != 1 {
+                        return Err(io::Error::from_raw_os_error(libc::EPIPE));
+                    }
+                    Ok(())
+                });
+            }
+            let spawned = command.spawn();
+            drop(child);
+            spawned.unwrap()
+        });
+        let mut inherited = [0];
+        parent.read_exact(&mut inherited).unwrap();
+        // The sibling is now paused after fork, before CLOEXEC takes effect.
+        // No Arc<Vm> or lease descriptor remains in this test after release.
+        let released = provider.release_terminal_native_vm(&handle).await;
+        let closed = unsafe { libc::fcntl(lease_fd, libc::F_GETFD) } == -1
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+        let held_before_exec = !super::super::try_lock_exclusive(&contender).unwrap();
+        parent.write_all(&[1]).unwrap();
+        let mut sibling = spawn.join().unwrap();
+        let alive_after_exec = sibling.try_wait().unwrap().is_none();
+        let free_after_exec = super::super::try_lock_exclusive(&contender).unwrap();
+        // EOF settles cat after checking the lock while it is still alive.
+        drop(sibling.stdin.take());
+        assert!(sibling.wait().unwrap().success());
+        assert_eq!(inherited, [1], "sibling inherited the CLOEXEC lease fd");
+        assert!(released);
+        assert!(closed, "release closed the supervisor's lease fd");
+        assert!(held_before_exec, "fork retained the same flock description");
+        assert!(alive_after_exec);
+        assert!(free_after_exec, "CLOEXEC closed the sibling's lease fd");
     }
 
     #[test]
