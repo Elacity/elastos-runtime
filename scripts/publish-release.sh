@@ -1086,8 +1086,8 @@ runtime_tunnel_url() {
     token=$(jq -r '.shell_token // empty' "$coords_file" 2>/dev/null || true)
     [[ -n "$api" && -n "$token" ]] || return 1
 
-    response=$(curl -fsS --max-time 3 \
-        -H "Authorization: Bearer ${token}" \
+    # printf is a shell builtin and curl reads the header from stdin, so the token stays out of every argv.
+    response=$(printf 'header = "Authorization: Bearer %s"\n' "${token}" | curl -fsS --max-time 3 -K - \
         -H "Content-Type: application/json" \
         -X POST \
         -d '{}' \

@@ -4,9 +4,11 @@ Launch it from the signing account with an empty environment (env -i), so the
 OS loader and Python start without candidate-controlled library/site settings.
 
 Only api.github.com supplies source authority, authenticated with GH_TOKEN when
-the launch passes one (env -i GH_TOKEN=...), else anonymously. Network, outage
-and rate-limit failures refuse with a distinct retry message. The operator-owned
-policy (outside the input root) pins repository/commit/tree/version/channel and
+the launch exports one into the cleared environment, else anonymously. The
+launch reads that token from a file descriptor, so it stays out of every argv.
+Network, outage and rate-limit failures refuse with a distinct retry message.
+The operator-owned policy (outside the input root)
+pins repository/commit/tree/version/channel and
 either a canary develop_oid or a remote version tag/tag_oid for main admission
 (main must contain the tagged commit and carry exactly its tree),
 publisher_did, manifest_sha256 and tool/python/openssl {path, sha256}, plus a

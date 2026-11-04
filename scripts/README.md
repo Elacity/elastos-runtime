@@ -482,10 +482,15 @@ sets the protected Ed25519 PEM key path. Use the signer from its installed,
 reviewed path, with a clean environment and its pinned Python:
 
 ```sh
-env -i GH_TOKEN="$(gh auth token)" /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+env -i /bin/sh -c 'IFS= read -r GH_TOKEN <&3; export GH_TOKEN; exec "$0" -I -S "$@"' \
+  /path/to/pinned-python /path/to/installed-release-signer.py \
   --policy /path/to/operator-policy.json --input-root /path/to/unsigned-input \
-  --output-root /path/to/new-signed-set
+  --output-root /path/to/new-signed-set 3< <(gh auth token)
 ```
+
+The token reaches the signer's environment through file descriptor 3, which
+`env -i` keeps, so no process carries it in an argv. Run the line in `bash` or
+`zsh`, which both support that process substitution.
 
 The tool verifies the pinned remote `develop` head and candidate ancestry for
 canary, or the approved remote version tag and `main` ancestry for the other
