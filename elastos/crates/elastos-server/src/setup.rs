@@ -169,23 +169,30 @@ pub struct CapsuleEntry {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct PlatformInfo {
     /// Legacy artifact hint; setup never fetches this URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// IPFS CID for content-addressed downloads (used instead of url).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cid: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extract_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_path: Option<String>,
     /// Executable path inside a directory-valued extracted bundle.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
     /// Local filesystem path to copy from (for "local-copy" strategy).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
 }
 
@@ -7796,6 +7803,47 @@ pub(crate) mod tests {
             verify_installed_component(&data_dir, "kubo", &binary).unwrap();
             assert!(plan(&data_dir).is_empty());
         }
+    }
+
+    #[test]
+    fn test_write_installed_manifest_preserves_kubo_receipt_platform_fields() {
+        let receipt = serde_json::json!({
+            "checksum": format!("sha256:{}", "a".repeat(64)),
+            "extract_path": "kubo",
+            "install_path": "capsules/kubo",
+            "release_path": "kubo-linux-arm64.tar.gz",
+            "size": 37212060
+        });
+        let native = serde_json::json!({
+            "checksum": format!("sha256:{}", "b".repeat(64)),
+            "install_path": "bin/kubo",
+            "release_path": "kubo-linux-arm64",
+            "size": 12345
+        });
+        let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "external": {"kubo": {
+                "install_path": "bin/kubo",
+                "platforms": {"linux-arm64": native},
+                "capsule_metadata": {
+                    "install_path": "capsules/kubo",
+                    "platforms": {"linux-arm64": receipt}
+                }
+            }},
+            "profiles": {}
+        }))
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_installed_manifest(tmp.path(), &manifest, "linux-arm64").unwrap();
+        let installed: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join("components.json")).unwrap()).unwrap();
+        let kubo = &installed["external"]["kubo"];
+        let metadata = &kubo["capsule_metadata"]["platforms"]["linux-arm64"];
+        assert_eq!(
+            metadata.as_object().unwrap().keys().collect::<Vec<_>>(),
+            receipt.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(metadata, &receipt);
+        assert_eq!(kubo["platforms"]["linux-arm64"], native);
     }
 
     #[test]
