@@ -510,37 +510,65 @@ class FiniteRuntime:
                     observed[name] = cgroup_membership(pid)
             except (OSError, RuntimeError, ValueError, IndexError) as error:
                 observed[name + "_error"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
-        retained = self.known[pid]
-        detail = {"retained": retained["census_sample"], "observed": observed,
-                  "role": retained["role"], "exe_sha256": retained["exe_sha256"],
+        retained = self.known.get(pid, {})
+        detail = {"retained": retained.get("census_sample", {}), "observed": observed,
+                  "role": retained.get("role"), "exe_sha256": retained.get("exe_sha256"),
                   "expected_cgroup": self.binding["ControlGroup"]}
+        try:
+            pids = [int(value) for value in bounded_text(self.group / "cgroup.procs", 8192).split()]
+            if len(pids) > 512:
+                raise RuntimeError("finite journey process census exceeds its bound")
+            detail["expected_cgroup_procs"] = pids
+        except (OSError, RuntimeError, ValueError) as error:
+            detail["expected_cgroup_procs_error"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
+        parent_pid = observed.get("ppid", detail["retained"].get("ppid", retained.get("parent")))
+        parent = {"pid": parent_pid}
+        if parent_pid is not None and parent_pid > 0:
+            try:
+                if parent_pid in self.fds:
+                    parent["pidfd_exited"] = pidfd_exited(self.fds[parent_pid])
+                else:
+                    parent_fd = os.pidfd_open(parent_pid, 0)
+                    try:
+                        parent["pidfd_exited"] = pidfd_exited(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+            except (OSError, RuntimeError) as error:
+                parent["pidfd_error"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
+            try:
+                parent["cgroup"] = cgroup_membership(parent_pid)
+            except (OSError, RuntimeError, ValueError) as error:
+                parent["cgroup_error"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
+        detail["parent"] = parent
         try:
             detail["pidfd_exited"] = pidfd_exited(fd)
         except (OSError, RuntimeError) as error:
             detail["pidfd_error"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
-        # Raw argv and foreign cgroup names stay with the private Runtime log.
+        detail["same_start_ticks"] = (observed["start_ticks"] == retained["start_ticks"]
+                                      if "start_ticks" in observed and "start_ticks" in retained else None)
+        # Raw argv and non-unit cgroup names stay with the private Runtime log.
         # CI uploads JSON and PNG only; this file deliberately uses .private.log.
         try:
             private_json(self.control / "census-gap.private.log", detail)
             detail["private_capture"] = "saved"
         except (OSError, RuntimeError) as error:
             detail["private_capture"] = PUBLIC_ERROR_TYPES.get(type(error), "redacted")
-        detail["same_start_ticks"] = (observed.get("start_ticks") == retained["start_ticks"]
-                                      if "start_ticks" in observed else None)
-        for key in ("retained", "observed"):
+        for key in ("retained", "observed", "parent"):
             sample = dict(detail[key])
             if "cmdline" in sample:
                 # Only the bound executable's name and fixed harness verbs leave
                 # the runner. Arbitrary positional values can contain credentials.
-                executable = Path(retained["executable"]).name
+                executable = Path(retained.get("executable", "")).name
                 sample["cmdline"] = [executable if index == 0 and Path(arg).name == executable else
                                      arg if arg in ("gateway", "init", "daemon", "--internal-local-llama-guard")
                                      else "<redacted>" for index, arg in enumerate(sample["cmdline"])]
             if "cgroup" in sample and sample["cgroup"] != self.binding["ControlGroup"]:
                 sample["cgroup_sha256"] = hashlib.sha256(sample["cgroup"].encode()).hexdigest()
-                sample["cgroup"] = redact(sample["cgroup"], (self.home, self.data))
+                sample["cgroup"] = "/" + "/".join(
+                    part if re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}\.(slice|scope|service|mount|socket)", part)
+                    else "<name>" for part in sample["cgroup"].split("/")[1:])
             if key == "retained":
-                sample.update(role=retained["role"], exe_sha256=retained["exe_sha256"])
+                sample.update(role=retained.get("role"), exe_sha256=retained.get("exe_sha256"))
             detail[key] = sample
         self.census_gap = detail
 
