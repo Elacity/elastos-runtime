@@ -37,7 +37,7 @@ class InputWriterGate:
                 raise ValueError("invalid pending writer receipt")
             self.lease = {"id": record["admission_id"], "expires": clock(),
                           "pending_effect": record["effect_id"], "release_requested": True}
-        self.retired = set()
+        self.retired = {}
         self.keys = set()
         self.closed = False
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -50,10 +50,15 @@ class InputWriterGate:
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
+    def _retire(self, lease_id):
+        self.retired.pop(lease_id, None)
+        self.retired[lease_id] = None
+        if len(self.retired) > 128:
+            del self.retired[next(iter(self.retired))]
+
     def _active(self):
         if self.lease and (self.clock() >= self.lease["expires"] or self.lease["release_requested"]):
-            if len(self.retired) < 128:
-                self.retired.add(self.lease["id"])
+            self._retire(self.lease["id"])
             # Expiry retires authority, but an unacknowledged native effect
             # keeps human input blocked until exact settlement or Engine teardown.
             if self.lease["pending_effect"] is None:
@@ -67,6 +72,9 @@ class InputWriterGate:
             if not isinstance(message, str) or len(message) > 131072:
                 return
             command = message.split(",", 1)[0]
+            # Runtime owns display geometry; Selkies remains the media/input transport.
+            if command in ("r", "_arg_resize", "s"):
+                return
             fields = message.split(",")
             key = None
             if command in ("kd", "ku"):
@@ -102,8 +110,7 @@ class InputWriterGate:
             active = self._active()
             command = request.get("command")
             if command == "release":
-                if lease_id not in self.retired and len(self.retired) < 128:
-                    self.retired.add(lease_id)
+                self._retire(lease_id)
                 if active and active["id"] == lease_id:
                     active["release_requested"] = True
             elif command in ("begin", "settle"):
@@ -131,7 +138,7 @@ class InputWriterGate:
                 duration = request.get("duration_ms")
                 if type(duration) is not int or not 2000 <= duration <= 30000:
                     raise ValueError("invalid writer duration")
-                if lease_id in self.retired or (active and active["id"] != lease_id) or len(self.retired) >= 128:
+                if lease_id in self.retired or (active and active["id"] != lease_id):
                     raise ValueError("writer unavailable")
                 if not active:
                     # This acknowledgement uses the X server input barrier.
@@ -148,7 +155,7 @@ class InputWriterGate:
                     self.native_input.send_x11_mouse(0, 0, 0, 0, relative=True)
                     self.native_input.xdisplay.sync()
                     if self.clock() >= deadline:
-                        self.retired.add(lease_id)
+                        self._retire(lease_id)
                         raise ValueError("writer deadline")
                     self.lease = {"id": lease_id, "expires": deadline, "pending_effect": None, "release_requested": False}
             elif command != "check":

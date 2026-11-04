@@ -771,7 +771,6 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
     let (source, choice, head) = choice_fixture();
     verify_update_choice(&head, &choice, &source).unwrap();
     for refusal in [
-        "head CID",
         "release CID",
         "version",
         "chosen publisher",
@@ -784,10 +783,6 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
         let mut choice = choice.clone();
         let mut value: Value = serde_json::from_slice(&head).unwrap();
         let bytes = match refusal {
-            "head CID" => {
-                choice.head_cid = raw_cid(b"another head");
-                head.clone()
-            }
             "release CID" => {
                 choice.release_cid = raw_cid(b"another release");
                 head.clone()
@@ -819,9 +814,7 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
             "signing domain" => signed(value["payload"].clone(), "elastos.release.v1"),
             _ => unreachable!(),
         };
-        if !matches!(refusal, "head CID") {
-            choice.head_cid = raw_cid(&bytes);
-        }
+        choice.head_cid = raw_cid(&bytes);
         assert!(
             verify_update_choice(&bytes, &choice, &source).is_err(),
             "{refusal}"
@@ -882,6 +875,75 @@ fn canary_update_choice_accepts_only_the_trusted_signers_stable_head() {
         let error = verify_update_choice(&bytes, &choice, &source).unwrap_err();
         assert!(error.to_string().contains(expected), "{case}: {error:#}");
     }
+}
+
+/// Bytes that do not match the chosen head CID are a retryable download
+/// mismatch through the real apply path, never a recorded refusal.
+#[tokio::test]
+async fn apply_keeps_a_head_cid_mismatch_retryable_and_records_no_refusal() {
+    let fixture = PrivateFixture::new();
+    let source = fixture.publish_installed_release();
+    publish_retained_receipt(&fixture);
+    let release = signed(
+        json!({"schema":"elastos.release/v1","version":"0.7.1","channel":"stable","platforms":{}}),
+        "elastos.release.v1",
+    );
+    let head = signed(
+        json!({
+            "schema":"elastos.release.head/v1","version":"0.7.1","channel":"stable",
+            "latest_release_cid":raw_cid(&release),"release_sha256":digest(&release)
+        }),
+        "elastos.release.head.v1",
+    );
+    let (_, mut request, _) = choice_fixture();
+    request.head_cid = raw_cid(&head);
+    request.release_cid = raw_cid(&release);
+    verify_update_choice(&head, &request, &installed_source(&fixture.data).unwrap()).unwrap();
+    let mut truncated = head.clone();
+    truncated.truncate(head.len() / 2);
+    let (_reachable, endpoint, serving) = crate::setup::tests::carrier_cid_source(
+        &fixture.data,
+        &source,
+        std::collections::HashMap::from([
+            (request.head_cid.clone(), truncated),
+            (request.release_cid.clone(), release),
+        ]),
+    )
+    .await;
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "exec sleep 60"]);
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(child::OwnedChild::spawn(&mut command).unwrap()),
+        request: Some(request.clone()),
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: "a".repeat(32),
+        host_ready: true,
+        carrier: None,
+        carrier_close: None,
+        test_readiness: None,
+    };
+    controller
+        .publish("staging", "Checking the signed update.")
+        .unwrap();
+    let result = controller.apply().await;
+    controller.publish_apply_result(&result).unwrap();
+    endpoint.close().await;
+    serving.await.unwrap();
+    let error = result.unwrap_err();
+    assert_eq!(
+        classify_apply_failure(&error),
+        ApplyFailure::DownloadMismatch,
+        "{error:#}"
+    );
+    assert_eq!(
+        status(&fixture.data).unwrap().unwrap().message,
+        ApplyFailure::DownloadMismatch.message()
+    );
+    assert!(!fixture.directory.join(REFUSED).exists());
+    assert!(!release_refused(&fixture.data, &request.head_cid, &request.release_cid).unwrap());
 }
 
 #[test]
@@ -1121,6 +1183,41 @@ fn approved_home_readiness_urls_keep_the_exact_listener_origin_and_path() {
     ] {
         assert!(approved_home_url(value, 8090).is_err(), "{value}");
     }
+}
+
+#[test]
+fn browser_home_refuses_a_port_another_program_holds_on_either_loopback() {
+    let data = tempfile::tempdir().unwrap();
+    let expected = |port: u16| {
+        format!(
+            "Home cannot start because another program is using port {port}; run `lsof -i :{port}` to see which one."
+        )
+    };
+
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let error = refuse_browser_home_port_in_use(data.path(), port).unwrap_err();
+    assert_eq!(error.to_string(), expected(port));
+    drop(v4);
+    refuse_browser_home_port_in_use(data.path(), port).unwrap();
+
+    // `localhost` would still bind 127.0.0.1 here while browsers reach the other program.
+    if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
+        let port = v6.local_addr().unwrap().port();
+        let error = refuse_browser_home_port_in_use(data.path(), port).unwrap_err();
+        assert_eq!(error.to_string(), expected(port));
+    }
+}
+
+#[test]
+fn browser_home_port_check_leaves_a_runtime_that_owns_this_home_to_the_host_lock() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _owner =
+        crate::host_lock::acquire_host_process_lock(data.path(), "gateway", "localhost:8090")
+            .unwrap();
+    refuse_browser_home_port_in_use(data.path(), port).unwrap();
 }
 
 #[tokio::test]
@@ -3306,9 +3403,7 @@ struct RestartScenario {
     old: Vec<(PathBuf, Vec<u8>)>,
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
+use crate::install_transaction::shell_quote;
 
 /// Shell lines that export `settings` and exec the real fixture Home below.
 fn fixture_home_exec(settings: &str) -> String {
@@ -4336,6 +4431,69 @@ async fn home_launch_and_browser_paths_refuse_a_release_whose_record_differs_bef
     assert!(crate::install_transaction::acquire_installed_writer(&fixture.data).is_err());
     drop(admitted);
     assert!(crate::install_transaction::acquire_installed_writer(&fixture.data).is_ok());
+}
+
+#[test]
+fn installed_release_signers_name_only_rows_their_signed_record_matches() {
+    let app = b"fixture app archive";
+    let row = json!({"install_path":"capsules/fixture-app", "extract_path":"fixture-app",
+        "release_path":"fixture-app.tar.gz", "cid":raw_cid(app),
+        "checksum":format!("sha256:{}", digest(app)), "size":app.len()});
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
+        "external":{"fixture-app":{"install_path":"capsules/fixture-app","platforms":{"*":row}}}
+    }))
+    .unwrap();
+    let did = crate::crypto::encode_signing_key_did(&test_key());
+    let record = |size: usize| {
+        crate::capsule_record::signed_record(
+            &test_key(),
+            json!({"schema":"elastos.capsule.record/v1", "name":"fixture-app", "platform":"*",
+                "capsule_version":null, "sha256":digest(app), "size":size, "cid":raw_cid(app),
+                "release_path":"fixture-app.tar.gz", "signer_did":did}),
+        )
+    };
+    // A Home without a signed release names no signer.
+    let fixture = PrivateFixture::new();
+    assert!(crate::setup::installed_release_signers(&fixture.data)
+        .unwrap()
+        .is_empty());
+    // Nor does a release that lists no records.
+    fixture.publish_installed_release_listing(&components, json!({}));
+    assert!(crate::setup::installed_release_signers(&fixture.data)
+        .unwrap()
+        .is_empty());
+
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len())]}),
+    );
+    assert_eq!(
+        crate::setup::installed_release_signers(&fixture.data).unwrap(),
+        std::collections::BTreeMap::from([("fixture-app".to_owned(), did.clone())])
+    );
+
+    // A record that differs from its row names nobody.
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len() + 1)]}),
+    );
+    assert!(crate::setup::installed_release_signers(&fixture.data).is_err());
+
+    // Nor does a record signed by a key the Home does not trust.
+    let fixture = PrivateFixture::new();
+    let other = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+    let foreign = crate::capsule_record::signed_record(
+        &other,
+        json!({"schema":"elastos.capsule.record/v1", "name":"fixture-app", "platform":"*",
+            "capsule_version":null, "sha256":digest(app), "size":app.len(), "cid":raw_cid(app),
+            "release_path":"fixture-app.tar.gz",
+            "signer_did":crate::crypto::encode_signing_key_did(&other)}),
+    );
+    fixture.publish_installed_release_listing(&components, json!({"capsule_records":[foreign]}));
+    assert!(crate::setup::installed_release_signers(&fixture.data).is_err());
 }
 
 #[tokio::test]
@@ -5396,4 +5554,23 @@ fn refused_releases_live_outside_status_and_keep_the_latest_eight() {
     forget_refused_release(&fixture.directory, &request(5)).unwrap();
     assert!(!release_refused(&fixture.data, "head-5", "release-5").unwrap());
     assert!(release_refused(&fixture.data, "head-6", "release-6").unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_home_start_notes_progress_while_it_waits() {
+    let mut notes = Vec::new();
+    let ready = note_while_starting(
+        async {
+            tokio::time::sleep(Duration::from_secs(65)).await;
+            7
+        },
+        |seconds| notes.push(seconds),
+    )
+    .await;
+    assert_eq!(ready, 7);
+    assert_eq!(notes, [20, 40, 60]);
+    // A quick start prints nothing more.
+    let mut quick = Vec::new();
+    note_while_starting(async {}, |seconds| quick.push(seconds)).await;
+    assert!(quick.is_empty());
 }

@@ -194,6 +194,8 @@ test("only Browser can read and exact matching text/plain result settles it", as
 
 test("client accepts the closed first-party write purposes", async () => {
   const cases = [
+    ["people", "profile.id", "did:key:zProfile"],
+    ["chat-room", "profile.id", "did:key:zProfile"],
     ["wallet", "wallet.address", "0x1234"],
     ["wallet", "wallet.recovery-key", '{"secret":"bounded"}'],
     ["wallet-metamask", "wallet.address", "0x2345"],
@@ -201,7 +203,6 @@ test("client accepts the closed first-party write purposes", async () => {
     ["wallet-walletconnect", "wallet.address", "0x3456"],
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
-    ["documents", "resource.uri", "elastos://bafy-document"],
     ["assistant", "transcript.markdown", "# Assistant transcript\n\n## User\n\nHello"],
     ["assistant", "message.text", "**Reply** with `code`"],
   ];

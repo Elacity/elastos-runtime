@@ -70,6 +70,27 @@ async fn caller_capsule_catalog_summary(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
 ) -> CapsuleCatalogResponse {
+    let mut catalog = caller_capsule_catalog_rows(state, context).await;
+    // A publisher is named only for an installed package whose row matches a
+    // record of the installed signed release; any failure names none.
+    let data_dir = state.data_dir.clone();
+    let signers =
+        tokio::task::spawn_blocking(move || crate::setup::installed_release_signers(&data_dir))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|signers| signers)
+            .unwrap_or_else(|error| {
+                tracing::debug!("installed release publishers unavailable: {error:#}");
+                Default::default()
+            });
+    read_model::project_release_publishers(&mut catalog, &signers);
+    catalog
+}
+
+async fn caller_capsule_catalog_rows(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> CapsuleCatalogResponse {
     // Home may have started offline without its pinned catalogue; Local AI's
     // read retries it, and otherwise reports it unavailable.
     if let Err(error) = crate::setup::retry_model_catalog(&state.data_dir).await {
@@ -1434,8 +1455,16 @@ mod tests {
                 crate::protected_content_runtime::protected_content_enabled(data_dir.path())
                     || *name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
             })
+            // WalletConnect stays out until an operator pins its config.
+            .filter(|name| *name != WALLET_WALLETCONNECT_CAPSULE_ID)
+            // Services is hidden until sharing moves into People.
+            .filter(|name| *name != SERVICES_CAPSULE_ID)
             .collect::<BTreeSet<_>>();
         assert_eq!(catalog_names, expected);
+        assert!(active_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
+        assert!(!catalog_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
+        assert!(active_names.contains(SERVICES_CAPSULE_ID));
+        assert!(!catalog_names.contains(SERVICES_CAPSULE_ID));
         assert!(!catalog_names.contains("bus-v1-conformance"));
 
         let catalog_interface_count = catalog
@@ -1459,7 +1488,6 @@ mod tests {
             "browser",
             "wallet",
             "inbox",
-            "services",
             SYSTEM_CAPSULE_ID,
             "library",
             "documents",

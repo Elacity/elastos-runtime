@@ -350,12 +350,16 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     targets
 }
 
+/// Targets Home shows in its launcher and on its desktop. Wallet connectors
+/// open from Wallet and Archive opens archives from Library, so both stay
+/// launchable but are not listed.
 pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,
         WALLET_METAMASK_CAPSULE_ID
             | WALLET_UNISAT_CAPSULE_ID
             | WALLET_WALLETCONNECT_CAPSULE_ID
+            | "archive-manager"
             | "home-agent"
     )
 }
@@ -880,13 +884,11 @@ fn app_shell_title(name: &str) -> String {
 
 fn app_shell_description(name: &str, manifest_description: Option<String>) -> String {
     match name {
-        DOCUMENTS_CAPSULE_ID => {
-            "Create, edit, and publish markdown documents from this device.".to_string()
-        }
+        DOCUMENTS_CAPSULE_ID => "Write Markdown and text documents.".to_string(),
         CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
-            "Browse installed apps, services, viewers, and content.".to_string()
+            "Find apps, viewers, content and models you can open or get.".to_string()
         }
         PEOPLE_CAPSULE_ID => "Manage people and local discovery.".to_string(),
         INBOX_CAPSULE_ID => "Review messages, requests, and approvals.".to_string(),
@@ -1097,6 +1099,7 @@ fn home_people_summary(
                 // Room membership rows have no presence basis of their own; a
                 // room participant with an active session is the signal here.
                 reachable: None,
+                delivery_detail: None,
             }
         })
         .collect::<Vec<_>>();

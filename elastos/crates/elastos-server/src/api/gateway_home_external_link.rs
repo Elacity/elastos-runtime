@@ -15,8 +15,8 @@ pub(super) struct HomeExternalLinkRequest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct HomeExternalLinkApp {
-    id: String,
+pub(super) struct HomeExternalLinkApp {
+    pub(super) id: String,
     title: String,
 }
 
@@ -58,7 +58,7 @@ pub(super) async fn home_external_link(
 /// The app a carried launch token names, accepted only when Home launched it
 /// under the caller's own Home authority (principal, session, proof binding and
 /// grant all match).
-fn home_external_link_app(
+pub(super) fn home_external_link_app(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
     app_token: &str,

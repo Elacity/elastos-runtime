@@ -8,7 +8,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_FILES: usize = 33; // 32 model payload files plus the exact object index.
@@ -116,11 +116,15 @@ enum RootMode {
     BackendObservation,
 }
 
-fn open_root(path: &Path) -> io::Result<File> {
-    open_root_with_mode(path, RootMode::Staging)
+fn open_root(path: &Path, data_root: &Path) -> io::Result<File> {
+    open_root_with_mode(path, RootMode::Staging, data_root)
 }
 
-fn open_root_with_mode(path: &Path, mode: RootMode) -> io::Result<File> {
+/// `data_root` is the Runtime data directory: it and its ancestors keep their
+/// owner's group permissions (Ubuntu umask 002 makes ~/.local group-writable);
+/// directories below it are ElastOS's own and stay closed to group writes.
+fn open_root_with_mode(path: &Path, mode: RootMode, data_root: &Path) -> io::Result<File> {
+    let boundary = fs::canonicalize(data_root).unwrap_or_else(|_| data_root.to_path_buf());
     let text = path
         .to_str()
         .filter(|s| s.starts_with('/') && s.len() <= 4096)
@@ -137,7 +141,9 @@ fn open_root_with_mode(path: &Path, mode: RootMode) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
+    let mut current = PathBuf::from("/");
     for (index, name) in parts.iter().enumerate() {
+        current.push(name);
         dir = open_at(&dir, name, true)?;
         let meta = dir.metadata()?;
         if index + 1 == parts.len() {
@@ -156,8 +162,11 @@ fn open_root_with_mode(path: &Path, mode: RootMode) -> io::Result<File> {
             // Canonical OS temp ancestors can be root-owned sticky directories.
             // Every component is opened without following links, including /tmp aliases.
             let owner = meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() };
-            let protected =
-                meta.mode() & 0o022 == 0 || (meta.uid() == 0 && meta.mode() & 0o1000 != 0);
+            // The sticky exception applies only to DATA and above; below it stays strict.
+            let shared = boundary.starts_with(&current);
+            let refused = if shared { 0o002 } else { 0o022 };
+            let protected = meta.mode() & refused == 0
+                || (shared && meta.uid() == 0 && meta.mode() & 0o1000 != 0);
             if !owner || !protected {
                 return Err(invalid("unsafe staged ancestor"));
             }
@@ -244,12 +253,13 @@ struct OpenFile {
 struct Closure {
     root: File,
     root_stamp: Stamp,
+    data_root: PathBuf,
     directories: Vec<(String, File, Stamp)>,
     files: Vec<OpenFile>,
 }
 
 impl Closure {
-    fn open(descriptor: &StagedDirectory) -> io::Result<Self> {
+    fn open(descriptor: &StagedDirectory, data_root: &Path) -> io::Result<Self> {
         if descriptor.files.is_empty()
             || descriptor.files.len() > MAX_FILES
             || descriptor.total_bytes == 0
@@ -287,10 +297,11 @@ impl Closure {
         {
             return Err(invalid("staged closure mismatch"));
         }
-        let root = open_root(&descriptor.root)?;
+        let root = open_root(&descriptor.root, data_root)?;
         let mut closure = Self {
             root_stamp: stamp(&root.metadata()?),
             root: root.try_clone()?,
+            data_root: data_root.to_path_buf(),
             directories: Vec::new(),
             files: Vec::new(),
         };
@@ -342,7 +353,7 @@ impl Closure {
     }
 
     fn check(&self, descriptor: &StagedDirectory) -> io::Result<()> {
-        if stamp(&open_root(&descriptor.root)?.metadata()?) != self.root_stamp
+        if stamp(&open_root(&descriptor.root, &self.data_root)?.metadata()?) != self.root_stamp
             || stamp(&self.root.metadata()?) != self.root_stamp
         {
             return Err(invalid("staged root changed"));
@@ -484,19 +495,17 @@ fn bounded_response(response: ureq::Response) -> io::Result<Vec<u8>> {
 
 fn profile_request(
     agent: &ureq::Agent,
-    api: &str,
+    api_port: u16,
     operation: &str,
     key: Option<&str>,
     deadline: Instant,
 ) -> io::Result<serde_json::Value> {
-    let mut request = agent
-        .post(&format!("{api}/api/v0/{operation}"))
+    let query: Vec<(&str, &str)> = key.map(|key| ("arg", key)).into_iter().collect();
+    let request = agent
+        .post(&super::kubo_rpc_url(api_port, operation, &query))
         .set("Accept-Encoding", "identity")
         .set("Connection", "close")
         .timeout(remaining(deadline)?);
-    if let Some(key) = key {
-        request = request.query("arg", key);
-    }
     let response = request
         .call()
         .map_err(|_| invalid("directory hash profile request failed"))?;
@@ -523,15 +532,15 @@ fn check_hamt_value(key: &str, value: &serde_json::Value) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_profile(agent: &ureq::Agent, api: &str, deadline: Instant) -> io::Result<()> {
-    if profile_request(agent, api, "version", None, deadline)?["Version"] != "0.40.1" {
+fn verify_profile(agent: &ureq::Agent, api_port: u16, deadline: Instant) -> io::Result<()> {
+    if profile_request(agent, api_port, "version", None, deadline)?["Version"] != "0.40.1" {
         return Err(invalid("unsupported directory hash Kubo version"));
     }
     for key in [
         "Import.UnixFSHAMTDirectorySizeThreshold",
         "Import.UnixFSHAMTDirectorySizeEstimation",
     ] {
-        let response = profile_request(agent, api, "config", Some(key), deadline)?;
+        let response = profile_request(agent, api_port, "config", Some(key), deadline)?;
         if response["Key"] != key {
             return Err(invalid("directory hash config key mismatch"));
         }
@@ -615,7 +624,7 @@ pub(super) fn verify_backend(provider: &super::IpfsProvider) -> io::Result<()> {
         .max_idle_connections(0)
         .build();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let version = profile_request(&agent, &provider.api_url(), "version", None, deadline)?;
+    let version = profile_request(&agent, provider.api_port, "version", None, deadline)?;
     if version["Version"] != "0.40.1" {
         return Err(invalid("unsupported directory hash backend"));
     }
@@ -692,9 +701,13 @@ fn require_same_capacity_volume(repo_volume: u64, data_volumes: [u64; 2]) -> io:
     Ok(())
 }
 
-fn observe_repo_capacity(repo: &Path, required_bytes: u64) -> io::Result<CapacityObservation> {
+fn observe_repo_capacity(
+    repo: &Path,
+    data_root: &Path,
+    required_bytes: u64,
+) -> io::Result<CapacityObservation> {
     // Keep the opened no-follow repo handle for the filesystem observation.
-    let directory = open_root_with_mode(repo, RootMode::BackendObservation)?;
+    let directory = open_root_with_mode(repo, RootMode::BackendObservation, data_root)?;
     let before = directory.metadata()?;
     let data_dirs = [
         open_at(&directory, "blocks", true)?,
@@ -724,7 +737,9 @@ fn observe_repo_capacity(repo: &Path, required_bytes: u64) -> io::Result<Capacit
     let observation = capacity_observation(before.dev(), capacity, available, required_bytes)?;
     if stamp(&before) != stamp(&directory.metadata()?)
         || stamp(&before)
-            != stamp(&open_root_with_mode(repo, RootMode::BackendObservation)?.metadata()?)
+            != stamp(
+                &open_root_with_mode(repo, RootMode::BackendObservation, data_root)?.metadata()?,
+            )
     {
         return Err(invalid("backend repository changed during observation"));
     }
@@ -754,19 +769,19 @@ pub(super) fn check_capacity(
         .max_idle_connections(0)
         .build();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let api = provider.api_url();
-    if profile_request(&agent, &api, "version", None, deadline)?["Version"] != "0.40.1" {
+    let api = provider.api_port;
+    if profile_request(&agent, api, "version", None, deadline)?["Version"] != "0.40.1" {
         return Err(invalid("unsupported capacity backend"));
     }
     validate_capacity_datastore(&profile_request(
         &agent,
-        &api,
+        api,
         "config",
         Some("Datastore.Spec"),
         deadline,
     )?)?;
     // size-only omits RepoPath. A full stat is still bounded by this call's deadline.
-    let stat = profile_request(&agent, &api, "repo/stat", None, deadline)?;
+    let stat = profile_request(&agent, api, "repo/stat", None, deadline)?;
     let repo = stat
         .get("RepoPath")
         .and_then(serde_json::Value::as_str)
@@ -779,7 +794,7 @@ pub(super) fn check_capacity(
         return Err(invalid("invalid repository size"));
     }
     remaining(deadline)?;
-    let observation = observe_repo_capacity(Path::new(repo), required_bytes)?;
+    let observation = observe_repo_capacity(Path::new(repo), &provider.data_dir, required_bytes)?;
     remaining(deadline)?;
     Ok(observation)
 }
@@ -799,7 +814,7 @@ fn hash_directory_with_timeout(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| invalid("invalid directory hash deadline"))?;
-    let mut closure = Closure::open(descriptor)?;
+    let mut closure = Closure::open(descriptor, &provider.data_dir)?;
     let boundary = new_boundary()?;
     let body_length = closure
         .files
@@ -814,10 +829,10 @@ fn hash_directory_with_timeout(
         .try_proxy_from_env(false)
         .max_idle_connections(0)
         .build();
-    let api = provider.api_url();
-    verify_profile(&agent, &api, deadline)?;
-    let mut request = agent
-        .post(&format!("{api}/api/v0/add"))
+    let api = provider.api_port;
+    verify_profile(&agent, api, deadline)?;
+    let request = agent
+        .post(&super::kubo_rpc_url(api, "add", ADD_OPTIONS))
         .set(
             "Content-Type",
             &format!("multipart/form-data; boundary={boundary}"),
@@ -826,9 +841,6 @@ fn hash_directory_with_timeout(
         .set("Accept-Encoding", "identity")
         .set("Connection", "close")
         .timeout(remaining(deadline)?);
-    for (key, value) in ADD_OPTIONS {
-        request = request.query(key, value);
-    }
     // Synchronous send(Read) settles or errors before handles are dropped. This
     // owner starts no background work. Runtime must wait for return before cleanup.
     let response = request
@@ -836,7 +848,7 @@ fn hash_directory_with_timeout(
         .map_err(|_| invalid("directory hash stream failed"))?;
     let root = parse_root(&bounded_response(response)?)?;
     closure.check(descriptor)?;
-    verify_profile(&agent, &api, deadline)?;
+    verify_profile(&agent, api, deadline)?;
     remaining(deadline)?;
     Ok(root)
 }
@@ -1308,6 +1320,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                offline: true,
             },
         );
         assert_eq!(
@@ -1472,6 +1485,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                offline: true,
             },
         );
         let ready =
@@ -1727,6 +1741,42 @@ mod tests {
     }
 
     #[test]
+    fn staged_root_ancestors_accept_owned_group_writable_and_refuse_world_writable() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().canonicalize().unwrap().join("local");
+        let data = shared.join("elastos");
+        let root = data.join("staging/object");
+        fs::create_dir_all(&root).unwrap();
+        for (path, mode) in [
+            (&root, 0o700),
+            (&data.join("staging"), 0o755),
+            (&data, 0o770),
+            (&shared, 0o775),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        open_root(&root, &data).unwrap();
+        // Below the data root ElastOS owns the folders; group write stays refused.
+        fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(open_root(&root, &data).is_err());
+        // A data root that is not above the staged root leaves every ancestor strict.
+        fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(open_root(&root, Path::new("/elastos-data-root-elsewhere")).is_err());
+        // Sticky does not excuse group or world write below DATA.
+        for mode in [0o1770, 0o1777] {
+            fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(open_root(&root, &data).is_err());
+        }
+        fs::set_permissions(data.join("staging"), fs::Permissions::from_mode(0o755)).unwrap();
+        // An owned sticky group-writable folder above DATA stays accepted.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1775)).unwrap();
+        open_root(&root, &data).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_root(&root, &data).is_err());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
     fn private_capacity_uses_actual_repo_and_rejects_unsafe_or_malformed_facts() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("actual-repo");
@@ -1820,6 +1870,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: crate::now_unix_secs(),
+                offline: true,
             },
         );
         // One check every 500 ms, as a download does per window, for three idle limits.
@@ -1924,12 +1975,12 @@ mod tests {
     #[test]
     fn staged_directory_hash_rejects_descriptor_and_closure_mismatches() {
         let (dir, mut descriptor) = small_closure();
-        assert!(Closure::open(&descriptor).is_ok());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_ok());
         descriptor.total_bytes = 7;
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         descriptor.total_bytes = 6;
         descriptor.files[2].size = MAX_BYTES + 1;
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         descriptor.files[2].size = 2;
         for path in [
             "../weights",
@@ -1941,17 +1992,20 @@ mod tests {
             "_elastos_object.json",
         ] {
             descriptor.files[2].path = path.into();
-            assert!(Closure::open(&descriptor).is_err(), "accepted {path}");
+            assert!(
+                Closure::open(&descriptor, &descriptor.root).is_err(),
+                "accepted {path}"
+            );
         }
         descriptor.files[2].path = "nested/weights.gguf".into();
         put(&dir.path().join("extra"), b"{}");
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         fs::remove_file(dir.path().join("extra")).unwrap();
         fs::create_dir(dir.path().join("empty")).unwrap();
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         fs::remove_dir(dir.path().join("empty")).unwrap();
         fs::remove_file(dir.path().join("capsule.json")).unwrap();
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         descriptor.files = (0..34)
             .map(|i| StagedFile {
                 path: format!("f{i}"),
@@ -1959,7 +2013,7 @@ mod tests {
             })
             .collect();
         descriptor.total_bytes = 34;
-        assert!(Closure::open(&descriptor).is_err());
+        assert!(Closure::open(&descriptor, &descriptor.root).is_err());
         let mut provider = ready_provider(dir.path(), 1);
         provider.state = KuboState::Cold;
         assert!(hash_directory(&provider, &descriptor).is_err());
@@ -2028,18 +2082,24 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(Closure::open(&descriptor).is_err(), "accepted {case}");
+            assert!(
+                Closure::open(&descriptor, &descriptor.root).is_err(),
+                "accepted {case}"
+            );
         }
         let (dir, mut descriptor) = small_closure();
         symlink(dir.path(), dir.path().join("alias")).unwrap();
         descriptor.root.push("alias");
-        assert!(Closure::open(&descriptor).is_err(), "followed root symlink");
+        assert!(
+            Closure::open(&descriptor, &descriptor.root).is_err(),
+            "followed root symlink"
+        );
     }
 
     #[test]
     fn staged_directory_hash_detects_replacement_and_changes_during_stream() {
         let (dir, descriptor) = small_closure();
-        let mut closure = Closure::open(&descriptor).unwrap();
+        let mut closure = Closure::open(&descriptor, &descriptor.root).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         {
             let mut reader = Multipart::new(&mut closure.files, deadline, new_boundary().unwrap());
@@ -2050,7 +2110,7 @@ mod tests {
         }
         assert!(closure.check(&descriptor).is_err());
         let (_dir, descriptor) = small_closure();
-        let closure = Closure::open(&descriptor).unwrap();
+        let closure = Closure::open(&descriptor, &descriptor.root).unwrap();
         fs::rename(
             descriptor.root.join("capsule.json"),
             descriptor.root.join("old"),
@@ -2062,7 +2122,7 @@ mod tests {
             "replacement inode accepted"
         );
         let (dir, descriptor) = small_closure();
-        let closure = Closure::open(&descriptor).unwrap();
+        let closure = Closure::open(&descriptor, &descriptor.root).unwrap();
         let moved = dir.path().join("moved");
         // Replace a retained nested directory, not a fixture-owned temp root.
         fs::rename(dir.path().join("nested"), &moved).unwrap();

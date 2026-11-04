@@ -1533,6 +1533,18 @@ impl CollaborationCore {
         })
     }
 
+    /// Whether this Profile may send one more Community message now, without
+    /// sending: work that must not be lost to a refused send checks first.
+    pub(crate) fn check_community_send_allowed(
+        &self,
+        sender_profile_did: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
+        self.check_community_send_window(&state, sender_profile_did, now)?;
+        Ok(())
+    }
+
     /// Counts this Profile's stored Community messages created in the last
     /// window. Stored state is the count, so an unsaved send never counts and
     /// a saved one always does, across restarts too.

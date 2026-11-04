@@ -76,6 +76,50 @@ function colorDistance(left, right, base = null) {
   );
 }
 
+function relativeLuminance([r, g, b]) {
+  const channel = (value) => {
+    const s = value / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return (0.2126 * channel(r)) + (0.7152 * channel(g)) + (0.0722 * channel(b));
+}
+
+// WCAG ratio of text over a surface that may be translucent over its base.
+function contrastRatio(text, surface, base) {
+  const back = flattenColor(surface, base);
+  const fore = back && flattenColor(text, `rgb(${back.join(", ")})`);
+  if (!fore) return 0;
+  const [light, dark] = [relativeLuminance(fore), relativeLuminance(back)].sort((a, b) => b - a);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+// The upload panel renders uploads.js rows; its text must read in either theme.
+async function assertUploadProgressReadable(page, label) {
+  const colors = await page.evaluate(async () => {
+    const panel = document.getElementById("upload-progress");
+    const { createLibraryUploads } = await import(new URL("./src/uploads.js", document.baseURI).href);
+    createLibraryUploads({
+      container: panel,
+      perf: { uploadRenderCount: 0, uploadRenderScheduledCount: 0 },
+      state: { uploads: [{ id: "contrast", name: "explorer-note.txt", status: "Complete", progress: 100 }] },
+    }).renderUploads();
+    const read = (selector) => getComputedStyle(document.querySelector(selector));
+    const result = {
+      base: read("body").backgroundColor,
+      surface: read("#upload-progress").backgroundColor,
+      name: read(".upload-name").color,
+      status: read(".upload-name + div").color,
+    };
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return result;
+  });
+  for (const key of ["name", "status"]) {
+    const ratio = contrastRatio(colors[key], colors.surface, colors.base);
+    assert(ratio >= 4.5, `${label}: upload ${key} contrast ${ratio.toFixed(2)}:1 is below 4.5:1 (${JSON.stringify(colors)}).`);
+  }
+}
+
 function object(uri, name, kind) {
   return {
     schema: "elastos.library.object/v1",
@@ -230,12 +274,12 @@ async function readThemeSnapshot(page) {
       };
     };
     return {
-      activeTab: document.querySelector(".item-props-tab-selected")?.textContent?.trim() || "",
+      detailsOpen: document.querySelector(".item-props-details")?.open === true,
       body: read("body"),
       statusbar: read(".statusbar"),
       card: read(".window-item-properties"),
       title: read(".properties-window-title"),
-      panel: read(".item-props-tab-content-selected"),
+      panel: read(".item-props-body"),
       label: read(".item-prop-label"),
       value: read(".item-prop-val"),
       copyButton: read(".props-copy-btn"),
@@ -244,7 +288,6 @@ async function readThemeSnapshot(page) {
 }
 
 function assertReadableTheme(snapshot, label) {
-  assert(snapshot.activeTab.length > 0, `${label}: Properties tab did not stay selected.`);
   assert(
     colorDistance(snapshot.statusbar.backgroundColor, snapshot.statusbar.color, snapshot.body.backgroundColor) > 40,
     `${label}: footer text lost readable contrast.`,
@@ -398,25 +441,28 @@ async function run() {
 
     await openProperties(page, "Alpha.txt");
     const darkGeneral = await readThemeSnapshot(page);
-    assert(darkGeneral.activeTab === "General", "Properties must open on the General tab.");
+    assert(!darkGeneral.detailsOpen, "Properties must open with Details collapsed.");
     assertReadableTheme(darkGeneral, "dark general");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').waitFor();
-    const darkTechnical = await readThemeSnapshot(page);
-    assert(darkTechnical.activeTab === "Technical", "Properties must switch to the Technical tab.");
-    assertReadableTheme(darkTechnical, "dark technical");
+    await page.locator(".item-props-details > summary").click();
+    await page.locator(".item-props-details[open]").filter({ hasText: "Object URI" }).waitFor();
+    const darkDetails = await readThemeSnapshot(page);
+    assert(darkDetails.detailsOpen, "Properties Details must open on click.");
+    assertReadableTheme(darkDetails, "dark details");
     await page.evaluate(() => {
       document.documentElement.setAttribute("data-el-theme", "light");
     });
-    const lightTechnical = await readThemeSnapshot(page);
-    assertReadableTheme(lightTechnical, "light technical");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "General" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="general"]').waitFor();
+    const lightDetails = await readThemeSnapshot(page);
+    assertReadableTheme(lightDetails, "light details");
+    await page.locator(".item-props-details > summary").click();
     const lightGeneral = await readThemeSnapshot(page);
-    assert(lightGeneral.activeTab === "General", "Properties must return to the General tab.");
+    assert(!lightGeneral.detailsOpen, "Properties Details must close on a second click.");
     assertReadableTheme(lightGeneral, "light general");
     assert(darkGeneral.statusbar.backgroundColor !== lightGeneral.statusbar.backgroundColor, "Library footer must react to theme changes.");
     assert(darkGeneral.panel.backgroundColor !== lightGeneral.panel.backgroundColor, "Library Properties panel must react to theme changes.");
+    await assertUploadProgressReadable(page, "light");
+    await page.evaluate(() => document.documentElement.removeAttribute("data-el-theme"));
+    await assertUploadProgressReadable(page, "dark");
+    await page.evaluate(() => document.documentElement.setAttribute("data-el-theme", "light"));
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.fill("#search", "missing");

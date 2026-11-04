@@ -5,7 +5,7 @@ not receive hosted-model credentials, provider endpoints, local model process
 access, or authority to choose a hidden alternate backend.
 
 This document defines the target contract needed by a durable Agent Host.
-Current implementation truth stays in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Current implementation truth stays in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 ## Authority boundary
 
@@ -46,7 +46,7 @@ remote-model authorization path. The destination verifies the authenticated
 source endpoint and service grant, then constructs its own local provider binding
 for the consumer principal, capsule and run. `RuntimeCreateBinding` and
 `RuntimeAccessBinding` remain local-channel authority records. Installed
-acceptance and remaining remote-service work are recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+acceptance and remaining remote-service work are recorded in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 An operator explicitly selects a configured capability for publication under
 Runtime policy. The owning Runtime publishes it as an
@@ -347,10 +347,11 @@ request, including saved operator connections; End stops its sends. The Home
 can also use an owner-scoped
 `providers/model-provider/validate-fixtures.json`. That file, when present,
 may bind validate HTTP only to `http://127.0.0.1` with an explicit port.
-Save stays private and publishes no service offer. A later Share action uses
-existing Marketplace, Services, grants, Carrier routing, and run journals.
-Services summary reports `share_enabled` on hosted cards. That field matches
-the stored share state. The key stays on the provider Home. Consumers see the
+Save stays private and publishes no service offer. Share uses grants, Carrier
+routing, and run journals. In 0.8.0 the Services app, where Share lived, is
+hidden: a hosted model shared by an earlier version stays shared, and each
+person's access ends when its grant expires, 6 hours after approval, or when
+the owner selects Revoke access in Inbox. The key stays on the provider Home. Consumers see the
 intermediary Home, the selected upstream processor (OpenRouter or Venice), and
 the payer. One
 connection budget covers that provider's private and shared offers, including
@@ -363,8 +364,8 @@ the generic model-provider capsule with repeatable owner-bound instances.
 Each instance has a stable offer identity, display name, adapter, selected
 model, Runtime secret reference, privacy and share policy, limits, and
 lifecycle. One Home can keep several instances of the same provider, for
-example Jev via OpenRouter, private DeepSeek via OpenRouter, and shared
-Venice. Private is the default. Changing or disconnecting one instance leaves
+example private DeepSeek and Qwen via OpenRouter, and shared Venice. Private is
+the default. Changing or disconnecting one instance leaves
 the others. Existing `model:openrouter` and `model:venice` offers migrate into
 named instances without losing secrets.
 
@@ -383,7 +384,7 @@ retains its original credential and journal binding. A failed provider refresh
 returns a pending state after saving configuration; the Home must retry activation
 or restart before claiming that configuration is active.
 
-For Decisions, Save binds the exact validated catalog entry's canonical model
+A Decisions offer binds the exact validated catalog entry's canonical model
 ID to the offer revision. This binding is part of the execution hash. The
 adapter checks the response against that ID before projecting `output.model`
 as the selected contract model. The terminal backend report retains the actual
@@ -399,19 +400,13 @@ selector, resolved model when the backend reports it, and explicit fallback
 policy. The secret stays in Runtime-owned storage on the provider Home. It
 does not enter catalogues, offers, logs, or a consumer Home.
 
-System Models owns the Approval Lens evaluator selection by saved instance ID.
-Renaming an instance preserves the selection. If that instance becomes
-unavailable, Runtime keeps human review required and Inbox remains the decision
-surface. Another configured evaluator becomes active only through an explicit
-selection.
-
-The labelled sample evaluates a fixed fictional weather request through the
-same Decisions contract and provider journal. The selected processor receives
-the sample and the Home pays for the evaluation. Advice changes no permission
-and dispatches no downstream weather request. A durable receipt binds the
-sample to its principal and evaluator; later checks read that same run. Lost
-responses or missing journal state retain unknown acceptance instead of
-dispatching another paid evaluation.
+System offers no decision models and no Approval Lens evaluator: OpenRouter
+discovery lists text models only, no screen selects an evaluator, and an
+instance's display name never selects one. Runtime asks no evaluator: an
+evaluator choice saved by an earlier release is ignored, and an Assistant
+hosted request needs only the hosted connection approval in Inbox. A decision
+model saved by an earlier release stays in System's Hosted list, without Use
+in Assistant, so it can be disconnected.
 
 ## Local content selection and retention
 
@@ -421,16 +416,16 @@ offer. Marketplace owns discovery and details; System owns model configuration
 and storage controls. Assistant selects an exact admitted or granted offer and
 keeps its typed run lifecycle. These surfaces share Runtime state.
 
-Marketplace separates verified local content, exact granted shared models, and
-contact access opportunities. The last group opens the existing Services card;
-the person requests access there and the provider Home decides in Inbox. After
-approval, Marketplace reads grant-scoped model offers and hands the selected
-offer to Assistant. Provider Home, processor, prompt destination, payer and
-reported limits use the same facts as Assistant. Discovery gives Marketplace
-read authority; Services and Runtime retain grant and inference authority.
+Marketplace separates verified local content and exact granted shared models.
+In 0.8.0 the Services app is hidden, so Marketplace no longer lists contacts' AI
+services and no new access can be requested. A model approved earlier stays
+listed until its grant expires, 6 hours after approval, and opens in Assistant.
+Provider Home, processor, prompt destination, payer and reported limits use the
+same facts as Assistant. Discovery gives Marketplace read authority; Runtime
+retains grant and inference authority.
 
 The installed small-model journey and its exact evidence scope are recorded in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
 separate checks. A local pin establishes a retained local copy; it does not
 establish global availability or exclusive custody.
 
@@ -478,7 +473,7 @@ model and provider are ready.
 Bounded transfer and manifest/inventory limits are in
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 The current execution queue and proof dependencies are in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Fresh-install acceptance must prove the compatible engine and its verified
 libraries are available, then select the real signed catalog entry with no
 pre-existing GGUF or private offer setup and obtain a real Qwen reply. Exact
@@ -514,7 +509,8 @@ pass installed lifecycle tests before it can be shared:
    This requires signed offer and grant admission plus bounded Carrier ingress.
    A Jetson deployment is a separate acceptance track.
 5. After each private connection exists, add an explicit owner-funded Share of
-   that exact provider and model through existing Services and Marketplace.
+   that exact provider and model. Services is hidden in 0.8.0; sharing returns
+   inside People.
    Qualify OpenRouter Terms 5.1–5.2 or Venice TOS 7.3, plus the selected model
    terms, before Share. Keep one connection budget across that provider's
    private and shared offers, with per-consumer limits. Commercial billing,

@@ -399,7 +399,7 @@ test("installed navigation waits for real Home GUI restoration and preserves app
               const waitForWindowControls = () => shellFrame.waitForFunction(() => performance.now() >= Number(
                 document.querySelector('section.window[data-target="marketplace"]').dataset.controlGuardUntil), null, { timeout: 1500 });
               const readTaskbarAction = () => shellFrame.evaluate(async () => {
-                const { shellState } = await import("/apps/home-gui/shell-core.js?v=home-20260813a");
+                const { shellState } = await import("/apps/home-gui/shell-core.js?v=home-20261101d");
                 const windowNode = document.querySelector('section.window[data-target="marketplace"]');
                 if (shellState.windows.get(windowNode.dataset.windowId)?.node !== windowNode) throw new Error("fixture requires the active Shell module");
                 return { ...shellState.recentUiAction, now: performance.now(),
@@ -504,12 +504,13 @@ test("Home GUI readiness waits for the one restore, survives a failed restore an
     return source.slice(start, source.indexOf("\n}\n", start) + 2);
   };
   const fixture = () => {
-    const restores = [], logged = [];
+    const restores = [], logged = [], backgrounds = [];
     const context = vm.createContext({
       document: { body: { dataset: { homeStatus: "booting" } } },
       console: { error: (...values) => logged.push(values) },
       projectHomeGuiAuthority() {},
       syncHomeGuiProjection: async () => {},
+      backgroundImage: { update: value => backgrounds.push(value) },
       hasContext: false,
       acceptHomeBrowserContextId() { context.hasContext = true; return true; },
       hasHomeBrowserContextId: () => context.hasContext,
@@ -517,9 +518,9 @@ test("Home GUI readiness waits for the one restore, survives a failed restore an
     });
     vm.runInContext(`let currentSummary = null;\nlet sessionRestore = null;\n${
       ["applySummary", "restoreSessionWhenReady", "acceptShellContext"].map(named).join("\n")}`, context);
-    return { context, restores, logged, status: () => context.document.body.dataset.homeStatus };
+    return { context, restores, logged, backgrounds, status: () => context.document.body.dataset.homeStatus };
   };
-  const signed = { authority: { signed_in: true } };
+  const signed = { authority: { signed_in: true }, appearance: { background_image_url: "https://home.invalid/wallpaper.png" } };
   const settle = () => new Promise(resolve => setImmediate(resolve));
 
   const ordered = fixture();
@@ -528,6 +529,7 @@ test("Home GUI readiness waits for the one restore, survives a failed restore an
   await settle();
   const second = ordered.context.applySummary(signed);
   await settle();
+  assert.deepEqual(ordered.backgrounds, [signed.appearance.background_image_url, signed.appearance.background_image_url]);
   assert.equal(ordered.restores.length, 1, "one restore for every summary");
   assert.equal(ordered.status(), "booting", "a later summary waits for the running restore");
   ordered.restores[0].reject(new Error("restore failed"));
@@ -544,6 +546,8 @@ test("Home GUI readiness waits for the one restore, survives a failed restore an
   late.restores[0].resolve();
   await settle();
   assert.equal(late.status(), "ready");
+  await late.context.applySummary({ ...signed, authority: { signed_in: false } });
+  assert.deepEqual(late.backgrounds, [signed.appearance.background_image_url, ""], "signed-out summaries clear the wallpaper");
 });
 
 test("a resize across the phone boundary waits out Home's stage reset and reopens the Assistant room it closed", async () => {

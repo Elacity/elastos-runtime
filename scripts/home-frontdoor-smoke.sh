@@ -361,7 +361,6 @@ for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home-gui/browser/home-gui-template.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/home-gui/browser/style.css" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/browser/index.html" \
-    "$HOME_DIR/xdg-data/elastos/capsules/services/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/people/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/browser/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/documents/browser/index.html" \
@@ -377,18 +376,30 @@ for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/wallet/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/wallet-metamask/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/wallet-unisat/browser/index.html" \
-    "$HOME_DIR/xdg-data/elastos/capsules/wallet-walletconnect/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/bin/net-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/chain-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/exit-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/browser-engine-adapter" \
     "$HOME_DIR/xdg-data/elastos/bin/browser-local-exit" \
     "$HOME_DIR/xdg-data/elastos/bin/object-provider" \
-    "$HOME_DIR/xdg-data/elastos/bin/wallet-provider" \
-    "$HOME_DIR/xdg-data/elastos/bin/content-block-graph-provider"
+    "$HOME_DIR/xdg-data/elastos/bin/wallet-provider"
 do
     if [[ ! -f "$installed" ]]; then
         echo "[home-frontdoor] installed first-party browser capsule asset missing after setup: $installed" >&2
+        exit 1
+    fi
+done
+# Hidden in 0.8.0: the Home profile leaves them out; `setup --with` adds them.
+for absent in \
+    "$HOME_DIR/xdg-data/elastos/capsules/services" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-walletconnect" \
+    "$HOME_DIR/xdg-data/elastos/capsules/elacity-player" \
+    "$HOME_DIR/xdg-data/elastos/bin/content-block-graph-provider" \
+    "$HOME_DIR/xdg-data/elastos/bin/media-provider" \
+    "$HOME_DIR/xdg-data/elastos/tools/media-tools"
+do
+    if [[ -e "$absent" ]]; then
+        echo "[home-frontdoor] hidden component installed by the Home profile: $absent" >&2
         exit 1
     fi
 done

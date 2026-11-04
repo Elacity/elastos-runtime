@@ -98,6 +98,13 @@ impl CapsuleRecords {
         Ok(())
     }
 
+    /// The DID that signed this release row's record, when the record matches it.
+    pub(crate) fn signer(&self, name: &str, info: &PlatformInfo) -> Option<&str> {
+        self.admit(name, info).ok()?;
+        self.get(name, info.release_path.as_deref())
+            .map(|record| record.signer_did.as_str())
+    }
+
     /// Every released row of a components manifest has exactly the record the
     /// release signer derives from it, and every record belongs to a row.
     pub(crate) fn admit_manifest(&self, manifest: &crate::setup::ComponentsManifest) -> Result<()> {

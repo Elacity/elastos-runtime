@@ -157,6 +157,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -165,6 +166,8 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import zlib
+from types import SimpleNamespace
 
 
 def digest(path):
@@ -587,6 +590,8 @@ CLI_REFUSALS = ("wrong-signer-head", "wrong-signer-release", "tampered-binary", 
 # A signed release whose components name a kind this Runtime does not know needs the
 # publisher's install command (#89); it is offered only to an installed Home.
 CLI_INSTALLER_CASE = "unknown-kind"
+# The default Ubuntu/Jetson account: umask 002 and group-writable ~/.local, bin and share (#368).
+CLI_UBUNTU_CASE = "ubuntu-umask-002"
 CLI_FUTURE_COMPONENT, CLI_FUTURE_KIND = "update-hop-future", "update-hop-future-kind"
 # install_command() names only an https gateway; .invalid never resolves, so it adds no request.
 CLI_INSTALL_GATEWAY = "https://publisher.invalid"
@@ -605,7 +610,7 @@ CLI_PLATFORM_ALIASES = {"x86_64-linux": ("linux-amd64",), "aarch64-linux": ("lin
                         "aarch64-darwin": ("darwin-arm64",), "darwin-arm64": ("aarch64-darwin",)}
 CLI_PUBLISHER = "ElastOS/SystemServices/Publisher"
 CLI_INSTALLED_METADATA = ("installation/release-head.json", "installation/release.json")
-CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("15.0.1", "15.1", "15.2", "15.3", "15.4", "16.1", "16.2"))
+CI_XCODE_APPS = tuple("Xcode_" + version + ".app" for version in ("16", "16.1", "16.2", "16.3", "16.4", "26.0.1", "26.1.1", "26.2", "26.3"))
 
 
 def cli_host_platform():
@@ -1149,7 +1154,7 @@ def cli_prepare_ci_disk():
     growth = 20 * 1024**3 + CLI_PUBLISHED_RESERVE
     receipt = cli_reclaim_xcode(applications, protected, growth,
                                 lambda: shutil.disk_usage(checkout), remove)
-    receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-14-arm64/20260831.0302/images/macos/macos-14-arm64-Readme.md"
+    receipt["image_inventory"] = "https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md"
     try:
         receipt = cli_reclaim_android(runner_home, os.geteuid(), receipt,
                                        lambda: shutil.disk_usage(checkout), remove)
@@ -1206,7 +1211,9 @@ def cli_build_hop(root, runtime, previous, local_rehearsal=None):
         for name, label, version in (("new", "build-next", new_version), ("next", "build-system", cli_next_version(new_version))):
             env = dict(os.environ)
             env["ELASTOS_RELEASE_VERSION"] = version
-            built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", label, timeout=900)
+            build_timeout = 1800
+            built = processes.command(command, env, Path(__file__).resolve().parents[1] / "elastos", label, timeout=build_timeout)
+            need(not built.get("timed_out"), f"{name} Runtime build timed out after {build_timeout} s")
             need(built["exit"] == 0, name + " Runtime build failed")
             binary = root / ("elastos-new" if name == "new" else "elastos-system")
             shutil.copyfile(runtime, binary)
@@ -1612,8 +1619,9 @@ def cli_verify_setup_support(root, manifest, home_path):
         for name, expected in zip(CLI_HOME_CACHE, values):
             path = cli_path(directory, folder + "/" + name)
             info = path.lstat()
+            # Setup writes these receipts with the person's umask (at least 022): owned, not writable by others.
             regular = (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
-                       and stat.S_IMODE(info.st_mode) == 0o600)
+                       and stat.S_IMODE(info.st_mode) & 0o7022 == 0)
             actual = path.read_text() if regular else None
             if regular and name == ".elastos-artifact-sha256":
                 # Archive receipts are bare sha256 hex; Homes set up by earlier releases keep the prefix.
@@ -1830,7 +1838,9 @@ def cli_previous_members(archive, prefix, destination):
 
 def cli_capsule_archive(folder, name):
     """A capsule archive as releases build it (publish-release.sh create_capsule_tar), from
-    the files setup extracted, without setup's cache receipts."""
+    the files setup extracted, without setup's cache receipts. Returns each encoding a
+    release may have used: the stored-deflate gzip of 2.0.0-rc.2 and later, then the host
+    deflate of earlier releases; the caller keeps the one the signed descriptor names."""
     def normalize(info):
         if Path(info.name).name in CLI_HOME_CACHE:
             return None
@@ -1839,11 +1849,20 @@ def cli_capsule_archive(folder, name):
         info.pax_headers = {}
         info.mode = 0o777 if info.issym() else (0o755 if info.isdir() or info.mode & 0o111 else 0o644)
         return info
-    output = io.BytesIO()
-    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            package.add(folder, arcname=name, filter=normalize)
-    return output.getvalue()
+    tar = io.BytesIO()
+    with tarfile.open(fileobj=tar, mode="w", format=tarfile.PAX_FORMAT) as package:
+        package.add(folder, arcname=name, filter=normalize)
+    data = tar.getvalue()
+    stored = io.BytesIO()
+    stored.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for index, chunk in enumerate(chunks):
+        stored.write(bytes([1 if index == len(chunks) - 1 else 0]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF) + chunk)
+    stored.write(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
+    deflated = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=deflated, mtime=0) as compressed:
+        compressed.write(data)
+    return [stored.getvalue(), deflated.getvalue()]
 
 
 def cli_previous_layout(output, release, component_platform, artifact, executable, receipt):
@@ -1965,9 +1984,10 @@ def cli_install_previous_release(home_path, output, pin_path=None):
     (home_path / "install.sh").write_bytes(installer)
     receipt = {"schema": "elastos.update-hop.previous-release-fetch/v1", "pin": pin,
                "published_installer_sha256": hashlib.sha256(installer).hexdigest()}
-    # Custody is listed outside the Home profile (#238); the fixture pins its bytes too.
+    # The fixture also pins optional providers that the Home profile leaves out.
     for argv, timeout in ((["/bin/bash", "install.sh", "--install-only"], 900),
-                          ([str(runtime), "setup", "--profile", "home", "--with", "custody-provider"], 1800),
+                          ([str(runtime), "setup", "--profile", "home", "--with",
+                            ",".join((*CLI_PROTECTED_PROVIDERS, "custody-provider"))], 1800),
                           ([str(runtime), "update", "--rollback-to", pin["head_cid"], "--yes"], 1800)):
         proc = subprocess.Popen(argv, env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home_path),
                                            "ELASTOS_COLLABORATION_STARTUP_MODE": "isolated"}, cwd=home_path,
@@ -1997,9 +2017,9 @@ def cli_install_previous_release(home_path, output, pin_path=None):
         installed, name = cli_path(data, selected["install_path"]), "artifacts/" + selected["release_path"]
         if not selected.get("extract_path"):
             return take(installed, name, selected["checksum"].removeprefix("sha256:"))
-        raw = cli_capsule_archive(installed, selected["extract_path"])
-        need(len(raw) == selected["size"] and "sha256:" + hashlib.sha256(raw).hexdigest() == selected["checksum"],
-             name + " differs from its signed hash")
+        raw = next((candidate for candidate in cli_capsule_archive(installed, selected["extract_path"])
+                    if len(candidate) == selected["size"] and "sha256:" + hashlib.sha256(candidate).hexdigest() == selected["checksum"]), None)
+        need(raw is not None, name + " differs from its signed hash")
         target = cli_path(output, name)
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         target.write_bytes(raw)
@@ -2379,24 +2399,27 @@ class CliProcesses:
     def __init__(self, output):
         self.output, self.processes, self.streams, self.roots = output, [], [], {}
 
-    def spawn(self, argv, env, cwd, label):
+    def spawn(self, argv, env, cwd, label, umask=-1):
+        """umask applies only in the child (Popen sets it after fork); the observer keeps its own."""
         stdout, stderr = ((self.output / (label + suffix)).open("wb") for suffix in (".stdout", ".stderr"))
         self.streams.extend((stdout, stderr))
         proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
-                                stdout=stdout, stderr=stderr, start_new_session=True)
+                                stdout=stdout, stderr=stderr, start_new_session=True, umask=umask)
         self.processes.append(proc)
         return proc
 
-    def command(self, argv, env, cwd, label, timeout=90):
+    def command(self, argv, env, cwd, label, timeout=90, umask=-1):
         started = time.monotonic()
-        proc = self.spawn(argv, env, cwd, label)
+        proc = self.spawn(argv, env, cwd, label, umask)
+        timed_out = False
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
             code = 124
-        return {"exit": code, "pid": proc.pid, "elapsed_ms": round((time.monotonic() - started) * 1000),
+        return {"exit": code, "timed_out": timed_out, "pid": proc.pid, "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "stdout_sha256": digest(self.output / (label + ".stdout")),
                 "stderr_sha256": digest(self.output / (label + ".stderr"))}
 
@@ -2711,7 +2734,10 @@ def cli_coordination(home_path, required=True):
     if original is None:
         need(not required, "Runtime coordination file absent")
         return {"status": "absent"}
-    need(stat.S_IMODE(original[2]) == 0o600, "Runtime coordination file mode differs")
+    # The Runtime creates this lock with the person's umask (clamped to at least 022)
+    # inside its 0700 data directory: owned by them, never writable by anyone else.
+    need(original[3] == os.geteuid() and stat.S_IMODE(original[2]) & 0o7022 == 0,
+         "Runtime coordination file mode differs")
     with path.open("rb") as stream:
         info = os.fstat(stream.fileno())
         need((info.st_dev, info.st_ino, info.st_mode, info.st_uid) == original, "Runtime coordination file changed during inspection")
@@ -2778,9 +2804,12 @@ def cli_legacy_installed_metadata(home_path):
     return snapshot
 
 
-def cli_state(manifest, home_path):
+def cli_state(manifest, home_path, coordination=True):
+    """This Home's installed files and data. The Runtime lock last written by an offline CLI
+    upgrade is admitted (coordination=True); after a Home gateway ran, the lock names that
+    gateway instead, so a caller that just stopped Home skips that admission."""
     directory = home_path / CLI_DATA
-    coordination = cli_coordination(home_path)
+    coordination = cli_coordination(home_path) if coordination else None
     sources = cli_json(directory / "sources.json")
     need(sources["default_source"] == "default" and len(sources["sources"]) == 1, "one installer-owned source required")
     return {"binary": digest(home_path / ".local/bin/elastos"),
@@ -2916,12 +2945,16 @@ def cli_process_executable(pid):
     return os.readlink(f"/proc/{pid}/exe")
 
 
-def cli_private_json(path, limit=256 * 1024):
+def cli_private_json(path, limit=256 * 1024, private=True):
+    """A Home record the observer reads. Private records are exactly 0600; the host lock
+    (private=False) follows the person's umask and must only be closed to others' writes."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
+        mode = stat.S_IMODE(info.st_mode)
         need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-             and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= limit, "private Home record ownership or bound differs")
+             and (mode == 0o600 if private else mode & 0o7022 == 0) and info.st_size <= limit,
+             "private Home record ownership or bound differs")
         raw = stream.read(limit + 1)
         need(len(raw) <= limit, "private Home record grew beyond its bound")
         def unique(pairs):
@@ -3009,7 +3042,7 @@ def cli_observe_initial_home(processes, manifest, home_path, process, status, re
          and re.fullmatch(r"[0-9a-f]{64}", coords["attach_secret"]), "live gateway coordinates differ")
     cli_home_base(coords["home_url"], public=True)
     cli_home_base(coords["api_url"])
-    host_lock = cli_private_json(directory / "host-process.lock", 4096)
+    host_lock = cli_private_json(directory / "host-process.lock", 4096, private=False)
     need(host_lock["pid"] == host_identity["pid"] and host_lock["role"] == "gateway"
          and host_lock["addr"] == "localhost:8090" and host_lock["generation"] == generation
          and lock_state(directory / "host-process.lock") == "held"
@@ -3332,6 +3365,65 @@ def cli_provider_warnings(home_path):
                    if "provider" in line and (match := re.search(r"\b(?:WARN|ERROR)\b(.*)", line))})
 
 
+# The person's commands on the default Ubuntu account; Popen applies it in the child only.
+CLI_UBUNTU_UMASK = 0o002
+
+
+def cli_ubuntu_layout(processes, manifest, home_path, evidence, steps):
+    """The default Ubuntu/Jetson account (#368): umask 002 leaves ~/.local and its bin and
+    share folders group-writable. This source's installer installs there and leaves those
+    folders as they were, Home starts and answers authenticated health, and a CLI update
+    applies the release after this one and keeps this Home's config and data. Only the
+    person's commands run with umask 002; the observer's own writes keep its 077."""
+    shared = [home_path / folder for folder in (".local", ".local/bin", ".local/share")]
+    for path in shared:
+        path.mkdir(mode=0o775)
+        path.chmod(0o775)
+    steps.phase("new")
+    reply = steps.install(home_path, "ubuntu-install", "new", umask=CLI_UBUNTU_UMASK)
+    need(cli_success(processes, "ubuntu-install", reply), "installer refused the default Ubuntu account layout; exit "
+         + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-install", "installer"))
+    steps.setup(home_path, "ubuntu-setup", "new", umask=CLI_UBUNTU_UMASK)
+    steps.verify(home_path, "new", "ubuntu-version", fresh=True)
+    steps.prepare(home_path, "ubuntu", "new")
+    env = cli_environment(home_path)
+    env["ELASTOS_CARRIER_MDNS"] = "0"
+    opener = cli_path(home_path / CLI_DATA, CLI_OPENER)
+    env["PATH"] = str(opener.parent) + ":" + env["PATH"]
+    processes.roots[str(opener)] = {manifest["files"][manifest["consumer"]["files"][CLI_OPENER]]["sha256"]}
+    process = processes.spawn([str(home_path / ".local/bin/elastos"), "home", "--browser"], env, home_path, "ubuntu-home",
+                              umask=CLI_UBUNTU_UMASK)
+    try:
+        status_path, deadline, ready = home_path / CLI_DATA / "update-controller/status.json", time.monotonic() + 150, None
+        while ready is None and process.poll() is None and time.monotonic() < deadline:
+            status = cli_private_json(status_path) if status_path.exists() else {}
+            if status.get("phase") == "ready" and status.get("controller_pid") == process.pid:
+                ready = cli_observe_initial_home(processes, manifest, home_path, process, status, "new")
+            else:
+                time.sleep(.2)
+        need(ready is not None and ready["authenticated_health"], "Home did not start on the default Ubuntu account layout"
+             + cli_ci_stderr_detail(processes, manifest, "ubuntu-home", "Home"))
+        evidence["home"] = {"generation": ready["generation"], "authenticated_health": True}
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        evidence["home_exit"] = process.wait(timeout=35)
+    need(evidence["home_exit"] == 0, "Home did not stop cleanly on the default Ubuntu account layout")
+    # This Home's own state after prepare and Home close; the update must keep it. The lock
+    # now names the gateway that just stopped, so only files and data are read here.
+    before = cli_state(manifest, home_path, coordination=False)
+    steps.phase(CLI_SYSTEM_PHASE)
+    reply = steps.command(home_path, ["update"], "ubuntu-update", umask=CLI_UBUNTU_UMASK)
+    need(cli_success(processes, "ubuntu-update", reply), "update failed on the default Ubuntu account layout; exit "
+         + str(reply["exit"]) + cli_ci_stderr_detail(processes, manifest, "ubuntu-update", "update"))
+    after = steps.verify(home_path, CLI_SYSTEM_PHASE, "ubuntu-updated-version", fresh=False)
+    need(after["preserved"] == before["preserved"] and after["data"] == before["data"],
+         "update changed preserved data on the default Ubuntu account layout")
+    need(all(path.stat().st_mode & 0o777 == 0o775 for path in shared), "installation changed a shared folder's mode")
+    evidence.update(status="passed", update={"from": manifest["new"]["version"], "to": manifest[CLI_SYSTEM_PHASE]["version"]})
+
+
+
 def cli_run(config, output, local_rehearsal=None):
     manifest = cli_admit(config, local_rehearsal)
     root = Path(config["root"])
@@ -3341,7 +3433,7 @@ def cli_run(config, output, local_rehearsal=None):
     result = {"schema": "elastos.update-hop.result/v1", "mode": CLI_MODE,
               "proof_kind": manifest["proof_kind"], "approval": manifest["approval"],
               "proof_scope": manifest.get("proof_scope", "production-positive"),
-              "signer_did": manifest["signer_did"], "channel": manifest["channel"],
+              "signer_did": manifest["signer_did"], "channel": manifest["channel"], "platform": manifest["platform"],
               "source": manifest["source"], "old": manifest["old"], "new": manifest["new"],
               "manifest_sha256": config["immutable"]["sha256"], "reference": manifest["reference"],
               "retrieval_reference": os.environ.get("ELASTOS_CI_FIXTURE_REFERENCE", ""),
@@ -3361,9 +3453,9 @@ def cli_run(config, output, local_rehearsal=None):
     holder_config = holder_data / "config.toml"
     holder_labels, holder_config_text = [], None
 
-    def command(home_path, args, label, evidence=None):
+    def command(home_path, args, label, evidence=None, umask=-1):
         reply = processes.command([str(home_path / ".local/bin/elastos"), *args],
-                                  cli_environment(home_path), home_path, label)
+                                  cli_environment(home_path), home_path, label, umask=umask)
         if evidence is not None:
             evidence.update(reply)
         if home_path != holder:
@@ -3419,24 +3511,25 @@ def cli_run(config, output, local_rehearsal=None):
         bootstrap = current
         installer_bootstrap.publication, published = publication, name
 
-    def install(home_path, label, release):
+    def install(home_path, label, release, umask=-1):
         env = cli_environment(home_path)
         env.update(ELASTOS_PUBLISHER_GATEWAY=installer_bootstrap.url,
                    ELASTOS_SOURCE_CONNECT_TICKET=bootstrap["ticket"], ELASTOS_PUBLISHER_NODE_ID=bootstrap["node_id"])
         installer_bootstrap.enabled = True
         try:
-            reply = processes.command(["/bin/bash", str(installers[release]), "--install-only"], env, home_path, label, timeout=180)
+            reply = processes.command(["/bin/bash", str(installers[release]), "--install-only"], env, home_path, label,
+                                      timeout=180, umask=umask)
             result["coordination"][label] = cli_coordination(home_path, required=reply["exit"] == 0)
             return reply
         finally:
             installer_bootstrap.enabled = False
 
-    def setup(home_path, label, release):
+    def setup(home_path, label, release, umask=-1):
         view = cli_support_view(manifest, release)
         track(home_path, {CLI_DATA + "/" + target: relative for target, relative in cli_setup_files(view).items()})
         evidence = {"status": "failed", "release": release}
         result["setup"][label] = evidence
-        reply = command(home_path, ["setup"], label, evidence)
+        reply = command(home_path, ["setup"], label, evidence, umask)
         need(cli_success(processes, label, reply), "installed setup failed; command exit " + str(reply["exit"])
              + cli_ci_stderr_detail(processes, manifest, label, label))
         for filename, key in (("components.json", "components"), ("model-catalog.json", "catalogue")):
@@ -3484,6 +3577,18 @@ def cli_run(config, output, local_rehearsal=None):
             need(stored["head_cid"] == manifest["files"][publication["head"]]["cid"],
                  "installed consumed head CID differs")
         return observation
+
+    def ubuntu_layout():
+        """The Ubuntu account case (cli_ubuntu_layout) on its own Home."""
+        home_path = output / "homes/ubuntu-umask"
+        home_path.mkdir(mode=0o750)
+        shared = [home_path / folder for folder in (".local", ".local/bin", ".local/share")]
+        evidence = {"status": "failed", "umask": "002", "group_writable": [str(path.relative_to(home_path)) for path in shared]}
+        result["paths"]["m2-discovery"]["checks"][CLI_UBUNTU_CASE] = evidence
+        processes.roots[str(home_path / ".local/bin/elastos")] = {
+            manifest["files"][manifest["publications"][name]["binary"]]["sha256"] for name in ("new", CLI_SYSTEM_PHASE)}
+        cli_ubuntu_layout(processes, manifest, home_path, evidence,
+                          SimpleNamespace(phase=phase, install=install, setup=setup, verify=verify, prepare=prepare, command=command))
 
     try:
         holder_mapping = manifest["holder"]["files"]
@@ -3565,6 +3670,8 @@ def cli_run(config, output, local_rehearsal=None):
             need(cli_success(processes, "m2-repeat", reply) and "Installed release is up to date." in processes.text("m2-repeat")
                  and cli_state(manifest, consumer) == after, "repeat update changed the installed fixture")
             result["paths"]["m2-discovery"]["checks"]["repeat"] = {"status": "passed", **reply}
+            if manifest["platform"].endswith("-linux") and "initial_home" in manifest and CLI_SYSTEM_PHASE in manifest["publications"]:
+                ubuntu_layout()
         refusals = manifest["selectors"]["m1-install"]["refusals"]
         for case in [*refusals, CLI_INSTALLER_CASE] if refusals else []:
             # A fresh install of a newer component kind is the installer's job, not a refusal.
@@ -3639,7 +3746,7 @@ def cli_run(config, output, local_rehearsal=None):
     return 0 if result["status"] == "passed" else 1
 
 
-def cli_check_result(result):
+def cli_check_result(result, platform):
     """The CI verdict on a run's result.json, which the job summary shows: the journey passed
     along the supported path from the pinned published release (its System installed the
     release with changed support), this source's System refused a tampered offer, showed the
@@ -3675,6 +3782,13 @@ def cli_check_result(result):
     need(all(path["checks"][case]["status"] == "passed" for path in result["paths"].values() for case in CLI_REFUSALS)
          and result["paths"]["m2-discovery"]["checks"].get(CLI_INSTALLER_CASE, {}).get("status") == "passed",
          "a CLI refusal did not hold")
+    # A Linux hop also proves the default Ubuntu account layout. The result names this runner's
+    # release platform, so a missing or other platform cannot skip the Ubuntu case.
+    need(platform in CLI_PLATFORMS and result.get("platform") == platform, "the result is not for this host's release platform")
+    ubuntu = result["paths"]["m2-discovery"]["checks"].get(CLI_UBUNTU_CASE, {})
+    need(not platform.endswith("-linux") or (ubuntu.get("status") == "passed"
+         and ubuntu["home"]["authenticated_health"] and ubuntu["update"]["to"] == next_version),
+         "the default Ubuntu account layout (umask 002, group-writable ~/.local) did not install, start and update")
     undo = home.get("undo", {})
     need(undo.get("status") == "passed" and undo["version"] == previous["version"]
          and undo["refused_plain_update"]["exit"] != 0 and undo["rollback"]["exit"] == 0,
@@ -3725,7 +3839,7 @@ def main():
             print(json.dumps(cli_install_previous_release(args.input, args.output)))
             return 0
         if args.operation == "check-result":
-            print(json.dumps(cli_check_result(cli_json(args.input))))
+            print(json.dumps(cli_check_result(cli_json(args.input), cli_host_platform())))
             return 0
         if args.operation == "build-ci-hop":
             need(args.runtime is not None and args.previous is not None and args.output is None and args.root is None,

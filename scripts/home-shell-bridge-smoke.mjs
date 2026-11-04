@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-update-20261003a";
+const moduleVersion = "home-wallpaper-20261030b";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;
@@ -252,6 +252,7 @@ const summary = {
     { target: "marketplace", title: "Marketplace", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "library", title: "Library", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
 };
 let activeShellName = "home-cli";
@@ -412,6 +413,7 @@ const externalLinkApps = {
   "wallet-token": ["wallet", "Wallet"],
   "root-token": ["home-cli", "Home CLI"],
   "chat-token-": ["chat-room", "Chat"],
+  "assistant-token": ["assistant", "Assistant"],
 };
 let externalLinkGate = null;
 let externalLinkResult = null;
@@ -604,6 +606,10 @@ globalThis.fetch = async (url, init = {}) => {
         target: "wallet-unisat",
         title: "UniSat",
       });
+    }
+    if (["library", "archive-manager"].includes(body?.target)) {
+      return jsonResponse({ attach_kind: "iframe", target: body.target, title: body.target === "library" ? "Library" : "Archive",
+        route: `/apps/${body.target}/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${body.target}-token` });
     }
     throw new Error(`unexpected launch target: ${body?.target || "missing"}`);
   }
@@ -891,7 +897,9 @@ assert(
 
 // Home's web-link sheet (#430). Home opens an app's web link only after its
 // own sheet shows the Runtime-named app and the exact address and the person
-// presses Open link; window.open is recorded only inside these checks.
+// presses Open link; window.open is recorded only inside these checks. With
+// Home GUI active and the Browser app in the summary, Open hands the address
+// to Home GUI's Browser instead (the Assistant's path), never a tab.
 const openedLinks = [];
 const strictWindowOpen = window.open;
 function recordLinkOpen(...args) {
@@ -940,13 +948,27 @@ async function settleLinks() {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
-function assertOpenedLinks(expected, message) {
+let browserLinkCursor = shellMessages.length;
+function browserLinkOpens() {
+  const sent = shellMessages.slice(browserLinkCursor).map((message) => message.payload)
+    .filter((payload) => payload?.type === "home:gui-command" && payload.command === "open-target" &&
+      payload.target === "browser" && payload.query?.url !== undefined);
+  browserLinkCursor = shellMessages.length;
+  return sent;
+}
+// Every open since the last check went to `via` ("tab" or "browser"), exactly
+// these addresses, once each, and none went the other way.
+function assertOpenedLinks(expected, message, via = "tab") {
   const opened = openedLinks.splice(0);
+  const browser = browserLinkOpens();
   assert(
     JSON.stringify(opened) ===
-      JSON.stringify(expected.map((url) => [url, "_blank", "noopener,noreferrer"])),
+      JSON.stringify((via === "tab" ? expected : []).map((url) => [url, "_blank", "noopener,noreferrer"])) &&
+    JSON.stringify(browser) === JSON.stringify((via === "browser" ? expected : []).map((url) => ({
+      type: "home:gui-command", command: "open-target", target: "browser", query: { url },
+    }))),
     message,
-    opened,
+    { opened, browser },
   );
 }
 {
@@ -968,6 +990,8 @@ function assertOpenedLinks(expected, message) {
     url: "https://example.com/cli?x=1",
   }), "Home did not hand the Runtime the sender's own launch token and unchanged address", check);
   assertOpenedLinks([], "Home opened a Home CLI link before Open link");
+  // Home CLI is the active shell, so Home GUI cannot open Browser: a tab.
+  assert(linkNode("open").textContent === "Open link", "the Home CLI sheet did not say Open link", linkNode("open").textContent);
   pressLink("open");
   assertOpenedLinks(["https://example.com/cli?x=1"], "Open link did not open the Home CLI link once");
   assert(linkSheet().hidden, "the link sheet stayed open after Open link", linkSheet());
@@ -1398,6 +1422,8 @@ sendChildMessage("null", walletFrameWindow, {
   await settleLinks();
   assert(JSON.stringify(linkSheet()) === shownLinkSheet("People", "example.com", address),
     "Home did not name the asking app and the exact address", linkSheet());
+  assert(linkNode("open").textContent === "Open in Browser",
+    "with the Browser app the sheet did not say Open in Browser", linkNode("open").textContent);
   const checksWhileOpen = linkChecks();
   askLink(peopleFrameWindow, people, "https://evil.example/b");
   askLink(walletFrameWindow, "wallet-token", "https://evil.example/c");
@@ -1415,7 +1441,7 @@ sendChildMessage("null", walletFrameWindow, {
   assert(!linkSheet().hidden, "an immediate Open press closed the sheet", linkSheet());
   assertOpenedLinks([], "an Open press inside the 500 ms guard opened the link");
   pressLink("open");
-  assertOpenedLinks([address], "Open link did not open exactly the address shown");
+  assertOpenedLinks([address], "Open in Browser did not hand exactly the address shown to Browser", "browser");
   pressLink("open");
   assertOpenedLinks([], "a second Open press replayed the link");
 
@@ -1523,6 +1549,19 @@ for (const actor of ["assistant", "home-agent"]) {
   assert(count() === inboxBefore + 1, "registered composer opens Inbox", shellMessages);
   const inboxOpened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
   assert(inboxOpened.target === "inbox" && JSON.stringify(inboxOpened.query) === "{}", "exact Inbox destination", inboxOpened);
+  if (actor === "assistant") {
+    // A Home without the Browser app sends an Assistant link here (the face
+    // answers home-agent:open-link): the same sheet, naming the Assistant.
+    askLink(source, token, "https://docs.example/guide");
+    await settleLinks();
+    assert(JSON.stringify(linkSheet()) === shownLinkSheet("Assistant", "docs.example", "https://docs.example/guide"),
+      "an Assistant link did not show Home's link sheet with the exact address", linkSheet());
+    assertOpenedLinks([], "an Assistant link opened before Open link");
+    pressLink("cancel");
+    assert(linkSheet().hidden, "Cancel left the Assistant link sheet open", linkSheet());
+    pressLink("open");
+    assertOpenedLinks([], "a cancelled Assistant link opened");
+  }
 }
 
 {
@@ -1599,6 +1638,41 @@ assert(
   "Home GUI obtained hidden connector launch authority",
   shellMessages,
 );
+
+{
+  // Archive is not a Home target: the GUI launches it only for the exact open
+  // Library just asked for, and only once.
+  const reply = (requestId) => shellMessages.find((message) =>
+    message.payload?.type === "home:shell-response" && message.payload?.requestId === requestId)?.payload;
+  const settle = async (requestId) => {
+    for (let i = 0; i < 50 && !reply(requestId); i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    return reply(requestId) || null;
+  };
+  const guiLaunch = (requestId, target, query) => sendChildMessage("null", shellFrameWindow,
+    { type: "home:launch-target", requestId, target, query, homeToken: "gui-token" });
+  const zip = "localhost://Users/bridge/Documents/Bundle.zip";
+  const archiveQuery = { objectUri: zip, uri: zip, name: "Bundle.zip", mime: "application/zip" };
+  const denied = "Home denied the shell launch";
+  guiLaunch("archive-unasked", "archive-manager", archiveQuery);
+  assert((await settle("archive-unasked"))?.error === denied, "Home GUI launched Archive that Library did not ask for", shellMessages);
+  guiLaunch("library-launch", "library", {});
+  assert((await settle("library-launch"))?.result?.target === "library", "Home GUI could not launch Library", shellMessages);
+  const librarySource = { postMessage() {} };
+  sendChildMessage("null", librarySource, { type: "home:app-ready", homeToken: "library-token" });
+  sendChildMessage("null", { postMessage() {} }, { type: "home:open-target", target: "archive-manager", query: archiveQuery, homeToken: "people-token" });
+  sendChildMessage("null", librarySource, { type: "home:open-target", target: "archive-manager", query: archiveQuery, homeToken: "library-token" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(shellMessages.some((message) => message.payload?.command === "open-target" &&
+    message.payload?.target === "archive-manager" && message.payload?.query?.objectUri === zip),
+  "Library's Archive open did not reach the Home GUI", shellMessages);
+  guiLaunch("archive-other", "archive-manager", { ...archiveQuery, objectUri: `${zip}.other` });
+  assert((await settle("archive-other"))?.error === denied, "Library's grant opened a different object", shellMessages);
+  guiLaunch("archive-asked", "archive-manager", { mime: "application/zip", name: "Bundle.zip", uri: zip, objectUri: zip });
+  const asked = await settle("archive-asked");
+  assert(asked?.result?.target === "archive-manager" && asked.result.title === "Archive", "Library's Archive open was refused", asked);
+  guiLaunch("archive-replay", "archive-manager", archiveQuery);
+  assert((await settle("archive-replay"))?.error === denied, "Library's Archive grant was reusable", shellMessages);
+}
 
 async function launchConnectorFromWallet(target, token) {
   const launchesBefore = requests.filter(
@@ -2547,6 +2621,27 @@ sendChildMessage("null", systemFrameWindow, {
   type: "home:app-ready",
   homeToken: "system-token",
 });
+{
+  // A visible-target app (System) may open Browser, but only empty: an address
+  // from an app must go through Home's link sheet, never straight to Browser.
+  const browserOpens = () => shellMessages
+    .map((message) => message.payload)
+    .filter((payload) => payload?.type === "home:gui-command" && payload.command === "open-target" && payload.target === "browser");
+  const before = browserOpens().length;
+  const checksBefore = linkChecks();
+  for (const query of [{ url: "https://evil.example/" }, { url: "https://evil.example/", extra: "1" },
+    { browser_instance: "x" }, ["https://evil.example/"], "https://evil.example/", null]) {
+    sendChildMessage("null", systemFrameWindow, { type: "home:open-target", homeToken: "system-token", target: "browser", query });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(browserOpens().length === before && linkChecks() === checksBefore && linkSheet().hidden,
+    "an app opened Browser with an address, bypassing Home's link sheet", browserOpens().slice(before));
+  sendChildMessage("null", systemFrameWindow, { type: "home:open-target", homeToken: "system-token", target: "browser", query: {} });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(JSON.stringify(browserOpens().slice(before)) ===
+    JSON.stringify([{ type: "home:gui-command", command: "open-target", target: "browser", query: {} }]),
+  "System could not open an empty Browser", browserOpens().slice(before));
+}
 const stepUpBeginsBeforeClosedMessage = requests.filter(
   (request) => request.url === "/api/auth/passkey-step-up/begin",
 ).length;
@@ -2699,7 +2794,7 @@ await settleLinks();
 assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-new"),
   "the reconnected Chat could not ask for a link", linkSheet());
 pressLink("open");
-assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link did not open once");
+assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link did not open once", "browser");
 window.open = strictWindowOpen;
 assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && chatReconnectTimers.size === 0,
   "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
@@ -2730,6 +2825,30 @@ for (const target of ["people", "inbox"]) sendChildMessage("null", chatFrameWind
   { type: "home:open-target", homeToken: freshChatToken, target, query: {} });
 await new Promise(resolve => setTimeout(resolve, 0));
 assert(openCommands() === beforeProfileActions + 2, "Profile card did not open its exact People and Inbox targets", shellMessages);
+const contactDid = "did:key:z6Mka1b2c3";
+const contactIntent = { type: "home:open-target", homeToken: freshChatToken,
+  target: "people", query: { did: contactDid } };
+const beforeDidActions = openCommands();
+for (const query of [
+  null, [], "did", { did: 42 }, { did: "" }, { did: "did:key:z" },
+  { did: "did:key:z0OIl" }, { did: `${contactDid}/path` }, { did: `${contactDid}?q=1` },
+  { did: `${contactDid}#key` }, { did: ` ${contactDid}` }, { did: `${contactDid}\n` },
+  { did: `did:key:z${"1".repeat(504)}` }, { did: contactDid, send: true },
+]) sendChildMessage("null", chatFrameWindow, { ...contactIntent, query });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, target: "inbox" });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, extra: true });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, homeToken: "wrong" });
+sendChildMessage("null", {}, contactIntent);
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(openCommands() === beforeDidActions, "Chat forwarded an invalid DID action", shellMessages);
+for (const did of [contactDid, `did:key:z${"1".repeat(503)}`]) {
+  sendChildMessage("null", chatFrameWindow, { ...contactIntent, query: { did } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const opened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
+  assert(opened.target === "people" && opened.query.did === did,
+    "Home dropped the Chat DID before it reached People", opened);
+}
+assert(openCommands() === beforeDidActions + 2, "Home did not forward each valid DID once");
 // Stale result inside one app: the old authority's Runtime check is still in
 // flight when the reconnect retires it and the new authority asks. The old
 // result arrives first and is dropped; only the new request shows and opens.
@@ -2754,7 +2873,7 @@ await settleLinks();
 assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-current"),
   "the old authority's late result replaced or hid the current request", linkSheet());
 pressLink("open");
-assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one");
+assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one", "browser");
 window.open = strictWindowOpen;
 acknowledgeChatCommit(refusedCommitPrepare, false, {});
 const beforeWrongCommitReceipt = openCommands();

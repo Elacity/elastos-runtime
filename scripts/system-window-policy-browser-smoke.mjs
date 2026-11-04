@@ -33,8 +33,8 @@ addEventListener('message', (event) => {
 </script>`;
 const shellHtml = `<link rel="stylesheet" href="/apps/home-gui/style.css">${template}
 <script type="module">
-import * as core from '/apps/home-gui/shell-core.js?v=home-20260813a';
-import * as windows from '/apps/home-gui/shell-windows.js?v=home-20260813a';
+import * as core from '/apps/home-gui/shell-core.js?v=home-20261101d';
+import * as windows from '/apps/home-gui/shell-windows.js?v=home-20261101d';
 document.querySelector('.desktop-workspace').hidden = false;
 document.querySelector('.desktop-workspace').inert = false;
 const target = {target:'system', title:'System', route:'/apps/system/', window_policy:'single'};
@@ -111,7 +111,6 @@ try {
           exports += 1;
           body = {schema:'elastos.full-recovery-bundle/v1', included:{people_identity:true}, bundle:{items:[]}};
         } else if (url.pathname === "/api/apps/home/active-shell") body = {active:'home-gui', candidates:[]};
-        else if (url.pathname === "/api/auth/passkey/status") body = {registered:true};
         else if (url.pathname === "/api/auth/passkeys") body = {passkeys:[]};
         else if (url.pathname === "/api/capsules/catalog") body = {capsules:[]};
         else if (url.pathname === "/api/capsules/interfaces") body = {interfaces:[]};

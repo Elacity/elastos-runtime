@@ -44,7 +44,7 @@ function harness() {
     currentPageGeneration: 1, currentDisplayMode: "webrtc_remote_display", currentView: { width: 1280, height: 720 },
     libraryPickerRequest: null, runtimePageOwner, sameRuntimePageOwner, selkiesMessagesForInput,
     PAGE_STATUS_AFTER_INPUT_DELAY_MS: 1, PAGE_STATUS_AFTER_SCROLL_DELAY_MS: 1,
-    DATACHANNEL_INPUT_SETTLE_MS, setTimeout,
+    DATACHANNEL_INPUT_SETTLE_MS, setTimeout, Date, resizeFrameFence: { reset() {} },
     remoteDisplay: {
       inputChannelOpen: () => channel.open,
       inputBufferedAmount: () => channel.buffered,
@@ -72,7 +72,7 @@ function harness() {
   // The old implementation remains executable so the same behavioral tests can
   // record a red baseline, rather than failing merely on a missing new symbol.
   if (source.includes("function dispatchBrowserInput(")) names.push("dispatchBrowserInput");
-  for (const name of ["noteDatachannelSend", "releaseDragButton", "awaitDatachannelInputSettled"]) {
+  for (const name of ["noteDatachannelSend", "releaseDragButton", "awaitDatachannelInputSettled", "resetPageInputDelivery"]) {
     if (source.includes(`function ${name}(`)) names.push(name);
   }
   const queue = source.match(/^let browserInputQueue = [^\n]+;$/m)?.[0] || "";
@@ -380,13 +380,18 @@ const release = { type: "mouse", x: 30, y: 20, buttons: 0 };
 for (const [name, first, messages] of [
   ["drag release", release, ["m,30,20,0,0"]],
   ["Cmd+A select-all", { type: "key_combo", keysyms: [65507, 97] }, ["kd,65507", "kd,97", "ku,97", "ku,65507"]],
-]) test(`Runtime text after a ${name} waits for the datachannel settle barrier`, async () => {
+]) test(`Runtime text after a ${name} waits for the datachannel settle barrier`, async t => {
+  // Advance the guest settle clock explicitly: a busy suite can delay a real
+  // sleep beyond the barrier before the assertion gets to observe it.
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   const h = harness(), results = [h.submit(first), h.submit(text("x"))];
   await nextTurn();
   assert.deepEqual(h.sends, messages);
-  await sleep(DATACHANNEL_INPUT_SETTLE_MS - 50);
+  t.mock.timers.tick(DATACHANNEL_INPUT_SETTLE_MS - 1);
+  await nextTurn();
   assert.equal(h.requests.length, 0, "replacement text must not overtake the selection");
-  await sleep(100);
+  t.mock.timers.tick(10);
+  await nextTurn();
   assert.equal(h.requests.length, 1);
   h.requests[0].ack();
   assert.ok((await Promise.all(results)).every(result => result.status === "fulfilled"));
@@ -493,4 +498,57 @@ test("settle starts at the observed drain, not at the first check", async () => 
   assert.equal(h.requests.length, 1);
   h.requests[0].ack();
   assert.equal((await typed).status, "fulfilled");
+});
+
+test("resize uses the Runtime page input route and holds later pointer input until ACK", async () => {
+  const h = harness();
+  const event = { type: "resize", width: 390, height: 1200, sequence: 7 };
+  const resize = h.submit(event), click = h.submit({ type: "click", x: 0, y: 0 });
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event), [event]);
+  assert.deepEqual(h.sends, []);
+  h.requests[0].ack({ accepted: true, width: 390, height: 1200, sequence: 7 });
+  await nextTurn();
+  assert.deepEqual(h.requests[1].event, { type: "click", x: 0, y: 0 });
+  h.requests[1].ack();
+  assert.ok((await Promise.all([resize, click])).every(result => result.status === "fulfilled"));
+});
+
+test("reopened page resets the old datachannel delivery barrier before its first resize", async () => {
+  const h = harness();
+  await h.submit({ type: "wheel", x: 0, y: 0, delta_y: 10 });
+  h.changeOwner("page"); h.channel.generation++;
+  h.state.resetPageInputDelivery();
+  const result = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  await nextTurn(); assert.equal(h.requests.length, 1);
+  h.requests[0].ack(); assert.equal((await result).status, "fulfilled");
+});
+
+test("typed resize refusal keeps later owner input usable", async () => {
+  const h = harness();
+  const result = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  await nextTurn(); h.requests[0].ack({ accepted: false, resize_error: { code: "resize_unavailable", message: "Guest tools unavailable" } });
+  assert.equal((await result).status, "fulfilled");
+  const click = h.submit({ type: "click", x: 0, y: 0 });
+  await nextTurn(); h.requests[1].ack(); assert.equal((await click).status, "fulfilled");
+});
+
+test("a failed resize does not cancel queued input; the navigate behind it is still sent", async () => {
+  const h = harness();
+  const resize = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  const navigate = h.submit({ type: "browser_command", command: "navigate", url: "https://fixture.invalid/next" });
+  const typed = h.submit(text("e"));
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event.type), ["resize"]);
+  const error = Object.assign(new Error("Browser Engine returned an invalid resize receipt"), { status: 502 });
+  h.requests[0].reject(error);
+  assert.equal((await resize).error, error);
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event.type), ["resize", "browser_command"]);
+  assert.equal(h.requests[1].event.url, "https://fixture.invalid/next");
+  h.requests[1].ack({ accepted: true, actual_url: "https://fixture.invalid/next" });
+  await nextTurn();
+  assert.equal(h.requests[2]?.event.text, "e");
+  h.requests[2].ack();
+  assert.ok((await Promise.all([navigate, typed])).every(result => result.status === "fulfilled"));
 });

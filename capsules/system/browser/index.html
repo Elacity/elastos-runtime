@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="./model-management.css">
 <script src="./elastos-accent-picker.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
-<link rel="stylesheet" href="./style.css?v=system-update-20261005a">
+<link rel="stylesheet" href="./style.css?v=system-update-notes-20261031">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -62,12 +62,6 @@
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-el-drawer-close data-settings="models">
           <span class="settings-sidebar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2"/></svg></span>
           <span class="settings-sidebar-text">Models</span>
-        </button>
-        <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-el-drawer-close data-settings="catalog">
-          <span class="settings-sidebar-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2"/></svg>
-          </span>
-          <span class="settings-sidebar-text">Apps &amp; Services</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-el-drawer-close data-settings="about">
           <span class="settings-sidebar-icon" aria-hidden="true">
@@ -286,7 +280,7 @@
               </div>
               <div class="pc2-group-row" id="community-presence-row" hidden>
                 <div class="pc2-card-label">Show me in Community</div>
-                <div class="pc2-card-sublabel">Members on this Community see your name, Profile and when your Home is online. Discovery in People is separate.</div>
+                <div class="pc2-card-sublabel">Members on this Community see your name, Profile and when your Home is online. Public in People is separate.</div>
                 <div id="community-presence" class="system-segment" role="radiogroup" aria-label="Show me in Community">
                   <button type="button" class="system-segment-option" data-presence-mode="always" role="radio" aria-checked="false" disabled>Always while Home is online</button>
                   <button type="button" class="system-segment-option" data-presence-mode="while_open" role="radio" aria-checked="false" disabled>Only while Community is open</button>
@@ -331,30 +325,6 @@
               </div>
             </div>
           </section>
-          <section id="approval-lens" class="pc2-section" aria-labelledby="approval-lens-title">
-            <h2 id="approval-lens-title" class="pc2-section-title">Approval Lens</h2>
-            <div class="pc2-group">
-              <div class="pc2-group-row models-row">
-                <div class="pc2-card-row">
-                  <div>
-                    <label class="pc2-card-label" for="approval-lens-model">Evaluator</label>
-                    <div class="pc2-card-sublabel">Choose who gives advice on hosted connections. You decide in Inbox.</div>
-                  </div>
-                  <div class="system-inline-row approval-lens-pick">
-                    <select id="approval-lens-model" class="pc2-input" aria-label="Evaluator"></select>
-                    <button id="approval-lens-select" class="pc2-btn pc2-btn-secondary" type="button">Use evaluator</button>
-                  </div>
-                </div>
-                <p id="approval-lens-status" class="pc2-card-value" role="status">Loading evaluator…</p>
-              </div>
-              <details id="approval-lens-manage" class="pc2-group-row models-disclosure"><summary class="pc2-card-label">Manage evaluator</summary>
-                <div class="system-inline-row">
-                  <button id="approval-lens-edit" class="pc2-btn pc2-btn-secondary" type="button">Edit connection</button>
-                  <button id="approval-lens-disconnect" class="pc2-btn pc2-btn-secondary" type="button">Disconnect</button>
-                </div>
-              </details>
-            </div>
-          </section>
           <section class="pc2-section" data-ai-provider aria-labelledby="ai-provider-title">
             <h2 id="ai-provider-title" class="pc2-section-title">Hosted</h2>
             <div class="pc2-group">
@@ -397,17 +367,6 @@
             </div>
           </section>
         </section>
-        <section class="settings-content" data-settings="catalog" aria-labelledby="catalog-title">
-          <div class="catalog-toolbar">
-            <div>
-              <h1 id="catalog-title">Apps &amp; Services</h1>
-              <p id="capsule-catalog-status" class="catalog-status" aria-live="polite">Loading</p>
-            </div>
-            <button id="capsule-catalog-refresh" class="pc2-btn pc2-btn-secondary" type="button">Refresh</button>
-          </div>
-          <div id="capsule-catalog" class="capsule-catalog" aria-live="polite"></div>
-        </section>
-
         <section class="settings-content" data-settings="about" aria-labelledby="device-title">
           <section class="pc2-section" aria-labelledby="device-title">
             <h1 id="device-title" class="pc2-section-title">This Device</h1>
@@ -416,7 +375,7 @@
                 <div class="pc2-card-row device-identity-row">
                   <div>
                     <div class="pc2-card-label">Device identity</div>
-                    <div class="pc2-card-sublabel">Identifying string for this device — not a trust grant.</div>
+                    <div class="pc2-card-sublabel">This device's ID. Sharing it gives no one access to your Home.</div>
                   </div>
                   <div class="device-did-inline">
                     <code
@@ -458,7 +417,7 @@
                   <div><dt>New version</dt><dd data-field="update-new-version"></dd></div>
                   <div data-field="update-publisher-row"><dt>Publisher</dt><dd data-field="update-publisher"></dd></div>
                 </dl>
-                <p class="runtime-update-changes" data-field="update-changes"></p>
+                <div class="runtime-update-changes" data-field="update-changes"></div>
               </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
@@ -474,17 +433,14 @@
               <div class="pc2-group-row">
                 <div class="pc2-card-row pc2-card-row-stack">
                   <div>
-                    <div class="pc2-card-label">Trusted source</div>
+                    <div class="pc2-card-label">Update channel</div>
                     <div class="pc2-card-sublabel" data-field="source-policy"></div>
                   </div>
                   <span class="pc2-card-value" data-field="source-status" hidden></span>
                 </div>
                 <dl class="system-fields compact-proof">
-                  <div><dt>Source</dt><dd data-field="source-name"></dd></div>
                   <div><dt>Channel</dt><dd data-field="source-channel"></dd></div>
-                  <div><dt>Installed</dt><dd data-field="source-installed-version"></dd></div>
-                  <div><dt>Checks</dt><dd data-field="source-checks"></dd></div>
-                  <div><dt>Transport</dt><dd data-field="source-transport"></dd></div>
+                  <div><dt>Installed version</dt><dd data-field="source-installed-version"></dd></div>
                 </dl>
               </div>
               <div class="pc2-group-row">
@@ -510,6 +466,6 @@
     <p class="system-error" hidden></p>
   </main>
   <script src="./system-tabs.js"></script>
-  <script type="module" src="./system.js?v=system-update-20261018b"></script>
+  <script type="module" src="./system.js?v=system-update-notes-20261031"></script>
 </body>
 </html>

@@ -1447,7 +1447,7 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotRegex(SOURCE, r"action-gh-release|elastos-runtime-\*|contents: write")
         for job, runner in (("source-home-linux", "ubuntu-24.04"),
                             ("source-home-linux-arm64", "ubuntu-22.04-arm"),
-                            ("source-home-macos", "macos-14")):
+                            ("source-home-macos", "macos-15")):
             packages = [step for step in steps(job) if step.startswith("name: build and package release binaries\n")]
             for event, ref, ref_type, override, _ in CASES:
                 context = {"github.event_name": event, "github.ref": ref,
@@ -1658,7 +1658,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "release-upstream-assets": ("release-upstream-assets (${{ matrix.platform }})", "${{ matrix.os }}"),
             "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
             "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
-            "source-home-macos": ("source-home-macos", "macos-14"),
+            "source-home-macos": ("source-home-macos", "macos-15"),
             "cancel-on-failure": ("cancel-on-failure", "ubuntu-24.04"),
             # Anders decides whether this becomes a required check (#320).
             "update-hop-linux": ("update-hop-linux", "ubuntu-24.04"),
@@ -1701,7 +1701,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 shim.chmod(0o700)
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
                                     env={**os.environ, "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}",
-                                         "GITHUB_REPOSITORY": "Elacity/elastos-runtime", "GITHUB_RUN_ID": "7",
+                                         "GITHUB_REPOSITORY": "elastos/elastos-runtime", "GITHUB_RUN_ID": "7",
                                          "GITHUB_RUN_ATTEMPT": "1", "POLL_DIR": str(queue),
                                          "CANCEL_LOG": str(root / "cancels")})
             cancels = (root / "cancels").read_text().splitlines() if (root / "cancels").exists() else []
@@ -1712,18 +1712,18 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@", watcher)
         self.assertEqual(watcher.split("    permissions:\n", 1)[1].split("    steps:\n", 1)[0], "      actions: write\n")
         for event, ref, ref_type, override, _ in CASES:
-            for head in ("Elacity/elastos-runtime", "someone/fork"):
-                context = {"github.event_name": event, "github.ref": ref, "github.repository": "Elacity/elastos-runtime",
+            for head in ("elastos/elastos-runtime", "someone/fork"):
+                context = {"github.event_name": event, "github.ref": ref, "github.repository": "elastos/elastos-runtime",
                            "github.event.pull_request.head.repo.full_name": head}
                 self.assertEqual(job_runs("cancel-on-failure", context),
-                                 event == "pull_request" and head == "Elacity/elastos-runtime", (event, head))
+                                 event == "pull_request" and head == "elastos/elastos-runtime", (event, head))
         watch = ("cancel-on-failure", "in_progress", None)
         gate = ("source-gate", "completed", "success")
         macos = ("source-home-macos", "in_progress", None)
         for conclusion in ("failure", "timed_out"):
             status, cancels, used = self.run_cancel_watcher(
                 [[watch, gate, macos], [watch, gate, ("lint", "completed", conclusion), macos]])
-            self.assertEqual((status, cancels, used), (0, ["repos/Elacity/elastos-runtime/actions/runs/7/cancel"], 2))
+            self.assertEqual((status, cancels, used), (0, ["repos/elastos/elastos-runtime/actions/runs/7/cancel"], 2))
         # A completed gate before dependent jobs appear is not the end of the run.
         done = [watch, gate, ("source-home-macos", "completed", "success"), ("lint", "completed", "cancelled")]
         status, cancels, used = self.run_cancel_watcher([[watch, gate], [watch, gate, macos], done, done])
@@ -2227,6 +2227,24 @@ class InstalledJourneyTests(unittest.TestCase):
                     else:
                         self.assertTrue(path.is_symlink())
                         self.assertFalse(path.exists())
+
+    def test_the_package_holder_starts_as_a_seed(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        with tempfile.TemporaryDirectory() as temp:
+            home, data = Path(temp) / "holder", Path(temp) / "holder/.local/share/elastos"
+            data.mkdir(parents=True)
+            started = []
+
+            def refuse_start(*args, **kwargs):
+                started.append((data / "ElastOS/SystemServices/Publisher/artifacts").is_dir())
+                raise RuntimeError("fixture stops at start")
+
+            with mock.patch.object(journey["subprocess"], "Popen", side_effect=refuse_start):
+                with self.assertRaisesRegex(RuntimeError, "fixture stops at start"):
+                    journey["start_holder"](home, data, Path(temp) / "consumer", {})
+            self.assertEqual(started, [True], "the holder is a seed before its Runtime starts")
+            artifacts = data / "ElastOS/SystemServices/Publisher/artifacts"
+            self.assertEqual(artifacts.stat().st_mode & 0o777, 0o700)
 
     def test_gateway_and_node_share_the_installed_fixture_root(self):
         for platform in ("macos", "linux"):

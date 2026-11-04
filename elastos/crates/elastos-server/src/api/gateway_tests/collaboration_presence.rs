@@ -178,6 +178,8 @@ fn room_attribution_name_map_never_upgrades_false_or_none_rows_after_reopen() {
             delivery_state: None,
             sender_profile_verified,
             seq,
+            message_id: None,
+            conversation_id: None,
             sender: sender.to_string(),
             sender_member_did: member_did,
             from_current_session: false,
@@ -535,7 +537,7 @@ async fn collaboration_presence_routes_are_capsule_scoped_and_unconfigured_is_pu
     assert_eq!(heartbeat.status(), StatusCode::CONFLICT);
     assert_eq!(
         response_text(heartbeat).await,
-        "Save your Profile before turning on Discovery"
+        "Save your Profile before turning on Public"
     );
     assert_eq!(file_snapshot(dir.path()), before);
 

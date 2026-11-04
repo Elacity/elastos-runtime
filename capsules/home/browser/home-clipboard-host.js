@@ -243,11 +243,6 @@ export function createHomeClipboardPrompt({
       "Continue to copy this bounded technical identifier to this device clipboard.",
       "Copy identifier",
     ],
-    "documents:resource.uri:write": [
-      "Copy Documents resource link?",
-      "Continue to copy this resource URI to this device clipboard.",
-      "Copy",
-    ],
     "assistant:transcript.markdown:write": [
       "Copy Assistant transcript?",
       "Continue to copy this Assistant conversation as Markdown to this device clipboard.",
@@ -262,6 +257,16 @@ export function createHomeClipboardPrompt({
       "Copy device DID?",
       "Continue to copy this bounded technical device identifier to this device clipboard.",
       "Copy identifier",
+    ],
+    "people:profile.id:write": [
+      "Copy your DID?",
+      "Continue to copy your DID to this device clipboard so people can add you.",
+      "Copy",
+    ],
+    "chat-room:profile.id:write": [
+      "Copy DID?",
+      "Continue to copy this person's DID to this device clipboard.",
+      "Copy",
     ],
     "chat-room:conversation.invite:write": [
       "Copy conversation invite?",

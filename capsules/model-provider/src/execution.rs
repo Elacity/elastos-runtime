@@ -827,7 +827,12 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_fake_llama_event(path: &Path, expected: &str) {
-        let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
+        wait_for_fake_llama_event_with_timeout(path, expected, FIXTURE_EVENT_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fake_llama_event_with_timeout(path: &Path, expected: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         while !fake_llama_events(path).iter().any(|line| line == expected) {
             assert!(
                 Instant::now() < deadline,
@@ -4077,11 +4082,16 @@ mod tests {
         let root = temp_root("local-llama-timeout-capacity");
         let (mut offer, events, root) = local_llama_offer(&root, "timeout_ignore_term");
         offer.policy.concurrency_limit = 1;
-        offer.policy.runtime_ms_limit = 2_000;
+        // The deadline must find the engine already ignoring termination. Its
+        // start is load-bound like every fixture event, so it gets the same
+        // bound; health keeps that bound too, so the run deadline comes first.
+        let runtime = FIXTURE_EVENT_TIMEOUT;
+        offer.policy.runtime_ms_limit = runtime.as_millis() as u64;
         let AdapterConfig::LocalLlamaCppText { settings, .. } = &mut offer.adapter else {
             unreachable!();
         };
-        settings.health_timeout_ms = 5_000;
+        // No forced reap races the checks below: the engine leaves on release.
+        settings.shutdown_timeout_ms = FIXTURE_EVENT_TIMEOUT.as_millis() as u64;
         let mut provider = ProviderCoordinatorHandle::start();
         init_provider(&provider, &root, vec![offer.clone()]);
 
@@ -4089,7 +4099,11 @@ mod tests {
         let first_binding = create_binding("request:local-timeout-first", &offer, &first_input);
         let first = create_run(&provider, &offer, &first_binding, &first_input);
         let first_run_id = first["data"]["run_id"].as_str().unwrap();
-        wait_for_fake_llama_event(&events, "term_ignored");
+        wait_for_fake_llama_event_with_timeout(
+            &events,
+            "term_ignored",
+            runtime + FIXTURE_EVENT_TIMEOUT,
+        );
         assert_eq!(
             get_run(&provider, first_run_id, &access_binding(&first_binding))["data"]["status"],
             "running"
@@ -4101,6 +4115,8 @@ mod tests {
         let blocked = create_run(&provider, &offer, &blocked_binding, &blocked_input);
         assert_eq!(blocked["data"]["terminal"]["error"]["code"], "model_busy");
 
+        // The worker stops only once the engine that ignored termination exits.
+        std::fs::write(events.with_extension("release"), b"release").unwrap();
         assert_eq!(
             wait_for_terminal(&provider, first_run_id, &access_binding(&first_binding))["data"]
                 ["terminal"]["error"]["code"],

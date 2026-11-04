@@ -11,7 +11,7 @@ artifacts. A public download version has a separate verification record.
 
 | Record | Owns |
 | --- | --- |
-| [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) | Scope, acceptance, status, dependencies, owner and proof |
+| [GitHub issues](https://github.com/elastos/elastos-runtime/issues) | Scope, acceptance, status, dependencies, owner and proof |
 | Journey audit workbook | Historical journey and finding snapshot; test input only |
 | Private current checkpoint and receipts | Worktree/target coordinates, resource owners, exact commands and raw proof |
 | Notion overview | Accepted milestone summaries and links to reviewed source |

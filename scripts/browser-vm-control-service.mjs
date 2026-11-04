@@ -4,6 +4,7 @@ import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -97,9 +98,21 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 }
 
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
-let verifiedHostReadiness = null;
+let readyHostReadiness = null;
+let hostReadinessProbe = null;
+// Probe inputs that are not files: where the preflight resolves its tools and
+// which platform it admits for. The Darwin TURN program is a stamped file.
+const READINESS_INPUT_ENV = [
+  "ELASTOS_BROWSER_VM_PLATFORM", "ELASTOS_BROWSER_VM_DATA_DIR", "ELASTOS_BROWSER_VM_ROOTFS",
+  "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "ELASTOS_BROWSER_VM_KERNEL", "ELASTOS_BROWSER_VM_INITRD",
+  "ELASTOS_BROWSER_VM_INITRAMFS", "ELASTOS_BROWSER_VM_CROSVM_BIN", "ELASTOS_BROWSER_VM_PYTHON",
+  "ELASTOS_DEBUGFS_BIN", "PATH",
+];
 
-function readinessArtifactIdentity(dataDir, launcher) {
+// Key of the in-memory ready result: host platform/architecture/OS release,
+// the probe's environment, and each input file's dev/inode/mode/size/mtime/
+// ctime. A changed input, platform or architecture probes again.
+function readinessInputStamps(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
   const files = [
@@ -118,14 +131,44 @@ function readinessArtifactIdentity(dataDir, launcher) {
     if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
     files.push(turnProgram);
   }
+  const stamp = (file) => {
+    const info = fs.statSync(file, { bigint: true });
+    return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
+  };
   try {
-    return JSON.stringify(files.map((file) => {
-      const info = fs.statSync(file, { bigint: true });
-      return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
-    }));
+    return JSON.stringify({
+      host: [process.platform, process.arch, os.release()],
+      env: READINESS_INPUT_ENV.map((key) => [key, process.env[key] ?? null]),
+      files: files.map(stamp),
+      // The preflight runs these through the same PATH; debugfs is optional.
+      tools: [
+        ["python", process.env.ELASTOS_BROWSER_VM_PYTHON || "python3"],
+        ["debugfs", process.env.ELASTOS_DEBUGFS_BIN || "debugfs"],
+      ].map(([name, command]) => {
+        const resolved = resolveReadinessTool(command);
+        return resolved ? [name, ...stamp(resolved)] : [name, command, "absent"];
+      }),
+    });
   } catch {
     return null;
   }
+}
+
+// Mirrors the preflight's resolution: a command with a slash is used as is; a
+// bare name is the first PATH entry holding a file this process may execute.
+// An empty PATH entry is the current directory, as in the shell.
+function resolveReadinessTool(command) {
+  const candidates = command.includes("/")
+    ? [path.resolve(command)]
+    : (process.env.PATH ?? "").split(":").map((dir) => path.resolve(dir || ".", command));
+  for (const candidate of candidates) {
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return null;
 }
 
 async function engineReadiness(config) {
@@ -154,9 +197,30 @@ async function engineReadiness(config) {
       return unavailable("preparation_required");
     }
   }
+  const stamps = readinessInputStamps(dataDir, config.launcher_program);
+  if (stamps && readyHostReadiness?.stamps === stamps) return readyHostReadiness.result;
+  // Service start and the first open share one probe.
+  hostReadinessProbe ??= probeHostReadiness(config, dataDir, stamps)
+    .finally(() => { hostReadinessProbe = null; });
+  return hostReadinessProbe;
+}
+
+function probeHostReadiness(config, dataDir, stamps) {
+  const unavailable = (reason) => ({
+    schema: "elastos.browser.engine-readiness/v1",
+    readiness: { state: "unavailable", reason },
+  });
+  const startedAt = Date.now();
+  const finish = (result) => {
+    logEvent("host_readiness", {
+      source: "probe",
+      state: result.readiness?.state || null,
+      reason: result.readiness?.reason || null,
+      latency_ms: Date.now() - startedAt,
+    });
+    return result;
+  };
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
-  const identity = readinessArtifactIdentity(dataDir, config.launcher_program);
-  if (identity && verifiedHostReadiness?.identity === identity) return verifiedHostReadiness.result;
   return new Promise((resolve) => {
     execFile(script, ["--host-readiness"], {
       timeout: 30000, maxBuffer: 64 * 1024,
@@ -166,19 +230,19 @@ async function engineReadiness(config) {
           ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
       },
     }, (error, stdout) => {
-      if (error) return resolve(unavailable("preparation_required"));
+      if (error) return resolve(finish(unavailable("preparation_required")));
       try {
         const result = JSON.parse(stdout);
         if (result.schema !== "elastos.browser.engine-readiness/v1") throw new Error("schema");
         if (result.readiness?.state === "ready") {
-          if (!identity || readinessArtifactIdentity(dataDir, config.launcher_program) !== identity) {
-            return resolve(unavailable("preparation_required"));
+          if (!stamps || readinessInputStamps(dataDir, config.launcher_program) !== stamps) {
+            return resolve(finish(unavailable("preparation_required")));
           }
-          verifiedHostReadiness = { identity, result };
+          readyHostReadiness = { stamps, result };
         }
-        resolve(result);
+        resolve(finish(result));
       } catch {
-        resolve(unavailable("readiness_unsupported"));
+        resolve(finish(unavailable("readiness_unsupported")));
       }
     });
   });
@@ -916,14 +980,6 @@ function tcpBindAbsent(host, port) {
   });
 }
 
-function bindTcpExclusive(host, port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", (error) => reject(error));
-    server.listen({ host, port, exclusive: true }, () => resolve(server));
-  });
-}
-
 function bindUdpExclusive(host, port) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket({
@@ -939,24 +995,18 @@ async function turnListenerPortAbsent(turn) {
   return tcpBindAbsent(turn.listen_host, turn.listen_port);
 }
 
+// TURN runs with no-tcp-relay, so its relays are UDP only. A TCP socket on a
+// relay port (for example a loopback connection's ephemeral port) is not a
+// relay and must not hold Close; the native owner checks the same way.
 async function turnRelayPortsAbsent(turn) {
   const held = [];
   try {
     for (let port = turn.relay_port_min; port <= turn.relay_port_max; port += 1) {
-      let tcp;
-      let udp;
       try {
-        tcp = await bindTcpExclusive(turn.relay_host, port);
+        held.push(await bindUdpExclusive(turn.relay_host, port));
       } catch {
         return false;
       }
-      held.push(tcp);
-      try {
-        udp = await bindUdpExclusive(turn.relay_host, port);
-      } catch {
-        return false;
-      }
-      held.push(udp);
     }
     return true;
   } finally {
@@ -1046,7 +1096,7 @@ async function exactTransportCleanupEffects(binding, termination) {
   // Supervisor connects to those paths and proves its own bridges by session
   // absence plus a graceful or already-terminal owned launcher exit.
   // Native browser-vz-engine-supervisor owns TURN child cleanup.
-  // Port binds prove only listen and declared TCP/UDP relay absence.
+  // Port binds prove only TCP listener and UDP relay absence (no-tcp-relay).
   const probeTurnPorts =
     binding.transport_receipt.effects.turn_launch_owned === true;
   const turnListenerAbsent = probeTurnPorts
@@ -1291,12 +1341,13 @@ function validateConfig(config) {
   if (!Array.isArray(config.shutdown_args || [])) {
     throw new Error("shutdown_args must be an array");
   }
-  if (
-    config.config_fingerprint !== undefined &&
-    (typeof config.config_fingerprint !== "string" ||
-      !/^[0-9a-f]{64}$/.test(config.config_fingerprint))
-  ) {
-    throw new Error("config_fingerprint must be a sha256 hex string");
+  for (const field of ["config_fingerprint", "config_fingerprint_without_owner"]) {
+    if (
+      config[field] !== undefined &&
+      (typeof config[field] !== "string" || !/^[0-9a-f]{64}$/.test(config[field]))
+    ) {
+      throw new Error(`${field} must be a sha256 hex string`);
+    }
   }
   if (config.persistent_launcher !== undefined && typeof config.persistent_launcher !== "boolean") {
     throw new Error("persistent_launcher must be a boolean");
@@ -3663,7 +3714,15 @@ async function openPage(
   const maxActivePages = Number(config.max_active_pages ?? 1);
   const livePages = liveCapacityPageCount(activePages, activeVms);
   if (livePages >= maxActivePages) {
-    throw new Error(`Browser VM active page capacity reached (${livePages}/${maxActivePages}); close a page before launching another page`);
+    logEvent("launch_refused", {
+      code: "browser_capacity_unavailable",
+      live_pages: livePages,
+      max_active_pages: maxActivePages,
+    });
+    throw codedError(
+      "browser_capacity_unavailable",
+      `Browser VM active page capacity reached (${livePages}/${maxActivePages}); close a page before launching another page`,
+    );
   }
   await retireConflictingIdleVmsForProfile(config, activeVms, vmKey, profileLeaseKey);
   await retireNonReusableIdleVmsForSinglePageRuntime(config, activeVms, vmKey);
@@ -4695,6 +4754,7 @@ function main() {
           started_at: serviceStartedAt,
           uptime_ms: Math.max(0, Date.now() - serviceStartedAtMs),
           config_fingerprint: config.config_fingerprint || null,
+          config_fingerprint_without_owner: config.config_fingerprint_without_owner || null,
           control_service: controlServiceIdentity,
           active_pages: livePages,
           active_vms: activeVms.size,
@@ -5025,6 +5085,8 @@ function main() {
       network_mode: "runtime_net_only",
       direct_network: false,
     })}\n`);
+    // Verify the image now, off the first open's path.
+    engineReadiness(config).catch(() => {});
   });
 }
 

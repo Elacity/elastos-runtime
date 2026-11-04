@@ -1081,12 +1081,23 @@ def post_json(url, body, token=None):
         return json.loads(response.read(1024 * 1024))
 
 
+def serve_as_seed(data):
+    """Make this data dir a seed: a node that serves publisher content (Runtime's Publisher artifacts root)."""
+    path = data
+    for part in ("ElastOS", "SystemServices", "Publisher", "artifacts"):
+        path = path / part
+        path.mkdir(mode=0o700, exist_ok=True)
+
+
 def start_holder(home, data, consumer_data, consumer_environment):
     """Start the separate holder Home and name it as the consumer's one Carrier peer.
 
     The holder gateway starts its own Kubo with the pinned package before health.
+    Production serves model packages from a seed, so the holder is one: an
+    ordinary Home serves peers only files its people publish to their contacts.
     """
     environment = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(data.parent))
+    serve_as_seed(data)
     installed, number = str(data / "bin/elastos"), free_port()
     with (home / "holder-runtime.private.log").open("wb") as log:
         child = subprocess.Popen([installed, "gateway", "--addr", f"127.0.0.1:{number}"], env=environment,

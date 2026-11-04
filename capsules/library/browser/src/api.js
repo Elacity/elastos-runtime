@@ -17,12 +17,21 @@ export function createLibraryRuntime({ getHomeToken }) {
     });
     const envelope = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(envelope.message || envelope.error || `Library request failed: ${response.status}`);
+      throw codedError(envelope.message || envelope.error || `Library request failed: ${response.status}`, envelope);
     }
     if (envelope.status === "error") {
-      throw new Error(envelope.message || "Runtime object provider failed.");
+      throw codedError(envelope.message || "Runtime object provider failed.", envelope);
     }
     return envelope.data || envelope;
+  }
+
+  // The provider's error code and reason travel with the error so Library can
+  // say what went wrong in plain words before any generic message replaces it.
+  function codedError(message, { code, reason } = {}) {
+    const error = new Error(message);
+    if (typeof code === "string" && code) error.code = code;
+    if (typeof reason === "string" && reason) error.reason = reason;
+    return error;
   }
 
   function uploadObject({ uri, file, mime, onProgress }) {
@@ -235,10 +244,6 @@ export function createLibraryRuntime({ getHomeToken }) {
     return shellMessage({ type: "home:open-target", target, query: query || {} });
   }
 
-  function openPublishedUri(uri, preferredViewer) {
-    return shellMessage({ type: "home:open-uri", uri, preferredViewer: preferredViewer || "documents" });
-  }
-
   function deliverToTarget(target, payload) {
     if (!pickerId || pickerDelivery) return Promise.resolve(false);
     const requestId = crypto.randomUUID();
@@ -274,7 +279,6 @@ export function createLibraryRuntime({ getHomeToken }) {
     uploadObject,
     downloadObjectRaw,
     openTarget,
-    openPublishedUri,
     deliverToTarget,
     closeSelf,
   };

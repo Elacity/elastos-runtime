@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
-import { requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
+import { createBrowserFrameFence } from "../capsules/browser/browser/browser-resize.js";
+import { normalizeUrl, requireBrowserViewer } from "../capsules/browser/browser/browser-runtime-api.js";
 import { friendlyOpenError, isAuthoritySessionError } from "../capsules/browser/browser/browser-status.js";
 import { sameRuntimePageOwner } from "../capsules/browser/browser/browser-page-cleanup.js";
 
@@ -75,7 +76,22 @@ function numericArrayConstant(source, name) {
   );
 }
 
+// Arithmetic constants such as `5 * 60_000`, evaluated from the actual source.
+function arithmeticConstant(source, name) {
+  const match = source.match(new RegExp(`const ${name} = ([0-9_ *+]+);`));
+  assert.ok(match, `${name} constant not found`);
+  return Function(`return (${match[1]});`)();
+}
+
+const closeTimingConstants = Object.fromEntries([
+  "BROWSER_OPEN_POLL_TIMEOUT_MS",
+  "HOME_CLOSE_PENDING_NOTICE_MS",
+  "WINDOW_CLOSE_OPEN_POLL_MS",
+  "WINDOW_CLOSE_PROBE_TIMEOUT_MS",
+].map((name) => [name, arithmeticConstant(browserSource, name)]));
+
 const handshakeSource = [
+  "resetPageInputDelivery",
   "currentRuntimePageOwner",
   "finalizeRuntimePageClose",
   "hasExactMessageKeys",
@@ -94,6 +110,10 @@ const handshakeSource = [
   "settleInitialRuntimeOpenPostFailure",
   "requestFreshRuntimeAuthority",
   "handleHomeBrowserWindowCloseRequest",
+  "resumeDeferredHomeBrowserWindowClose",
+  "closeHomeBrowserWindow",
+  "fetchWindowCloseProbe",
+  "awaitRuntimeOwnershipForWindowClose",
 ]
   .map((name) => extractFunction(browserSource, name))
   .join("\n");
@@ -304,6 +324,8 @@ function createHarness({
     launchToken: "launch-token-exact",
     currentPage: recoverable || ownerless ? null : page,
     currentPageGeneration: 7, unloadCleanupStarted: false,
+    lastDatachannelInputAt: 0, datachannelDrainedAt: 0, datachannelSendDisplay: null, datachannelSendGeneration: 0,
+    resizeFrameFence: createBrowserFrameFence({}),
     currentBrowserEngineId: "engine-exact",
     currentRemoteExitId: "exit-exact",
     browserSummaryPromise: null,
@@ -312,8 +334,15 @@ function createHarness({
     unsettledRuntimeOpen: unsettledOpen,
     runtimeOwnershipTerminallyAbsent: terminallyAbsent,
     homeWindowCloseInFlight: false,
+    deferredHomeWindowClose: null,
     homeWindowTerminalCloseConfirmed: false,
     pendingHomeWindowCloseDelivery: null,
+    windowCloseAbortControllers: new Set(),
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    async wait() {},
+    ...closeTimingConstants,
     window: { parent },
     recoverableRuntimePage() {
       return recoverable ? page : null;
@@ -368,7 +397,7 @@ function createHarness({
     },
   });
   vm.runInContext(
-    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, requestFreshRuntimeAuthority, settleInitialRuntimeOpenPostFailure };`,
+    `${handshakeSource}\nthis.handshake = { deliverPendingHomeBrowserWindowClose, finalizeRuntimePageClose, handleHomeBrowserWindowCloseRequest, normalizeRuntimeOpenUrl, requestFreshRuntimeAuthority, resumeDeferredHomeBrowserWindowClose, settleInitialRuntimeOpenPostFailure };`,
     context,
   );
   const request = {
@@ -379,6 +408,7 @@ function createHarness({
   };
   return {
     closeCalls,
+    context,
     fetchCalls,
     owner,
     parent,
@@ -391,6 +421,7 @@ function createHarness({
     handle: context.handshake.handleHomeBrowserWindowCloseRequest,
     normalizeOpenUrl: context.handshake.normalizeRuntimeOpenUrl,
     refreshAuthority: context.handshake.requestFreshRuntimeAuthority,
+    resume: context.handshake.resumeDeferredHomeBrowserWindowClose,
     settleInitial: context.handshake.settleInitialRuntimeOpenPostFailure,
   };
 }
@@ -1232,6 +1263,9 @@ test("viewer denial preserves an existing page before close or open dispatch", a
     fetchJson: () => assert.fail("Viewer rejection must precede Engine dispatch"),
     isAuthoritySessionError: () => false,
     friendlyOpenError: (error) => error.message,
+    resumeDeferredHomeBrowserWindowClose() {},
+    AbortController,
+    windowCloseAbortControllers: new Set(),
   });
   vm.runInContext(
     `${extractFunction(browserSource, "proveRuntimeOwnershipAbsentBeforeDispatch")}\n${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
@@ -1248,7 +1282,7 @@ test("viewer denial preserves an existing page before close or open dispatch", a
   assert.deepEqual(loading, [true, false]);
 });
 
-test("ownership-changing open returns pending without closing or claiming terminal", async () => {
+test("Close during an in-flight open waits silently, then closes once the open settles", async () => {
   const harness = createHarness({
     openInFlight: 1,
     outcome: {
@@ -1258,16 +1292,395 @@ test("ownership-changing open returns pending without closing or claiming termin
       terminal_kind: "closed",
     },
   });
-  await harness.handle({
-    origin: "null",
-    source: harness.parent,
-    data: harness.request,
-  });
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
   assert.equal(harness.closeCalls.length, 0);
-  assert.equal(harness.posted[0].message.state, "pending");
-  assert.equal(harness.posted[0].message.terminalKind, "");
-  assert.equal(harness.posted[0].message.reason, "runtime_open_in_flight");
-  assert.match(harness.statuses[0].message, /ownership is changing/);
+  assert.deepEqual(
+    [harness.posted[0].message.state, harness.posted[0].message.reason, harness.posted[0].message.pageId,
+      harness.posted[0].message.cleanupId, harness.posted[0].message.terminalKind],
+    ["pending", "runtime_open_in_flight", "", "", ""],
+    "a lifecycle-free pending receipt lets the later close bind the opened page",
+  );
+  assert.deepEqual(harness.statuses, [], "Close must not ask the person to close again");
+  harness.resume();
+  assert.equal(harness.closeCalls.length, 0, "Close waits while the open is still in flight");
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1);
+  assert.equal(harness.closeCalls[0].candidate, harness.owner);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.requestId, harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind],
+    ["request-exact", "terminal", "closed"],
+  );
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1, "a settled deferred Close runs once");
+});
+
+test("Close during an open that fails still closes the window", async () => {
+  const harness = createHarness({ openInFlight: 1, ownerless: true, outcome: null });
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  // The failed open proved Runtime holds no page for this window.
+  harness.context.runtimeOwnershipTerminallyAbsent = true;
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 0);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind, harness.posted.at(-1).message.pageId],
+    ["terminal", "no_page", ""],
+  );
+  assert.equal(harness.context.homeWindowTerminalCloseConfirmed, true);
+});
+
+test("a second Close during the in-flight open or close does not close twice", async () => {
+  let finishClose;
+  const harness = createHarness({ openInFlight: 1, outcome: null });
+  harness.context.closeRuntimePage = async (candidate, options) => {
+    harness.closeCalls.push({ candidate, options });
+    await new Promise((resolve) => { finishClose = resolve; });
+    harness.context.currentPage = null;
+    return { state: "terminal", page_id: "page-exact", generation: 7, terminal_kind: "closed" };
+  };
+  const second = { ...harness.request, requestId: "request-second" };
+  const third = { ...harness.request, requestId: "request-third" };
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  await harness.handle({ origin: "null", source: harness.parent, data: second });
+  harness.context.runtimeOpenInFlight = 0;
+  harness.resume();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1);
+  await harness.handle({ origin: "null", source: harness.parent, data: third });
+  assert.equal(harness.posted.at(-1).message.reason, "window_close_in_flight");
+  finishClose();
+  for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.closeCalls.length, 1, "the page is closed once");
+  const results = harness.posted.map(({ message }) => [message.requestId, message.state, message.terminalKind]);
+  assert.deepEqual(results.filter(([, state]) => state === "terminal"), [
+    ["request-second", "terminal", "closed"],
+    ["request-third", "terminal", "no_page"],
+  ]);
+  assert.deepEqual(harness.statuses, []);
+});
+
+function openHarness(overrides = {}) {
+  const events = [];
+  const statuses = [];
+  const context = vm.createContext({
+    runtimeOpenInFlight: 0,
+    homeWindowCloseInFlight: false,
+    pendingHomeWindowCloseDelivery: null,
+    homeWindowTerminalCloseConfirmed: false,
+    deferredHomeWindowClose: null,
+    currentPage: null,
+    currentPageGeneration: 0,
+    nextPageGeneration: 3,
+    unsettledRuntimeOpen: null,
+    runtimeOwnershipTerminallyAbsent: false,
+    currentRemoteExitId: "",
+    currentBrowserEngineId: "",
+    selectedRemoteExitId: "",
+    selectedBrowserEngineId: "",
+    browserInstanceId: "browser:0123456789abcdef0123456789abcdef",
+    lastRequestedUrl: "",
+    normalizeRuntimeOpenUrl: (value) => value,
+    visibleAddressForUrl: (value) => value,
+    browserEngineLabel: (value) => value,
+    browserExitLabel: (value) => value,
+    setLoading() {},
+    showStatus: (message) => statuses.push(message),
+    clearAddressDraft() {},
+    setCurrentUrl() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display", guaranteeLevel: "isolated" }),
+    requireViewer() {},
+    recoverableRuntimePage: () => null,
+    runtimePageOwner: (page, generation) => (page ? { page_id: page.page_id, generation, runtime_cleanup: page.runtime_cleanup } : null),
+    currentRuntimePageOwner: () => (context.currentPage ? { page_id: context.currentPage.page_id } : null),
+    sameRuntimePageOwner,
+    closeRuntimePage: async () => ({ state: "terminal" }),
+    requireTerminalRuntimePageCloseOutcome: (outcome) => outcome,
+    fetchJson: async () => ({ schema: "elastos.browser.open-accepted/v1", status_url: "/status" }),
+    settleInitialRuntimeOpenPostFailure() {},
+    proveRuntimeOwnershipAbsentBeforeDispatch: () => events.push(["absent"]),
+    isAuthoritySessionError: () => false,
+    friendlyOpenError: (error) => error.message,
+    resetPageInputDelivery() {},
+    publishRuntimePageForHost: (page) => events.push(["publish", page?.page_id]),
+    connectRemoteDisplay: () => assert.fail("a closing window must not connect the display"),
+    resumeDeferredHomeBrowserWindowClose: () => events.push(["resume", context.runtimeOpenInFlight]),
+    AbortController,
+    windowCloseAbortControllers: new Set(),
+    cleanupPendingError: (outcome) => Object.assign(new Error("cleanup pending"), { cleanupOutcome: outcome }),
+    ...overrides,
+  });
+  vm.runInContext(
+    `${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`,
+    context,
+  );
+  return { context, events, statuses };
+}
+
+test("an open that completes after Close was requested never connects its display", async () => {
+  const opened = {
+    page_id: "page-opened",
+    runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-opened" },
+    display_session: { mode: "webrtc_remote_display" },
+  };
+  const { context, events } = openHarness({
+    async waitForRuntimeOpen() {
+      // Home asks to close the window while the open is still pending.
+      context.deferredHomeWindowClose = { requestId: "request-exact" };
+      return { stream_session: {} };
+    },
+    runtimeOpenResultPage: () => opened,
+  });
+  await context.requestRuntimeOpen("https://example.com/");
+  assert.equal(context.currentPage, opened, "the deferred Close needs the opened page to close it");
+  assert.deepEqual(events, [["publish", "page-opened"], ["resume", 0]]);
+});
+
+test("Close aborts an open or summary still on the network", async () => {
+  const harness = createHarness({
+    openInFlight: 1,
+    outcome: { state: "terminal", page_id: "page-exact", generation: 7, terminal_kind: "closed" },
+  });
+  const network = new AbortController();
+  harness.context.windowCloseAbortControllers.add(network);
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  assert.equal(network.signal.aborted, true);
+  assert.deepEqual(harness.statuses, []);
+});
+
+test("a hung open POST is aborted by Close; the close then owns its settlement", async () => {
+  let posted = null;
+  const { context, events, statuses } = openHarness({
+    fetchJson: (path, options) => new Promise((_, reject) => {
+      posted = { path, options };
+      options.signal.addEventListener("abort", () => reject(new Error("Browser connection interrupted.")), { once: true });
+    }),
+  });
+  const opening = context.requestRuntimeOpen("https://example.com/");
+  for (let turn = 0; turn < 4 && !posted; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posted?.path, "/api/apps/browser/open");
+  assert.equal(context.windowCloseAbortControllers.size, 1);
+  const before = statuses.length;
+  // What the Close handler does with an open still on the network.
+  for (const controller of context.windowCloseAbortControllers) controller.abort();
+  await assert.rejects(opening, /interrupted/);
+  assert.deepEqual(statuses.slice(before), [], "a closing window shows no open error");
+  assert.deepEqual(events, [["resume", 0]]);
+  assert.equal(context.windowCloseAbortControllers.size, 0);
+  assert.equal(context.unsettledRuntimeOpen?.body?.url, "https://example.com/", "the close settles the dispatched open");
+  assert.ok(Number.isFinite(context.unsettledRuntimeOpen.startedAt));
+});
+
+test("Close during hung display signaling closes exactly the page the open retained", async () => {
+  const harness = createHarness({
+    ownerless: true,
+    outcome: { state: "terminal", page_id: "page-exact", generation: 0, terminal_kind: "closed" },
+    fetchResponses: [{ schema: "elastos.browser.open-accepted/v1", status_url: "/api/apps/browser/open/open-exact" }],
+  });
+  let connectSignal = null;
+  Object.assign(harness.context, {
+    nextPageGeneration: 0, lastRequestedUrl: "", selectedBrowserEngineId: "engine-exact", selectedRemoteExitId: "",
+    currentDisplayMode: "", currentView: null, canGoBack: false, canGoForward: false,
+    visibleAddressForUrl: (value) => value, browserEngineLabel: (value) => value, browserExitLabel: (value) => value,
+    setLoading() {}, clearAddressDraft() {}, setCurrentUrl() {}, requireViewer() {},
+    launchContractForOpen: async () => ({ displayMode: "webrtc_remote_display", guaranteeLevel: "isolated" }),
+    requireTerminalRuntimePageCloseOutcome: (outcome) => outcome,
+    cleanupPendingError: (outcome) => Object.assign(new Error("cleanup pending"), { cleanupOutcome: outcome }),
+    waitForRuntimeOpen: async () => ({
+      schema: "elastos.browser.open-result/v1",
+      engine_page: { schema: "elastos.browser.engine.page/v1", page_id: "page-exact", display_session: { mode: "webrtc_remote_display" } },
+      runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-exact" },
+    }),
+    syncDisplayInputFromSession() {}, viewFromDisplaySession: () => null, syncViewFromResponse() {}, syncBrowserLocation() {},
+    connectRemoteDisplay: (_session, _page, signal) => new Promise((_, reject) => {
+      connectSignal = signal;
+      signal.addEventListener("abort", () => reject(new Error("Browser connection interrupted.")), { once: true });
+    }),
+    startPageStatusPolling: () => assert.fail("a closing window must not start page polling"),
+    startPageHeartbeat() {},
+    remoteDisplay: { isTrackReady: () => false },
+    failRuntimeOwnedPage: () => assert.fail("Close, not the failed open, cleans up the retained page"),
+  });
+  vm.runInContext(`${extractFunction(browserSource, "requestRuntimeOpen")}\nthis.requestRuntimeOpen = requestRuntimeOpen;`, harness.context);
+  const opening = harness.context.requestRuntimeOpen("https://example.com/");
+  for (let turn = 0; turn < 8 && !connectSignal; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(connectSignal, "the display connect received Close's signal");
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  await assert.rejects(opening, /interrupted/);
+  for (let turn = 0; turn < 8; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.closeCalls.filter((call) => call.candidate).map((call) => call.candidate), [harness.owner]);
+  assert.deepEqual(
+    [harness.posted.at(-1).message.state, harness.posted.at(-1).message.terminalKind,
+      harness.posted.at(-1).message.pageId, harness.posted.at(-1).message.cleanupId],
+    ["terminal", "closed", "page-exact", "cleanup-exact"],
+  );
+  assert.equal(harness.statuses.some(({ message }) => /interrupted/.test(message)), false);
+  assert.equal(harness.context.windowCloseAbortControllers.size, 0);
+});
+
+test("a hung ownership probe ends at its deadline instead of holding the close", async () => {
+  const timers = [];
+  const harness = createHarness({
+    ownerless: true,
+    unsettledOpen: { body: {}, page: null, statusUrl: "/api/apps/browser/open/open-exact" },
+  });
+  harness.context.setTimeout = (fn, ms) => timers.push({ fn, ms });
+  harness.context.clearTimeout = () => {};
+  harness.context.fetchJson = (path, options) => new Promise((_, reject) => {
+    options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+  });
+  const closing = harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(timers[0]?.ms, closeTimingConstants.WINDOW_CLOSE_PROBE_TIMEOUT_MS);
+  timers[0].fn();
+  await closing;
+  assert.deepEqual(
+    [harness.posted.at(-1).message.state, harness.posted.at(-1).message.reason],
+    ["pending", "runtime_open_status_unavailable"],
+  );
+  assert.equal(harness.context.homeWindowCloseInFlight, false, "a Close retry is not held behind the hung probe");
+});
+
+test("a 60 s open with Close at 1 s keeps Home's request alive, then closes the late page", async () => {
+  const clock = { now: 1_000 };
+  const result = {
+    schema: "elastos.browser.open-result/v1",
+    engine_page: { schema: "elastos.browser.engine.page/v1", page_id: "page-exact" },
+    runtime_cleanup: { schema: "elastos.browser.cleanup-handle/v1", id: "cleanup-exact" },
+  };
+  const harness = createHarness({
+    ownerless: true,
+    unsettledOpen: { body: {}, page: null, statusUrl: "/api/apps/browser/open/open-exact", startedAt: 0 },
+    outcome: { state: "terminal", page_id: "page-exact", generation: 0, terminal_kind: "closed" },
+  });
+  const posts = [];
+  harness.parent.postMessage = (message) => posts.push({ ...message, at: clock.now });
+  harness.context.Date = { now: () => clock.now };
+  harness.context.wait = async (ms) => { clock.now += ms; };
+  harness.context.fetchJson = async () => clock.now < 60_000
+    ? { schema: "elastos.browser.open-status/v1", status: "pending" }
+    : { schema: "elastos.browser.open-status/v1", status: "completed", result };
+  await harness.handle({ origin: "null", source: harness.parent, data: harness.request });
+  const gaps = [1_000, ...posts.map((post) => post.at)].map((at, index, all) => (all[index + 1] ?? at) - at);
+  assert.ok(Math.max(...gaps) <= closeTimingConstants.HOME_CLOSE_PENDING_NOTICE_MS, JSON.stringify(gaps));
+  assert.ok(posts.filter((post) => post.reason === "runtime_open_status_pending").length >= 5);
+  assert.equal(harness.closeCalls.length, 1);
+  assert.equal(harness.closeCalls[0].candidate, harness.owner);
+  assert.deepEqual(
+    [posts.at(-1).state, posts.at(-1).terminalKind, posts.at(-1).pageId, posts.at(-1).cleanupId],
+    ["terminal", "closed", "page-exact", "cleanup-exact"],
+  );
+  assert.ok(posts.at(-1).at >= 60_000);
+});
+
+function homeCloseHarness() {
+  const clock = { now: 0 };
+  const timers = new Map();
+  let timerId = 0;
+  const frameWindow = { postMessage() {} };
+  const entry = { id: "window-1", node: {} };
+  const removed = [];
+  const states = [];
+  const context = vm.createContext({
+    BROWSER_WINDOW_CLOSE_TIMEOUT_MS: numericConstant(homeShellWindowsSource, "BROWSER_WINDOW_CLOSE_TIMEOUT_MS"),
+    BROWSER_WINDOW_CLOSE_CAP_MS: numericConstant(homeShellWindowsSource, "BROWSER_WINDOW_CLOSE_CAP_MS"),
+    BROWSER_WINDOW_CLOSE_REQUEST_TYPE: "elastos.browser.window-close.request/v1",
+    BROWSER_WINDOW_CLOSE_RESULT_TYPE: "elastos.browser.window-close.result/v1",
+    OPAQUE_CAPSULE_ORIGIN: "null",
+    pendingBrowserWindowCloses: new Map(),
+    shellState: { windows: new Map([[entry.id, entry]]) },
+    removeWindowEntries: (entries) => removed.push(...entries),
+    markBrowserWindowCloseState: (_entry, state) => states.push(state),
+    browserWindowCloseContext: () => ({ frameWindow, homeToken: "home-token", browserInstance: "browser-instance" }),
+    browserWindowCloseRequestId: () => "request-1",
+    Date: { now: () => clock.now },
+    window: {
+      setTimeout: (fn, ms) => { timers.set(++timerId, { fn, at: clock.now + ms }); return timerId; },
+      clearTimeout: (id) => timers.delete(id),
+    },
+  });
+  vm.runInContext(
+    ["hasExactKeys", "settleBrowserWindowClose", "handleBrowserWindowCloseResult", "armBrowserWindowCloseTimeout", "requestBrowserWindowClose"]
+      .map((name) => extractFunction(homeShellWindowsSource, name)).join("\n") +
+      "\nthis.home = { handleBrowserWindowCloseResult, requestBrowserWindowClose };",
+    context,
+  );
+  const advanceTo = (at) => {
+    for (;;) {
+      const due = [...timers].filter(([, timer]) => timer.at <= at).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!due) break;
+      timers.delete(due[0]);
+      clock.now = due[1].at;
+      due[1].fn();
+    }
+    clock.now = at;
+  };
+  const result = (fields) => context.home.handleBrowserWindowCloseResult({
+    origin: "null",
+    source: frameWindow,
+    data: {
+      type: "elastos.browser.window-close.result/v1", requestId: "request-1", homeToken: "home-token",
+      browserInstance: "browser-instance", state: "pending", pageId: "", generation: 0, cleanupId: "",
+      terminalKind: "", reason: "runtime_open_status_pending", ...fields,
+    },
+  });
+  let settled = null;
+  context.home.requestBrowserWindowClose(entry).then((value) => { settled = value; });
+  return { advanceTo, result, removed, states, settled: () => settled, context };
+}
+
+const settleTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test("Home keeps a close alive on each pending and removes the window when Browser reports terminal", async () => {
+  const home = homeCloseHarness();
+  for (let at = 10_000; at <= 60_000; at += 10_000) {
+    home.advanceTo(at);
+    home.result({});
+  }
+  home.advanceTo(61_000);
+  home.result({ pageId: "page-exact", cleanupId: "cleanup-exact", reason: "cleanup_in_flight" });
+  home.result({ state: "terminal", pageId: "page-exact", cleanupId: "cleanup-exact", terminalKind: "closed", reason: "" });
+  await settleTurn();
+  assert.equal(home.settled(), true);
+  assert.equal(home.removed.length, 1);
+  assert.deepEqual(home.states, ["pending"], "Home shows Closing… throughout");
+});
+
+test("Home gives up a close after 50 s without a pending from a hung frame", async () => {
+  const home = homeCloseHarness();
+  home.advanceTo(49_999);
+  await settleTurn();
+  assert.equal(home.settled(), null);
+  home.advanceTo(50_000);
+  await settleTurn();
+  assert.equal(home.settled(), false);
+  assert.deepEqual(home.states, ["pending", "retry"]);
+});
+
+test("Home stops extending at the cap and offers Retry", async () => {
+  const home = homeCloseHarness();
+  const cap = numericConstant(homeShellWindowsSource, "BROWSER_WINDOW_CLOSE_CAP_MS");
+  for (let at = 10_000; at < cap; at += 10_000) {
+    home.advanceTo(at);
+    home.result({});
+  }
+  await settleTurn();
+  assert.equal(home.settled(), null);
+  home.advanceTo(cap);
+  await settleTurn();
+  assert.equal(home.settled(), false);
+  assert.deepEqual(home.states, ["pending", "retry"]);
+});
+
+test("Home's extension window and cap fit Browser's keep-alive and open deadline", () => {
+  const idle = numericConstant(homeShellWindowsSource, "BROWSER_WINDOW_CLOSE_TIMEOUT_MS");
+  const cap = numericConstant(homeShellWindowsSource, "BROWSER_WINDOW_CLOSE_CAP_MS");
+  const { HOME_CLOSE_PENDING_NOTICE_MS, WINDOW_CLOSE_PROBE_TIMEOUT_MS, WINDOW_CLOSE_OPEN_POLL_MS, BROWSER_OPEN_POLL_TIMEOUT_MS } = closeTimingConstants;
+  assert.ok(HOME_CLOSE_PENDING_NOTICE_MS + WINDOW_CLOSE_PROBE_TIMEOUT_MS + WINDOW_CLOSE_OPEN_POLL_MS < idle);
+  assert.ok(cap > BROWSER_OPEN_POLL_TIMEOUT_MS + idle, "the cap covers the open deadline plus one close");
 });
 
 test("recoverable Runtime owner is closed exactly when no current page exists", async () => {
@@ -1345,4 +1758,215 @@ test("iframe unload and refresh remain teardown-only", () => {
     browserSource,
     /window\.addEventListener\("pagehide", \(event\) => \{/,
   );
+});
+
+function browserReuseHarness({ windows = [], route = "/apps/browser/?browser_instance=b1#home_token=tok-1" } = {}) {
+  const evidence = { creates: [], focused: [], posted: [] };
+  const launches = [];
+  const shellState = { windows: new Map(), currentSummary: { targets: [] } };
+  const addEntry = (id, z, entryRoute = route) => {
+    const frame = {
+      dataset: { route: entryRoute },
+      contentWindow: { postMessage: (message, origin) => evidence.posted.push({ id, message, origin }) },
+    };
+    const entry = { id, kind: "browser", targetId: "browser", node: { style: { zIndex: String(z) }, querySelector: () => frame } };
+    shellState.windows.set(id, entry);
+    return entry;
+  };
+  for (const [id, z] of windows) addEntry(id, z);
+  const context = {
+    shellState,
+    evidence,
+    window: { location: { href: "http://127.0.0.1:61180/apps/home-gui/" } },
+    URL,
+    URLSearchParams,
+    pendingWindowLaunches: new Map(),
+    isSingleWindowTarget: () => false,
+    targetById: () => ({ window_policy: "hybrid" }),
+    focusWindow: (id) => evidence.focused.push(id),
+    // Deferred like the real Runtime launch: the window exists only once the
+    // test settles the launch.
+    createBrowserTargetWindow: (targetId, options) => {
+      evidence.creates.push({ targetId, query: options.query });
+      let settle;
+      const promise = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+      launches.push({
+        succeed: (id = `new-${launches.length}`) => settle.resolve(addEntry(id, 50)),
+        fail: () => settle.reject(new Error("launch failed")),
+      });
+      return promise;
+    },
+  };
+  vm.runInNewContext(
+    [
+      "const BROWSER_ONE_WINDOW_MESSAGE = \"Only one Browser window can be open at a time. Close the other one first.\";",
+      "let pendingBrowserWindowCreate = null;",
+      ...[
+        "browserWindowEntries",
+        "sortWindowEntriesByZOrder",
+        "browserWindowEntriesForTarget",
+        "browserLaunchAuthority",
+        "postBrowserNavigate",
+        "openBrowserWindowOnce",
+        "topDefaultHybridWindow",
+        "launchBrowserTargetWindow",
+      ].map((name) => extractFunction(homeShellWindowsSource, name)),
+      "globalThis.launch = launchBrowserTargetWindow;",
+    ].join("\n"),
+    context,
+  );
+  context.launches = launches;
+  return context;
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a new Browser open focuses the live Browser window and navigates it instead of launching a second page", async () => {
+  const harness = browserReuseHarness({ windows: [["browser--1", 1], ["browser--2", 5]] });
+  const entry = await harness.launch("browser", { newWindow: true, query: { url: "https://example.org/" } });
+  assert.equal(entry.id, "browser--2");
+  assert.equal(harness.evidence.creates.length, 0);
+  assert.deepEqual(harness.evidence.focused, ["browser--2"]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.evidence.posted)),
+    [{ id: "browser--2", origin: "*", message: { type: "elastos.browser.navigate/v1", homeToken: "tok-1", url: "https://example.org/" } }],
+  );
+  const plain = await harness.launch("browser", { newWindow: true, query: {} });
+  assert.equal(plain.id, "browser--2");
+  assert.equal(harness.evidence.posted.length, 1, "a plain open only focuses");
+  assert.equal(harness.evidence.creates.length, 0);
+});
+
+test("opens during a pending Browser launch join it and navigate once it exists", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { newWindow: true, query: { url: "https://example.org/" } });
+  await tick();
+  assert.equal(harness.evidence.creates.length, 1, "the second open must wait for the first launch");
+  harness.launches[0].succeed("browser--new");
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.id, "browser--new");
+  assert.equal(b.id, "browser--new");
+  assert.equal(harness.evidence.creates.length, 1);
+  assert.equal(harness.evidence.posted.length, 1);
+  assert.equal(harness.evidence.posted[0].message.url, "https://example.org/");
+});
+
+test("a failed pending launch lets the waiting open start its own launch", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { query: { url: "https://example.net/" } });
+  await tick();
+  harness.launches[0].fail();
+  await assert.rejects(first, /launch failed/);
+  await tick();
+  assert.equal(harness.evidence.creates.length, 2);
+  assert.equal(harness.evidence.creates[1].query.url, "https://example.net/");
+  harness.launches[1].succeed("browser--retry");
+  assert.equal((await second).id, "browser--retry");
+});
+
+test("a window closed during the pending launch is not reused", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  const second = harness.launch("browser", { query: {} });
+  await tick();
+  harness.launches[0].succeed("browser--closed");
+  harness.shellState.windows.delete("browser--closed");
+  await first;
+  await tick();
+  assert.equal(harness.evidence.creates.length, 2, "the waiting open launches a fresh window");
+  harness.launches[1].succeed("browser--fresh");
+  assert.equal((await second).id, "browser--fresh");
+});
+
+test("sequential reopen after close still creates a Browser window", async () => {
+  const harness = browserReuseHarness();
+  const first = harness.launch("browser", { query: {} });
+  harness.launches[0].succeed("browser--a");
+  await first;
+  harness.shellState.windows.clear();
+  const second = harness.launch("browser", { query: { url: "https://example.net/" } });
+  harness.launches[1].succeed("browser--b");
+  assert.equal((await second).id, "browser--b");
+  assert.equal(harness.evidence.creates.length, 2);
+});
+
+test("an unreachable live Browser window explains the one-window limit", async () => {
+  const harness = browserReuseHarness({ windows: [["browser--1", 1]], route: "/apps/browser/" });
+  await assert.rejects(
+    harness.launch("browser", { query: { url: "https://example.org/" } }),
+    (error) => error.userMessage === "Only one Browser window can be open at a time. Close the other one first.",
+  );
+  assert.equal(harness.evidence.creates.length, 0);
+  assert.match(extractFunction(homeShellWindowsSource, "renderTargetLaunchError"), /error\?\.userMessage/);
+});
+
+test("Browser menus offer Show or Open Browser, never New Window", () => {
+  const supports = vm.runInNewContext(
+    `${extractFunction(homeShellWindowsSource, "supportsMenuNewWindow")}; supportsMenuNewWindow`,
+    { shellState: { currentSummary: {} }, targetById: () => ({ window_policy: "hybrid" }) },
+  );
+  assert.equal(supports("browser"), false);
+  assert.equal(supports("library"), true);
+  const surfaceSource = fs.readFileSync(new URL("../capsules/home-gui/browser/shell-surface.js", import.meta.url), "utf8");
+  const items = (openCount, source) => vm.runInNewContext(
+    `${extractFunction(surfaceSource, "targetContextMenuItems")}; targetContextMenuItems`,
+    {
+      shellState: { currentSummary: {} },
+      supportsMenuNewWindow: supports,
+      sortWindowEntriesByZOrder: (entries) => entries,
+      browserWindowEntriesForTarget: () => Array.from({ length: openCount }, (_, i) => ({ id: `w${i}` })),
+      browserWindowDisplayTitle: (entry) => entry.id,
+      targetTitle: () => "Browser",
+      desktopPinMenuItem: () => ({ action: "pin" }),
+      taskbarPinMenuItem: () => ({ action: "pin-taskbar" }),
+      appendTargetGroupManagementItems: () => {},
+      isPhone: () => false,
+    },
+  )({ targetId: "browser", source });
+  for (const source of ["taskbar", "desktop", "launcher"]) {
+    const shown = items(1, source).map((item) => item.label);
+    assert.ok(shown.includes("Show Browser"), `${source}: ${shown}`);
+    assert.ok(!shown.includes("New Window"), source);
+    assert.ok(items(0, source).some((item) => item.label === "Open Browser" && item.action === "open-target"), source);
+  }
+});
+
+function browserNavigateReceiver() {
+  const parent = { name: "home-gui" };
+  const top = { name: "home-shell" };
+  const context = {
+    window: { parent, top },
+    launchToken: "tok-1",
+    HOME_GUI_OPAQUE_ORIGIN: "null",
+    normalizeUrl,
+  };
+  vm.runInNewContext(
+    `${extractFunction(browserSource, "hasExactMessageKeys")}\n${extractFunction(browserSource, "homeBrowserNavigateUrl")}\nglobalThis.receive = homeBrowserNavigateUrl;`,
+    context,
+  );
+  const message = (overrides = {}) => ({ type: "elastos.browser.navigate/v1", homeToken: "tok-1", url: "https://example.org/", ...overrides });
+  return { receive: context.receive, parent, top, message, context };
+}
+
+test("Browser accepts Home's navigate request only from its Home parent with its own token", () => {
+  const { receive, parent, top, message, context } = browserNavigateReceiver();
+  assert.equal(receive({ origin: "null", source: parent, data: message() }), "https://example.org/");
+  assert.equal(receive({ origin: "null", source: top, data: message() }), "", "top");
+  assert.equal(receive({ origin: "null", source: { name: "sibling" }, data: message() }), "", "sibling frame");
+  assert.equal(receive({ origin: "http://127.0.0.1:61180", source: parent, data: message() }), "", "wrong origin");
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "tok-2" }) }), "", "wrong token");
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "" }) }), "", "empty token");
+  assert.equal(receive({ origin: "null", source: parent, data: { ...message(), extra: 1 } }), "", "extra keys");
+  for (const url of ["javascript:alert(1)", "file:///etc/passwd", "elastos://home", "", "   "]) {
+    assert.equal(receive({ origin: "null", source: parent, data: message({ url }) }), "", url);
+  }
+  context.launchToken = "";
+  assert.equal(receive({ origin: "null", source: parent, data: message({ homeToken: "" }) }), "", "no launch token");
+});
+
+test("Browser handles Home's navigate request before the top-level host guard", () => {
+  const listener = browserSource.slice(browserSource.indexOf("const homeNavigateUrl = homeBrowserNavigateUrl(event);"));
+  assert.ok(listener.indexOf("navigateAddress(homeNavigateUrl)") < listener.indexOf("event.source !== window.top"));
 });

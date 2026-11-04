@@ -1,7 +1,6 @@
 //! DID key encoding, domain-separated signing, and release envelope verification.
 
 use ed25519_dalek::Signer;
-use ed25519_dalek::Verifier as Ed25519Verifier;
 use elastos_runtime::signature;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -73,7 +72,7 @@ fn verify_signature_digest_with_cache_capacity(
         }
     }
     // Verification runs outside the lock; poisoning only repeats this check.
-    key.verify(digest, signature)?;
+    key.verify_strict(digest, signature)?;
     if let Ok(mut entries) = cache.lock() {
         if !entries.contains(&verified) {
             if entries.len() == capacity {
@@ -469,7 +468,7 @@ mod tests {
         assert_eq!(entries.len(), TEST_CAPACITY);
         for entry in entries.iter() {
             let key = ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key).unwrap();
-            key.verify(
+            key.verify_strict(
                 &entry.digest,
                 &ed25519_dalek::Signature::from_bytes(&entry.signature),
             )

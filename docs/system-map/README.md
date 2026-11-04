@@ -12,7 +12,7 @@ Read these in order when a statement matters:
    constraints.
 2. [`ARCHITECTURE.md`](../ARCHITECTURE.md) defines responsibility and trust
    boundaries.
-3. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record verified behavior, known limitations and open work.
+3. [GitHub issues](https://github.com/elastos/elastos-runtime/issues) record verified behavior, known limitations and open work.
 4. [`AGENTS.md`](../../AGENTS.md) defines the operator and agent process.
 6. The contract for the touched surface defines its exact interface.
 

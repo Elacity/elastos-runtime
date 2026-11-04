@@ -4,6 +4,7 @@ import {
   provenanceView,
 } from "./esp-projections.mjs";
 import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261101d";
 
 const errorNode = document.querySelector(".system-error");
 const backgroundInput = document.querySelector("#background-input");
@@ -53,9 +54,6 @@ const recoveryCancelButton = document.querySelector("#recovery-cancel");
 const chainTableNode = document.querySelector("#chain-table");
 const activeShellOptions = document.querySelector("#active-shell-options");
 const activeShellStatusNode = document.querySelector('[data-field="active-shell-status"]');
-const capsuleCatalogNode = document.querySelector("#capsule-catalog");
-const capsuleCatalogStatusNode = document.querySelector("#capsule-catalog-status");
-const capsuleCatalogRefreshButton = document.querySelector("#capsule-catalog-refresh");
 const technicalDetailsNode = document.querySelector("#technical-details");
 const technicalInspectListNode = document.querySelector("#technical-inspect-list");
 const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
@@ -115,7 +113,6 @@ let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
 let currentProfileName = "";
-let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
@@ -167,21 +164,13 @@ const READABLE_CHAIN_KINDS = new Set([
   "bitcoin_core_rpc",
   "bitcoin_rest",
 ]);
-const CATALOG_GROUPS = [
-  { role: "app", label: "Apps" },
-  { role: "viewer", label: "Viewers" },
-  { role: "content", label: "Content" },
-  { role: "provider", label: "Background services" },
-  { role: "shell", label: "Home views" },
-];
 const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   account: ["account", "passkey", "accounts", "credential", "signin", "sign in"],
   personalization: ["appearance", "theme", "accent", "background", "wallpaper", "dock", "sound"],
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
-  catalog: ["catalog", "apps", "services", "capsules"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
-  about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
+  about: ["about", "device", "version", "source", "channel", "network", "did", "update", "publisher", "changes"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
 const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
@@ -190,6 +179,14 @@ const homeClipboard = createHomeClipboardClient({
   targetId: "system",
   homeOrigin: homeParentOrigin,
   homeToken: frameHomeToken,
+});
+const backgroundImage = createHomeBackgroundImage({
+  homeOrigin: homeParentOrigin,
+  homeToken: frameHomeToken,
+  apply: (url) => {
+    if (backgroundPreview) backgroundPreview.style.backgroundImage = `url("${url || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+  },
+  onError: () => showBackgroundStatus("Home could not load the image. Close System and open it to retry.", "error"),
 });
 
 boot().catch((error) => {
@@ -216,7 +213,6 @@ async function boot() {
   configureRecoveryAccess();
   configureChainAccess();
   configureActiveShell();
-  configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
   configureRuntimeUpdate();
@@ -235,10 +231,6 @@ async function boot() {
   }
   await initialRecoveryState;
   await refreshChainNetworks();
-  await refreshCapsuleCatalog().catch((error) => {
-    console.error("catalog refresh failed", error);
-    showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-  });
 }
 
 function configureHomeRecoverySave() {
@@ -471,6 +463,35 @@ function setField(field, value, emptyText, titleValue) {
 function setTextFields(field, value) {
   for (const node of document.querySelectorAll(`[data-field="${field}"]`)) {
     node.textContent = value;
+  }
+}
+
+// Draws update notes as lists under any headings, as text only.
+function setUpdateNotes(items) {
+  for (const node of document.querySelectorAll('[data-field="update-changes"]')) {
+    if (!items.length) {
+      node.textContent = "Publisher has not supplied change notes.";
+      continue;
+    }
+    node.replaceChildren();
+    let list = null;
+    for (const item of items) {
+      if (item.heading) {
+        const heading = document.createElement("h4");
+        heading.className = "runtime-update-changes-heading";
+        heading.textContent = item.text;
+        node.append(heading);
+        list = null;
+        continue;
+      }
+      if (!list) {
+        list = document.createElement("ul");
+        node.append(list);
+      }
+      const entry = document.createElement("li");
+      entry.textContent = item.text;
+      list.append(entry);
+    }
   }
 }
 
@@ -764,7 +785,7 @@ async function updateCommunityMembership() {
       body: JSON.stringify({ joined: !communityMembership.joined }),
     }, "/api/apps/system/community");
     renderCommunityMembership(membership);
-    setTextFields("community-status", membership.joined ? "Community rejoined. Discovery uses its saved preference." : "Community and Discovery stopped on this Home.");
+    setTextFields("community-status", membership.joined ? "Community rejoined. Public keeps its saved setting." : "Community and Public stopped on this Home.");
     setHiddenFields("community-status", false);
   } catch (error) {
     setTextFields("community-status", publicSystemError(error, "Community setting could not be changed."));
@@ -972,7 +993,6 @@ function configureAiProvider() {
     formNode.hidden = true;
     instancesNode.hidden = false;
     document.querySelector("#local-models").hidden = false;
-    document.querySelector("#approval-lens").hidden = false;
     addButton.hidden = false;
     nameInput.value = "";
     keyInput.value = "";
@@ -986,7 +1006,6 @@ function configureAiProvider() {
     formNode.hidden = false;
     instancesNode.hidden = true;
     document.querySelector("#local-models").hidden = true;
-    document.querySelector("#approval-lens").hidden = true;
     addButton.hidden = true;
     editingId = instance && instance.id ? String(instance.id) : "";
     nameInput.value = instance && instance.name ? String(instance.name) : "";
@@ -1010,7 +1029,6 @@ function configureAiProvider() {
     instancesNode.replaceChildren();
     for (const connection of connections) {
       if (!connection || connection.connected !== true) continue;
-      if (connection.operation === "decision.evaluate") continue;
       const card = document.createElement("div");
       card.className = "ai-provider-instance";
       card.dataset.offerId = connection.id;
@@ -1029,11 +1047,6 @@ function configureAiProvider() {
       useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
       useButton.disabled = connection.egress_state === "paused";
       useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
-      const shareButton = document.createElement("button");
-      shareButton.className = "pc2-btn pc2-btn-secondary";
-      shareButton.type = "button";
-      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
-      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
       const replaceButton = document.createElement("button");
       replaceButton.className = "pc2-btn pc2-btn-secondary";
       replaceButton.type = "button";
@@ -1078,7 +1091,6 @@ function configureAiProvider() {
       summary.textContent = "Details and access";
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
-      secondary.append(shareButton);
       if (connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
         const endApproval = document.createElement("button");
         endApproval.className = "pc2-btn pc2-btn-secondary";
@@ -1103,7 +1115,10 @@ function configureAiProvider() {
       }
       secondary.append(disconnectButton);
       more.append(summary, secondary);
-      actions.append(useButton, replaceButton);
+      // A decision model saved by an earlier release cannot run Assistant
+      // prompts; it stays listed so it can be disconnected.
+      if (connection.operation === "decision.evaluate") actions.append(replaceButton);
+      else actions.append(useButton, replaceButton);
       card.append(title, detail, actions, more);
       instancesNode.append(card);
     }
@@ -1150,100 +1165,12 @@ function configureAiProvider() {
       [...instancesNode.querySelectorAll("button, summary")].find((node) => controlKey(node) === focused)?.focus({ preventScroll: true });
     }
   };
-  const lensModel = document.querySelector("#approval-lens-model");
-  const lensStatus = document.querySelector("#approval-lens-status");
-  const lensSelect = document.querySelector("#approval-lens-select");
-  const lensEdit = document.querySelector("#approval-lens-edit");
-  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
-  let lensChoice = ""; // an evaluator picked here and not yet saved
-  const lensEnd = document.createElement("button");
-  lensEnd.className = "pc2-btn pc2-btn-secondary";
-  lensEnd.type = "button";
-  lensEnd.textContent = "End hosted approval";
-  lensEnd.hidden = true;
-  lensDisconnect.after(lensEnd);
-  const updateLensEnd = () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    lensEnd.hidden = !connection || (connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
-    lensEnd.disabled = !hasShellAccess();
-  };
-  const renderLens = (status) => {
-    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
-    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
-    lensModel.replaceChildren();
-    for (const connection of decisions) {
-      const option = document.createElement("option"); option.value = connection.id;
-      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
-      lensModel.append(option);
-    }
-    if (!decisions.some((connection) => connection.id === lensChoice)) lensChoice = "";
-    if (lensChoice || current) lensModel.value = lensChoice || current.id;
-    lensStatus.textContent = current && status.hosted_external_https === "paused"
-      ? `${current.name} selected · external HTTPS paused`
-      : current ? `Using ${current.name} · ${current.processor_label}`
-      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
-      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
-    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
-    updateLensEnd();
-  };
-  lensModel.addEventListener("change", () => {
-    lensChoice = lensModel.value;
-    updateLensEnd();
-  });
-  lensEnd.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensEnd.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/approval-lens/revoke", {
-        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      await refreshStatus();
-      showState("Hosted approval ended.", "");
-    } catch (error) {
-      showState(publicSystemError(error, "Approval could not be ended."), "error");
-      lensEnd.disabled = false;
-    }
-  });
-  lensEdit.addEventListener("click", () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection) return;
-    showForm(connection);
-  });
-  lensDisconnect.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensDisconnect.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/ai-provider", {
-        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      hideForm();
-      await refreshStatus();
-      showState(`${readText(connection.name)} is disconnected.`, "");
-    } catch (error) {
-      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
-      lensDisconnect.disabled = false;
-    }
-  });
-  lensSelect.addEventListener("click", async () => {
-    lensSelect.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
-      lensChoice = "";
-      await refreshStatus();
-    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
-    finally { lensSelect.disabled = false; }
-  });
   const applyStatus = (status) => {
     latestStatus = status;
     const egressNote = document.querySelector("#ai-provider-egress-note");
     egressNote.hidden = latestStatus.hosted_external_https !== "paused";
     egressNote.textContent = egressNote.hidden ? "" : "External HTTPS is paused on this Home.";
     renderInstances(latestStatus);
-    renderLens(latestStatus);
     updateValidationEnd();
   };
   const readStatus = () => {
@@ -1405,7 +1332,6 @@ function configureAiProvider() {
         keyInput.value = "";
         formNode.hidden = true;
         addButton.hidden = true;
-        document.querySelector("#approval-lens").hidden = true;
         showState("Hosted model setup is not available for this account yet.", "error");
         return;
       }
@@ -1420,9 +1346,6 @@ function configurePasskeyAccess() {
     showPasskeyStatus("Not supported", "muted");
     return;
   }
-  refreshPasskeyStatus().catch(() => {
-    showPasskeyStatus("Not set", "muted");
-  });
   if (accountListNode) {
     accountListNode.addEventListener("click", onAccountListClick);
   }
@@ -1471,21 +1394,6 @@ function configureActiveShell() {
       showActiveShellStatus(String(error.message || error), "error");
     });
   });
-}
-
-function configureCapsuleCatalog() {
-  if (!capsuleCatalogRefreshButton) {
-    return;
-  }
-  capsuleCatalogRefreshButton.disabled = !hasShellAccess();
-  if (hasShellAccess()) {
-    capsuleCatalogRefreshButton.addEventListener("click", () => {
-      refreshCapsuleCatalog().catch((error) => {
-        console.error("catalog refresh failed", error);
-        showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-      });
-    });
-  }
 }
 
 function configureTechnicalDetails() {
@@ -1703,7 +1611,7 @@ function applyAppearance(appearance) {
   window.elastosTheme?.setAccentCustom?.(appearance.accent_custom);
   window.elastosTheme?.setAccent?.(appearance.accent);
   if (backgroundPreview) {
-    backgroundPreview.style.backgroundImage = `url("${imageUrl || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+    backgroundImage.update(imageUrl);
     backgroundPreview.dataset.empty = imageUrl ? "false" : "true";
   }
   if (backgroundResetButton) {
@@ -2544,246 +2452,6 @@ function showTechnicalApprovalStatus(section, message, tone) {
   status.hidden = !text;
 }
 
-async function refreshCapsuleCatalog() {
-  if (!capsuleCatalogNode || !hasShellAccess()) {
-    return;
-  }
-  setCapsuleCatalogBusy(true);
-  showCapsuleCatalogStatus("Loading", "muted");
-  try {
-    const [catalog, interfaces] = await Promise.all([
-      fetchJson("/api/capsules/catalog", { headers: shellHeaders() }),
-      fetchJson("/api/capsules/interfaces", { headers: shellHeaders() }),
-    ]);
-    const entries = (Array.isArray(catalog.capsules) ? catalog.capsules : [])
-      .filter((entry) => entry && entry.installed !== false);
-    const interfaceEntries = Array.isArray(interfaces.interfaces) ? interfaces.interfaces : [];
-    renderCapsuleCatalog(entries, interfaceEntries);
-    showCapsuleCatalogStatus(`${entries.length} available`, "muted");
-  } finally {
-    setCapsuleCatalogBusy(false);
-  }
-}
-
-function renderCapsuleCatalog(entries, interfaceEntries) {
-  if (!capsuleCatalogNode) {
-    return;
-  }
-  capsuleCatalogNode.replaceChildren();
-  if (entries.length === 0) {
-    capsuleCatalogNode.append(catalogEmpty("No apps or services are installed."));
-    return;
-  }
-  const entriesByName = new Map(entries.map((entry) => [readText(entry.name), entry]));
-  const interfacesByCapsule = new Map();
-  for (const entry of interfaceEntries) {
-    const capsule = readText(entry && entry.capsule);
-    if (!capsule) {
-      continue;
-    }
-    const current = interfacesByCapsule.get(capsule) || [];
-    current.push(entry);
-    interfacesByCapsule.set(capsule, current);
-  }
-  for (const group of CATALOG_GROUPS) {
-    const members = entries
-      .filter((entry) => readText(entry.role) === group.role)
-      .sort((left, right) => catalogTitle(left).localeCompare(catalogTitle(right)));
-    if (members.length === 0) {
-      continue;
-    }
-    const section = document.createElement("section");
-    section.className = "catalog-group";
-    const heading = document.createElement("div");
-    heading.className = "catalog-group-heading";
-    const title = document.createElement("h2");
-    title.className = "catalog-group-title";
-    title.textContent = group.label;
-    const count = document.createElement("span");
-    count.className = "catalog-group-count";
-    count.textContent = String(members.length);
-    heading.append(title, count);
-    const list = document.createElement("div");
-    list.className = "catalog-list";
-    for (const entry of members) {
-      list.append(catalogRow(entry, entriesByName, interfacesByCapsule.get(readText(entry.name)) || []));
-    }
-    section.append(heading, list);
-    capsuleCatalogNode.append(section);
-  }
-}
-
-function catalogRow(entry, entriesByName, interfaceEntries) {
-  const row = document.createElement("article");
-  row.className = "catalog-row";
-  const body = document.createElement("div");
-  body.className = "catalog-row-body";
-  const title = document.createElement("h3");
-  title.textContent = catalogTitle(entry);
-  const summary = document.createElement("p");
-  summary.className = "catalog-summary";
-  summary.textContent = catalogSummary(entry);
-  body.append(title, summary);
-
-  const facts = catalogFacts(entry, entriesByName, interfaceEntries);
-  if (facts.length > 0) {
-    const list = document.createElement("dl");
-    list.className = "catalog-facts";
-    for (const [label, value] of facts) {
-      const item = document.createElement("div");
-      const key = document.createElement("dt");
-      key.textContent = label;
-      const text = document.createElement("dd");
-      text.textContent = value;
-      item.append(key, text);
-      list.append(item);
-    }
-    body.append(list);
-  }
-  row.append(body);
-
-  if (entry.launchable === true && readText(entry.launch_target)) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "pc2-btn pc2-btn-secondary catalog-open";
-    button.textContent = "Open";
-    button.addEventListener("click", () => openCapsuleTarget(readText(entry.launch_target)));
-    row.append(button);
-  }
-  return row;
-}
-
-function catalogFacts(entry, entriesByName, interfaceEntries) {
-  const facts = [];
-  const role = readText(entry.role);
-  if (role === "viewer") {
-    const accepts = acceptedContent(entry, interfaceEntries);
-    if (accepts.length > 0) {
-      facts.push(["Accepts", joinWords(accepts)]);
-    }
-  }
-  if (role === "content") {
-    const viewer = readText(entry.viewer_title) || catalogTitle(entriesByName.get(readText(entry.viewer)));
-    if (viewer) {
-      facts.push(["Opens with", viewer]);
-    }
-  }
-  const dependencies = (Array.isArray(entry.requires) ? entry.requires : [])
-    .map((requirement) => {
-      const name = readText(requirement && requirement.name);
-      const dependency = entriesByName.get(name);
-      return dependency ? catalogTitle(dependency) : "";
-    })
-    .filter(Boolean);
-  if (dependencies.length > 0) {
-    facts.push(["Needs", joinWords(dependencies)]);
-  }
-  const executable = executableActions(interfaceEntries)
-    .filter((action) => action !== "Open");
-  if (executable.length > 0) {
-    facts.push(["Available", joinWords(executable)]);
-  }
-  return facts;
-}
-
-function acceptedContent(entry, interfaceEntries) {
-  const content = (Array.isArray(entry.accepted_content) ? entry.accepted_content : [])
-    .map((item) => readText(item && item.title) || humanizeName(readText(item && item.name)))
-    .filter(Boolean);
-  const extensions = new Set();
-  for (const interfaceEntry of interfaceEntries) {
-    const methods = interfaceEntry && interfaceEntry.interface && Array.isArray(interfaceEntry.interface.methods)
-      ? interfaceEntry.interface.methods
-      : [];
-    for (const method of methods) {
-      const accepts = method && method.input_schema && Array.isArray(method.input_schema.accepts)
-        ? method.input_schema.accepts
-        : [];
-      for (const accepted of accepts) {
-        if (readText(accepted && accepted.mode) === "unsupported_family_diagnostic") {
-          continue;
-        }
-        for (const extension of Array.isArray(accepted && accepted.extensions) ? accepted.extensions : []) {
-          const value = readText(extension);
-          if (value) {
-            extensions.add(value);
-          }
-        }
-      }
-    }
-  }
-  if (extensions.size > 0) {
-    content.push(`${joinWords([...extensions])} files`);
-  }
-  return content;
-}
-
-function executableActions(interfaceEntries) {
-  const actions = [];
-  for (const interfaceEntry of interfaceEntries) {
-    for (const binding of Array.isArray(interfaceEntry && interfaceEntry.bindings) ? interfaceEntry.bindings : []) {
-      if (!binding || binding.executable !== true) {
-        continue;
-      }
-      const methodId = readText(binding.method);
-      if (methodId === "capsule.open") {
-        actions.push("Open");
-        continue;
-      }
-      const operation = methodId.split(".").filter(Boolean).at(-1);
-      if (operation) actions.push(humanizeName(operation));
-    }
-  }
-  return [...new Set(actions)];
-}
-
-function catalogSummary(entry) {
-  const title = catalogTitle(entry);
-  const role = readText(entry && entry.role);
-  if (role === "provider") {
-    return "Service for apps on this Home.";
-  }
-  if (role === "shell") {
-    return readText(entry && entry.name).endsWith("-cli")
-      ? "Use Home from a command line."
-      : "Use the Home desktop.";
-  }
-  if (readText(entry && entry.name) === "home") {
-    return "Keeps your selected Home view available.";
-  }
-  const description = readText(entry && entry.description)
-    .replace(/\s+through the ElastOS [^.]+ boundary/gi, "")
-    .replace(/\s+inside ElastOS/gi, "")
-    .replace(/\bcapsules\b/gi, "apps")
-    .replace(/\bproviders\b/gi, "services")
-    .replace(/\bruntime settings\b/gi, "settings");
-  if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capabilit(?:y|ies)|affordances?|host-loaded|frontend)\b/i.test(description)) {
-    return description;
-  }
-  if (role === "viewer") {
-    return `Open compatible content with ${title}.`;
-  }
-  return `${title} is available on this Home.`;
-}
-
-function catalogTitle(entry) {
-  const title = readText(entry && entry.title);
-  if (readText(entry && entry.role) === "provider") {
-    return serviceLabel(entry);
-  }
-  return title ? normalizeDisplayTitle(title) : humanizeName(readText(entry && entry.name));
-}
-
-function serviceLabel(entry) {
-  const title = readText(entry && entry.title) || humanizeName(readText(entry && entry.name));
-  return normalizeDisplayTitle(title.replace(/\s+(Provider|Adapter)$/i, ""));
-}
-
-function normalizeDisplayTitle(value) {
-  const acronyms = new Map([["Did", "DID"], ["Gba", "GBA"], ["Ipfs", "IPFS"], ["Cli", "CLI"], ["Gui", "GUI"]]);
-  return readText(value).split(/\s+/).map((part) => acronyms.get(part) || part).join(" ");
-}
-
 function humanizeName(value) {
   const acronyms = new Map([
     ["did", "DID"],
@@ -2811,40 +2479,6 @@ function joinWords(values) {
     return words[0] || "";
   }
   return `${words.slice(0, -1).join(", ")} and ${words.at(-1)}`;
-}
-
-function catalogEmpty(message) {
-  const empty = document.createElement("div");
-  empty.className = "catalog-empty";
-  empty.textContent = message;
-  return empty;
-}
-
-function setCapsuleCatalogBusy(busy) {
-  if (capsuleCatalogRefreshButton) {
-    capsuleCatalogRefreshButton.disabled = busy || !hasShellAccess();
-  }
-}
-
-function showCapsuleCatalogStatus(message, tone) {
-  if (!capsuleCatalogStatusNode) {
-    return;
-  }
-  capsuleCatalogStatusNode.textContent = tone === "error"
-    ? publicSystemError(message, "Apps and services could not be loaded.")
-    : readText(message);
-  capsuleCatalogStatusNode.dataset.tone = tone;
-}
-
-async function refreshPasskeyStatus() {
-  if (!passkeyStatusNode || !window.PublicKeyCredential) {
-    return;
-  }
-  if (passkeyAuthorityActive) {
-    return;
-  }
-  const status = await fetchJson("/api/auth/passkey/status");
-  showPasskeyStatus(status.registered ? "" : "Not set", status.registered ? "muted" : "muted");
 }
 
 async function refreshAccountList() {
@@ -3039,12 +2673,10 @@ async function onAccountListClick(event) {
     });
     if (!promote && revokingCurrent) {
       apiHomeToken = "";
-      passkeyAuthorityActive = false;
       renderAccounts([]);
       showPasskeyStatus("Removed. Open Home to sign in.", "muted");
     } else {
       await refreshAccountList();
-      await refreshPasskeyStatus();
       showPasskeyStatus(promote || demote ? "Updated" : "Removed", "success");
     }
     notifyHomeSummaryChanged();
@@ -4028,7 +3660,6 @@ function setPasskeyAuthority(authority) {
   if (!proofBinding || !proofBinding.startsWith("proof:passkey:")) {
     return;
   }
-  passkeyAuthorityActive = true;
   showPasskeyStatus("", "muted");
 }
 
@@ -4058,27 +3689,27 @@ function setRuntimeState(runtime) {
   setHiddenFields("runtime-status", version.length === 0);
 }
 
+const SOURCE_CHANNEL_NAMES = { canary: "Test", stable: "Stable" };
+const SOURCE_SIGNED_TEXT = "Home installs only updates signed by its configured publisher.";
+
 function setSourceState(source) {
   const configured = Boolean(source && source.configured);
-  const name = configured ? readText(source.name) || "default" : "Not configured";
-  const channel = readText(source && source.channel) || "not configured";
-  const installed = readText(source && source.installed_version) || "unknown";
-  const mode = readText(source && source.mode) || "development";
-  const policy = readText(source && source.update_policy);
-  const transport = readText(source && source.transport);
-  const sourcePeer = readText(source && source.source_peer);
+  const channelId = readText(source && source.channel);
+  const channel = SOURCE_CHANNEL_NAMES[channelId] || channelId;
   const checksAllowed = Boolean(source && source.update_checks_allowed);
-  setTextFields("source-status", configured ? mode : "Not configured");
+  setTextFields("source-status", configured ? channel || "Unknown" : "Off");
   setHiddenFields("source-status", false);
-  setTextFields("source-policy", policy);
-  setTextFields("source-name", name);
-  setTextFields("source-channel", channel);
-  setTextFields("source-installed-version", installed);
-  setTextFields("source-checks", checksAllowed ? "Allowed" : "Disabled");
-  setTextFields(
-    "source-transport",
-    sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
-  );
+  setTextFields("source-policy", !configured
+    ? "Home has no update source, so it does not check for updates."
+    : readText(source.mode) === "development"
+      ? "This is a development build, so System does not check for updates."
+      : !checksAllowed
+        ? "Home cannot check for updates because its update source names no publisher."
+        : channelId === "canary"
+          ? `Test versions arrive here before they become stable. ${SOURCE_SIGNED_TEXT}`
+          : SOURCE_SIGNED_TEXT);
+  setTextFields("source-channel", configured ? channel : "None");
+  setTextFields("source-installed-version", readText(source && source.installed_version) || "unknown");
 }
 
 function configureRuntimeUpdate() {
@@ -4104,6 +3735,23 @@ function homeRuntimeEventsFrom(event) {
     && message?.type === "elastos:runtime-events"
     && message?.schema === "elastos.home.runtime-events/v1"
     && Array.isArray(message.events) ? message.events : null;
+}
+
+// Signed release notes as plain items: a "#" line is a heading, and Markdown marks are dropped.
+function updateNoteItems(notes) {
+  if (!Array.isArray(notes)) return [];
+  return notes.filter((note) => typeof note === "string").slice(0, 32).map((note) => {
+    const line = readText(note);
+    return {
+      heading: /^#{1,6}(?:\s|$)/.test(line),
+      text: line.replace(/^(?:#{1,6}|[-*])(?:\s+|$)/, "")
+        .replace(/\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
+        .replace(/\*\*|__|`/g, "")
+        .replace(/(^|[^\w*])\*(?=\S)([^*]*?\S)\*(?![\w*])/g, "$1$2")
+        .replace(/(^|[^\w])_(?=\S)([^_]*?\S)_(?!\w)/g, "$1$2")
+        .trim(),
+    };
+  }).filter((item) => item.text);
 }
 
 function renderRuntimeUpdate(update) {
@@ -4144,11 +3792,9 @@ function renderRuntimeUpdate(update) {
   setHiddenFields("update-publisher-row", !publisher);
   const hideOffer = runtimeUpdate?.available !== true && !inProgress;
   setHiddenFields("update-offer", hideOffer);
-  const notes = runtimeUpdatePending?.changes || runtimeUpdate?.changes;
-  const changes = Array.isArray(notes) ? notes.filter((note) => typeof note === "string")
-    .slice(0, 32).map((note) => readText(note)).filter(Boolean).join("\n") : "";
-  setHiddenFields("update-changes", hideOffer || (inProgress && !changes && runtimeUpdate?.available !== true));
-  setTextFields("update-changes", changes || "Publisher has not supplied change notes.");
+  const changes = updateNoteItems(runtimeUpdatePending?.changes || runtimeUpdate?.changes);
+  setHiddenFields("update-changes", hideOffer || (inProgress && !changes.length && runtimeUpdate?.available !== true));
+  setUpdateNotes(changes);
   const actionable = runtimeUpdateCanApply();
   runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
   runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);

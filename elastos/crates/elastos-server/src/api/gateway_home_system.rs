@@ -38,11 +38,11 @@ const HOME_BROWSER_EXIT_LOCAL_OFFER_ID: &str = "local:provider:browser-exit";
 const HOME_BROWSER_EXIT_PEER_SERVICE_URI: &str = "elastos://peer/browser-exit";
 const HOME_REMOTE_EXIT_SERVICE_KIND: &str = "remote_exit";
 pub(super) const PROFILE_REQUIRED_DISCOVERY_MESSAGE: &str =
-    "Save your Profile before turning on Discovery";
+    "Save your Profile before turning on Public";
 const PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE: &str =
     "Save your Profile before using People contacts";
 const PROFILE_REQUIRED_SERVICES_MESSAGE: &str =
-    "Save your Profile before using Services with other people";
+    "Save your Profile before sharing with other people";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProfileRequiredError(&'static str);
@@ -172,6 +172,14 @@ pub(super) struct PeopleDiscoveryUpdateRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct PeopleDiscoveryRequestCreate {
     advertisement_id: String,
+}
+
+/// `POST /api/apps/people/contacts/request`: add someone by the DID they
+/// shared. Response `{status, display_name}`; see `contact_request_response`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PeopleContactRequestCreate {
+    profile_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -549,6 +557,7 @@ pub(super) async fn people_summary(
         Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
         None => None,
     };
+    let community_names = community_member_names_or_none(&state).await;
     match tokio::task::spawn_blocking(move || {
         let mut state = home_state(&data_dir);
         let contact_authority = load_configured_contact_authority_for_context(
@@ -569,6 +578,8 @@ pub(super) async fn people_summary(
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
             let snapshot = authority.store.read_only_snapshot()?;
+            stamp_undeliverable_requests(&mut people, &snapshot, service, now)?;
+            stamp_community_names(&mut people, &snapshot, &community_names, now)?;
             configured_people_discovery_summary(
                 &service.read_only_status_from_snapshot(&snapshot, &authority.profile, now)?,
                 &contact_relationships(&snapshot, now),
@@ -577,9 +588,15 @@ pub(super) async fn people_summary(
         } else {
             unconfigured_people_discovery_summary()
         };
+        // The local Profile DID, so People can show "Your DID" and copy it.
+        // It is deliberately not part of `identity`, which never carries DIDs.
+        let profile_id = contact_authority
+            .as_ref()
+            .map(|authority| authority.profile.document().profile_did.clone());
         Ok::<_, anyhow::Error>(serde_json::json!({
             "schema": "elastos.people.summary/v1",
             "identity": identity.without_device_identity(),
+            "profile_id": profile_id,
             "people": people,
             "discovery": discovery,
         }))
@@ -658,11 +675,7 @@ pub(super) async fn people_discovery_request_create(
 ) -> Response {
     let advertisement_id = body.advertisement_id.trim().to_string();
     if advertisement_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "discovery advertisement id is required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "Choose someone on Public to add.").into_response();
     }
     let summary = match configured_people_discovery_action(
         &state,
@@ -773,6 +786,176 @@ pub(super) async fn people_contact_remove(
     .into_response()
 }
 
+pub(super) async fn people_contact_request_create(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleContactRequestCreate>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
+    let Some(service) = state.collaboration_discovery_service.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            "Contacts are unavailable on this Home.",
+        )
+            .into_response();
+    };
+    let data_dir = state.data_dir.clone();
+    let authority = match tokio::task::spawn_blocking({
+        let context = context.clone();
+        let service = service.clone();
+        move || load_configured_contact_authority_for_context(&data_dir, &context, Some(&service))
+    })
+    .await
+    {
+        Ok(Ok(Some(authority))) => authority,
+        Ok(Ok(None)) => {
+            return room_service_error_response(profile_required_error(
+                PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE,
+            ))
+        }
+        Ok(Err(err)) => return room_service_error_response(err),
+        Err(err) => return room_service_join_error_response(err),
+    };
+    let recipient = body.profile_id.trim().to_string();
+    let community_names = community_member_names_or_none(&state).await;
+    send_profile_contact_request_response(
+        &service,
+        &state,
+        &community_names,
+        &context,
+        &authority,
+        &recipient,
+    )
+    .await
+}
+
+/// Community names for presentation only: an unreadable source leaves the
+/// name unknown and never blocks the action.
+pub(super) async fn community_member_names_or_none(
+    state: &GatewayState,
+) -> std::collections::HashMap<String, String> {
+    match super::gateway_room::community_member_names(state, now_ts()).await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "Community names are unavailable");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Queues a request by Profile DID and answers with `contact_request_answer`.
+/// A refusal is a 400 or 409 whose body is the refusal's text, and never
+/// echoes the DID. The device DIDs this Home knows from Community, presence
+/// and signed posts, are refused like a contact's device DID.
+pub(super) async fn send_profile_contact_request_response(
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    state: &GatewayState,
+    community_names: &std::collections::HashMap<String, String>,
+    context: &HomeLaunchTokenContext,
+    authority: &ConfiguredContactAuthority,
+    recipient_profile_did: &str,
+) -> Response {
+    let now = now_ts();
+    // The device check only adds a refusal; an unreadable Community store
+    // must not block a request by DID.
+    let mut seen_device_dids = Vec::new();
+    if let Some(port) = state.collaboration_presence_product_port.as_ref() {
+        match port.seen_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community presence")
+            }
+        }
+    }
+    if let Some(port) = state.collaboration_chat_product_port.as_ref() {
+        match port.community_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community posts")
+            }
+        }
+    }
+    // A Community node that refuses requests by DID is known before anything
+    // is queued, so the first request is refused like the later ones.
+    service
+        .check_profile_relay_support(authority.store.as_ref(), &authority.profile, now)
+        .await;
+    let outcome = match service
+        .send_profile_contact_request(
+            authority.store.as_ref(),
+            recipient_profile_did,
+            &seen_device_dids,
+            &authority.profile,
+            now,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => return room_service_error_response(err),
+    };
+    if let Err(err) = register_configured_contact_sync_for_context(service, context, authority, now)
+        .and_then(|()| {
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)
+        })
+    {
+        return room_service_error_response(err);
+    }
+    // The signed name this Home holds: its contact store first, then the
+    // Community names Chat shows.
+    let display_name = if outcome
+        == crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::OwnProfile
+    {
+        Ok(None)
+    } else {
+        authority
+            .store
+            .read_only_snapshot()
+            .and_then(|read| read.display_name_for(recipient_profile_did, now))
+    };
+    match display_name {
+        Ok(name) => contact_request_answer(
+            &outcome,
+            name.or_else(|| community_names.get(recipient_profile_did).cloned())
+                .as_deref(),
+        ),
+        Err(err) => room_service_error_response(err),
+    }
+}
+
+/// The answer to a contact request from People or a Chat card:
+/// `{status, message}`. `status` is `requested`, `already_requested`,
+/// `already_contact`, `pending_from_them` or `own_profile`; `message` is the
+/// text a person sees, naming them by the signed name this Home holds, if any.
+pub(super) fn contact_request_answer(
+    outcome: &crate::collaboration_discovery_runtime::ProfileContactRequestOutcome,
+    display_name: Option<&str>,
+) -> Response {
+    use crate::collaboration_discovery_runtime::ProfileContactRequestOutcome as Outcome;
+    let message = match (outcome, display_name) {
+        // A pending request is one fact; who sees it when is not something
+        // to act on.
+        (Outcome::Requested | Outcome::AlreadyRequested, _) => "Request sent.".to_string(),
+        (Outcome::AlreadyContact { .. }, Some(name)) => format!("{name} is already a contact."),
+        (Outcome::AlreadyContact { .. }, None) => "They're already a contact.".to_string(),
+        (Outcome::PendingFromThem { .. }, Some(name)) => {
+            format!("{name} already asked to connect. Open Inbox to answer.")
+        }
+        (Outcome::PendingFromThem { .. }, None) => {
+            "They already asked to connect. Open Inbox to answer.".to_string()
+        }
+        (Outcome::OwnProfile, _) => "That's your own DID.".to_string(),
+    };
+    Json(serde_json::json!({
+        "status": outcome.status(),
+        "message": message,
+    }))
+    .into_response()
+}
+
 fn configured_people_summary_from_contact_store(
     store: &crate::collaboration_contact_store::CollaborationContactStore,
 ) -> anyhow::Result<HomePeopleSummary> {
@@ -800,6 +983,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         })
         .collect::<Vec<_>>();
     // The complete People states, each projected from signed truth. Precedence
@@ -812,22 +996,25 @@ fn configured_people_summary_from_snapshot(
         .map(|contact| contact.remote_profile_did().to_string())
         .collect();
     for requested in read.outgoing_pending_requests(now)? {
-        if !seen.insert(requested.remote_profile_did.clone()) {
+        if !seen.insert(requested.recipient_profile_did.clone()) {
             continue;
         }
         contacts.push(HomePeopleContactSummary {
-            contact_id: home_people_contact_id(&requested.remote_profile_did),
-            remote_profile_did: Some(requested.remote_profile_did.clone()),
-            added_at: requested.occurred_at,
+            contact_id: home_people_contact_id(&requested.recipient_profile_did),
+            remote_profile_did: Some(requested.recipient_profile_did),
+            added_at: requested.created_at,
             conversation_id: None,
-            display_name: requested.display_name.clone(),
-            handle: requested.handle.clone(),
+            // Empty while this Home holds no signed Profile for them; People
+            // then shows the row as Request sent.
+            display_name: requested.display_name.unwrap_or_default(),
+            handle: requested.handle,
             relationship: "requested".to_string(),
             can_message: false,
             device_label: None,
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     for removed in snapshot.removed() {
@@ -851,6 +1038,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     for declined in read.declined_relationships()? {
@@ -870,6 +1058,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     Ok(HomePeopleSummary {
@@ -888,8 +1077,9 @@ pub(super) struct ConfiguredContactAuthority {
 }
 
 /// Profile DID to (`contact` | `requested` | `pending`, direct conversation)
-/// from this principal's signed contact store. People absent from the map
-/// have no relationship yet; a store that cannot be read yields none.
+/// from this principal's signed contact store, over both request kinds. A
+/// removed or declined pair is absent like a stranger, because a new request
+/// may be sent to it; a store that cannot be read yields none.
 pub(super) type ContactRelationships =
     std::collections::HashMap<String, (&'static str, Option<String>)>;
 
@@ -897,29 +1087,24 @@ pub(super) fn contact_relationships(
     store: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
     now: u64,
 ) -> ContactRelationships {
-    let mut relationships = ContactRelationships::new();
-    if let Ok(requests) = store.pending_incoming_requests() {
-        for request in requests {
-            relationships.insert(
-                request.requester_profile_did().to_string(),
-                ("pending", None),
-            );
-        }
-    }
-    if let Ok(requests) = store.outgoing_pending_requests(now) {
-        for request in requests {
-            relationships.insert(request.remote_profile_did, ("requested", None));
-        }
-    }
-    if let Ok(snapshot) = store.snapshot() {
-        for contact in snapshot.contacts() {
-            relationships.insert(
-                contact.remote_profile_did().to_string(),
-                ("contact", Some(contact.conversation_id().to_string())),
-            );
-        }
-    }
+    use crate::collaboration_contact_store::CollaborationContactRelationship as Relationship;
+    let Ok(relationships) = store.relationships(now) else {
+        return ContactRelationships::new();
+    };
     relationships
+        .into_iter()
+        .filter_map(|(profile_did, relationship)| {
+            let conversation_id = match &relationship {
+                Relationship::Contact { conversation_id } => Some(conversation_id.clone()),
+                Relationship::PendingFromThem { .. } | Relationship::Requested => None,
+                Relationship::None
+                | Relationship::OwnProfile
+                | Relationship::Removed { .. }
+                | Relationship::Declined => return None,
+            };
+            Some((profile_did, (relationship.as_str(), conversation_id)))
+        })
+        .collect()
 }
 
 /// Adds this principal's durable pending contact requests to one Home/Inbox
@@ -1089,11 +1274,7 @@ where
     let presentation = match authenticated_presence_presentation_for_context(state, &context) {
         Ok(presentation) => presentation,
         Err(HomePresenceAuthenticationError::Denied) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "People discovery authorization denied",
-            )
-                .into_response());
+            return Err((StatusCode::FORBIDDEN, "Public isn’t allowed here.").into_response());
         }
         Err(HomePresenceAuthenticationError::ProfileRequired) => {
             return Err((StatusCode::CONFLICT, PROFILE_REQUIRED_DISCOVERY_MESSAGE).into_response());
@@ -1101,7 +1282,7 @@ where
         Err(HomePresenceAuthenticationError::Internal) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "People discovery presentation is unavailable",
+                "Public isn’t available right now.",
             )
                 .into_response());
         }
@@ -1111,7 +1292,7 @@ where
         if require_configured {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "collaboration discovery is not configured",
+                "Public isn’t available on this Home.",
             )
                 .into_response());
         }
@@ -1184,31 +1365,24 @@ fn configured_people_discovery_summary(
             crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string(),
         )
     } else if !status.enabled() && remote_visibility_may_remain_until.is_some() {
-        let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
+        // The last listing outlives the switch until it expires; no countdown,
+        // since the person cannot act on the seconds.
         (
             "off_pending_expiry",
-            format!(
-                "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another {remaining} seconds while withdrawal is unavailable.",
-            ),
+            "Public is off. You may stay listed for a few minutes.".to_string(),
         )
     } else if !status.enabled() {
-        ("off", "Discovery is off.".to_string())
+        ("off", "Public is off.".to_string())
     } else if status.connecting() {
-        (
-            "connecting",
-            "Discovery is connecting. People who are visible appear here in a few seconds."
-                .to_string(),
-        )
+        ("connecting", "Public is on.".to_string())
     } else if status.available() {
-        (
-            "visible",
-            "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
-                .to_string(),
-        )
+        // The listing lasts ten minutes and renews while a signed-in session
+        // keeps this Profile's sync registered, so it reads as plain on.
+        ("visible", "Public is on.".to_string())
     } else {
         (
             "relay_unavailable",
-            "Discovery is temporarily unavailable. Runtime will retry.".to_string(),
+            "Public isn’t working right now. Your Home will try again.".to_string(),
         )
     };
     HomePeopleDiscoverySummary {
@@ -1237,7 +1411,7 @@ fn unconfigured_people_discovery_summary() -> HomePeopleDiscoverySummary {
         remote_visibility_may_remain_until: None,
         remote_visibility_remaining_seconds: None,
         status: "unconfigured".to_string(),
-        status_message: "Discovery isn’t available on this Home.".to_string(),
+        status_message: "Public isn’t available on this Home.".to_string(),
         discovered_count: 0,
         discovered_peers: Vec::new(),
         request_count: 0,
@@ -1328,10 +1502,7 @@ mod discovery_summary_tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["request_count"], 1);
         assert!(json.get("requests").is_none());
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("ten minutes"));
+        assert_eq!(json["status_message"], "Public is on.");
         assert_eq!(json["discovered_peers"][0]["advertisement_id"], "ad-123");
         assert!(json["discovered_peers"][0].get("peer_id").is_none());
     }
@@ -1412,10 +1583,10 @@ mod discovery_summary_tests {
         assert!(json["expires_at"].is_null());
         assert_eq!(json["remote_visibility_may_remain_until"], 700);
         assert_eq!(json["remote_visibility_remaining_seconds"], 600);
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("another 600 seconds"));
+        assert_eq!(
+            json["status_message"],
+            "Public is off. You may stay listed for a few minutes."
+        );
     }
 
     #[test]
@@ -1457,10 +1628,7 @@ mod discovery_summary_tests {
 
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["status"], "connecting");
-        assert_eq!(
-            json["status_message"],
-            "Discovery is connecting. People who are visible appear here in a few seconds."
-        );
+        assert_eq!(json["status_message"], "Public is on.");
     }
 
     #[test]
@@ -1491,7 +1659,7 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "relay_unavailable");
         assert_eq!(
             json["status_message"],
-            "Discovery is temporarily unavailable. Runtime will retry."
+            "Public isn’t working right now. Your Home will try again."
         );
         assert_eq!(json["request_count"], 1);
         assert!(json.get("pending_request_count").is_none());
@@ -2168,6 +2336,7 @@ mod discovery_summary_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             service_offer_count: 0,
             service_offers: Vec::new(),
@@ -2195,11 +2364,79 @@ fn stamp_contact_reachability(
         let Some(profile_did) = contact.remote_profile_did.as_deref() else {
             continue;
         };
-        contact.reachable =
-            Some(snapshot.records().iter().any(|record| {
-                record.sender_profile_did() == profile_did && record.expires_at() > now
-            }));
+        contact.reachable = Some(profile_reachable(snapshot, profile_did, now));
     }
+}
+
+/// A waiting request to someone whose signed Profile this Home's contact
+/// store does not hold is named from Community, as Chat's card names them.
+fn stamp_community_names(
+    people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    community_names: &std::collections::HashMap<String, String>,
+    now: u64,
+) -> anyhow::Result<()> {
+    for contact in &mut people.contacts {
+        if contact.relationship != "requested" {
+            continue;
+        }
+        let Some(did) = contact.remote_profile_did.as_deref() else {
+            continue;
+        };
+        let Some(name) = community_names.get(did) else {
+            continue;
+        };
+        if read.display_name_for(did, now)?.is_none() {
+            contact.display_name = name.clone();
+        }
+    }
+    Ok(())
+}
+
+/// While the Community node refuses the Profile-contact operations (it runs
+/// a release older than 0.8.0), each waiting request by DID says it can't
+/// be delivered. Requests bound to a Discovery listing use the v1 operations
+/// and keep their plain row. The outbox keeps retrying either way.
+fn stamp_undeliverable_requests(
+    people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    now: u64,
+) -> anyhow::Result<()> {
+    if !service.profile_contact_delivery_unavailable() {
+        return Ok(());
+    }
+    let waiting = read
+        .outgoing_pending_requests(now)?
+        .into_iter()
+        .filter(|request| request.addressed_by_did)
+        .map(|request| request.recipient_profile_did)
+        .collect::<std::collections::HashSet<_>>();
+    for contact in &mut people.contacts {
+        if contact.relationship == "requested"
+            && contact
+                .remote_profile_did
+                .as_deref()
+                .is_some_and(|did| waiting.contains(did))
+        {
+            contact.delivery_detail =
+                Some(crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `profile_did` has an unexpired presence heartbeat right now: the
+/// one meaning of "reachable" for a contact.
+pub(super) fn profile_reachable(
+    snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,
+    profile_did: &str,
+    now: u64,
+) -> bool {
+    snapshot
+        .records()
+        .iter()
+        .any(|record| record.sender_profile_did() == profile_did && record.expires_at() > now)
 }
 
 fn apply_profile_people_authority(
@@ -2269,6 +2506,7 @@ fn apply_services_peer_authority_from_snapshot(
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             })
         })
         .collect::<Vec<_>>();
@@ -2390,14 +2628,11 @@ pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_launch_token_binding(
-        &state.data_dir,
-        &headers,
-        &[SERVICES_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
-    ) {
-        Ok(binding) => binding.context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SERVICES_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     let provider_registry = state.provider_registry.clone();
@@ -3933,6 +4168,70 @@ fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String 
     }
 }
 
+/// The presence device DID of `context`'s accepted contact that speaks as the
+/// Carrier peer `source`, if any. Every Carrier service that serves only
+/// contacts asks this one question. A principal without a Profile has no
+/// contacts.
+fn accepted_contact_for_carrier_source(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    context: &HomeLaunchTokenContext,
+    local_did: &str,
+    source: &iroh::PublicKey,
+) -> anyhow::Result<Option<String>> {
+    let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
+        return Ok(None);
+    };
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        data_dir,
+        &context.principal_id,
+        &home_browser_localhost_root(context),
+        network.clone(),
+        &profile,
+        local_did,
+    )?;
+    Ok(store
+        .snapshot()?
+        .contacts()
+        .iter()
+        .find(|contact| {
+            crate::carrier::did_to_public_key(contact.remote_presence_device_did()) == Some(*source)
+        })
+        .map(|contact| contact.remote_presence_device_did().to_string()))
+}
+
+/// Whether the Carrier peer `source` is an accepted contact of any of
+/// `principals` on this Home: the people a published file is for. A store
+/// that cannot be read counts as no contact.
+pub(crate) fn carrier_source_is_contact_of(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    principals: &std::collections::BTreeSet<String>,
+    source: &iroh::PublicKey,
+) -> bool {
+    let Ok(Some(local_did)) =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)
+    else {
+        return false;
+    };
+    let Ok(records) = crate::auth::active_passkey_principals(data_dir) else {
+        return false;
+    };
+    passkey_principals_once(records)
+        .into_iter()
+        .filter(|(principal, _)| principals.contains(&principal.principal_id))
+        .any(|(principal, _)| {
+            let context = HomeLaunchTokenContext {
+                principal_id: principal.principal_id,
+                proof_binding_id: Some(principal.proof_binding_id),
+                session_id: String::new(),
+                grant_id: String::new(),
+            };
+            accepted_contact_for_carrier_source(data_dir, network, &context, &local_did, source)
+                .is_ok_and(|contact| contact.is_some())
+        })
+}
+
 /// One entry per principal from the active passkey records. A principal with
 /// several passkeys has one record per passkey but owns one set of service
 /// requests, so the grant loops must read it once. The flag is true only when
@@ -3989,24 +4288,11 @@ pub(crate) fn authorize_home_service_exit(
                     && home_services_local_exit_shared(data_dir, &context)?,
                 "Exit grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Exit profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Exit requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserExitGrant {
@@ -4122,24 +4408,11 @@ pub(crate) fn authorize_home_service_engine(
                     && home_services_local_engine_shared(data_dir, &context)?,
                 "Engine grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Engine profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Engine requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserEngineGrant {
@@ -4441,24 +4714,11 @@ pub(crate) fn authorize_home_service_model(
                         || crate::api::any_hosted_model_shared(data_dir)),
                 "model grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("model profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "model requester is no longer an accepted contact"
             );
             let grant = super::ModelServiceGrant {
@@ -4918,7 +5178,7 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
 }
 
 const PRIVATE_ENGINE_APPROVAL_COPY: &str =
-    "Your Browser Engine is private. Share it in Services before approving this request.";
+    "Your Browser Engine is not shared, so this request cannot be approved.";
 const HOSTED_MODEL_APPROVAL_COPY: &str =
     "Only an admin can approve use of this Home's hosted AI connection.";
 
@@ -4993,14 +5253,16 @@ pub(super) fn append_home_service_access_notifications(
             match home_services_local_engine_shared(data_dir, context) {
                 Ok(false) => PRIVATE_ENGINE_APPROVAL_COPY.to_string(),
                 Ok(true) => approval_effect.to_string(),
-                Err(_) => "Check Browser Engine sharing in Services before approval.".to_string(),
+                Err(_) => {
+                    "This Home could not check whether your Browser Engine is shared.".to_string()
+                }
             }
         } else {
             approval_effect.to_string()
         };
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
                 "{} requests your {service_noun}",
@@ -5011,7 +5273,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),
             }),
             severity: "attention".to_string(),
@@ -5028,7 +5290,7 @@ pub(super) fn append_home_service_access_notifications(
             home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_grant".to_string(),
             title: format!(
                 "{} may use your {service_noun}",
@@ -5039,7 +5301,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-deny-request:{}", request.request_id),
             }),
             severity: "info".to_string(),
@@ -5693,6 +5955,10 @@ async fn home_realtime_snapshot(
             service.read_only_status(authority.store.as_ref(), &authority.profile, now_ts())
         {
             people_signature.push(home_discovery_realtime_signature(&status));
+        }
+        // Waiting requests by DID change their row text when this flips.
+        if service.profile_contact_delivery_unavailable() {
+            people_signature.push("profile-contact-undeliverable".to_string());
         }
     }
     let services_signature = home_services_realtime_signature(&home_state.services);
@@ -8476,9 +8742,21 @@ pub(super) async fn home_background_image(
     ) {
         Ok(bytes) => {
             let mut response = bytes.into_response();
-            response.headers_mut().insert(
+            let headers = response.headers_mut();
+            headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
+            );
+            // Home owns this authenticated same-origin read and hands image
+            // bytes to the opaque GUI/System frames. CORP governs embedding;
+            // the Home token and browser provenance gates above own access.
+            headers.insert(
+                axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+                HeaderValue::from_static("cross-origin"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
             );
             response
         }
@@ -8539,6 +8817,7 @@ mod home_realtime_tests {
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         };
         let mut people = HomePeopleSummary {
             contact_count: 3,
@@ -8582,6 +8861,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: Some(20),
                 reachable: Some(true),
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };
@@ -8614,6 +8894,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };

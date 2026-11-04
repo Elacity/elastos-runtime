@@ -2316,6 +2316,23 @@ fn people_identity_for_full_bundle(
             .expect("people identity is an object")
             .insert("contact_store_state".to_string(), contact_store_state);
     }
+    // Contacts added by DID live in a sibling file; it travels beside the v1
+    // state so a recovered Home keeps them.
+    if let Some(profile_contact_store_state) =
+        crate::collaboration_contact_store::export_profile_contact_store_state_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+        )?
+    {
+        people_identity
+            .as_object_mut()
+            .expect("people identity is an object")
+            .insert(
+                "profile_contact_store_state".to_string(),
+                profile_contact_store_state,
+            );
+    }
     Ok(Some(people_identity))
 }
 
@@ -2444,6 +2461,15 @@ fn restore_people_identity_inner(
         }
         None => false,
     };
+    if let Some(state) = people_identity.get("profile_contact_store_state") {
+        crate::collaboration_contact_store::restore_profile_contact_store_state_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+            state,
+            &profile_did,
+        )?;
+    }
     let (_, device_did) = elastos_identity::load_or_create_did(data_dir)?;
     let rebound_device = if restored.authorizes_endpoint(&device_did) {
         false
@@ -5719,7 +5745,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .revoked_at = Some(crate::auth::now_ts());
-        crate::auth::save_auth_state(root.path(), &auth).unwrap();
+        crate::auth::save_auth_state(root.path(), &auth, None).unwrap();
         let auth_path = crate::auth::auth_state_path(root.path()).unwrap();
         let identity_path = root.path().join("identity/credentials.json");
         let auth_before = std::fs::read(&auth_path).unwrap();
@@ -5773,7 +5799,7 @@ mod tests {
             destination.join("identity/device.key"),
         )
         .unwrap();
-        crate::auth::save_auth_state(destination, &state).unwrap();
+        crate::auth::save_auth_state(destination, &state, None).unwrap();
     }
 
     fn home_token_headers(token: &str) -> HeaderMap {
@@ -7343,7 +7369,7 @@ mod tests {
         protection.protectors.clear();
         let mut auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         auth_state.principal_root_protections.push(protection);
-        crate::auth::save_auth_state(temp.path(), &auth_state).unwrap();
+        crate::auth::save_auth_state(temp.path(), &auth_state, None).unwrap();
 
         let err = recovery_status_inner(&state, &home_token_headers(&grant.home_token))
             .await
@@ -7587,7 +7613,7 @@ mod tests {
         .unwrap();
         let mut auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         auth_state.principal_root_protections.clear();
-        crate::auth::save_auth_state(temp.path(), &auth_state).unwrap();
+        crate::auth::save_auth_state(temp.path(), &auth_state, None).unwrap();
         let request = RecoveryKitMaterialImport {
             principal_id: grant.principal_id.clone(),
             localhost_root: principal.localhost_root.clone(),
@@ -8895,7 +8921,7 @@ mod tests {
                 } else {
                     auth.sessions[0].revoked_at = Some(crate::auth::now_ts());
                 }
-                crate::auth::save_auth_state(root.path(), &auth).unwrap();
+                crate::auth::save_auth_state(root.path(), &auth, None).unwrap();
                 assert!(
                     crate::auth::confirmed_initial_profile_name(root.path(), &original).is_err()
                 );
@@ -9063,7 +9089,7 @@ mod tests {
         assert!(passkey_response_for_grant(&state, guest.clone()).is_err());
         let mut auth = crate::auth::load_auth_state(root.path()).unwrap();
         auth.sessions.clear();
-        crate::auth::save_auth_state(root.path(), &auth).unwrap();
+        crate::auth::save_auth_state(root.path(), &auth, None).unwrap();
         let current = local_profile_sign_in(root.path(), &guest_credential);
         let response = passkey_response_for_grant(&state, current.clone()).unwrap();
         assert_eq!(response.principal_id, guest.principal_id);

@@ -206,11 +206,13 @@ const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
   "browser-engine-adapter", "browser-local-exit",
   "webspace-provider", "object-provider", "wallet-provider", "model-provider",
-  "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
+  "home", "home-cli", "home-gui", "system", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
 const obsolete = ["browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
 const archiveAssets = ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"];
+// Hidden in 0.8.0: fresh Homes do not install them; they stay published for `setup --with` and updates.
+const hiddenFromHome = ["services", "wallet-walletconnect", "content-block-graph-provider", "elacity-player", "protected-content-protect-provider", "protected-content-decrypt-provider", "media-provider", "media-tools"];
 
 export function parsePublishData(shellSource, rustSource) {
   const shell = (name) => {
@@ -269,6 +271,10 @@ export function validateComponents(components, manifests) {
   const home = components.profiles.home.components;
   for (const name of homeCore) assert(home.includes(name), `home: required component ${name}`);
   for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "custody-provider", "gba-emulator", "gba-ucity"]) assert(!home.includes(name), `Home: ${name} is a developer --with component`);
+  for (const name of hiddenFromHome) {
+    assert(!home.includes(name), `Home: ${name} is hidden in 0.8.0 and installs only with --with`);
+    assert(object(components.external[name]?.platforms), `${name}: hidden component stays published for --with`);
+  }
   // Local AI is optional: Assistant fetches the engine and models from the signed release on demand (#217).
   // model-provider is the Runtime's model broker, not a model.
   const localAi = home.filter((name) => name === "llama-server" || (name.startsWith("model-") && name !== "model-provider"));

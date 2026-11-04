@@ -603,7 +603,7 @@ Escape, or picking an item closes it. It is bound by markup alone
 | Library | one header block: navigation row with the folder as title, Favorites as a sliding chip row; Search takes the navigation row; the icons/details toggle is two 44 px segments; status floats as a pill |
 | System | menu button on the leading edge, on the page title's line, leads the push drawer at every phone width |
 | Inbox | the filters (the phone bar has no app menu) return as a two-segment row above the list; the request list is as tall as its requests (capped at 40 dvh); the detail follows directly |
-| People | 44 px buttons and 16 px profile fields |
+| People | People, Profile and Public are a three-segment row above the content, as on a narrow window; 44 px buttons and 16 px fields |
 | Archive | 44 px Open archive and New ZIP |
 | Assistant | a vendor-ui target, so the room lands the size class; composer controls, the field, header buttons and session rows are 44 px, with the composer chips keeping their 32 px paint |
 | Browser | the navigation row spans the stage (no traffic-light inset) with 44 px controls; a sticky status's Copy is a 44 px snackbar action |
@@ -616,8 +616,9 @@ A first-party capsule fits the phone stage when:
   from `capsules/_shared/elastos-ui.css`, vendored with `just vendor-ui`;
   never edit the generated per-capsule copies);
 - text inputs are 16 px on the phone stage so iOS does not zoom the page;
-- a sidebar or navigation column becomes a sheet or drawer on the phone stage and
-  content comes first;
+- a sidebar or navigation column becomes a sheet or drawer on the phone stage,
+  or a segmented row above the content when it has only a few pages (People),
+  and content comes first;
 - rows are at least 48 px tall;
 - the capsule needs no keyboard code: the shell ends its frame above the soft
   keyboard (a framed `visualViewport` never sees the keyboard, so capsule-side

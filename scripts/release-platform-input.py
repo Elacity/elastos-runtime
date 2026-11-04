@@ -29,6 +29,23 @@ SCHEMA = "elastos.release-platform-input/v1"
 RELEASE_NETWORK_FILE = "collaboration-network-release-v1.json"
 # Publication imports a pinned raw block up to this size.
 MAX_RELEASE_NETWORK_BYTES = 2 * 1024 * 1024
+
+
+def read_whole_content_ceiling():
+    """elastos_common::MAX_WHOLE_CONTENT_BYTES, read from its one definition."""
+    text = (SCRIPT_ROOT.parent / "elastos/crates/elastos-common/src/lib.rs").read_text()
+    match = re.search(r"^pub const MAX_WHOLE_CONTENT_BYTES: usize = ([0-9_ *]+);$", text, re.M)
+    if match is None:
+        raise RuntimeError("elastos-common no longer defines MAX_WHOLE_CONTENT_BYTES")
+    value = 1
+    for factor in match.group(1).split("*"):
+        value *= int(factor.strip().replace("_", ""))
+    return value
+
+
+# Runtime moves every release file except the Browser image whole through
+# memory (Carrier content_fetch, ipfs-provider whole reads); each must fit.
+WHOLE_CONTENT_CEILING = read_whole_content_ceiling()
 PLATFORMS = {
     "x86_64-linux": ("linux-amd64", "x86_64-unknown-linux-musl", 62),
     "aarch64-linux": ("linux-arm64", "aarch64-unknown-linux-musl", 183),
@@ -234,6 +251,27 @@ def check_binary(path, platform):
     with path.open("rb") as source:
         header = source.read(64)
     check_native_header(header, path.stat().st_mode, platform, path.name)
+
+
+def macos_minos(otool_load_commands):
+    """Minimum macOS from `otool -l` text: LC_BUILD_VERSION minos or LC_VERSION_MIN_MACOSX version."""
+    found, command = [], None
+    for line in otool_load_commands.splitlines():
+        words = line.split()
+        if words[:1] == ["cmd"] and len(words) == 2:
+            command = words[1]
+        elif ((command == "LC_BUILD_VERSION" and words[:1] == ["minos"])
+              or (command == "LC_VERSION_MIN_MACOSX" and words[:1] == ["version"])) and len(words) == 2:
+            found.append(tuple(int(part) for part in words[1].split(".")))
+    if not found:
+        raise ValueError("Mach-O has no macOS minimum version")
+    return max(found)
+
+
+def check_macos_floor(otool_load_commands, floor, label):
+    minos = macos_minos(otool_load_commands)
+    if minos > tuple(int(part) for part in floor.split(".")):
+        raise ValueError(f"{label}: requires macOS {'.'.join(map(str, minos))}, above its {floor} floor")
 
 
 def check_native_header(header, mode, platform, label):
@@ -616,6 +654,7 @@ def check_contents(root, platform, omissions):
     browser_scripts = (browser_host.script_sources(template, setup_platform, native_handoff)
                        if browser_role else {})
     referenced = {f"elastos-{platform}"}
+    streamed = set()  # The Browser image streams to disk instead.
     for name, component in manifest["external"].items():
         contract = lambda value: {k: v for k, v in value.items() if k not in ("platforms", "capsule_metadata")}
         if contract(component) != contract(template["external"][name]):
@@ -671,6 +710,7 @@ def check_contents(root, platform, omissions):
                 if not image_strategy or info.get("extract_path") != BROWSER_IMAGE or expected_install != BROWSER_IMAGE_INSTALL:
                     raise ValueError("Browser image descriptor requires its atomic image-set contract")
                 check_browser_image_archive(path, setup_platform)
+                streamed.add(relative)
                 continue
             if name in upstream_recipes:
                 continue  # Complete archive admission above includes the extracted native payload.
@@ -694,6 +734,11 @@ def check_contents(root, platform, omissions):
     admit_collaboration_network_artifact(manifest, template, root / "artifacts", referenced)
     if actual != referenced:
         raise ValueError(f"artifact inventory mismatch: {sorted(actual ^ referenced)}")
+    for relative in sorted(referenced - streamed):
+        size = (root / "artifacts" / relative).stat().st_size
+        if size > WHOLE_CONTENT_CEILING:
+            raise ValueError(f"{relative}: {size} bytes exceed the whole-content transfer "
+                             f"ceiling of {WHOLE_CONTENT_CEILING} bytes")
     return manifest, template
 
 
@@ -1373,6 +1418,9 @@ def main():
     create.add_argument("--platform", choices=PLATFORMS, required=True)
     check = commands.add_parser("verify")
     check.add_argument("root", type=Path)
+    floor = commands.add_parser("macos-floor", help="refuse Mach-O files whose minimum macOS exceeds the floor")
+    floor.add_argument("--floor", required=True)
+    floor.add_argument("files", nargs="+", type=Path)
     reuse = commands.add_parser("copy-support", help="copy verified native support without the original Runtime")
     for name in ("input", "root"):
         reuse.add_argument("--" + name, type=Path, required=True)
@@ -1411,6 +1459,9 @@ def main():
             copy_support(args)
         elif args.command == "verify":
             print(json.dumps(verify(args.root), sort_keys=True))
+        elif args.command == "macos-floor":
+            for path in args.files:
+                check_macos_floor(run("otool", "-l", str(path)), args.floor, path.name)
         elif args.command == "stage-inputs":
             stage_inputs(args.input, args.version, args.output, args.preview_platform)
         elif args.command == "verify-staged":

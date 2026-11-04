@@ -512,7 +512,7 @@ fn add_second_active_passkey(
     second.proof_binding_id = second.proof_binding.id();
     second.role = role;
     auth.principals.push(second);
-    crate::auth::save_auth_state(data_dir, &auth).unwrap();
+    crate::auth::save_auth_state(data_dir, &auth, None).unwrap();
     assert_eq!(
         crate::auth::active_passkey_principals(data_dir)
             .unwrap()

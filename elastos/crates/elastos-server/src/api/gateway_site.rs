@@ -523,10 +523,14 @@ pub(super) async fn redirect_cid_root(Path(cid): Path<String>) -> Redirect {
 
 pub(super) async fn serve_cid_root(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path(cid): Path<String>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
+    }
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
     }
 
     serve_directory_root(&state, &cid).await
@@ -534,40 +538,40 @@ pub(super) async fn serve_cid_root(
 
 pub(super) async fn serve_ipfs_cid_root(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path(cid): Path<String>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
     }
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
+    }
 
-    let raw_cache = state.cache_dir.join(format!("{}.raw", cid));
-    if let Ok(bytes) = tokio::fs::read(&raw_cache).await {
-        return (
+    match fetch_file_inline(&state, &cid, "").await {
+        Ok(bytes) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
             bytes,
         )
-            .into_response();
-    }
-
-    let cached_index = state.cache_dir.join(&cid).join("index.html");
-    if cached_index.is_file() {
-        return serve_directory_root(&state, &cid).await;
-    }
-
-    match fetch_file_inline(&state, &cid, "").await {
-        Ok(bytes) => {
-            let _ = tokio::fs::create_dir_all(&state.cache_dir).await;
-            let _ = tokio::fs::write(&raw_cache, &bytes).await;
-            (
-                StatusCode::OK,
-                [("content-type", "application/octet-stream")],
-                bytes,
-            )
-                .into_response()
-        }
+            .into_response(),
         Err(_) => serve_directory_root(&state, &cid).await,
     }
+}
+
+/// Whether the raw CID routes serve this request. An ordinary Home reads its
+/// local store over HTTP only for its own signed-in sessions and apps: it
+/// shares files with others over Carrier, with its contacts, never over open
+/// HTTP, so a file that stops being shared is never served here either. A
+/// node that serves publisher content (a seed) keeps its public CID gateway.
+/// A published site is served through its own route.
+fn cid_route_admitted(state: &GatewayState, headers: &HeaderMap) -> bool {
+    crate::carrier::is_trusted_source_runtime(&state.data_dir)
+        || super::gateway_home_token::require_gateway_launch(&state.data_dir, headers).is_ok()
+}
+
+fn cid_route_refused() -> Response {
+    (StatusCode::NOT_FOUND, "File not found").into_response()
 }
 
 async fn serve_directory_root(state: &GatewayState, cid: &str) -> Response {
@@ -584,30 +588,9 @@ async fn serve_cid_path_result(
 ) -> Result<Response, StatusCode> {
     validate_file_path(file_path).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Fast path: check local cache.
-    let cid_dir = state.cache_dir.join(cid);
-    let requested = cid_dir.join(file_path);
-    if cid_dir.is_dir() {
-        let canonical_cid_dir = cid_dir.canonicalize().unwrap_or_else(|_| cid_dir.clone());
-        let canonical_requested = requested
-            .canonicalize()
-            .unwrap_or_else(|_| cid_dir.join(file_path));
-        if canonical_requested.starts_with(&canonical_cid_dir) {
-            if let Ok(bytes) = tokio::fs::read(&requested).await {
-                let ct = content_type(file_path);
-                return Ok((StatusCode::OK, [("content-type", ct)], bytes).into_response());
-            }
-        }
-    }
-
-    // Cache miss: fetch the individual file through the content provider.
+    // Every read goes to the local content store; the gateway keeps no copy.
     match fetch_file_inline(state, cid, file_path).await {
         Ok(bytes) => {
-            let cache_path = state.cache_dir.join(cid).join(file_path);
-            if let Some(parent) = cache_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            let _ = tokio::fs::write(&cache_path, &bytes).await;
             let ct = content_type(file_path);
             Ok((StatusCode::OK, [("content-type", ct)], bytes).into_response())
         }
@@ -740,12 +723,15 @@ async fn serve_site_file(
 
 pub(super) async fn serve_cid_file(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path((cid, file_path)): Path<(String, String)>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
     }
-
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
+    }
     match serve_cid_path_result(&state, &cid, &file_path).await {
         Ok(response) => response,
         Err(StatusCode::BAD_REQUEST) => {
@@ -755,17 +741,23 @@ pub(super) async fn serve_cid_file(
     }
 }
 
-/// Fetch a single file through the content availability provider.
-/// Returns raw bytes; the provider decides whether the current backend is local IPFS,
-/// an availability replica, or a future repair/fetch path.
+/// Fetch a single file from this node's IPFS repo only: no network search, pin
+/// or gateway fallback, and content held only by availability replicas is not
+/// served.
+/// The gateway keeps no copy: earlier releases' cache entries are never read.
+/// The local backend refuses a file past `MAX_GATEWAY_FILE_SIZE` while reading.
 async fn fetch_file_inline(state: &GatewayState, cid: &str, path: &str) -> anyhow::Result<Vec<u8>> {
     let registry = state
         .provider_registry
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("gateway provider registry unavailable"))?;
-    let bytes =
-        crate::content::fetch_bytes_via_provider(registry, cid, (!path.is_empty()).then_some(path))
-            .await?;
+    let bytes = crate::content::fetch_verified_local_bytes_via_provider(
+        registry,
+        cid,
+        (!path.is_empty()).then_some(path),
+        MAX_GATEWAY_FILE_SIZE,
+    )
+    .await?;
     if bytes.len() > MAX_GATEWAY_FILE_SIZE {
         anyhow::bail!("file exceeds size limit");
     }

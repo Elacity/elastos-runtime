@@ -12,7 +12,6 @@ export function bindLibraryEvents({
   handleBrowserPopState,
   hideDialog,
   hideMenu,
-  loadCurrentFolder,
   moveSelectedObjectsTo,
   navigate,
   navigateBack,
@@ -21,6 +20,7 @@ export function bindLibraryEvents({
   objectByUri,
   openObject,
   prepareDragSelection,
+  refreshCurrentFolder,
   reorderPlace,
   scheduleContentRender,
   selectAllVisible,
@@ -138,7 +138,7 @@ export function bindLibraryEvents({
   elements.backButton.addEventListener("click", () => navigateBack().catch(showError));
   elements.forwardButton.addEventListener("click", () => navigateForward().catch(showError));
   elements.upButton.addEventListener("click", () => navigateUp().catch(showError));
-  elements.refreshButton.addEventListener("click", () => loadCurrentFolder().catch(showError));
+  elements.refreshButton.addEventListener("click", () => refreshCurrentFolder().catch(showError));
   elements.gridButton.addEventListener("click", () => setView("grid"));
   elements.listButton.addEventListener("click", () => setView("list"));
   elements.uploadButton.addEventListener("click", () => elements.fileInput.click());

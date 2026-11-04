@@ -136,7 +136,7 @@ async function assertSystemWindowLayout(tabId) {
   assert(state.panelLabels.includes("Shell"), "System window is missing Shell", state);
   assert(state.panelLabels.includes("Appearance"), "System window is missing Appearance", state);
   assert(state.panelLabels.includes("Recovery"), "System window is missing Recovery", state);
-  assert(state.panelLabels.includes("Apps & Services"), "System window is missing Apps & Services", state);
+  assert(!state.panelLabels.includes("Apps & Services"), "System window still has Apps & Services", state);
   assert(state.panelLabels.includes("This Device"), "System window is missing About device details", state);
   assert(!state.panelLabels.includes("Profile"), "System window still duplicates People profile settings", state);
   assert(!state.panelLabels.includes("Local state"), "System window still has the old Local state card", state);
@@ -230,8 +230,7 @@ async function systemState(tabId) {
       recoveryDownloadLabel: document.querySelector('#recovery-download')?.textContent?.trim() || '',
       recoveryImportPresent: !!document.querySelector('#recovery-import'),
       recoveryImportLabel: document.querySelector('label[for="recovery-import"]')?.textContent?.trim() || '',
-      catalogPresent: !!document.querySelector('#capsule-catalog'),
-      catalogGroupLabels: [...document.querySelectorAll('.catalog-group-title')].map((node) => node.textContent?.trim() || ''),
+      catalogPresent: !!document.querySelector('#capsule-catalog, [data-settings="catalog"]'),
       technicalDetailsPresent: !!document.querySelector('#technical-details'),
       technicalDetailsOpen: document.querySelector('#technical-details')?.open ?? null,
       technicalDetailsLabels: [...document.querySelectorAll('.technical-section-title')].map((node) => node.textContent?.trim() || ''),
@@ -267,7 +266,7 @@ async function systemWindowState(tabId) {
       }
       const root = doc.documentElement;
       const body = doc.body;
-      const overflowing = [...doc.querySelectorAll('.pc2-group, .pc2-card-value, .pc2-input, .system-code, .account-table, .account-table td, .account-name-wrap, .capsule-catalog, .catalog-row, .catalog-facts, .technical-inspect-grid, .technical-inspect-row, .technical-section')]
+      const overflowing = [...doc.querySelectorAll('.pc2-group, .pc2-card-value, .pc2-input, .system-code, .account-table, .account-table td, .account-name-wrap, .technical-inspect-grid, .technical-inspect-row, .technical-section')]
         .filter((node) => node.scrollWidth > node.clientWidth + 2)
         .map((node) => ({
           tag: node.tagName.toLowerCase(),
@@ -277,7 +276,7 @@ async function systemWindowState(tabId) {
           clientWidth: node.clientWidth,
         }));
       return {
-        panelLabels: [...doc.querySelectorAll('.pc2-section-title, #catalog-title')].map((node) => node.textContent?.trim() || ''),
+        panelLabels: [...doc.querySelectorAll('.pc2-section-title, .settings-content h1')].map((node) => node.textContent?.trim() || ''),
         bodyScrollHeight: body?.scrollHeight || 0,
         rootClientHeight: root?.clientHeight || 0,
         overflowing,
@@ -321,7 +320,7 @@ async function main() {
     assert(state.recoveryDownloadLabel.toLowerCase().includes("recovery kit"), "System page must expose Recovery Kit download", state);
     assert(state.recoveryImportPresent === true, "System page must expose Recovery Kit import", state);
     assert(state.recoveryImportLabel === "Import Recovery Kit", "Recovery Kit import label drifted", state);
-    assert(state.catalogPresent === true, "System page must expose Apps & Services", state);
+    assert(state.catalogPresent === false, "System page still has Apps & Services; Marketplace and Technical Details list apps", state);
     assert(state.technicalDetailsPresent === true, "System Security must expose Technical Details", state);
     assert(state.technicalDetailsOpen === false, "System Technical Details must be closed by default", state);
     assert(state.legacyInspectorPresent === false, "System page still exposes the old Capsule Inspector", state);

@@ -301,6 +301,7 @@ impl CollaborationHistoryService {
                         ProviderCarrierRoute::PeerDid {
                             peer_did: peer.endpoint_did.clone(),
                             timeout_ms: Some(PEER_TIMEOUT.as_millis() as u64),
+                            reply_wait_ms: None,
                         },
                     ),
                 }),

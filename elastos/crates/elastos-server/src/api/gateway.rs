@@ -66,6 +66,8 @@ mod gateway_home_agent;
 mod gateway_home_external_link;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
+#[path = "gateway_home_shared_content.rs"]
+mod gateway_home_shared_content;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
 #[path = "gateway_home_system_ai_provider.rs"]
@@ -120,6 +122,7 @@ use gateway_esp::*;
 use gateway_home_external_link::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+use gateway_home_shared_content::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
@@ -141,7 +144,7 @@ pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 pub(crate) use gateway_home_system::{
     authorize_home_engine_preparation_cancellation, authorize_home_service_engine,
-    authorize_home_service_exit, sync_runtime_services_mailboxes,
+    authorize_home_service_exit, carrier_source_is_contact_of, sync_runtime_services_mailboxes,
 };
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;
@@ -213,10 +216,19 @@ pub(super) use gateway_site::{content_type, validate_file_path};
 use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
+
+/// A capsule this Home does not offer is absent everywhere: not served, not
+/// launchable and not in the catalog. Services is hidden until sharing moves
+/// into People; WalletConnect waits for an operator-pinned config.
+pub(crate) fn capsule_is_offered(data_dir: &std::path::Path, name: &str) -> bool {
+    name != SERVICES_CAPSULE_ID && ensure_wallet_connector_configured(data_dir, name).is_ok()
+}
 pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
-/// Maximum size for a single file fetched through the gateway (100 MB).
+/// Largest single file the gateway serves or Library accepts (100 MiB). Gateway
+/// reads ask the local store for at most this, below the transfer ceiling.
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
+const _: () = assert!(MAX_GATEWAY_FILE_SIZE <= elastos_common::MAX_WHOLE_CONTENT_BYTES);
 const LIBRARY_UPLOAD_CHUNK_MAX_BYTES: usize = 768 * 1024;
 const BROWSER_FILE_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 const BROWSER_INPUT_BODY_MAX_BYTES: usize = (BROWSER_FILE_UPLOAD_BYTES.div_ceil(3) * 4) + 64 * 1024;
@@ -727,6 +739,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(chat_room_contact_request),
         )
         .route(
+            "/api/apps/chat-room/contacts/profile-id",
+            post(chat_room_contact_profile_id),
+        )
+        .route(
             "/api/apps/chat-room/community-presence/request",
             post(chat_room_community_presence_request),
         )
@@ -802,10 +818,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/ai-provider/staged",
             delete(gateway_home_system_ai_provider::system_ai_provider_discard_staged),
-        )
-        .route(
-            "/api/apps/system/approval-lens",
-            post(gateway_home_system_ai_provider::system_approval_lens_select),
         )
         .route(
             "/api/apps/system/approval-lens/revoke",
@@ -1046,6 +1058,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/home/launch", post(home_launch))
         .route("/api/apps/home/external-link", post(home_external_link))
         .route(
+            "/api/apps/home/shared-content/check",
+            post(home_shared_content_check),
+        )
+        .route(
+            "/api/apps/home/shared-content/get",
+            post(home_shared_content_get),
+        )
+        .route(
             "/api/apps/home-cli/terminal/contract",
             get(home_cli_terminal_contract),
         )
@@ -1088,6 +1108,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
+        // Reachable only with a Services token, which Home stops issuing while
+        // Services is hidden (0.8.0; see capsule_is_offered). The share and
+        // request backend stays: Inbox approval, grant use and revocation run on
+        // it, its tests set up grants through these routes, and the 0.8.1 People
+        // rework reuses it.
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))
@@ -1114,6 +1139,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/people/contacts/remove",
             post(people_contact_remove),
+        )
+        .route(
+            "/api/apps/people/contacts/request",
+            post(people_contact_request_create),
         )
         .route("/api/apps/chat-room/summary", get(chat_room_summary))
         .route(
@@ -1184,6 +1213,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/chat-room/objects/send",
             post(room_service_objects_send),
+        )
+        .route(
+            "/api/apps/chat-room/attach-library",
+            post(chat_room_attach_library),
         )
         .route(
             "/api/apps/chat-room/upload/start",
@@ -1270,143 +1303,36 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn landing_page() -> Html<String> {
-    Html(format!(
-        r#"<!DOCTYPE html>
+const LANDING_PAGE_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ElastOS Gateway</title>
+  <meta name="color-scheme" content="light dark" />
+  <title>ElastOS Home</title>
   <style>
-    :root {{
-      --bg: #0c1217;
-      --panel: #111a21;
-      --text: #e9f0f4;
-      --muted: #9bb1bf;
-      --accent: #29b6f6;
-      --ok: #54d66d;
-      --border: #203241;
-    }}
-    body {{
-      margin: 0;
-      font-family: "Segoe UI", "SF Pro Text", system-ui, sans-serif;
-      background: radial-gradient(circle at 20% 0%, #122130 0%, var(--bg) 45%);
-      color: var(--text);
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 1.25rem;
-    }}
-    main {{
-      width: min(820px, 100%);
-      background: linear-gradient(180deg, #111a21 0%, #0f171f 100%);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 1.25rem;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35);
-    }}
-    h1 {{
-      margin: 0 0 0.25rem;
-      font-size: 1.5rem;
-    }}
-    .muted {{
-      color: var(--muted);
-      margin: 0.125rem 0 0.75rem;
-    }}
-    .version {{
-      font-size: 0.875rem;
-      color: var(--ok);
-      margin-bottom: 1rem;
-    }}
-    form {{
-      display: flex;
-      gap: 0.5rem;
-      margin: 1rem 0 0.75rem;
-      flex-wrap: wrap;
-    }}
-    input[type="text"] {{
-      flex: 1 1 420px;
-      min-width: 220px;
-      background: #0d141b;
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 0.7rem 0.8rem;
-      font-size: 0.95rem;
-    }}
-    button {{
-      background: var(--accent);
-      color: #05131d;
-      border: 0;
-      border-radius: 10px;
-      padding: 0.7rem 1rem;
-      font-weight: 700;
-      cursor: pointer;
-    }}
-    code {{
-      background: #0c141b;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.1rem 0.35rem;
-    }}
-    ul {{
-      margin-top: 0.5rem;
-      color: var(--muted);
-    }}
-    a {{
-      color: var(--accent);
-    }}
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; box-sizing: border-box; font-family: system-ui, sans-serif; line-height: 1.5; background: #ffffff; color: #1a1a1a; }
+    main { max-width: 32rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+    a { color: #0b57d0; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #121212; color: #ececec; }
+      a { color: #8ab4f8; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>ElastOS Gateway</h1>
-    <p class="muted">Public ElastOS edge for MyWebSite, publisher objects, and read-only CID content.</p>
-    <p class="version">Version {}</p>
-
-    <form id="cid-form">
-      <input id="cid-input" type="text" placeholder="Paste CID, elastos://CID, or gateway URL" autocomplete="off" />
-      <button type="submit">Open</button>
-    </form>
-
-    <p class="muted">URL format: <code>/s/&lt;cid&gt;/</code></p>
-    <ul>
-      <li>Health check: <a href="/healthz">/healthz</a></li>
-      <li>Site root: <code>/</code> from <code>localhost://MyWebSite</code> or a bound Edge target.</li>
-      <li>Publisher objects: <code>/release-head.json</code>, <code>/release.json</code>, <code>/install.sh</code>, <code>/artifacts/...</code></li>
-      <li>Content example: <code>/s/bafy.../</code></li>
-    </ul>
+    <h1>ElastOS Home</h1>
+    <p>This is an ElastOS Home. No public website is available here.</p>
+    <p><a href="https://elastos.elacitylabs.com/">About ElastOS</a></p>
   </main>
-
-  <script>
-    (function () {{
-      function extractCid(input) {{
-        var s = (input || "").trim().replace(/\/+$/, "");
-        if (!s) return "";
-        if (s.startsWith("elastos://")) return s.slice("elastos://".length).split("/")[0];
-        var m1 = s.match(/\/ipfs\/([^\/?#]+)/);
-        if (m1 && m1[1]) return m1[1];
-        var m2 = s.match(/^https?:\/\/([^./]+)\.ipfs\./i);
-        if (m2 && m2[1]) return m2[1];
-        return s;
-      }}
-
-      var form = document.getElementById("cid-form");
-      var input = document.getElementById("cid-input");
-      if (!form || !input) return;
-      form.addEventListener("submit", function (e) {{
-        e.preventDefault();
-        var cid = extractCid(input.value);
-        if (!cid) return;
-        window.location.href = "/s/" + encodeURIComponent(cid) + "/";
-      }});
-    }})();
-  </script>
 </body>
-</html>"#,
-        GATEWAY_VERSION
-    ))
+</html>
+"#;
+
+async fn landing_page() -> Html<String> {
+    Html(LANDING_PAGE_HTML.to_string())
 }
 
 include!("gateway_models.rs");

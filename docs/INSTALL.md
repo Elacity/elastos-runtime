@@ -18,7 +18,7 @@ An enabled Terminal runs commands with the host user's rights.
 The [data, keys and backups](#data-keys-and-backups) section explains current
 host access and the protection target for hosted and locked self-hosted Homes.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -37,8 +37,12 @@ curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 Developers can use the [Mac source guide](MAC.md) for source-home staging and
 Browser VM work.
 
-The installer needs `curl` and a working `python3`; on a Mac without the
-Command Line Tools it stops first and asks you to run `xcode-select --install`.
+The installer needs `curl` and a working `python3`. On a Mac without Apple's
+Command Line Tools, the installer opens Apple's installer for them. Click
+Install in Apple's window; the ElastOS installer continues by itself when the
+tools are installed. It waits up to 20 minutes, and Ctrl+C stops it. If it
+stops, or there is no terminal, run `xcode-select --install`, wait for it to
+finish, then run the install command again.
 Setup and updates need outgoing UDP to port 4433 for Carrier.
 
 Carrier uses mDNS by default to find other Homes on the same local network.
@@ -59,8 +63,17 @@ macOS Apple silicon), verifies the signed release, installs Runtime, and
 fetches the Home profile from the trusted publisher. It
 starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
 terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
-setup completes and prints the full command for opening Home later. The installer
-uses the installed binary's full path, so editing PATH is optional.
+setup completes and prints the full command for opening Home later. On a Linux
+computer with no desktop, such as a Jetson used over SSH, it prints the SSH
+tunnel command for opening Home from another computer.
+
+So that `elastos` is found in new terminals and after a restart, the installer
+adds one line ending in `# Added by the ElastOS installer` to your login profile
+(`~/.zprofile` for zsh, the default on macOS; `~/.profile` for bash, the default
+on Ubuntu, or `~/.bash_profile` if you have one). It does this only when the
+install folder is not already on PATH and the line is not there yet, and it
+prints the file it changed. Set `ELASTOS_NO_MODIFY_PATH=1` to skip it. To undo,
+delete that line; `--uninstall` removes it too.
 
 For automated provisioning, use `--install-only`:
 
@@ -73,8 +86,8 @@ setting to own setup, launch, and cleanup; older installers ignore it and alread
 stop after bootstrap.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
-Services, Wallet, Documents, Library, Marketplace, Archive, and Inbox. On Apple Silicon
-Macs it also exposes Browser; Linux Homes do not show Browser in 0.8.0. People is installed as a
+Wallet, Documents, Library, Marketplace, and Inbox. On Apple Silicon
+Macs it also exposes Browser; Linux Homes do not show Browser in 2.0.0. People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 
 Native Windows is not an accepted install target today. The current product
@@ -255,6 +268,10 @@ elastos update --check
 elastos update
 ```
 
+A terminal update or Undo leaves Home stopped, even if it was running before.
+Start it again with `elastos home --browser`. An update from System restarts
+Home by itself.
+
 After install, the web is used only to look up the publisher's current Carrier
 address from the `gateways` in `sources.json`; that answer is accepted only when
 it matches the trusted source. Releases and components come over Carrier and are
@@ -270,8 +287,11 @@ keep the files in place and follow Runtime's operator repair step.
 
 Running `install.sh` again uses the same installation lock and journal. Before it
 stops Runtime, it restores an interrupted install and refuses an older release,
-another channel, a pending Home update, a second writer and an installed Runtime
-without a readable `sources.json`. Until an interrupted install is restored,
+a channel a stable or canary Home does not follow (for example canary on a
+stable Home), a pending Home update, a second writer and an installed Runtime
+without a readable `sources.json`. A Home on another channel, such as the
+retired `jetson-test`, can install a stable or canary release and then follows
+that channel. Until an interrupted install is restored,
 Home does not start and asks you to run `install.sh` again.
 
 How releases get to the seed is in
@@ -310,7 +330,7 @@ key if you need to recover across that first update.
 
 ### Recover an interrupted update
 
-On 0.8.0 and its test release 0.8.0-alpha.25, an update that stops partway
+On 2.0.0 and its test releases from 0.8.0-alpha.25, an update that stops partway
 keeps Home closed until it is recovered. Keep the installation files and data
 in place, and stay connected to the network Home updates over.
 
@@ -326,17 +346,17 @@ in place, and stay connected to the network Home updates over.
    it was finishing, and a System update that stopped while it was replacing an
    app. The command a message names then stops with the same message every
    time. Do not delete or move any files. Ask for help in
-   [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) and
+   [GitHub issues](https://github.com/elastos/elastos-runtime/issues) and
    include the output of `elastos --version` and the exact message. We are
    fixing this in a later update
-   ([#108](https://github.com/Elacity/elastos-runtime/issues/108)).
+   ([#108](https://github.com/elastos/elastos-runtime/issues/108)).
 
 A Home with an installed update controller keeps its controller Runtime and
 private receipt in the data directory. The controller of the version that runs
 the update owns its restart and recovery, so the steps below depend on that
 version.
 
-From 0.8.0 (and its test release 0.8.0-alpha.18), if a Home restart was
+From 2.0.0 (and its test releases from 0.8.0-alpha.18), if a Home restart was
 interrupted, run `elastos home --browser`. It
 hands recovery to that retained controller, which verifies its signed Runtime,
 retained launch settings and saved release before it starts Home. When the
@@ -350,7 +370,7 @@ through the update controller appends its output under a header to the private
 after the rollback; a startup failure names that file.
 
 On 0.8.0-alpha.16 and 0.8.0-alpha.17 (including an update from one of them to
-0.8.0), an update or rollback start has a 30-second limit, each start replaces
+2.0.0), an update or rollback start has a 30-second limit, each start replaces
 `update-controller/runtime.log`, and `elastos home --browser` refuses a pending
 restart. Set `ELASTOS_RECOVERY_DATA` to the data directory shown in the local
 message and run the retained controller:
@@ -445,13 +465,25 @@ of that key exists.
 
 `--install-dir` moves only the binary. Everything else in the data directory is
 yours: identity keys, wallets, recovery material and user files. ElastOS adds
-no login items, launch agents, desktop entries or shell profile changes.
+no login items, launch agents or desktop entries.
+
+The installer adds one line to your login profile so new terminals find
+`elastos`: `~/.zprofile` for zsh; for bash, the first of `~/.bash_profile`,
+`~/.bash_login` or `~/.profile` that exists, else `~/.profile`; for other
+shells, `~/.zprofile` on macOS and `~/.profile` on Linux. The line ends with
+`# Added by the ElastOS installer`, and the installer prints which file it
+changed. It adds nothing when the install folder is already on PATH or the line
+is already there. To skip it, set `ELASTOS_NO_MODIFY_PATH=1` when you run the
+install command. A profile that is a link, has a second hard link or is not
+your own file stays unchanged, and the installer prints the line for you to
+add yourself. Uninstall does not change your profile: it prints the line to
+delete and the file that holds it.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
 components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
-from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+from the version label or a successful setup. [Install/update acceptance](https://github.com/elastos/elastos-runtime/issues/89)
 owns exact public-manifest parity evidence.
 
 ## Remove ElastOS
@@ -464,7 +496,8 @@ The installer stops this installation's Runtime the same way an install does:
 it stops only processes whose ownership records and command match this
 installation, and removes nothing if another process holds them. It then
 removes the binary, the components (including the release scripts and the
-Browser image), the trusted sources and the verified release. Your data
+Browser image), the trusted sources, the verified release and the PATH line the
+installer added to your login profile. Your data
 directory stays, including Browser profiles, so installing again continues with
 the same identity. Pass the same `--install-dir` you installed with. An install
 or update that is running or was interrupted stops the removal; finish it first.
@@ -494,7 +527,7 @@ material; keep it under your own control.
 
 Use hosted accounts only for public demos. Keep wallets, private data and
 recovery material on your own device until
-[hosted protection](https://github.com/Elacity/elastos-runtime/issues/209) passes
+[hosted protection](https://github.com/elastos/elastos-runtime/issues/209) passes
 its acceptance gate. The seed operator can read hosted data, wallet keys and
 recovery phrases stored on the seed. Host-side encryption with keys stored
 beside the data leaves those secrets accessible to that operator.

@@ -22,7 +22,7 @@ does not describe the later SmolLM2 result.
 A later signed-in Mac Home acquired and admitted SmolLM2 through ordinary
 Marketplace and Carrier, then completed a terminal Assistant reply. Its current
 installed readiness regression also passed after Runtime restart; the exact
-local receipt is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+local receipt is recorded in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Full Qwen, combined retention and failure-path acceptance, and public delivery
 remain open.
 
@@ -127,7 +127,7 @@ workflow, file picker or editable model path. It uses this sequence:
 Off-box catalog and package delivery uses the existing Content and availability
 contracts over Carrier. Runtime applies the same publisher, identity and
 authority checks. A bounded local miss can fetch from an authenticated holder;
-the installed direct-Carrier SmolLM2 result is recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+the installed direct-Carrier SmolLM2 result is recorded in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Independent-holder and wider route acceptance remain open.
 
 The CID proves the closure bytes. The publisher signature proves who made the
@@ -324,7 +324,7 @@ unknown settlement when backend stop is unconfirmed. The catalog signer and
 successful revalidation callback belong to the fixture. They do not prove the
 installed Home grant/session path. The installed operator catalog and receipt
 exist. That earlier Qwen Use failed; the later SmolLM2 installed journey passed.
-Their separate evidence and limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Their separate evidence and limits are in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Resource samples do not establish continuous peaks or complete idle/busy
 retention and eviction acceptance.
 
@@ -394,7 +394,7 @@ The following separates implemented primitives from remaining package work:
 | --- | --- |
 | `elastos/crates/elastos-common/src/manifest.rs` | The bounded passive metadata profile above is implemented, including the current viewer rejection. Review handoff compatibility separately from execution authority; preparation verifies facts against the complete fetched package. |
 | `elastos/crates/elastos-server/src/api/capsule_inventory.rs` and `gateway_capsule_catalog/read_model.rs` | The catalog projects installed inventory plus signed model metadata and caller-scoped admission, Keep and dispatch readiness. The preparation inventory owns reservations and admission receipts. Marketplace/System consume these facts; Assistant matches exact ready offers and preserves optional CID intent. |
-| `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` and aggregate `import_object` remain capped at 64 MiB and 512 files; these are separate paths. |
+| `elastos/crates/elastos-server/src/content.rs` | Preparation uses the explicit bounded local-fetch loop. Ordinary `fetch_bytes_via_provider` and `materialize_data_capsule` still drain whole files. `import_exact` remains capped at 64 MiB; it is a separate path. |
 | `elastos/crates/elastos-runtime/src/provider/registry.rs` | Bounded reads validate and consume the native range once for Bytes and Stream. Ordinary `open_provider_stream` still decodes the full response into `ProviderStreamSession.bytes`; consumer chunking alone does not bound producer memory or cancel network work. |
 | `capsules/ipfs-provider/src/main.rs` | Explicit bounded Cat enforces finite bytes/time and uses the existing backend lifecycle. Ordinary `cat` and `cat_to_path` still read the entire file before encoding or writing. |
 | `elastos/crates/elastos-server/src/api/gateway_site.rs` | Gateway CID reads buffer content before enforcing the 100 MiB file limit. Ordinary browser file responses are not a model-transfer route. |
@@ -503,7 +503,7 @@ llama.cpp engine; `components.json` estimates 6170 MB, which is not an exact
 signed closure size. The local operator package records exact bytes,
 complete-closure CID, publisher signature/trust, licenses, provenance claims,
 resource limits and local availability. Its verified scope and upstream
-provenance limits are in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+provenance limits are in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 That local package proof does not establish off-box distribution. The existing
 engine's platform/checksum receipt
 and shared libraries must work on a genuinely fresh supported install; missing

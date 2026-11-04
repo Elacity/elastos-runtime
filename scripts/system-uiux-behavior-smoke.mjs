@@ -274,9 +274,11 @@ async function main() {
   const appearanceRequests = [];
   const appearancePlans = [];
   const requestOrder = [];
+  // The gateway answers an opaque-origin app only when it sends its Home
+  // token; a call without it fails CORS in Home (/api/auth/passkey/status).
+  const tokenlessRequests = [];
   let heldRecoveryStatus = null;
   let heldChainNetworks = null;
-  let heldCapsuleCatalog = null;
   let hostedStatus = null;
   let hostedReads = 0;
   const discardedStaged = [];
@@ -322,6 +324,9 @@ async function main() {
       }
       const url = new URL(request.url());
       requestOrder.push(url.pathname);
+      if (!request.headers()["x-elastos-home-token"]) {
+        tokenlessRequests.push(url.pathname);
+      }
       if (url.pathname === "/api/apps/system/summary") {
         summaryTrace.push({
           count: summaryTrace.length + 1,
@@ -383,9 +388,6 @@ async function main() {
         return;
       }
       if (url.pathname === "/api/capsules/catalog") {
-        if (heldCapsuleCatalog) {
-          await heldCapsuleCatalog.promise;
-        }
         await route.fulfill({
           status: 200,
           contentType: "application/json",
@@ -483,7 +485,6 @@ async function main() {
     });
 
     heldChainNetworks = deferred();
-    heldCapsuleCatalog = deferred();
     requestOrder.length = 0;
     await page.goto(`${server.baseUrl}/fixture?settings=security`, {
       waitUntil: "domcontentloaded",
@@ -494,7 +495,15 @@ async function main() {
         document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "security"
         && document.activeElement?.id === "recovery-download",
     );
+    // Chain networks is held, so its read is in flight, never answered, here.
+    for (let tries = 0; tries < 250 && !requestOrder.includes("/api/provider/chain/networks"); tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     const securityFocusOrder = [...requestOrder];
+    assert(
+      await frame.evaluate(() => document.activeElement?.id === "recovery-download"),
+      "System should keep Recovery focused while later reads run",
+    );
     assert(
       securityFocusOrder.indexOf("/api/auth/recovery/status") >= 0
         && securityFocusOrder.indexOf("/api/provider/chain/networks") >= 0
@@ -504,12 +513,17 @@ async function main() {
       "System should focus Recovery after recovery readiness resolves and before later reads",
       { requestOrder: securityFocusOrder },
     );
-    const catalogRequested = page.waitForRequest("**/api/capsules/catalog");
     heldChainNetworks.resolve();
-    await catalogRequested;
-    heldCapsuleCatalog.resolve();
     heldChainNetworks = null;
-    heldCapsuleCatalog = null;
+    await page.waitForLoadState("networkidle");
+    // Marketplace and Security > Technical Details list apps and components;
+    // System has no Apps & Services inventory to load.
+    assert(
+      !requestOrder.includes("/api/capsules/catalog")
+        && await frame.evaluate(() => !document.querySelector('[data-settings="catalog"]')),
+      "System still loads or shows an Apps & Services inventory",
+      { requestOrder },
+    );
 
     heldRecoveryStatus = deferred();
     requestOrder.length = 0;
@@ -576,6 +590,11 @@ async function main() {
         startup.errorText.length === 0,
       "System startup diagnostic failed",
       startup,
+    );
+    assert(
+      tokenlessRequests.length === 0,
+      "System must send its Home token on every Runtime call",
+      tokenlessRequests,
     );
     await activateTab(frame, "personalization");
 
@@ -876,14 +895,18 @@ async function main() {
         note: document.querySelector("#ai-provider-egress-note")?.textContent?.trim(),
         state: card?.querySelector(".ai-provider-state")?.textContent?.trim(),
         useDisabled: card?.querySelector("button")?.disabled,
-        lens: document.querySelector("#approval-lens-status")?.textContent?.trim(),
+        lensSection: Boolean(document.querySelector("#approval-lens")),
+        decisionButtons: [...([...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+          .find((node) => node.textContent.includes("Jev"))?.querySelectorAll("button") || [])]
+          .map((button) => button.textContent.trim()),
       };
     });
     assert(
       hostedPause.note?.includes("External HTTPS is paused") &&
         hostedPause.state === "External HTTPS paused" &&
         hostedPause.useDisabled === true &&
-        hostedPause.lens?.includes("external HTTPS paused"),
+        hostedPause.lensSection === false &&
+        hostedPause.decisionButtons.join() === "Edit,Disconnect",
       "System did not show saved hosted connections as paused",
       hostedPause,
     );
@@ -998,7 +1021,8 @@ async function main() {
     await frame.fill("#ai-provider-key", "rejected-key");
     await frame.click("#ai-provider-validate");
     await frame.waitForFunction(() => document.querySelector('[data-field="ai-provider-state"]')?.textContent
-      === "The provider rejected this key." && document.querySelector("#ai-provider-cancel").textContent === "Cancel");
+      === "The provider rejected this key." && document.querySelector("#ai-provider-cancel").textContent === "Cancel"
+      && !document.querySelector("#ai-provider-cancel").disabled);
     assert(
       discardedStaged.at(-1) === "model:hosted-22222222222222222222222222222222",
       "System kept a key rejected while editing a saved connection",

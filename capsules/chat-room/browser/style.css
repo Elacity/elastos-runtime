@@ -838,6 +838,36 @@ button.secondary {
   text-decoration: none;
 }
 
+/* A Library file Community is about to post publicly, and how it went. */
+.library-post {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 0.45rem;
+  margin: 0 0.75rem 0.55rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--el-surface-raised);
+  overflow-wrap: anywhere;
+}
+
+.library-post h2 {
+  font-size: 0.95rem;
+}
+
+#library-post-lines {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.library-post-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
 /* Published compact composer and emoji popover. */
 .composer {
   display: flex;

@@ -7,7 +7,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const start = source.indexOf("function escapeHtml(");
-const end = source.indexOf("function shortCid(", start);
+const end = source.indexOf("function documentUri(", start);
 assert.ok(start >= 0 && end > start, "Documents Markdown renderer must exist");
 const exports = "\n({ renderMarkdownDocument, renderInlineMarkdown, markdownHref })";
 // DOCUMENTS_INSIDE_HOME is a module constant decided at launch; the

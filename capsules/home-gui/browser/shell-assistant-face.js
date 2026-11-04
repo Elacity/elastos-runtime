@@ -19,6 +19,9 @@
    Contract with the frame (event.source pins the sender; the frame is
    opaque-sandboxed so target origin is "*"):
      Home → capsule   home-agent:open | home-agent:shelf-handover {on} | home-agent:close
+                      home-agent:open-link {url} (this Home has no Browser app:
+                      the capsule asks Home's link prompt for that address)
+                      elastos:ui-preference {preferences} (on ready, and on every change)
      capsule → Home   home-agent:hello {docId} (document started) |
                       home-agent:ready {docId} (workspace loaded) | home-agent:shelf-metrics {width,height,radius}
                       home-agent:close | home-agent:open-viewer {request}
@@ -29,21 +32,21 @@ import {
   LAYER_STATE,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20260813a";
+} from "./shell-popovers.js?v=home-20261101d";
 import {
   agentStageId,
   bindAgentSpace,
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20260813a";
-import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261101d";
+import { isPhone } from "./shell-form-factor.js?v=home-20261101d";
 import {
   createAssistantFrameReadiness,
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
-} from "./home-agent-message-contract.js?v=home-20260813a";
-import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20260813a";
+} from "./home-agent-message-contract.js?v=home-20261101d";
+import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261101d";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "assistant";
@@ -193,7 +196,7 @@ function clearFaceGeometry(taskbar) {
 
 function setHandover(on) {
   taskbarEl()?.classList.toggle("is-assistant-handover", on);
-  postToFrame({ type: "home-agent:shelf-handover", on });
+  postToAssistantFrame({ type: "home-agent:shelf-handover", on });
 }
 
 export function assistantFaceActive() {
@@ -226,7 +229,9 @@ export function assistantSpaceActive() {
   return document.body.classList.contains("assistant-space-active");
 }
 
-function postToFrame(message) {
+/* Ready-gated: a frame that is not ready yet gets the remembered UI
+   preferences in markFrameReady, so a change made meanwhile is not lost. */
+export function postToAssistantFrame(message) {
   const target = frame?.contentWindow;
   if (!target || !frame.dataset.route || !frameReady) {
     return;
@@ -244,9 +249,9 @@ function markFrameReady() {
   frame?.classList.add("is-ready");
   deps.pushUiPreferencesToFrameWindow(frame?.contentWindow);
   if (assistantSpaceActive()) {
-    postToFrame({ type: "home-agent:open", query: launchQuery });
+    postToAssistantFrame({ type: "home-agent:open", query: launchQuery });
     if (taskbarEl()?.classList.contains("is-assistant-handover")) {
-      postToFrame({ type: "home-agent:shelf-handover", on: true });
+      postToAssistantFrame({ type: "home-agent:shelf-handover", on: true });
     }
   }
 }
@@ -325,7 +330,7 @@ function openAssistantSpace() {
   document.body.classList.add("assistant-space-active");
   spaceEl.classList.add("is-visible");
   void mountAssistantFrame();
-  postToFrame({ type: "home-agent:open", query: launchQuery });
+  postToAssistantFrame({ type: "home-agent:open", query: launchQuery });
 }
 
 function closeAssistantSpace({ instant = false } = {}) {
@@ -337,7 +342,7 @@ function closeAssistantSpace({ instant = false } = {}) {
   /* Sent on every leave, including one the capsule asked for: the capsule
      lowers its room on this message and never on its own request, so both
      paths are the same morph. */
-  postToFrame({ type: "home-agent:close" });
+  postToAssistantFrame({ type: "home-agent:close" });
   const park = () => {
     document.body.classList.remove("assistant-space-leaving");
     spaceEl.hidden = true;
@@ -420,8 +425,18 @@ function onFrameMessage(event) {
     }
     case "home-agent:open-browser": {
       const url = normalizeHomeAgentBrowserUrl(message);
-      if (url && browserAvailable && typeof deps?.openTarget === "function") {
+      if (!url) {
+        break;
+      }
+      if (browserAvailable && typeof deps?.openTarget === "function") {
         deps.openTarget("browser", { query: { url } });
+      } else {
+        // No Browser app: the capsule asks Home's own link prompt (#430),
+        // which shows the address and opens a tab only on Open link. The
+        // reply carries the capsule's own string (checked above), so the
+        // capsule can match it to the link it asked about; the Runtime
+        // canonicalizes it for the sheet.
+        postToAssistantFrame({ type: "home-agent:open-link", url: message.url });
       }
       break;
     }
@@ -453,7 +468,7 @@ export function showAssistantFace(query = {}, launched = null) {
   launchQuery = Object.fromEntries(Object.entries(query).filter(([key, value]) =>
     ["model_cid", "offer_id", "mode", "session_id"].includes(key) && typeof value === "string"));
   if (assistantFaceActive()) {
-    postToFrame({ type: "home-agent:open", query: launchQuery });
+    postToAssistantFrame({ type: "home-agent:open", query: launchQuery });
     return;
   }
   const taskbar = taskbarEl();
@@ -552,7 +567,7 @@ export function hideAssistantFace({ instant = false } = {}) {
      through the leave; Home takes the glass back as the shrink begins, and
      the room breathes out with it — not before. */
   setPhase(taskbar, "leave");
-  postToFrame({ type: "home-agent:shelf-handover", on: false });
+  postToAssistantFrame({ type: "home-agent:shelf-handover", on: false });
   after(LEAVE_MS, () => {
     closeAssistantSpace();
     setPhase(taskbar, "shrink");

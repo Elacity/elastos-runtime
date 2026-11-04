@@ -58,8 +58,8 @@ class CiCapacityTests(unittest.TestCase):
         self.apps.mkdir()
         for name in observer.CI_XCODE_APPS:
             (self.apps / name).mkdir()
-        self.active = self.apps / "Xcode_15.4.app"
-        self.override = self.apps / "Xcode_16.2.app"
+        self.active = self.apps / "Xcode_16.4.app"
+        self.override = self.apps / "Xcode_26.3.app"
 
     def test_reclaim_preserves_both_selected_apps_and_measures_each_deletion(self):
         removed = []
@@ -70,15 +70,15 @@ class CiCapacityTests(unittest.TestCase):
             return SimpleNamespace(total=1000, free=100 + 100 * len(removed))
         # Reclaim stops as soon as the planned growth fits the free bytes.
         receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 300, measure, remove)
-        self.assertEqual(removed, ["Xcode_15.0.1.app", "Xcode_15.1.app"])
+        self.assertEqual(removed, ["Xcode_16.app", "Xcode_16.1.app"])
         self.assertEqual(receipt["status"], "ready")
         self.assertEqual(receipt["free_bytes_after"], 300)
         self.assertEqual(receipt["planned_growth_bytes"], 300)
         self.assertTrue(self.active.is_dir() and self.override.is_dir())
-        self.assertTrue((self.apps / "Xcode_15.2.app").exists())
+        self.assertTrue((self.apps / "Xcode_16.2.app").exists())
 
     def test_alias_and_unlisted_apps_are_preserved_and_shortfall_fails_closed(self):
-        candidate = self.apps / "Xcode_15.0.1.app"
+        candidate = self.apps / "Xcode_16.app"
         candidate.rmdir()
         candidate.symlink_to(self.active, target_is_directory=True)
         (self.apps / "Xcode_99.app").mkdir()
@@ -96,7 +96,7 @@ class CiCapacityTests(unittest.TestCase):
         self.assertTrue(candidate.is_symlink() and (self.apps / "Xcode_99.app").exists())
 
     def test_reclaim_refuses_unexpected_selected_ancestry_and_symlink_roots(self):
-        outside = self.root / "Xcode_15.4.app"
+        outside = self.root / "Xcode_16.4.app"
         outside.mkdir()
         measure, remove = lambda: SimpleNamespace(total=1000, free=100), lambda path: path.rmdir()
         with self.assertRaisesRegex(ValueError, "selected Xcode ancestry"):
@@ -694,6 +694,18 @@ class CliFixtureTests(unittest.TestCase):
         other.write_bytes(b"changed user data")
         self.assertNotEqual(after["data"], observer.cli_state(self.manifest, home)["data"])
 
+    def test_coordination_file_follows_the_umask_but_is_never_writable_by_others(self):
+        # The Runtime creates host-process.lock with the person's umask (0644 under
+        # Ubuntu's 002 after its 022 clamp) inside the 0700 data directory.
+        home, lock = self.coordination_fixture()
+        for mode in (0o600, 0o644):
+            lock.chmod(mode)
+            self.assertEqual(observer.cli_coordination(home)["status"], "released")
+        for mode in (0o664, 0o646, 0o4600):
+            lock.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(ValueError, "coordination file mode differs"):
+                observer.cli_coordination(home)
+
     def test_coordination_refuses_held_flock(self):
         home, lock = self.coordination_fixture()
         with lock.open("rb") as owner:
@@ -715,7 +727,7 @@ class CliFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeats a field"):
             observer.cli_state(self.manifest, home)
         observer.write(lock, valid)
-        lock.chmod(0o644)
+        lock.chmod(0o664)
         with self.assertRaisesRegex(ValueError, "file mode differs"):
             observer.cli_state(self.manifest, home)
 
@@ -1889,6 +1901,11 @@ class CliFixtureTests(unittest.TestCase):
         path.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "ownership"):
             observer.cli_private_json(path)
+        # The host lock follows the person's umask: 0644 is read, group write is refused.
+        self.assertEqual(observer.cli_private_json(path, private=False), {"pid": 1})
+        path.chmod(0o664)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            observer.cli_private_json(path, private=False)
         for value in ("http://localhost:8090/home/", "http://127.0.0.1:8090/home/", "http://[::1]:8090/home/"):
             with self.subTest(accepted=value):
                 self.assertEqual(observer.cli_home_base(value, public=True).port, 8090)
@@ -2182,7 +2199,7 @@ class CliFixtureTests(unittest.TestCase):
 
         def result(pinned="0.8.0-alpha.8"):
             refusals = {case: {"status": "passed"} for case in observer.CLI_REFUSALS}
-            return {"schema": "elastos.update-hop.result/v1", "status": "passed",
+            return {"schema": "elastos.update-hop.result/v1", "status": "passed", "platform": "x86_64-linux",
                     "old": {"version": pinned}, "new": {"version": "0.8.0-alpha.9"},
                     "previous_release": {"version": pinned},
                     "paths": {"m1-install": {"checks": {**refusals, "initial-home": {
@@ -2195,8 +2212,11 @@ class CliFixtureTests(unittest.TestCase):
                                               "next-updated": {"current_version": "0.8.0-alpha.10"}}},
                         "undo": {"status": "passed", "version": pinned,
                                  "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}},
-                              "m2-discovery": {"checks": {**json.loads(json.dumps(refusals)), observer.CLI_INSTALLER_CASE: {"status": "passed"}}}}}
-        verdict = observer.cli_check_result(result())
+                              "m2-discovery": {"checks": {**json.loads(json.dumps(refusals)), observer.CLI_INSTALLER_CASE: {"status": "passed"},
+                                                          observer.CLI_UBUNTU_CASE: {"status": "passed", "home": {"authenticated_health": True},
+                                                                                     "update": {"from": "0.8.0-alpha.9", "to": "0.8.0-alpha.10"}}}}}}
+        linux = "x86_64-linux"
+        verdict = observer.cli_check_result(result(), linux)
         self.assertEqual((verdict["from"], verdict["to"], verdict["next"]), ("0.8.0-alpha.8", "0.8.0-alpha.9", "0.8.0-alpha.10"))
         self.assertEqual((verdict["cli_installer_required"], verdict["system_installer_required"]), (observer.CLI_INSTALLER_CASE,) * 2)
         # From 0.8.0-alpha.7 on, a published System installs changed support (#246), by version
@@ -2205,10 +2225,15 @@ class CliFixtureTests(unittest.TestCase):
                                  ("0.8.0-alpha.6", False), ("0.7.9", False)):
             with self.subTest(pinned=pinned):
                 if installs:
-                    self.assertEqual(observer.cli_check_result(result(pinned))["from"], pinned)
+                    self.assertEqual(observer.cli_check_result(result(pinned), linux)["from"], pinned)
                 else:
                     with self.assertRaisesRegex(ValueError, "cannot install changed support from System"):
-                        observer.cli_check_result(result(pinned))
+                        observer.cli_check_result(result(pinned), linux)
+        # Only a Linux hop installs the default Ubuntu account layout.
+        mac = result()
+        mac.update(platform="aarch64-darwin")
+        mac["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)
+        self.assertEqual(observer.cli_check_result(mac, "aarch64-darwin")["next"], "0.8.0-alpha.10")
         home = lambda value: value["paths"]["m1-install"]["checks"]["initial-home"]  # noqa: E731
 
         # What alpha.6 recorded: its System refused changed support and kept Home, then its CLI
@@ -2221,7 +2246,7 @@ class CliFixtureTests(unittest.TestCase):
         home(restored)["system"]["published_system"].update(phase="restored", to="0.8.0-alpha.8")
         for value in (alpha6, restored):
             with self.assertRaisesRegex(ValueError, "System did not install the release with changed support"):
-                observer.cli_check_result(value)
+                observer.cli_check_result(value, linux)
         faults = {"failed run": lambda value: value.update(status="failed", failure="System did not update"),
                   "new provider warning": lambda value: home(value)["system"]["provider_warnings"].update(new=["provider refused"]),
                   "same-build hop": lambda value: value.pop("previous_release"),
@@ -2246,11 +2271,102 @@ class CliFixtureTests(unittest.TestCase):
                   "controller did not fail": lambda value: home(value)["system"]["installer_required"].update(phase="updated"),
                   "Home restarted": lambda value: home(value)["system"]["installer_required"].update(home_kept=False),
                   "support changed": lambda value: home(value)["system"]["installer_required"].update(support_unchanged=False)}
+        faults.update({
+            "Ubuntu layout case missing": lambda value: value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE),
+            "Ubuntu layout case failed": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE].update(status="failed"),
+            "Ubuntu layout updated elsewhere": lambda value: value["paths"]["m2-discovery"]["checks"][observer.CLI_UBUNTU_CASE]["update"].update(to="0.8.0-alpha.9"),
+            # A Linux runner's result without its platform, or naming a Mac, cannot skip the Ubuntu case.
+            "platform missing": lambda value: (value.pop("platform"), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)),
+            "platform untyped": lambda value: (value.update(platform=None), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE)),
+            "Mac result on Linux": lambda value: (value.update(platform="aarch64-darwin"), value["paths"]["m2-discovery"]["checks"].pop(observer.CLI_UBUNTU_CASE))})
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
                 value = result()
                 fault(value)
-                observer.cli_check_result(value)
+                observer.cli_check_result(value, linux)
+        # The verdict names this host's release platform; it does not trust the result's.
+        with self.assertRaisesRegex(ValueError, "this host's release platform"):
+            observer.cli_check_result(mac, linux)
+        with patch.object(observer.sys, "argv", ["observer", "check-result", str(self.root / "result.json")]), \
+             patch.object(observer, "cli_json", return_value=mac), patch.object(observer, "cli_host_platform", return_value=linux), \
+             patch.object(observer.os, "umask"), patch.object(observer.signal, "signal"), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertNotEqual(observer.main(), 0)
+        self.assertIn("this host's release platform", stderr.getvalue())
+
+    def test_cli_processes_umask_reaches_only_the_child(self):
+        output = self.root / "umask"
+        output.mkdir()
+        processes = observer.CliProcesses(output)
+        inherited = os.umask(0o077)
+        try:
+            reply = processes.command(["/bin/sh", "-c", "umask"], {"PATH": "/usr/bin:/bin"}, output, "child", umask=0o002)
+            self.assertEqual(os.umask(0o077), 0o077)
+        finally:
+            os.umask(inherited)
+        self.assertEqual((reply["exit"], processes.text("child").strip()), (0, "0002"))
+        for stream in processes.streams:
+            stream.close()
+
+    def test_ubuntu_layout_gives_umask_002_only_to_children_and_keeps_this_homes_data(self):
+        manifest = {"files": {"opener": {"sha256": "o"}}, "consumer": {"files": {observer.CLI_OPENER: "opener"}},
+                    "new": {"version": "0.8.0-alpha.9"}, observer.CLI_SYSTEM_PHASE: {"version": "0.8.0-alpha.10"}}
+        state = {"preserved": {"identity": {"identity/device.key": {"sha256": "a"}}}, "data": {"state/value": {"sha256": "b"}}}
+
+        def run(name, after):
+            home = self.root / ("ubuntu-" + name)
+            home.mkdir()
+            umasks, order = {}, []
+            process = SimpleNamespace(pid=4242, poll=lambda: None, wait=lambda timeout=None: order.append("home-closed") or 0)
+
+            def spawn(argv, env, cwd, label, umask=-1):
+                umasks[label] = umask
+                return process
+
+            status = home / observer.CLI_DATA / "update-controller/status.json"
+
+            def child(label):
+                def step(home_path, *args, umask=-1, **kwargs):
+                    umasks[label] = umask
+                    order.append(label)
+                    if label == "install":
+                        # The installer creates Home's data inside the fresh account's
+                        # ~/.local on Linux, so it cannot exist before the layout is made.
+                        status.parent.mkdir(parents=True)
+                        status.write_text("{}")
+                    return {"exit": 0}
+                return step
+
+            def verify(home_path, name, label, fresh):
+                order.append(label)
+                return after if name == observer.CLI_SYSTEM_PHASE else None
+
+            steps = SimpleNamespace(phase=lambda name: order.append("phase-" + name), install=child("install"), setup=child("setup"),
+                                    verify=verify, prepare=lambda *args: order.append("prepare"), command=child("update"))
+            processes = SimpleNamespace(spawn=spawn, roots={})
+            evidence = {}
+
+            def state_now(manifest_value, home_path, coordination=True):
+                # The same Home's state, read after prepare and Home close and before the update;
+                # the stopped gateway's lock is not an offline upgrade lock, so it is not admitted.
+                self.assertEqual((home_path, "prepare" in order, order[-1], coordination), (home, True, "home-closed", False))
+                return json.loads(json.dumps(state))
+            with patch.object(observer, "cli_success", return_value=True), patch.object(observer, "cli_state", side_effect=state_now) as observed, \
+                 patch.object(observer, "cli_private_json", return_value={"phase": "ready", "controller_pid": 4242}), \
+                 patch.object(observer, "cli_observe_initial_home", return_value={"generation": 1, "authenticated_health": True}), \
+                 patch.object(observer.os, "umask", side_effect=AssertionError("observer umask changed")), patch.object(observer.os, "killpg"):
+                observer.cli_ubuntu_layout(processes, manifest, home, evidence, steps)
+            observed.assert_called_once()
+            return umasks, evidence
+
+        umasks, evidence = run("same", state)
+        self.assertEqual(umasks, {"install": 0o002, "setup": 0o002, "ubuntu-home": 0o002, "update": 0o002})
+        self.assertEqual((evidence["status"], evidence["update"]["to"]), ("passed", "0.8.0-alpha.10"))
+        for name, change in (("preserved", lambda value: value["preserved"]["identity"].update({"identity/device.key": None})),
+                             ("data", lambda value: value["data"].update({"state/value": {"sha256": "c"}}))):
+            changed = json.loads(json.dumps(state))
+            change(changed)
+            with self.subTest(changed=name), self.assertRaisesRegex(ValueError, "update changed preserved data"):
+                run(name, changed)
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
         with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac or Linux CI"):
@@ -2281,7 +2397,7 @@ class CliFixtureTests(unittest.TestCase):
                 version = "0.8.0-alpha.7" if label == "build-next" else "0.8.0-alpha.8"
                 self.assertEqual(env["ELASTOS_RELEASE_VERSION"], version)
                 self.assertEqual(env, {**os.environ, "ELASTOS_RELEASE_VERSION": version})
-                self.assertEqual(timeout, 900)
+                self.assertEqual(timeout, 1800)
                 runtime.write_bytes(header + (b"N+1" if label == "build-next" else b"N+2"))
             else:
                 stdout = b"elastos 0.8.0-alpha.7\n" if label == "new-version" else b"elastos 0.8.0-alpha.8\n"
@@ -2335,6 +2451,13 @@ class CliFixtureTests(unittest.TestCase):
                 self.assertFalse((self.root / "build-inputs").exists())
 
     def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
+        self.assert_hop_builder_failed_compile(False)
+
+    def test_hop_builder_timed_out_compile_reports_limit_and_keeps_old_bytes(self):
+        self.assert_hop_builder_failed_compile(True)
+
+    def assert_hop_builder_failed_compile(self, timed_out):
+        run_command = observer.CliProcesses.command
         runtime = self.root / "built-runtime"
         original = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         runtime.write_bytes(original)
@@ -2343,14 +2466,34 @@ class CliFixtureTests(unittest.TestCase):
         def command(manager, argv, env, cwd, label, timeout):
             (destination / (label + ".stdout")).write_bytes(b"elastos 0.7.1\n" if label == "old-version" else b"")
             (destination / (label + ".stderr")).write_bytes(b"")
-            return {"exit": 0 if label == "old-version" else 124}
+            if label == "old-version":
+                return {"exit": 0}
+            self.assertEqual(timeout, 1800)
+            process = SimpleNamespace(pid=30000)
+            waits = []
+            def wait(timeout):
+                waits.append(timeout)
+                if timed_out and len(waits) == 1:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                return -observer.signal.SIGKILL if timed_out else 124
+            process.wait = wait
+            with patch.object(manager, "spawn", return_value=process), patch.object(observer.os, "killpg") as kill:
+                result = run_command(manager, argv, env, cwd, label, timeout)
+            self.assertEqual(result["exit"], 124)
+            self.assertEqual(result["timed_out"], timed_out)
+            self.assertEqual(waits, [1800, 5] if timed_out else [1800])
+            if timed_out:
+                kill.assert_called_once_with(process.pid, observer.signal.SIGKILL)
+            else:
+                kill.assert_not_called()
+            return result
         def git(argv, **kwargs):
             return "" if argv[1] == "status" else "a" * 40 + "\n"
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
              patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
-             self.assertRaisesRegex(ValueError, "new Runtime build failed"):
+             self.assertRaisesRegex(ValueError, "^new Runtime build timed out after 1800 s$" if timed_out else "^new Runtime build failed$"):
             observer.cli_build_hop(destination, runtime, previous)
         receipt = observer.cli_json(destination / "build.json")
         self.assertEqual(receipt["status"], "failed")
@@ -2990,10 +3133,11 @@ class PreviousReleaseInstallTests(unittest.TestCase):
             target.start()
             self.addCleanup(target.stop)
 
-    def published(self, case):
+    def published(self, case, home_components=None):
         """The pinned release as Runtime installs it, its signed release and components, and the pin."""
         root = self.root / case
-        installed, stage = root / "installed", root / "stage"
+        installed, stage, optional = root / "installed", root / "stage", root / "optional"
+        home_components = list(observer.CLI_SETUP_COMPONENTS if home_components is None else home_components)
         builder = re.search(r"(?ms)^create_capsule_tar\(\) \{\n.*?^\}\n", Path(__file__).with_name("publish-release.sh").read_text())[0]
 
         def put(path, raw, mode):
@@ -3029,7 +3173,7 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                 metadata = {"install_path": "capsules/" + name, "platforms": {"*": signed}}
         for name in ("ipfs-provider", "localhost-provider", *observer.CLI_PROTECTED_PROVIDERS, "custody-provider"):
             natives[name] = b"native " + name.encode()
-            put(installed / "bin" / name, natives[name], 0o755)
+            put((installed if name in home_components else optional) / "bin" / name, natives[name], 0o755)
             external[name] = {"install_path": "bin/" + name, "platforms": {self.PLATFORM: entry(
                 natives[name], name + "-" + self.PLATFORM, install_path="bin/" + name)}}
         external["localhost-provider"]["capsule_metadata"] = metadata
@@ -3044,7 +3188,7 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                             "capsule_metadata": {"install_path": "capsules/kubo", "platforms": {
                                 self.PLATFORM: {**kubo, "extract_path": "kubo", "install_path": "capsules/kubo"}}}}
         observer.write(installed / "components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
-                                                       "profiles": {"home": {"components": list(observer.CLI_SETUP_COMPONENTS)}}})
+                                                       "profiles": {"home": {"components": home_components}}})
         pinned, current = root / "pinned-elastos", root / "current-elastos"
         pinned.write_bytes(b"#!/bin/sh\n# the pinned Runtime\n")
         source = {key: subprocess.check_output(["git", "rev-parse", ref], cwd=Path(__file__).resolve().parents[1], text=True).strip()
@@ -3060,7 +3204,20 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                                            "release_cid": observer.cli_v0_cid(raw), "release_sha256": hashlib.sha256(raw).hexdigest(),
                                            "head_cid": observer.cli_v0_cid(b"pinned head"), "signer_did": envelope["signer_did"]})
         data = '"$HOME"/' + shlex.quote(observer.CLI_DATA)
-        current.write_text("#!/bin/bash\nset -eu\ncase $1 in\nsetup) exit ;;\n"
+        current.write_text("#!/bin/bash\nset -eu\ncase $1 in\nsetup)\n"
+                           "while [ $# -gt 0 ]; do\n"
+                           "  if [ \"$1\" = --with ]; then\n"
+                           "    IFS=, read -ra names <<< \"$2\"\n"
+                           "    for name in \"${names[@]}\"; do\n"
+                           "      optional=" + shlex.quote(str(optional)) + "/bin/\"$name\"\n"
+                           "      if [ -f \"$optional\" ]; then\n"
+                           "        mkdir -p " + data + "/bin\n"
+                           "        cp \"$optional\" " + data + "/bin/\n"
+                           "      fi\n"
+                           "    done\n"
+                           "    shift 2\n"
+                           "  else shift; fi\n"
+                           "done\nexit ;;\n"
                            "update) [ \"$2 $3 $4\" = '--rollback-to " + observer.cli_v0_cid(b"pinned head") + " --yes' ] ;;\n*) exit 1 ;;\nesac\n"
                            "cp -R " + shlex.quote(str(installed)) + "/. " + data + "/\n"
                            "cp " + shlex.quote(str(pinned)) + ' "$HOME/.local/bin/elastos.new"\n'
@@ -3099,12 +3256,26 @@ class PreviousReleaseInstallTests(unittest.TestCase):
         self.assertEqual({name: (support / "bin" / name).read_bytes() for name in fixture["natives"]}, fixture["natives"])
         self.assertFalse((fixture["root"] / "home").exists())
 
+    def test_home_profile_can_leave_required_fixture_providers_optional(self):
+        home = [name for name in observer.CLI_SETUP_COMPONENTS if name not in observer.CLI_PROTECTED_PROVIDERS]
+        fixture = self.published("optional-providers", home_components=home)
+        published = observer.cli_json(fixture["installed"] / "components.json")
+        for name in observer.CLI_PROTECTED_PROVIDERS:
+            self.assertNotIn(name, published["profiles"]["home"]["components"])
+            self.assertIn(name, published["external"])
+            self.assertFalse((fixture["installed"] / "bin" / name).exists())
+        self.assertEqual(self.install(fixture)["release"]["version"], "0.8.0-alpha.8")
+        for name in observer.CLI_PROTECTED_PROVIDERS:
+            self.assertEqual((fixture["root"] / "previous/support/bin" / name).read_bytes(), fixture["natives"][name])
+
     def test_rollback_refuses_installed_bytes_that_differ_from_the_pin_or_their_signed_hash(self):
         def tamper(relative):
             return lambda fixture: (fixture["installed"] / relative).write_bytes(b"tampered")
         faults = {"release.json differs from its signed hash": tamper("installation/release.json"),
                   "artifacts/home.tar.gz differs from its signed hash": tamper("capsules/home/browser/app.js"),
                   "artifacts/ipfs-provider-linux-amd64 differs from its signed hash": tamper("bin/ipfs-provider"),
+                  "artifacts/protected-content-protect-provider-linux-amd64 differs from its signed hash":
+                      tamper("bin/protected-content-protect-provider"),
                   "installed kubo differs from its signed archive": tamper("capsules/kubo/.elastos-artifact-sha256"),
                   "support/bin/kubo differs from its signed hash": tamper("bin/kubo"),
                   "localhost-provider-capsule-metadata.tar.gz differs from its signed hash": tamper("capsules/localhost-provider/icons/icon-32.png"),

@@ -179,7 +179,8 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                  patch.object(builder.platform, 'machine', return_value='x86_64' if platform == 'linux-amd64' else 'arm64'), \
                  patch.object(builder.shutil, 'which', return_value='/fixture/build-tool'), \
                  patch.object(builder.subprocess, 'run', side_effect=run), \
-                 patch.dict(os.environ, {'ELASTOS_BROWSER_LINUX_UAPI_INCLUDE': str(headers)}), \
+                 patch.dict(os.environ, {'ELASTOS_BROWSER_LINUX_UAPI_INCLUDE': str(headers),
+                                         'MACOSX_DEPLOYMENT_TARGET': '11.0'}), \
                  patch.object(upstream, 'builder_module', return_value=builder):
                 receipt = upstream.package(recipe, root / 'cache', root / 'output')
             self.assertFalse((root / "cache" / ("turnserver-built-" + platform + ".tar.gz")).exists())
@@ -198,6 +199,10 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
             self.assertTrue(any('--disable-shared' in args for args in calls))
             self.assertTrue(any('--enable-openssl' in args for args in calls))
             self.assertTrue(any(e.get('PKG_CONFIG_SYSROOT_DIR') and e.get('TURN_DISABLE_RPATH') == '1' for e in environments))
+            # The job's Cargo target is 11.0; Darwin helpers still build for their 14.0 floor.
+            builds = [e for e in environments if e.get('TURN_DISABLE_RPATH') == '1']
+            self.assertTrue(builds)
+            self.assertTrue(all(e['MACOSX_DEPLOYMENT_TARGET'] == ('14.0' if mac else '11.0') for e in builds))
             self.assertTrue(any('relocated/bin/turnserver' in args[0] for args in calls))
             self.assertFalse(any(args[0] in ('curl', 'wget') for args in calls))
 

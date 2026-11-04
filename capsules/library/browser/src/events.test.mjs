@@ -124,12 +124,12 @@ function createHarness() {
     handleBrowserPopState: async () => {},
     hideDialog() {},
     hideMenu() {},
-    loadCurrentFolder: async () => {},
     moveSelectedObjectsTo() {},
     navigate: async () => {},
     navigateBack: async () => {},
     navigateForward: async () => {},
     navigateUp: async () => {},
+    refreshCurrentFolder: async () => {},
     objectByUri(uri) {
       return selected.find((object) => object.uri === uri) || null;
     },

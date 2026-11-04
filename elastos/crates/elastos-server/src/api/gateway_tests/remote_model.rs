@@ -2449,7 +2449,7 @@ async fn an_admin_with_two_passkeys_serves_local_and_hosted_model_grants() {
         })
         .unwrap()
         .role = crate::auth::RuntimePrincipalRole::Guest;
-    crate::auth::save_auth_state(fx.owner.path(), &auth).unwrap();
+    crate::auth::save_auth_state(fx.owner.path(), &auth, None).unwrap();
     fx.write_request_record_with_expiry_and_offers("approved", now_ts() + 3600, &[hosted]);
     let refused = fx.create_run("hosted-mixed-roles", hosted).await;
     assert_eq!(refused["ok"], false, "{refused}");

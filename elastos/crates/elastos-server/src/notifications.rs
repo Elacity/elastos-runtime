@@ -327,9 +327,9 @@ pub fn project_contact_request_notifications(
     });
     for request in pending {
         let id = contact_request_notification_id(&request.request_hash);
-        let title = format!("{} wants to connect", request.display_name);
-        let body =
-            contact_request_notification_body(&request.display_name, request.handle.as_deref());
+        let title =
+            contact_request_notification_title(&request.display_name, request.handle.as_deref());
+        let body = "Accepting adds them to People.".to_string();
         summary.entries.push(NotificationEntryView {
             id,
             source_app: "people".to_string(),
@@ -356,14 +356,10 @@ pub fn project_contact_request_notifications(
         .count();
 }
 
-fn contact_request_notification_body(display_name: &str, handle: Option<&str>) -> String {
+fn contact_request_notification_title(display_name: &str, handle: Option<&str>) -> String {
     match handle {
-        Some(handle) => format!(
-            "{display_name} (@{handle}) wants to add you as a contact. Accepting adds them to People."
-        ),
-        None => {
-            format!("{display_name} wants to add you as a contact. Accepting adds them to People.")
-        }
+        Some(handle) => format!("{display_name} (@{handle}) wants to add you"),
+        None => format!("{display_name} wants to add you"),
     }
 }
 
@@ -1271,14 +1267,14 @@ mod tests {
     }
 
     #[test]
-    fn contact_request_notification_explains_the_people_consequence_only() {
+    fn contact_request_notification_names_the_person_once() {
         assert_eq!(
-            contact_request_notification_body("Morgan", None),
-            "Morgan wants to add you as a contact. Accepting adds them to People."
+            contact_request_notification_title("Morgan", None),
+            "Morgan wants to add you"
         );
         assert_eq!(
-            contact_request_notification_body("Morgan", Some("morgan")),
-            "Morgan (@morgan) wants to add you as a contact. Accepting adds them to People."
+            contact_request_notification_title("Morgan", Some("morgan")),
+            "Morgan (@morgan) wants to add you"
         );
     }
 
@@ -1301,7 +1297,8 @@ mod tests {
         assert_eq!(entry.kind, CONTACT_REQUEST_KIND);
         assert_eq!(entry.id, "contact-request:sha256:req");
         assert_eq!(entry.source_app, "people");
-        assert_eq!(entry.title, "Morgan wants to connect");
+        assert_eq!(entry.title, "Morgan (@morgan) wants to add you");
+        assert_eq!(entry.body, "Accepting adds them to People.");
         // The notification points at Inbox and never carries the decision:
         // its action is the Inbox review reference, resolved by Inbox alone.
         assert_eq!(

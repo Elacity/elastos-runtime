@@ -14,3 +14,7 @@ hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# Fixtures for tests in other crates and workspaces; never enabled in builds.
+test-fixtures = []

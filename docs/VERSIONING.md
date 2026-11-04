@@ -95,8 +95,9 @@ Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 ## Pre-release Policy
 
 Use `-alpha.N` for a signed test release published while a version is still
-being built; the 0.8.0 train ships `0.8.0-alpha.N`. Use `-rc.N` for a signed
-candidate that is published before its final version.
+being built (the 0.8.0 test releases ran to `0.8.0-alpha.26`). Use `-rc.N` for
+a signed candidate that is published before its final version; 2.0.0 is
+published first as `2.0.0-rc.N`.
 A monthly source release (a repository tag; signed releases over Carrier are
 the only binary distribution) uses plain `X.Y.Z`; its notes state what is not
 ready for users.
@@ -152,6 +153,8 @@ This repo keeps one coordinated release changelog:
 
 That matches the coordinated runtime release train better than per-crate changelogs. A publish is not complete unless the changelog and public status story are honest about what changed.
 
+A release section's Added, Changed, Fixed, Removed and Security bullets are what System shows, without their headings, before someone updates. `scripts/release-platform-input-test.py` holds every section dated from 31 October 2026 to the release-notes rules (#507): plain text for a person using Home, one standalone line per bullet, no internal terms, and an issue number only where a bullet states a limit.
+
 ## Publishing a release
 
 A release moves through three places: GitHub builds it without keys, the
@@ -194,7 +197,7 @@ The approval has these fields:
 ```json
 {
   "schema": "elastos.release.approval/v1",
-  "repository": "Elacity/elastos-runtime",
+  "repository": "elastos/elastos-runtime",
   "source": {"commit": "APPROVED_SOURCE_COMMIT", "tree": "APPROVED_SOURCE_TREE"},
   "workflow": {
     "commit": "APPROVED_BUILDER_COMMIT",
@@ -297,8 +300,9 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    attested `components.json`. It shows source, builder, publisher tuple and approval digest
    before the operator types the DID. The source admission gate still applies.
    A network, outage or rate-limit failure refuses with a retry message,
-   distinct from a provenance refusal; the printed command passes the operator's
-   `gh auth token` to avoid anonymous rate limits.
+   distinct from a provenance refusal; the printed command gives the signer the
+   operator's `gh auth token` through a file descriptor, which avoids anonymous
+   rate limits and keeps the token out of every argv.
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every

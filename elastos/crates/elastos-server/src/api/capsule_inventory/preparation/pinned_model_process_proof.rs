@@ -20,7 +20,7 @@ struct PinnedModel {
     quantized_repository: &'static str,
     quantized_revision: &'static str,
     provenance: &'static str,
-    /// Whole-proof budget: import, loopback transfer, admission, reply/restart.
+    /// Whole-proof budget: import, holder transfer, admission, reply/restart.
     deadline_secs: u64,
     /// Accepts the completed text of the first reply.
     reply_accepts: fn(&str) -> bool,

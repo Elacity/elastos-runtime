@@ -45,8 +45,6 @@ const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
-/// The Attach button is an icon; this is its accessible name.
-const ATTACH_LABEL: &str = "Attach";
 const SHELL_SESSION_LOST_DETAIL: &str =
     "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
@@ -146,6 +144,8 @@ struct AppState {
     /// Attachments whose download failed, keyed by attachment id.
     attachment_retry: BTreeMap<String, AttachmentRetry>,
     attachment_downloads_running: bool,
+    /// The Library file Community is about to post, or has just posted.
+    library_post: Option<LibraryPost>,
     join_invite_url: Option<String>,
     direct: DirectUiState,
     /// The conversation whose text the composer shows: `None` is the shared
@@ -169,6 +169,11 @@ struct AppState {
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
     community_unread: bool,
+    /// A Community poll ran while Chat could not mark it read (hidden, or
+    /// another conversation open), so rows it holds may be unread. Runtime
+    /// counts only rows returned by a marking poll as read, so the next
+    /// visible Community poll asks again from the start.
+    community_read_catchup: bool,
     /// This person's Community presence state from Runtime: `requested`,
     /// `deferred`, `refused`, `hidden`, `always` or `while_open`. Runtime owns
     /// the decision (Inbox, System); Chat only reflects it and re-asks.
@@ -225,6 +230,8 @@ struct App {
     /// that sent it.
     participant_card_opening: Cell<u64>,
     participant_contact_requests: RefCell<BTreeSet<String>>,
+    participant_card_notice: RefCell<Option<(String, String)>>,
+    participant_profile_copying: Cell<bool>,
     /// The name that opened the card: its reference, and the message `seq`
     /// when it was a message sender. Lists re-render, so closing the card finds
     /// that exact name again and returns focus to it.
@@ -258,6 +265,10 @@ struct App {
     composer_form: HtmlFormElement,
     message_input: HtmlTextAreaElement,
     attach_button: HtmlButtonElement,
+    library_post_panel: HtmlElement,
+    library_post_title: HtmlElement,
+    library_post_lines: HtmlElement,
+    library_post_buttons: Vec<(LibraryPostAction, HtmlButtonElement)>,
     send_button: HtmlButtonElement,
     participant_toggle: HtmlButtonElement,
     room_access_toggle: HtmlButtonElement,
@@ -271,6 +282,7 @@ struct App {
     participant_card_name: HtmlElement,
     participant_card_state: HtmlElement,
     participant_card_action: HtmlButtonElement,
+    participant_card_copy: HtmlButtonElement,
     participant_card_close: HtmlButtonElement,
     browser_access_section: HtmlElement,
     browser_access_count: HtmlElement,
@@ -338,6 +350,10 @@ impl ShellSessionBootstrapFailure {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ConversationObjectView {
     seq: u64,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
     sender: String,
     /// Opaque reference to the sender's profile card, when Runtime has one.
     #[serde(default)]
@@ -357,6 +373,19 @@ struct ConversationObjectView {
     created_at: u64,
     #[serde(default)]
     delivery_state: Option<CommunityDeliveryState>,
+}
+
+impl ConversationObjectView {
+    fn message_reference(&self) -> Option<String> {
+        if self.from_current_session {
+            return None;
+        }
+        Some(format!(
+            "{}/{}",
+            self.conversation_id.as_deref()?,
+            self.message_id.as_deref()?
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -626,6 +655,297 @@ struct AttachmentUploadStartResponse {
     chunk_size_bytes: u64,
 }
 
+fn validate_attachment_size(size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("Empty files can't be sent.".into());
+    }
+    if size > 8 * 1024 * 1024 {
+        return Err("Choose a file of 8 MB or less.".into());
+    }
+    Ok(())
+}
+
+/// The same words Library shows before it publishes a file.
+const POST_PUBLICLY_BODY: &str = "Your contacts can get it from the post while your Home is open.";
+
+/// Shown when Home's answer was lost: the post may or may not have gone out.
+const POST_OUTCOME_UNKNOWN: &str = "Couldn't confirm the post. Check Community, or try again.";
+
+/// A Library file Community posts publicly: Chat asks once, then Home
+/// publishes the file from Library and posts its link. Publishing and
+/// posting are reported apart, so a failed post can be retried without
+/// publishing again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibraryPost {
+    /// Names this post to Home; a retry reuses it.
+    request_id: String,
+    object_uri: String,
+    revision: String,
+    file_name: String,
+    size_bytes: u64,
+    phase: LibraryPostPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LibraryPostPhase {
+    Confirm,
+    Working,
+    Posted {
+        link: String,
+    },
+    PostFailed {
+        link: String,
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
+    /// Home's answer was lost. Trying again reuses the request id, so Home
+    /// cannot post the file twice.
+    Unknown {
+        link: Option<String>,
+    },
+    /// Unpublished in Library after an unknown outcome: the lost attempt may
+    /// still have posted the file.
+    UnpublishedUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryPostAction {
+    Cancel,
+    Post,
+    Retry,
+    OpenLibrary,
+    Close,
+}
+
+const LIBRARY_POST_ACTIONS: [(LibraryPostAction, &str); 5] = [
+    (LibraryPostAction::Cancel, "library-post-cancel"),
+    (LibraryPostAction::Post, "library-post-confirm"),
+    (LibraryPostAction::Retry, "library-post-retry"),
+    (LibraryPostAction::OpenLibrary, "library-post-open-library"),
+    (LibraryPostAction::Close, "library-post-close"),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct LibraryPostView {
+    title: String,
+    lines: Vec<String>,
+    actions: &'static [LibraryPostAction],
+    /// The Retry button's words: "Retry post" after a failed post, "Try
+    /// again" when the outcome is unknown.
+    retry_label: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AttachLibraryInput<'a> {
+    uri: &'a str,
+    if_revision: &'a str,
+    request_id: &'a str,
+}
+
+/// The Community post Chat shows: kept for Community across conversation
+/// switches and reconnects, hidden while a direct conversation is open.
+/// Generation guards cover only the picker delivery and in-flight requests.
+fn visible_library_post(state: &AppState) -> Option<&LibraryPost> {
+    state
+        .direct
+        .selected_conversation_id
+        .is_none()
+        .then_some(state.library_post.as_ref())
+        .flatten()
+}
+
+/// A Community picker selection: the Library file's address, revision, name
+/// and size. Bytes never travel through Chat for a Community post.
+fn library_post_from_selection(
+    request_id: String,
+    object_uri: Option<String>,
+    revision: Option<String>,
+    file_name: String,
+    size_bytes: Option<f64>,
+) -> Result<LibraryPost, String> {
+    let (Some(object_uri), Some(revision)) = (object_uri, revision) else {
+        return Err("Choose the file again in Library.".to_string());
+    };
+    if !object_uri.starts_with("localhost://") {
+        return Err("Choose the file again in Library.".to_string());
+    }
+    let size_bytes = size_bytes
+        .filter(|size| size.is_finite() && *size >= 0.0 && size.fract() == 0.0)
+        .map(|size| size as u64)
+        .ok_or_else(|| "Choose the file again in Library.".to_string())?;
+    validate_attachment_size(size_bytes)?;
+    Ok(LibraryPost {
+        request_id,
+        object_uri,
+        revision,
+        file_name,
+        size_bytes,
+        phase: LibraryPostPhase::Confirm,
+    })
+}
+
+fn attach_library_error_text(code: &str, reason: &str) -> &'static str {
+    match (code, reason) {
+        ("empty_file", _) => "Empty files can't be shared.",
+        ("too_large", _) => "This file is too large to share. Files up to 8 MiB can be shared.",
+        ("stale_revision", _) => "This file changed. Choose it again in Library.",
+        ("unsupported", "folder") => "Folders can't be posted. Choose a file.",
+        ("unsupported", "protected") => "Protected files can't be posted.",
+        ("unsupported", _) => "This file can't be posted from here.",
+        ("unavailable", _) => "Sharing isn't available right now. Try again.",
+        ("changed_since_publish", _) => {
+            "This file changed after you shared it. Stop sharing it in Library, then post it again."
+        }
+        ("withdrawn", _) => "Sharing of this file stopped in Library, so it was not posted.",
+        ("request_id_reused", _) => "This post can't be sent again. Attach the file again.",
+        _ => "This file could not be posted. Try again.",
+    }
+}
+
+/// Home's answer to a request whose earlier attempt is the `previous` phase.
+/// After an unknown outcome, `withdrawn` says the file was unpublished, not
+/// that it was never posted: the lost attempt may have posted it.
+fn library_post_answer(
+    previous: &LibraryPostPhase,
+    http_status: u16,
+    body: &serde_json::Value,
+) -> LibraryPostPhase {
+    let withdrawn = body.get("code").and_then(serde_json::Value::as_str) == Some("withdrawn");
+    if withdrawn && matches!(previous, LibraryPostPhase::Unknown { .. }) {
+        return LibraryPostPhase::UnpublishedUnknown;
+    }
+    library_post_outcome(http_status, body)
+}
+
+/// Home's answer to one attach-library request, read whatever its HTTP
+/// status: a failed post after a successful publish keeps the published link.
+fn library_post_outcome(http_status: u16, body: &serde_json::Value) -> LibraryPostPhase {
+    let link = body
+        .pointer("/data/publication/uri")
+        .and_then(serde_json::Value::as_str)
+        .filter(|link| link.starts_with("elastos://"))
+        .unwrap_or_default()
+        .to_string();
+    let ok = (200..300).contains(&http_status)
+        && body.get("status").and_then(serde_json::Value::as_str) == Some("ok");
+    // A body that is not Home's answer (a proxy error page, an empty reply)
+    // says nothing about whether the post went out.
+    if !matches!(
+        body.get("status").and_then(serde_json::Value::as_str),
+        Some("ok" | "error")
+    ) {
+        return LibraryPostPhase::Unknown {
+            link: (!link.is_empty()).then_some(link),
+        };
+    }
+    if ok
+        && body.pointer("/data/posted") == Some(&serde_json::Value::Bool(true))
+        && !link.is_empty()
+    {
+        return LibraryPostPhase::Posted { link };
+    }
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if code == "post_failed" && !link.is_empty() {
+        let detail = if http_status == 429 {
+            "Community is busy. Wait a moment, then retry the post."
+        } else {
+            "Posting to Community failed. Retry the post."
+        };
+        return LibraryPostPhase::PostFailed {
+            link,
+            detail: detail.to_string(),
+        };
+    }
+    let reason = body
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    LibraryPostPhase::Failed {
+        detail: attach_library_error_text(code, reason).to_string(),
+    }
+}
+
+fn library_post_view(post: &LibraryPost) -> LibraryPostView {
+    use LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
+    let file = format!("{} · {}", post.file_name, format_bytes(post.size_bytes));
+    match &post.phase {
+        LibraryPostPhase::Confirm => LibraryPostView {
+            title: format!("Post \"{}\" in Community?", post.file_name),
+            lines: vec![POST_PUBLICLY_BODY.to_string()],
+            actions: &[Cancel, Post],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::Working => LibraryPostView {
+            title: format!("Post \"{}\" in Community?", post.file_name),
+            lines: vec!["Sharing and posting...".to_string()],
+            actions: &[],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::Posted { link } => LibraryPostView {
+            title: "Posted in Community".to_string(),
+            lines: vec![
+                file,
+                format!("Shared: {link}"),
+                "Posted in Community.".to_string(),
+            ],
+            actions: &[OpenLibrary, Close],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::PostFailed { link, detail } => LibraryPostView {
+            title: "Shared, not posted".to_string(),
+            lines: vec![
+                file,
+                format!("Shared: {link}"),
+                detail.clone(),
+                "Shared from Library. You can stop sharing it there.".to_string(),
+            ],
+            actions: &[Retry, OpenLibrary, Close],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::Failed { detail } => LibraryPostView {
+            title: "Not posted".to_string(),
+            lines: vec![file, detail.clone()],
+            actions: &[Close],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::UnpublishedUnknown => LibraryPostView {
+            title: "Post not confirmed".to_string(),
+            lines: vec![
+                file,
+                "Sharing stopped in Library. Check Community to see whether it was posted."
+                    .to_string(),
+            ],
+            actions: &[Close],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::Unknown { link } => {
+            let mut lines = vec![file];
+            if let Some(link) = link {
+                lines.push(format!("Shared: {link}"));
+            }
+            lines.push(POST_OUTCOME_UNKNOWN.to_string());
+            LibraryPostView {
+                title: "Post not confirmed".to_string(),
+                lines,
+                actions: &[Retry, OpenLibrary, Close],
+                retry_label: "Try again",
+            }
+        }
+    }
+}
+
+/// The Library folder that holds a posted file.
+fn library_folder_uri(object_uri: &str) -> &str {
+    object_uri
+        .rsplit_once('/')
+        .map_or(object_uri, |(folder, _)| folder)
+}
+
 #[derive(Debug, Serialize)]
 struct RoomAccessPolicyInput {
     allow_guest_invites: bool,
@@ -695,6 +1015,8 @@ pub fn start() -> Result<(), JsValue> {
         picker_request: RefCell::new(None),
         participant_card_opening: Cell::new(0),
         participant_contact_requests: RefCell::new(BTreeSet::new()),
+        participant_card_notice: RefCell::new(None),
+        participant_profile_copying: Cell::new(false),
         participant_card_opener: RefCell::new(None),
         direct_pending_seen: RefCell::new(BTreeMap::new()),
         pending_note_render: RefCell::new(None),
@@ -723,6 +1045,13 @@ pub fn start() -> Result<(), JsValue> {
         composer_form: form_by_id(&document, "composer-form")?,
         message_input: textarea_by_id(&document, "message-input")?,
         attach_button: button_by_id(&document, "attach-button")?,
+        library_post_panel: element_by_id(&document, "library-post")?,
+        library_post_title: element_by_id(&document, "library-post-title")?,
+        library_post_lines: element_by_id(&document, "library-post-lines")?,
+        library_post_buttons: LIBRARY_POST_ACTIONS
+            .iter()
+            .map(|(action, id)| Ok((*action, button_by_id(&document, id)?)))
+            .collect::<Result<Vec<_>, JsValue>>()?,
         send_button: button_by_id(&document, "send-button")?,
         participant_toggle: button_by_id(&document, "participant-toggle")?,
         room_access_toggle: button_by_id(&document, "room-access-toggle")?,
@@ -739,6 +1068,7 @@ pub fn start() -> Result<(), JsValue> {
         participant_card_name: element_by_id(&document, "participant-card-name")?,
         participant_card_state: element_by_id(&document, "participant-card-state")?,
         participant_card_action: button_by_id(&document, "participant-card-action")?,
+        participant_card_copy: button_by_id(&document, "participant-card-copy")?,
         participant_card_close: button_by_id(&document, "participant-card-close")?,
         browser_access_section: element_by_id(&document, "browser-access-section")?,
         browser_access_count: element_by_id(&document, "browser-access-count")?,
@@ -802,14 +1132,7 @@ impl App {
     }
 
     fn can_mark_read(&self, conversation_id: Option<&str>) -> bool {
-        self.view_visible()
-            && self
-                .state
-                .borrow()
-                .direct
-                .selected_conversation_id
-                .as_deref()
-                == conversation_id
+        mark_read_decision(&self.state.borrow(), self.view_visible(), conversation_id)
     }
 
     fn default_status_badge(&self) -> String {
@@ -1155,11 +1478,12 @@ impl App {
         if !selected_is_available {
             return Err(403);
         }
+        let mark_read = self.can_mark_read(Some(&conversation_id));
         let messages_result: Result<DirectMessageList, u16> = direct_get_json(
             &format!(
                 "{DIRECT_API_BASE}/conversations/{}/messages?retry_details=true&mark_read={}",
                 encode_path_segment(&conversation_id),
-                self.can_mark_read(Some(&conversation_id))
+                mark_read
             ),
             &self.home_token_headers(),
         )
@@ -1183,12 +1507,13 @@ impl App {
         let unread_changed =
             state.community_unread != conversations.community_unread.unwrap_or(false);
         state.community_unread = conversations.community_unread.unwrap_or(false);
-        let Some(result) = apply_direct_refresh_if_current(
-            &mut state,
-            guard,
-            conversations.conversations,
-            response,
-        ) else {
+        let mut conversation_list = conversations.conversations;
+        if mark_read {
+            mark_conversation_read(&mut conversation_list, &conversation_id);
+        }
+        let Some(result) =
+            apply_direct_refresh_if_current(&mut state, guard, conversation_list, response)
+        else {
             return Ok(false);
         };
         drop(state);
@@ -1240,7 +1565,9 @@ impl App {
                     };
                     let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
                         .unwrap_or(JsValue::NULL);
-                    if event.origin() != origin || !JsObject::is(&source, parent.as_ref()) {
+                    if !shell_layout_origin_admitted(&event.origin(), origin)
+                        || !JsObject::is(&source, parent.as_ref())
+                    {
                         return;
                     }
                     let data = event.data();
@@ -1261,15 +1588,16 @@ impl App {
             layout.forget();
             // WASM initialization can finish after the iframe load message.
             // Request the same presentation snapshot once the listener exists.
-            if let (Some(window), Some(origin)) = (
-                window(),
-                admitted_home_origin(self.home_parent_origin.as_deref()),
-            ) {
-                if let Ok(Some(parent)) = window.parent() {
-                    if let Ok(request) =
-                        js_sys::JSON::parse(r#"{"type":"elastos:shell-layout","request":true}"#)
-                    {
-                        let _ = parent.post_message(&request, origin);
+            // The Home GUI shell is an opaque frame, so a request addressed to
+            // the Home origin would be dropped; it carries no data.
+            if admitted_home_origin(self.home_parent_origin.as_deref()).is_some() {
+                if let Some(window) = window() {
+                    if let Ok(Some(parent)) = window.parent() {
+                        if let Ok(request) =
+                            js_sys::JSON::parse(r#"{"type":"elastos:shell-layout","request":true}"#)
+                        {
+                            let _ = parent.post_message(&request, "*");
+                        }
                     }
                 }
             }
@@ -1470,6 +1798,18 @@ impl App {
         self.attach_button
             .add_event_listener_with_callback("click", attach_click.as_ref().unchecked_ref())?;
         attach_click.forget();
+
+        for (action, button) in &self.library_post_buttons {
+            let action = *action;
+            let post_app = Rc::clone(self);
+            let post_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+                event.prevent_default();
+                post_app.library_post_action(action);
+            }));
+            button
+                .add_event_listener_with_callback("click", post_click.as_ref().unchecked_ref())?;
+            post_click.forget();
+        }
 
         let toggle_app = Rc::clone(self);
         let toggle_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
@@ -1759,7 +2099,14 @@ impl App {
             let Some(uri) = anchor.get_attribute("data-open-uri") else {
                 return;
             };
-            match link_app.open_elastos_uri_from_shell(&uri) {
+            if selection_intersects(&anchor) {
+                return;
+            }
+            match link_app.open_elastos_uri_from_shell(
+                &uri,
+                anchor.get_attribute("data-message-ref").as_deref(),
+                anchor.get_attribute("data-file-name").as_deref(),
+            ) {
                 Ok(true) => event.prevent_default(),
                 Ok(false) => {}
                 Err(error) => {
@@ -1782,14 +2129,25 @@ impl App {
                 let Some(link) = event
                     .target()
                     .and_then(|value| value.dyn_into::<Element>().ok())
-                    .and_then(|target| target.closest("[data-open-external]").ok().flatten())
+                    .and_then(|target| {
+                        target
+                            .closest("[data-open-external], [data-open-uri]")
+                            .ok()
+                            .flatten()
+                    })
                 else {
                     return;
                 };
-                let Some(url) = link.get_attribute("data-open-external") else {
-                    return;
-                };
-                key_app.activate_external_link(&event, &url);
+                if let Some(uri) = link.get_attribute("data-open-uri") {
+                    event.prevent_default();
+                    let _ = key_app.open_elastos_uri_from_shell(
+                        &uri,
+                        link.get_attribute("data-message-ref").as_deref(),
+                        link.get_attribute("data-file-name").as_deref(),
+                    );
+                } else if let Some(url) = link.get_attribute("data-open-external") {
+                    key_app.activate_external_link(&event, &url);
+                }
             },
         ));
         self.message_list
@@ -1858,13 +2216,45 @@ impl App {
                     request.consumed = true;
                     request.clone()
                 };
-                let blob = js_blob_field(&data, "blob");
                 let file_name = js_string_field(&data, "fileName")
                     .or_else(|| js_string_field(&data, "title"))
                     .unwrap_or_else(|| "Library item".to_string());
                 let mime_type = js_string_field(&data, "mimeType")
                     .unwrap_or_else(|| "application/octet-stream".to_string());
                 let app = Rc::clone(&library_attach_app);
+                if app.state.borrow().collaboration_configured {
+                    // Community asks before it posts, so it acknowledges the
+                    // picker at once: Home's delivery expires after 30 seconds.
+                    app.clear_error();
+                    let post = new_chat_message_request_id().and_then(|post_id| {
+                        library_post_from_selection(
+                            post_id,
+                            js_string_field(&data, "objectUri"),
+                            js_string_field(&data, "revision"),
+                            file_name,
+                            js_number_field(&data, "sizeBytes"),
+                        )
+                    });
+                    let accepted = match post {
+                        Ok(post) if app.library_picker_is_current(&request) => {
+                            app.state.borrow_mut().library_post = Some(post);
+                            true
+                        }
+                        Ok(_) => false,
+                        Err(err) => {
+                            app.set_error(Some(err));
+                            false
+                        }
+                    };
+                    let _ = app.post_library_picker_message(serde_json::json!({
+                        "type": "home:picker-accepted", "homeToken": app.home_token(),
+                        "pickerId": picker_id, "requestId": request_id,
+                        "documentNonce": document_nonce, "deliveryId": delivery_id, "accepted": accepted,
+                    }));
+                    let _ = app.render();
+                    return;
+                }
+                let blob = js_blob_field(&data, "blob");
                 spawn_local(async move {
                     app.clear_error();
                     let result = if let Some(blob) = blob {
@@ -2092,12 +2482,12 @@ impl App {
         spawn_local(async move {
             let headers = app.room_request_headers();
             let poll_guard = begin_poll_request(&mut app.state.borrow_mut());
+            let mark_read = app.can_mark_read(None);
+            let (since, mark_read) =
+                community_poll_cursor(&mut app.state.borrow_mut(), 0, mark_read);
             let result = api_post_session_json(
                 &app.room_api_url("/poll"),
-                &RoomPollInput {
-                    since: 0,
-                    mark_read: app.can_mark_read(None),
-                },
+                &RoomPollInput { since, mark_read },
                 &headers,
                 Some(REQUEST_DEADLINE_MS),
             )
@@ -2109,6 +2499,7 @@ impl App {
             }
             match result {
                 Ok(poll) => {
+                    community_poll_answered(&mut app.state.borrow_mut(), since, mark_read);
                     if app.apply_active_poll(&poll_guard, poll).is_none() {
                         return;
                     }
@@ -2732,7 +3123,13 @@ impl App {
                 .filter(|value| !value.trim().is_empty())
         }
         .ok_or_else(|| "Create a join link first.".to_string())?;
-        copy_text_to_clipboard(&invite_url).await?;
+        write_home_clipboard(
+            "elastosChatCopyInvite",
+            &invite_url,
+            "Trusted Home Clipboard is unavailable.",
+            "Join link could not be copied. Try again.",
+        )
+        .await?;
         self.set_status("Copied", "Conversation join link copied.");
         Ok(())
     }
@@ -3066,14 +3463,14 @@ impl App {
         blob: Blob,
         request: &LibraryPickerRequest,
     ) -> Result<(), String> {
+        validate_attachment_size(blob.size() as u64)?;
         let bytes = blob_to_bytes(blob).await?;
-        if bytes.is_empty() {
-            return Err("Library item is empty.".to_string());
-        }
         self.send_attachment_bytes(file_name, mime_type, &bytes, request)
             .await
     }
 
+    /// A room on this Home only: Community posts Library files by publishing
+    /// them (`run_library_post`), never by uploading bytes.
     async fn send_attachment_bytes(
         &self,
         file_name: &str,
@@ -3084,6 +3481,7 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("Open a new Library picker in the current conversation.".to_string());
         }
+        validate_attachment_size(bytes.len() as u64)?;
         let headers = self.room_request_headers();
         let start: AttachmentUploadStartResponse = api_post_session_json(
             &self.room_api_url("/upload/start"),
@@ -3119,7 +3517,7 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        let sent: ConversationObjectView = api_post_empty_json_with_headers(
+        let sent: serde_json::Value = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/upload/{}/finish", start.upload_id)),
             &headers,
         )
@@ -3128,7 +3526,148 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        record_own_shared_send(&mut self.state.borrow_mut(), sent);
+        let object = serde_json::from_value(sent)
+            .map_err(|_| "Home could not confirm the attachment.".to_string())?;
+        record_own_shared_send(&mut self.state.borrow_mut(), object);
+        Ok(())
+    }
+
+    fn library_post_action(self: &Rc<Self>, action: LibraryPostAction) {
+        match action {
+            LibraryPostAction::Cancel | LibraryPostAction::Close => {
+                self.state.borrow_mut().library_post = None;
+                let _ = self.render();
+            }
+            LibraryPostAction::Post | LibraryPostAction::Retry => {
+                let app = Rc::clone(self);
+                spawn_local(async move { app.run_library_post().await });
+            }
+            LibraryPostAction::OpenLibrary => {
+                let Some(object_uri) = self
+                    .state
+                    .borrow()
+                    .library_post
+                    .as_ref()
+                    .map(|post| post.object_uri.clone())
+                else {
+                    return;
+                };
+                let opened = self.post_home_message(&serde_json::json!({
+                    "type": "home:open-target", "target": "library", "homeToken": self.home_token(),
+                    "query": { "uri": library_folder_uri(&object_uri) },
+                }));
+                if !matches!(opened, Ok(true)) {
+                    self.set_error(Some("Open Home to open Library.".to_string()));
+                    let _ = self.render();
+                }
+            }
+        }
+    }
+
+    /// Asks Home to publish the chosen Library file and post its link. A
+    /// retry after a failed post reuses the request id, so Home posts the
+    /// same publication instead of publishing again.
+    async fn run_library_post(self: &Rc<Self>) {
+        let started = {
+            let mut state = self.state.borrow_mut();
+            let allowed = state.community_send_enabled() && visible_library_post(&state).is_some();
+            match state.library_post.as_mut() {
+                Some(post)
+                    if matches!(
+                        post.phase,
+                        LibraryPostPhase::Confirm
+                            | LibraryPostPhase::PostFailed { .. }
+                            | LibraryPostPhase::Unknown { .. }
+                    ) =>
+                {
+                    allowed.then(|| {
+                        let previous =
+                            std::mem::replace(&mut post.phase, LibraryPostPhase::Working);
+                        (post.clone(), previous)
+                    })
+                }
+                _ => return,
+            }
+        };
+        let Some((post, previous)) = started else {
+            self.set_error(Some("Open Community to post this file.".to_string()));
+            let _ = self.render();
+            return;
+        };
+        let _ = self.render();
+        let result = api_post_session_envelope(
+            &self.room_api_url("/attach-library"),
+            &AttachLibraryInput {
+                uri: &post.object_uri,
+                if_revision: &post.revision,
+                request_id: &post.request_id,
+            },
+            &self.room_request_headers(),
+        )
+        .await;
+        let phase = match result {
+            Ok((401, _)) => {
+                self.handle_session_loss(self.session_loss_detail());
+                match previous {
+                    LibraryPostPhase::PostFailed { link, .. } => LibraryPostPhase::PostFailed {
+                        link,
+                        detail: "Reconnect, then retry the post.".to_string(),
+                    },
+                    unknown @ LibraryPostPhase::Unknown { .. } => unknown,
+                    _ => LibraryPostPhase::Failed {
+                        detail: "Reconnect, then attach the file again.".to_string(),
+                    },
+                }
+            }
+            Ok((status, body)) => library_post_answer(&previous, status, &body),
+            // The request may have reached Home: the outcome is unknown, and
+            // trying again reuses this request id so the file is posted once.
+            Err(_) => LibraryPostPhase::Unknown {
+                link: match previous {
+                    LibraryPostPhase::PostFailed { link, .. } => Some(link),
+                    LibraryPostPhase::Unknown { link } => link,
+                    _ => None,
+                },
+            },
+        };
+        if let Some(current) = self.state.borrow_mut().library_post.as_mut() {
+            if current.request_id == post.request_id {
+                current.phase = phase;
+            }
+        }
+        let _ = self.render();
+    }
+
+    fn render_library_post(&self, post: Option<&LibraryPost>) -> Result<(), JsValue> {
+        set_hidden(&self.library_post_panel, post.is_none())?;
+        let Some(post) = post else {
+            return Ok(());
+        };
+        let view = library_post_view(post);
+        self.library_post_title.set_text_content(Some(&view.title));
+        let signature = view.lines.join("\n");
+        if self
+            .library_post_lines
+            .get_attribute("data-lines")
+            .as_deref()
+            != Some(signature.as_str())
+        {
+            self.library_post_lines
+                .set_attribute("data-lines", &signature)?;
+            self.library_post_lines.set_text_content(None);
+            for line in &view.lines {
+                let paragraph = self.document.create_element("p")?;
+                paragraph.set_class_name("detail");
+                paragraph.set_text_content(Some(line));
+                self.library_post_lines.append_child(&paragraph)?;
+            }
+        }
+        for (action, button) in &self.library_post_buttons {
+            set_hidden(button.unchecked_ref(), !view.actions.contains(action))?;
+            if *action == LibraryPostAction::Retry {
+                button.set_text_content(Some(view.retry_label));
+            }
+        }
         Ok(())
     }
 
@@ -3167,18 +3706,21 @@ impl App {
         Ok(true)
     }
 
-    fn open_elastos_uri_from_shell(&self, uri: &str) -> Result<bool, JsValue> {
-        let clean_uri = uri.trim();
-        let Some(home_token) = self.home_token() else {
-            return Ok(false);
-        };
-        if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
+    fn open_elastos_uri_from_shell(
+        &self,
+        uri: &str,
+        message_ref: Option<&str>,
+        file_name: Option<&str>,
+    ) -> Result<bool, JsValue> {
+        if !self.is_shell_mode() {
             return Ok(false);
         }
-        self.post_home_message(&serde_json::json!({
-            "type": "home:open-uri", "uri": clean_uri, "preferredViewer": "documents",
-            "homeToken": home_token,
-        }))
+        let Some(message) =
+            shared_file_request(self.home_token().as_deref(), uri, message_ref, file_name)
+        else {
+            return Ok(false);
+        };
+        self.post_home_message(&message)
     }
 
     /// App documents have no popup permission. Inside Home a web link has no
@@ -3217,7 +3759,12 @@ impl App {
     /// Appends a message's text: plain runs as text nodes (never parsed as
     /// markup) and each web address as a link element. Shared by room Text
     /// messages and direct messages.
-    fn append_message_text(&self, body: &Element, text: &str) -> Result<(), JsValue> {
+    fn append_message_text(
+        &self,
+        body: &Element,
+        text: &str,
+        message_ref: Option<&str>,
+    ) -> Result<(), JsValue> {
         for node in message_text_nodes(text, self.is_shell_mode()) {
             match node {
                 MessageTextNode::Text(text) => body.append_with_str_1(text)?,
@@ -3226,6 +3773,11 @@ impl App {
                     link.set_class_name("message-link");
                     for (name, value) in attributes {
                         link.set_attribute(name, &value)?;
+                    }
+                    if text.starts_with("elastos://") {
+                        if let Some(message_ref) = message_ref {
+                            link.set_attribute("data-message-ref", message_ref)?;
+                        }
                     }
                     link.set_text_content(Some(text));
                     body.append_child(&link)?;
@@ -3372,27 +3924,16 @@ impl App {
         })
     }
 
-    fn participant_activity_for(&self, participant_ref: &str) -> Option<String> {
-        let state = self.state.borrow();
-        let participant = state.participants.iter().find(|participant| {
-            participant
-                .card
-                .as_ref()
-                .is_some_and(|card| card.participant_ref == participant_ref)
-        })?;
-        let card = participant.card.as_ref()?;
-        if card.active_now {
-            Some("Home online".to_string())
-        } else if participant.last_seen_at > 0 {
-            Some(last_message_text(participant.last_seen_at))
-        } else {
-            None
-        }
-    }
-
     fn open_participant_card(&self, participant_ref: &str, message_seq: Option<u64>) {
         if self.participant_card_for(participant_ref).is_none() {
             return;
+        }
+        self.participant_card_notice.borrow_mut().take();
+        // The card lives in the People drawer; a name on a message opens it too.
+        let drawer_closed =
+            !std::mem::replace(&mut self.state.borrow_mut().show_participants, true);
+        if drawer_closed {
+            let _ = self.render();
         }
         self.participant_card_opening
             .set(self.participant_card_opening.get().wrapping_add(1));
@@ -3421,17 +3962,20 @@ impl App {
             return false;
         };
         let (state_text, action) = participant_card_copy(&card, self.home_token().is_some());
-        let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
             .set_text_content(Some(&participant_initial(&name)));
         self.participant_card_name.set_text_content(Some(&name));
         self.participant_card_state
-            .set_text_content(Some(&match activity {
-                Some(activity) if card.relationship != "you" => {
-                    format!("{state_text} · {activity}")
-                }
-                _ => state_text.to_string(),
-            }));
+            .set_text_content(Some(state_text));
+        if let Some((relationship, message)) = self.participant_card_notice.borrow().as_ref() {
+            if relationship == &card.relationship {
+                self.participant_card_state.set_text_content(Some(message));
+            }
+        }
+        self.participant_card_copy
+            .set_hidden(card.relationship == "you" || self.home_token().is_none());
+        self.participant_card_copy
+            .set_disabled(self.participant_profile_copying.get());
         match action {
             Some((label, action)) => {
                 self.participant_card_action.set_text_content(Some(label));
@@ -3519,6 +4063,7 @@ impl App {
                 {
                     return;
                 }
+                self.participant_card_notice.borrow_mut().take();
                 self.participant_card_action.set_disabled(true);
                 let opening = self.participant_card_opening.get();
                 self.participant_contact_requests
@@ -3541,31 +4086,42 @@ impl App {
                         app.close_participant_card(true);
                         return;
                     };
-                    if current.relationship != "none" {
-                        app.refresh_open_participant_card();
-                        return;
-                    }
                     match result {
-                        Ok(()) => {
+                        Ok(response) => {
+                            if current.relationship != "none"
+                                && current.relationship != response.status.relationship()
+                            {
+                                app.refresh_open_participant_card();
+                                return;
+                            }
                             for participant in &mut app.state.borrow_mut().participants {
                                 if let Some(card) = participant.card.as_mut().filter(|card| {
                                     card.participant_ref == participant_ref
                                         && card.relationship == "none"
                                 }) {
-                                    card.relationship = "requested".to_string();
+                                    card.relationship = response.status.relationship().to_string();
                                     card.can_add_contact = false;
                                 }
                             }
+                            *app.participant_card_notice.borrow_mut() = Some((
+                                response.status.relationship().to_string(),
+                                response.message,
+                            ));
                             app.refresh_open_participant_card();
                         }
                         Err(error) => {
+                            if current.relationship != "none" {
+                                app.refresh_open_participant_card();
+                                return;
+                            }
+                            *app.participant_card_notice.borrow_mut() =
+                                Some((current.relationship, error));
                             app.refresh_open_participant_card();
-                            app.participant_card_state.set_text_content(Some(&error));
                         }
                     }
                 });
             }
-            "inbox" | "people" => {
+            "inbox" => {
                 self.close_participant_card(false);
                 let _ = self.post_library_picker_message(serde_json::json!({
                     "type": "home:open-target", "target": action, "query": {},
@@ -3576,15 +4132,79 @@ impl App {
         }
     }
 
-    async fn request_contact(&self, participant_ref: &str) -> Result<(), String> {
-        let _: serde_json::Value = api_post_json_with_headers(
+    async fn request_contact(
+        &self,
+        participant_ref: &str,
+    ) -> Result<ContactRequestResponse, String> {
+        api_post_json_with_headers(
             &self.room_api_url("/contacts/request"),
             &serde_json::json!({ "participant_ref": participant_ref }),
             &self.home_token_headers(),
-            None,
+            Some(REQUEST_DEADLINE_MS),
         )
-        .await?;
-        Ok(())
+        .await
+        .map_err(|error| contact_failure_message(&error, "Could not send the request. Try again."))
+    }
+
+    fn copy_participant_profile_id(self: &Rc<Self>) {
+        let Some(participant_ref) = self.participant_card.get_attribute("data-participant-ref")
+        else {
+            return;
+        };
+        let Some((_, card)) = self.participant_card_for(&participant_ref) else {
+            return;
+        };
+        if card.relationship == "you"
+            || self.home_token().is_none()
+            || self.participant_profile_copying.replace(true)
+        {
+            return;
+        }
+        self.participant_card_copy.set_disabled(true);
+        let opening = self.participant_card_opening.get();
+        let request_token = self.home_token();
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            let result: Result<ProfileIdResponse, String> = api_post_json_with_headers(
+                &app.room_api_url("/contacts/profile-id"),
+                &serde_json::json!({ "participant_ref": participant_ref }),
+                &app.home_token_headers(),
+                Some(REQUEST_DEADLINE_MS),
+            )
+            .await
+            .map_err(|error| {
+                contact_failure_message(&error, "DID could not be copied. Try again.")
+            });
+            if app.home_token() != request_token || app.participant_card_opening.get() != opening {
+                app.participant_profile_copying.set(false);
+                app.refresh_open_participant_card();
+                return;
+            }
+            let copied = match result {
+                Ok(response) => {
+                    write_home_clipboard(
+                        "elastosChatCopyProfileId",
+                        &response.profile_id,
+                        "Open Chat from Home to copy a DID.",
+                        "DID could not be copied. Try again.",
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            app.participant_profile_copying.set(false);
+            if app.home_token() == request_token && app.participant_card_opening.get() == opening {
+                if let Some((_, current)) = app.participant_card_for(&participant_ref) {
+                    *app.participant_card_notice.borrow_mut() = Some((
+                        current.relationship,
+                        copied
+                            .map(|()| "DID copied.".to_string())
+                            .unwrap_or_else(|error| error),
+                    ));
+                }
+            }
+            app.refresh_open_participant_card();
+        });
     }
 
     /// "Show me in Community" after Later: Runtime opens the Inbox card
@@ -3656,6 +4276,13 @@ impl App {
         self.participant_card_action
             .add_event_listener_with_callback("click", card_action.as_ref().unchecked_ref())?;
         card_action.forget();
+        let card_copy_app = Rc::clone(self);
+        let card_copy = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            card_copy_app.copy_participant_profile_id();
+        }));
+        self.participant_card_copy
+            .add_event_listener_with_callback("click", card_copy.as_ref().unchecked_ref())?;
+        card_copy.forget();
         let card_close_app = Rc::clone(self);
         let card_close = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
             card_close_app.close_participant_card(true);
@@ -3731,6 +4358,12 @@ impl App {
             .as_ref()
             .is_some_and(|current| current.id == request.id)
             && self.state.borrow().community_send_enabled()
+            && self
+                .state
+                .borrow()
+                .direct
+                .selected_conversation_id
+                .is_none()
             && self.selection_guard_is_current(&request.selection)
     }
 
@@ -3743,15 +4376,15 @@ impl App {
             let request_token = self.home_token();
             let headers = self.room_request_headers();
             let poll_guard = begin_poll_request(&mut self.state.borrow_mut());
+            let mark_read = self.can_mark_read(None);
+            let (since, mark_read) = {
+                let mut state = self.state.borrow_mut();
+                let latest_seq = state.latest_seq;
+                community_poll_cursor(&mut state, latest_seq, mark_read)
+            };
             let response = api_post_session_json(
                 &self.room_api_url("/poll"),
-                &RoomPollInput {
-                    since: {
-                        let state = self.state.borrow();
-                        state.latest_seq
-                    },
-                    mark_read: self.can_mark_read(None),
-                },
+                &RoomPollInput { since, mark_read },
                 &headers,
                 Some(REQUEST_DEADLINE_MS),
             )
@@ -3762,7 +4395,10 @@ impl App {
                 return Ok(false);
             }
             let poll: RoomPollView = match response {
-                Ok(poll) => poll,
+                Ok(poll) => {
+                    community_poll_answered(&mut self.state.borrow_mut(), since, mark_read);
+                    poll
+                }
                 Err(err) if is_session_error(&err) => {
                     self.handle_session_loss(self.session_loss_detail());
                     return Ok(true);
@@ -4093,21 +4729,11 @@ impl App {
         } else {
             !controls.enable_text_send
         });
-        // Direct conversations are text-only by declared decision, and the
-        // control says so where the person meets it — visibly unavailable,
-        // never silently missing.
-        set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
-        self.attach_button
-            .set_disabled(direct_mode || !controls.enable_attach);
-        if direct_mode {
-            self.attach_button.set_title(DIRECT_ATTACHMENTS_UNAVAILABLE);
-            self.attach_button
-                .set_attribute("aria-label", DIRECT_ATTACHMENTS_UNAVAILABLE)?;
-        } else {
-            self.attach_button.set_title(ATTACH_LABEL);
-            self.attach_button
-                .set_attribute("aria-label", ATTACH_LABEL)?;
-        }
+        // Direct conversations carry no files, so Attach shows only in Community.
+        set_hidden(&self.attach_button, direct_mode || !controls.show_attach)?;
+        let library_post = visible_library_post(&state);
+        self.render_library_post(library_post)?;
+        self.attach_button.set_disabled(!controls.enable_attach);
         self.send_button.set_disabled(if direct_mode {
             !direct_send_enabled
                 || state.reconnect_needed
@@ -4288,16 +4914,13 @@ impl App {
         self.conversation_avatar.set_text_content(Some(&avatar));
         self.conversation_title.set_text_content(Some(&title));
         self.conversation_detail.set_text_content(Some(detail));
-        if let Some(history) = history.filter(|history| {
-            selected.is_none()
-                && matches!(
-                    history.status.as_str(),
-                    "searching" | "available" | "unavailable"
-                )
-                && !history.detail.trim().is_empty()
-        }) {
+        // While Community is live, the subtitle says Live; only history that
+        // cannot be loaded is worth saying instead.
+        if let Some(history) =
+            community_history_notice(selected.is_none(), community_state, history)
+        {
             self.conversation_detail
-                .set_text_content(Some(&format!("{detail} · {}", history.detail.trim())));
+                .set_text_content(Some(history.detail.trim()));
             self.conversation_detail
                 .set_attribute("data-history-status", &history.status)?;
             self.conversation_detail
@@ -4341,6 +4964,11 @@ impl App {
             let outgoing = message.direction == DirectMessageDirection::Outgoing;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-direct-message-id", &message.message_id)?;
+            let message_ref =
+                direct_message_reference(conversation_id, &message.message_id, message.direction);
+            if let Some(message_ref) = &message_ref {
+                item.set_attribute("data-message-ref", message_ref)?;
+            }
             item.set_class_name(if outgoing {
                 "message self-message"
             } else {
@@ -4355,24 +4983,23 @@ impl App {
                 &conversation.display_name
             }));
             let detail = self.document.create_element("span")?;
-            detail.set_text_content(Some(&format!(
-                "{} · {}",
-                format_time(message.created_at),
-                if message
-                    .request_id
-                    .as_ref()
-                    .is_some_and(|id| state.direct_in_flight.contains_key(id))
-                {
-                    "Sending"
-                } else {
-                    message.delivery_state.label()
-                }
-            )));
+            let in_flight = message
+                .request_id
+                .as_ref()
+                .is_some_and(|id| state.direct_in_flight.contains_key(id));
+            detail.set_text_content(Some(&if in_flight {
+                "Sending".to_string()
+            } else {
+                message
+                    .delivery_state
+                    .label()
+                    .map_or_else(|| format_time(message.created_at), str::to_string)
+            }));
             meta.append_child(&sender)?;
             meta.append_child(&detail)?;
             let body = self.document.create_element("div")?;
             body.set_class_name("message-body");
-            self.append_message_text(&body, &message.text)?;
+            self.append_message_text(&body, &message.text, message_ref.as_deref())?;
             item.append_child(&meta)?;
             item.append_child(&body)?;
             if outgoing
@@ -4737,11 +5364,11 @@ impl App {
 
             let name = self.document.create_element("div")?;
             name.set_class_name("node-row-name");
-            name.set_text_content(Some("Pending profile invite"));
+            name.set_text_content(Some("ElastOS invite"));
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some("Pending ElastOS invite"));
+            detail.set_text_content(Some("Pending"));
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -4831,7 +5458,7 @@ impl App {
             }
             let empty = self.document.create_element("li")?;
             empty.set_class_name("empty");
-            empty.set_text_content(Some("No messages yet. Say hi."));
+            empty.set_text_content(Some("No messages yet."));
             self.message_list.append_child(&empty)?;
             return Ok(());
         }
@@ -4841,6 +5468,10 @@ impl App {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-seq", &object.seq.to_string())?;
+            let message_ref = object.message_reference();
+            if let Some(message_ref) = &message_ref {
+                item.set_attribute("data-message-ref", message_ref)?;
+            }
             let is_self = object.from_current_session;
             item.set_class_name(
                 if is_self && object.kind != ConversationObjectKind::System {
@@ -4885,7 +5516,11 @@ impl App {
                 }
                 ConversationObjectKind::Text => {
                     body.set_class_name("message-body");
-                    self.append_message_text(&body, object.body.as_deref().unwrap_or_default())?;
+                    self.append_message_text(
+                        &body,
+                        object.body.as_deref().unwrap_or_default(),
+                        message_ref.as_deref(),
+                    )?;
                 }
                 ConversationObjectKind::Emoji => {
                     body.set_class_name("message-body emoji-body");
@@ -4896,9 +5531,14 @@ impl App {
                     if let Some(link) = &object.link {
                         let anchor = if link.url.starts_with("elastos://") {
                             let anchor = self.document.create_element("a")?;
-                            anchor.set_attribute("href", &link.url)?;
-                            anchor.set_attribute("data-open-uri", &link.url)?;
-                            anchor.set_attribute("aria-label", "Open published document")?;
+                            if is_shared_file_uri(&link.url) {
+                                for (name, value) in shared_file_attributes(&link.url) {
+                                    anchor.set_attribute(name, &value)?;
+                                }
+                                if let Some(message_ref) = &message_ref {
+                                    anchor.set_attribute("data-message-ref", message_ref)?;
+                                }
+                            }
                             anchor
                         } else {
                             self.external_link_element(&link.url, &link.title)?
@@ -5255,9 +5895,123 @@ fn documents_attachment_message(
     })
 }
 
+fn is_shared_file_uri(uri: &str) -> bool {
+    uri.strip_prefix("elastos://").is_some_and(|host| {
+        host.parse::<cid::Cid>()
+            .is_ok_and(|cid| cid.to_string() == host)
+    })
+}
+
+fn shared_file_attributes(uri: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("data-open-uri", uri.into()),
+        ("role", "link".into()),
+        ("tabindex", "0".into()),
+        ("aria-label", format!("Open shared file {uri}")),
+    ]
+}
+
+fn direct_message_reference(
+    conversation_id: &str,
+    message_id: &str,
+    direction: DirectMessageDirection,
+) -> Option<String> {
+    if direction == DirectMessageDirection::Outgoing {
+        return None;
+    }
+    Some(format!("{conversation_id}/{message_id}"))
+}
+
+/// The longest file name, in UTF-8 bytes, Chat passes to Home with a shared
+/// file link. The Runtime writes a file through a temporary
+/// `.<name>.<16 hex>.tmp` (elastos-server auth.rs `atomic_write`) under the
+/// 255-byte file-name limit, so a name may take 233 bytes; 200 leaves room for
+/// the `-2` a duplicate gets. Home, Documents and Library apply the same rule.
+const SHARED_FILE_NAME_MAX_BYTES: usize = 200;
+/// An extension longer than this is part of the name when a name is cut.
+const SHARED_FILE_EXTENSION_MAX_BYTES: usize = 16;
+
+/// A file name fit to show and to suggest when saving: no path separators,
+/// control characters or leading dots, at most 200 UTF-8 bytes, cut on a
+/// character boundary before the extension. It is only a title and default
+/// name; it never decides the type or the app.
+fn shared_file_display_name(raw: &str) -> Option<String> {
+    if raw.contains(['/', '\\']) {
+        return None;
+    }
+    let cleaned: String = raw.chars().filter(|ch| !ch.is_control()).collect();
+    let name = cleaned
+        .trim_start_matches(|ch: char| ch == '.' || ch.is_whitespace())
+        .trim_end();
+    if name.len() <= SHARED_FILE_NAME_MAX_BYTES {
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= SHARED_FILE_EXTENSION_MAX_BYTES => {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    };
+    let budget = SHARED_FILE_NAME_MAX_BYTES - extension.len();
+    let end = stem
+        .char_indices()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .take_while(|end| *end <= budget)
+        .last()
+        .unwrap_or(0);
+    let stem = stem[..end].trim_end_matches(|ch: char| ch == '.' || ch.is_whitespace());
+    (!stem.is_empty()).then(|| format!("{stem}{extension}"))
+}
+
+/// The file name a Chat file post states (`name · size · elastos://<cid>`),
+/// when the whole message is that post and its link is `uri`.
+fn shared_file_post_name(text: &str, uri: &str) -> Option<String> {
+    let mut parts = text.rsplitn(3, " · ");
+    if parts.next()? != uri {
+        return None;
+    }
+    let size = parts.next()?;
+    let stated_size = match size.strip_suffix(" bytes") {
+        Some(bytes) => !bytes.is_empty() && bytes.bytes().all(|byte| byte.is_ascii_digit()),
+        None => size.split_once(' ').is_some_and(|(number, unit)| {
+            ["KB", "MB", "GB"].contains(&unit) && number.parse::<f64>().is_ok_and(f64::is_finite)
+        }),
+    };
+    if !stated_size {
+        return None;
+    }
+    shared_file_display_name(parts.next()?)
+}
+
+fn shared_file_request(
+    home_token: Option<&str>,
+    uri: &str,
+    message_ref: Option<&str>,
+    file_name: Option<&str>,
+) -> Option<serde_json::Value> {
+    let home_token = home_token.filter(|token| !token.is_empty())?;
+    if !is_shared_file_uri(uri) {
+        return None;
+    }
+    let mut request =
+        serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": home_token});
+    if let Some(reference) = message_ref {
+        let (conversation_id, message_id) = reference.split_once('/')?;
+        if conversation_id.is_empty() || message_id.is_empty() {
+            return None;
+        }
+        request["source"] =
+            serde_json::json!({"conversation_id": conversation_id, "message_id": message_id});
+    }
+    if let Some(name) = file_name.and_then(shared_file_display_name) {
+        request["name"] = serde_json::Value::String(name);
+    }
+    Some(request)
+}
+
 const OPEN_LINK_FROM_HOME: &str = "Open Chat from Home to open web links.";
 
-/// One run of a Text message: plain text, or a web address shown as a link.
+/// One run of a Text message: plain text, a web address, or a shared file link.
 #[derive(Debug, PartialEq, Eq)]
 enum TextSegment<'a> {
     Text(&'a str),
@@ -5283,18 +6037,64 @@ fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> 
             TextSegment::Text(text) => MessageTextNode::Text(text),
             TextSegment::Link(url) => MessageTextNode::Link {
                 text: url,
-                attributes: external_link_attributes(url, None, shell_mode),
+                attributes: if url.starts_with("elastos://") {
+                    let mut attributes = shared_file_attributes(url);
+                    if let Some(name) = shared_file_post_name(text, url) {
+                        attributes.push(("data-file-name", name));
+                    }
+                    attributes
+                } else {
+                    external_link_attributes(url, None, shell_mode)
+                },
             },
         })
         .collect()
 }
 
-/// Splits message text into plain runs and `http://`/`https://` addresses.
+fn is_bare_profile_did(text: &str) -> bool {
+    text.strip_prefix("did:key:z").is_some_and(|key| {
+        !key.is_empty()
+            && key.bytes().all(|byte| {
+                b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&byte)
+            })
+    })
+}
+
+/// Bare DID tokens use the same Home launch route as other app links.
+/// A DID URL, attached punctuation or an embedded token stays plain text.
+fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
+    let mut segments = Vec::new();
+    for segment in split_address_links(text) {
+        let TextSegment::Text(plain) = segment else {
+            segments.push(segment);
+            continue;
+        };
+        let mut offset = 0;
+        let mut plain_start = 0;
+        for run in plain.split_inclusive(char::is_whitespace) {
+            let token = run.trim_end();
+            if is_bare_profile_did(token) {
+                if plain_start < offset {
+                    segments.push(TextSegment::Text(&plain[plain_start..offset]));
+                }
+                segments.push(TextSegment::Link(token));
+                plain_start = offset + token.len();
+            }
+            offset += run.len();
+        }
+        if plain_start < plain.len() {
+            segments.push(TextSegment::Text(&plain[plain_start..]));
+        }
+    }
+    segments
+}
+
+/// Splits message text into plain runs, web addresses and canonical CID links.
 /// An address runs to the next whitespace or full-width (CJK) punctuation,
 /// minus trailing sentence punctuation, quotes and unbalanced closing
 /// brackets. Nothing else (a bare `example.com`) is a link. The address is
 /// sent unchanged; the Runtime checks it.
-fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
+fn split_address_links(text: &str) -> Vec<TextSegment<'_>> {
     let mut segments = Vec::new();
     let mut plain_start = 0;
     let mut cursor = 0;
@@ -5302,7 +6102,11 @@ fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
         let rest = &text[start..];
         let run_end = start + rest.find(ends_link_run).unwrap_or(rest.len());
         let end = start + trim_link_end(&text[start..run_end]).len();
-        if end > start + scheme_len {
+        if end > start + scheme_len
+            && (scheme_len != "elastos://".len()
+                || (is_shared_file_uri(&text[start..end])
+                    && !text[start + scheme_len..run_end].contains(['/', '?', '#'])))
+        {
             if plain_start < start {
                 segments.push(TextSegment::Text(&text[plain_start..start]));
             }
@@ -5319,7 +6123,7 @@ fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
     segments
 }
 
-/// The next `http://` or `https://` (any ASCII case) at or after `from` that
+/// The next web or shared-file scheme at or after `from` that
 /// does not continue an ASCII word, with the scheme's length. CJK text needs
 /// no space before an address.
 fn next_web_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
@@ -5333,12 +6137,14 @@ fn next_web_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
         {
             return None;
         }
-        ["https://", "http://"].into_iter().find_map(|scheme| {
-            bytes
-                .get(index..index + scheme.len())
-                .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
-                .map(|_| (index, scheme.len()))
-        })
+        ["https://", "http://", "elastos://"]
+            .into_iter()
+            .find_map(|scheme| {
+                bytes
+                    .get(index..index + scheme.len())
+                    .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
+                    .map(|_| (index, scheme.len()))
+            })
     })
 }
 
@@ -5399,7 +6205,13 @@ fn external_link_attributes(
     shell_mode: bool,
 ) -> Vec<(&'static str, String)> {
     let mut attributes = vec![("data-open-external", url.to_string())];
-    if shell_mode {
+    if is_bare_profile_did(url) {
+        attributes.extend([
+            ("role", "link".to_string()),
+            ("tabindex", "0".to_string()),
+            ("aria-label", format!("Add by DID in People: {url}")),
+        ]);
+    } else if shell_mode {
         let label = match title.map(str::trim).filter(|title| !title.is_empty()) {
             Some(title) => format!("Open link: {title} ({url})"),
             None => format!("Open link: {url}"),
@@ -5451,6 +6263,15 @@ fn external_link_request(
     home_token: Option<&str>,
     url: &str,
 ) -> ExternalLinkRequest {
+    if is_bare_profile_did(url) {
+        return match (shell_mode, home_token) {
+            (true, Some(home_token)) => ExternalLinkRequest::AskHome(serde_json::json!({
+                "type": "home:open-target", "target": "people",
+                "query": { "did": url }, "homeToken": home_token,
+            })),
+            _ => ExternalLinkRequest::Refuse,
+        };
+    }
     match (shell_mode, home_token) {
         (false, _) => ExternalLinkRequest::Native,
         (true, Some(home_token)) => {
@@ -5735,6 +6556,50 @@ fn configured_shared_participant_visible(participant: &ParticipantView) -> bool 
     participant.profile_verified == Some(true) && !participant.display_name.trim().is_empty()
 }
 
+/// A messages request marks a conversation read only while it is the open
+/// conversation and Chat is on screen now.
+fn mark_read_decision(state: &AppState, visible: bool, conversation_id: Option<&str>) -> bool {
+    visible && state.direct.selected_conversation_id.as_deref() == conversation_id
+}
+
+/// The cursor and read flag for one Community poll. A poll that cannot mark
+/// read leaves a catch-up owed; the next poll that can mark read asks from
+/// the start, so the rows Chat already holds are counted as read.
+fn community_poll_cursor(state: &mut AppState, since: u64, mark_read: bool) -> (u64, bool) {
+    if !mark_read {
+        state.community_read_catchup = true;
+        (since, false)
+    } else if state.community_read_catchup {
+        (0, true)
+    } else {
+        (since, true)
+    }
+}
+
+/// Runtime answered a Community poll: a marking poll from the start pays the
+/// catch-up.
+fn community_poll_answered(state: &mut AppState, since: u64, mark_read: bool) {
+    if mark_read && since == 0 {
+        state.community_read_catchup = false;
+    }
+}
+
+/// The conversation list is fetched before the messages request that marks
+/// the open conversation read, so it still carries that conversation's unread
+/// flag; once the messages request has marked it read, the flag is cleared
+/// here too, or the dot would stay until a later refresh.
+fn mark_conversation_read(
+    conversations: &mut [direct::DirectConversationView],
+    conversation_id: &str,
+) {
+    if let Some(conversation) = conversations
+        .iter_mut()
+        .find(|conversation| conversation.conversation_id == conversation_id)
+    {
+        conversation.unread = false;
+    }
+}
+
 fn apply_direct_refresh_if_current(
     state: &mut AppState,
     guard: &SelectionGuard,
@@ -5903,6 +6768,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         attachment_urls: BTreeMap::new(),
         attachment_retry: BTreeMap::new(),
         attachment_downloads_running: false,
+        library_post: None,
         join_invite_url: None,
         direct: DirectUiState::default(),
         composer_conversation: None,
@@ -5914,6 +6780,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
         community_unread: false,
+        community_read_catchup: false,
         community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
@@ -6224,6 +7091,83 @@ mod tests {
     }
 
     #[test]
+    fn the_opaque_home_shell_can_tell_chat_it_is_visible() {
+        // On a real Home the Home GUI shell is sandboxed without
+        // allow-same-origin, so its layout message arrives from "null".
+        assert!(super::shell_layout_origin_admitted(
+            "null",
+            "http://localhost:61200"
+        ));
+        assert!(super::shell_layout_origin_admitted(
+            "http://localhost:61200",
+            "http://localhost:61200"
+        ));
+        assert!(!super::shell_layout_origin_admitted(
+            "http://evil.example",
+            "http://localhost:61200"
+        ));
+    }
+
+    #[test]
+    fn rows_polled_while_hidden_are_marked_read_by_the_next_visible_poll() {
+        let mut state = super::AppState::default();
+        // Visible from the start: ordinary incremental marking polls.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (24, true)
+        );
+        // A poll while hidden cannot mark read and leaves a catch-up owed.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        // Still hidden: nothing marked, nothing re-asked.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        // Visible again: one marking poll from the start, then incremental.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
+        super::community_poll_answered(&mut state, 0, true);
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (24, true)
+        );
+        // A failed catch-up poll (no answer) is asked again.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn only_a_visible_open_conversation_is_marked_read() {
+        let mut state = super::AppState::default();
+        state.direct.selected_conversation_id = Some("buddy".to_string());
+        assert!(super::mark_read_decision(&state, true, Some("buddy")));
+        assert!(!super::mark_read_decision(&state, true, Some("other")));
+        // A reply is pending and Chat is minimized before the next refresh
+        // (a new message arrives meanwhile): nothing is marked read.
+        state.direct.pending_send = Some(super::PendingDirectSend {
+            request_id: "send-1".into(),
+            conversation_id: "buddy".into(),
+            text: "hi".into(),
+        });
+        assert!(!super::mark_read_decision(&state, false, Some("buddy")));
+    }
+
+    #[test]
     fn presence_heartbeat_stops_while_shell_hides_chat_and_resumes_when_shown() {
         use super::{chat_view_visible as visible, presence_heartbeat_due as due};
         let tick = |shell_visible| {
@@ -6247,6 +7191,8 @@ mod tests {
     fn runtime_delivery_changes_refresh_known_community_rows_without_new_sequence() {
         use super::CommunityDeliveryState::{Accepted, Expired, Sending, Unknown};
         let object = |seq, is_own| ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: if is_own { "Local" } else { "Peer" }.into(),
@@ -6523,6 +7469,8 @@ mod tests {
 
     fn attachment_object(seq: u64, attachment_id: Option<&str>) -> ConversationObjectView {
         ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             created_at: 100 + seq,
@@ -6629,6 +7577,8 @@ mod tests {
     #[test]
     fn recovered_history_changes_display_order_without_rewinding_poll_cursor() {
         let object = |seq, created_at| ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             created_at,
@@ -6689,6 +7639,15 @@ mod tests {
             assert!(state.session_active);
             assert!(!state.reconnect_needed);
             assert_eq!(state.status_badge, "Live");
+            // The header says Live unless earlier posts cannot be loaded.
+            let notice = super::community_history_notice(
+                true,
+                Some(CommunityState::Live),
+                state.history.as_ref(),
+            )
+            .map(|history| history.detail.as_str());
+            let expected = (status == "unavailable").then_some("History unavailable.");
+            assert_eq!(notice, expected, "{status}");
         }
     }
 
@@ -6697,6 +7656,8 @@ mod tests {
         let mut state = two_direct_conversations();
         state.session_active = true;
         state.objects.push(ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq: 1,
             created_at: 100,
@@ -6890,6 +7851,8 @@ mod tests {
     #[test]
     fn a_late_community_send_does_not_move_a_direct_reader() {
         let sent = || ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq: 7,
             sender: "Me".into(),
@@ -6917,6 +7880,8 @@ mod tests {
     #[test]
     fn a_shared_send_keeps_the_poll_cursor_until_intervening_peer_rows_arrive() {
         let object = |seq, sender: &str| ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -6956,6 +7921,8 @@ mod tests {
     #[test]
     fn a_late_community_receipt_keeps_one_object_and_the_newer_poll_cursor() {
         let object = |seq, sender: &str, body: &str| ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -7070,6 +8037,55 @@ mod tests {
     }
 
     #[test]
+    fn bare_did_tokens_link_to_people_without_sending_a_request() {
+        use TextSegment::{Link, Text};
+        let did = "did:key:z6Mka1b2c3";
+        let text = format!("My DID {did}\nmessage me");
+        assert_eq!(
+            split_text_links(&text),
+            [Text("My DID "), Link(did), Text("\nmessage me")]
+        );
+        for plain in [
+            "did:key:z",
+            "did:key:z0OIl",
+            "DID:key:z6Mka1b2c3",
+            "xdid:key:z6Mka1b2c3",
+            "did:key:z6Mka1b2c3/path",
+            "did:key:z6Mka1b2c3?x=1",
+            "did:key:z6Mka1b2c3#key",
+            "(did:key:z6Mka1b2c3)",
+            "did:key:z6Mka1b2c3,",
+            "<did:key:z6Mka1b2c3>",
+        ] {
+            assert_eq!(split_text_links(plain), [Text(plain)], "{plain}");
+        }
+        assert_eq!(
+            external_link_request(true, Some("home-token"), did),
+            ExternalLinkRequest::AskHome(serde_json::json!({
+                "type": "home:open-target", "target": "people",
+                "query": { "did": did }, "homeToken": "home-token",
+            }))
+        );
+        assert_eq!(
+            external_link_request(true, None, did),
+            ExternalLinkRequest::Refuse
+        );
+        assert_eq!(
+            external_link_request(false, Some("home-token"), did),
+            ExternalLinkRequest::Refuse
+        );
+        for shell in [false, true] {
+            let nodes = message_text_nodes(did, shell);
+            let [super::MessageTextNode::Link { text, attributes }] = &nodes[..] else {
+                panic!("DID link missing")
+            };
+            assert_eq!(*text, did);
+            assert!(attributes.iter().all(|(name, _)| *name != "href"));
+            assert!(attributes.contains(&("aria-label", format!("Add by DID in People: {did}"))));
+        }
+    }
+
+    #[test]
     fn text_web_addresses_split_into_links() {
         use TextSegment::{Link, Text};
         let cases: &[(&str, &[TextSegment])] = &[
@@ -7161,6 +8177,523 @@ mod tests {
             split_text_links(&text),
             [Link(url), Text(&text[url.len()..])]
         );
+    }
+
+    #[test]
+    fn community_link_cites_the_conversation_from_its_row() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for conversation in ["file-community", "another-community"] {
+            let poll = serde_json::json!({
+                "room_slug": "chat-room", "display_name": "Me", "latest_seq": 7,
+                "objects": [{
+                    "seq": 7, "conversation_id": conversation, "message_id": "sha256:message",
+                    "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
+                }],
+            });
+            let polled: super::RoomPollView = serde_json::from_value(poll.clone()).unwrap();
+            let started: super::ShellSessionStartOutput =
+                serde_json::from_value(serde_json::json!({ "poll": poll })).unwrap();
+            for row in [&polled.objects[0], &started.poll.objects[0]] {
+                let request = super::shared_file_request(
+                    Some("launch"),
+                    uri,
+                    row.message_reference().as_deref(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    request["source"],
+                    serde_json::json!({
+                        "conversation_id": conversation, "message_id": "sha256:message",
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_and_incomplete_rows_do_not_invent_a_message_reference() {
+        for ids in [
+            serde_json::json!({}),
+            serde_json::json!({ "message_id": "sha256:message" }),
+            serde_json::json!({ "conversation_id": "file-community" }),
+        ] {
+            let mut row = serde_json::json!({
+                "seq": 7, "sender": "Alma", "kind": "text", "body": "Hello", "created_at": 1,
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(ids.as_object().unwrap().clone());
+            let row: ConversationObjectView = serde_json::from_value(row).unwrap();
+            assert_eq!(row.message_reference(), None);
+        }
+    }
+
+    #[test]
+    fn own_direct_file_links_have_no_remote_source() {
+        assert_eq!(
+            super::direct_message_reference(
+                "direct:conversation",
+                "message",
+                super::DirectMessageDirection::Outgoing
+            ),
+            None
+        );
+        assert_eq!(
+            super::direct_message_reference(
+                "direct:conversation",
+                "message",
+                super::DirectMessageDirection::Incoming
+            ),
+            Some("direct:conversation/message".to_string())
+        );
+    }
+
+    #[test]
+    fn own_community_file_links_have_no_remote_source() {
+        let row: ConversationObjectView = serde_json::from_value(serde_json::json!({
+            "seq": 7, "conversation_id": "file-community", "message_id": "sha256:message",
+            "sender": "Me", "from_current_session": true, "kind": "text", "body": "file", "created_at": 1,
+        })).unwrap();
+        assert_eq!(row.message_reference(), None);
+    }
+
+    #[test]
+    fn shared_file_post_link_carries_only_the_cid_and_the_stated_name() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        let post = format!("report.pdf · 1.0 MB · {uri}");
+        let nodes = message_text_nodes(&post, true);
+        let MessageTextNode::Link { attributes, .. } = nodes.last().unwrap() else {
+            panic!("file link missing")
+        };
+        let mut expected = super::shared_file_attributes(uri);
+        expected.push(("data-file-name", "report.pdf".to_string()));
+        assert_eq!(*attributes, expected);
+        assert_eq!(
+            super::shared_file_request(Some("launch"), uri, None, None).unwrap(),
+            serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": "launch"})
+        );
+        assert_eq!(
+            super::shared_file_request(Some("launch"), uri, None, Some("report.pdf")).unwrap(),
+            serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": "launch", "name": "report.pdf"})
+        );
+        // A name with a separator, or no name at all, sends none.
+        assert!(
+            super::shared_file_request(Some("launch"), uri, None, Some("../x.txt"))
+                .unwrap()
+                .get("name")
+                .is_none()
+        );
+        for post in [
+            uri.to_string(),
+            format!("../report.pdf · 30 bytes · {uri}"),
+            format!("a\\b.txt · 30 bytes · {uri}"),
+            format!("report.pdf · unknown · {uri}"),
+            format!("report.pdf · 30 bytes · {uri} more"),
+            format!("..... · 30 bytes · {uri}"),
+        ] {
+            let nodes = message_text_nodes(&post, true);
+            let MessageTextNode::Link { attributes, .. } = nodes
+                .iter()
+                .find(|node| matches!(node, MessageTextNode::Link { .. }))
+                .unwrap()
+            else {
+                panic!("file link missing")
+            };
+            assert!(
+                !attributes.iter().any(|(key, _)| *key == "data-file-name"),
+                "{post}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_file_names_are_cleaned_and_bounded() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        assert_eq!(
+            super::shared_file_post_name(&format!("omp-test-note.txt · 35 bytes · {uri}"), uri),
+            Some("omp-test-note.txt".to_string())
+        );
+        assert_eq!(
+            super::shared_file_post_name(&format!("a · b.txt · 2.5 KB · {uri}"), uri),
+            Some("a · b.txt".to_string())
+        );
+        assert_eq!(
+            super::shared_file_display_name("..hidden\u{7}.txt"),
+            Some("hidden.txt".to_string())
+        );
+        // At most 200 UTF-8 bytes, cut on a character boundary before the
+        // extension; the same cases as documents-shared-file-name.test.mjs.
+        let wide = |count: usize| "中".repeat(count);
+        for (raw, expected) in [
+            ("n".repeat(300), "n".repeat(200)),
+            (format!("{}.txt", wide(80)), format!("{}.txt", wide(65))),
+            (format!("{}.txt", wide(66)), format!("{}.txt", wide(65))),
+            (format!("{}.txt", wide(65)), format!("{}.txt", wide(65))),
+            (
+                format!("{}.txt", "a".repeat(196)),
+                format!("{}.txt", "a".repeat(196)),
+            ),
+            (
+                format!("{}.txt", "a".repeat(197)),
+                format!("{}.txt", "a".repeat(196)),
+            ),
+            (wide(300), wide(66)),
+            (
+                format!("{}.{}", "a".repeat(190), "b".repeat(20)),
+                format!("{}.{}", "a".repeat(190), "b".repeat(9)),
+            ),
+            (
+                format!("{}.md", "😀".repeat(60)),
+                format!("{}.md", "😀".repeat(49)),
+            ),
+            (format!("{}.pdf.txt", wide(65)), format!("{}.txt", wide(65))),
+            (
+                format!("{} {}.txt", "a".repeat(195), wide(10)),
+                format!("{}.txt", "a".repeat(195)),
+            ),
+        ] {
+            let name = super::shared_file_display_name(&raw).unwrap();
+            assert!(name.len() <= 200, "{raw}");
+            assert_eq!(name, expected, "{raw}");
+        }
+        assert_eq!(super::shared_file_display_name(" \u{1b} "), None);
+        assert_eq!(super::shared_file_display_name("dir/x.txt"), None);
+    }
+
+    #[test]
+    fn shared_file_request_keeps_the_server_message_reference() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for conversation in ["file-community", "direct:sha256:conversation"] {
+            let reference = format!("{conversation}/sha256:message");
+            assert_eq!(
+                super::shared_file_request(Some("launch"), uri, Some(&reference), None),
+                Some(serde_json::json!({
+                    "type": "home:open-uri", "uri": uri, "homeToken": "launch",
+                    "source": { "conversation_id": conversation, "message_id": "sha256:message" },
+                }))
+            );
+        }
+        let row: ConversationObjectView = serde_json::from_value(serde_json::json!({
+            "seq": 7, "message_id": "sha256:message", "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
+        })).unwrap();
+        assert_eq!(row.message_id.as_deref(), Some("sha256:message"));
+        assert!(super::shared_file_request(Some("launch"), uri, None, None)
+            .unwrap()
+            .get("source")
+            .is_none());
+        assert!(
+            super::shared_file_request(None, uri, Some("file-community/message"), None).is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), uri, Some("file-community/"), None)
+                .is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), &format!(" {uri}"), None, None).is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), &format!("{uri} "), None, None).is_none()
+        );
+        let nodes = message_text_nodes(uri, true);
+        assert_eq!(
+            nodes,
+            vec![MessageTextNode::Link {
+                text: uri,
+                attributes: super::shared_file_attributes(uri)
+            }]
+        );
+    }
+
+    #[test]
+    fn attachment_sizes_match_the_upload_contract() {
+        assert_eq!(
+            super::validate_attachment_size(0).unwrap_err(),
+            "Empty files can't be sent."
+        );
+        assert!(super::validate_attachment_size(8 * 1024 * 1024).is_ok());
+        assert_eq!(
+            super::validate_attachment_size(8 * 1024 * 1024 + 1).unwrap_err(),
+            "Choose a file of 8 MB or less."
+        );
+    }
+
+    fn library_post_fixture(phase: super::LibraryPostPhase) -> super::LibraryPost {
+        super::LibraryPost {
+            request_id: "post-1".to_string(),
+            object_uri: "localhost://Users/alma/Documents/notes.txt".to_string(),
+            revision: "rev:1".to_string(),
+            file_name: "notes.txt".to_string(),
+            size_bytes: 30,
+            phase,
+        }
+    }
+
+    #[test]
+    fn a_community_post_survives_conversation_switches_and_reconnects() {
+        let mut state = super::AppState {
+            session_active: true,
+            community_state: super::CommunityState::Live,
+            library_post: Some(library_post_fixture(super::LibraryPostPhase::Unknown {
+                link: None,
+            })),
+            ..Default::default()
+        };
+        // Community, then a direct conversation, then Community again.
+        state.direct.selected_conversation_id = Some("direct:sha256:alma".to_string());
+        state.selection_generation += 1;
+        assert!(super::visible_library_post(&state).is_none());
+        state.direct.selected_conversation_id = None;
+        state.selection_generation += 1;
+        assert_eq!(
+            super::visible_library_post(&state).map(|post| post.request_id.as_str()),
+            Some("post-1")
+        );
+        // A reconnect bumps the generation and restores the session.
+        state.reconnect_needed = true;
+        state.selection_generation += 1;
+        assert!(!state.community_send_enabled());
+        state.reconnect_needed = false;
+        assert!(state.community_send_enabled() && super::visible_library_post(&state).is_some());
+    }
+
+    #[test]
+    fn community_picker_selection_names_a_library_file_by_address_and_revision() {
+        let select = |uri: Option<&str>, revision: Option<&str>, size: Option<f64>| {
+            super::library_post_from_selection(
+                "post-1".to_string(),
+                uri.map(str::to_string),
+                revision.map(str::to_string),
+                "notes.txt".to_string(),
+                size,
+            )
+        };
+        let uri = Some("localhost://Users/alma/Documents/notes.txt");
+        assert_eq!(
+            select(uri, Some("rev:1"), Some(30.0)).unwrap(),
+            library_post_fixture(super::LibraryPostPhase::Confirm)
+        );
+        let again = "Choose the file again in Library.";
+        assert_eq!(select(uri, None, Some(30.0)).unwrap_err(), again);
+        assert_eq!(select(None, Some("rev:1"), Some(30.0)).unwrap_err(), again);
+        assert_eq!(
+            select(Some("elastos://bafy"), Some("rev:1"), Some(30.0)).unwrap_err(),
+            again
+        );
+        assert_eq!(select(uri, Some("rev:1"), None).unwrap_err(), again);
+        assert_eq!(
+            select(uri, Some("rev:1"), Some(0.0)).unwrap_err(),
+            "Empty files can't be sent."
+        );
+        assert_eq!(
+            select(uri, Some("rev:1"), Some((8 * 1024 * 1024 + 1) as f64)).unwrap_err(),
+            "Choose a file of 8 MB or less."
+        );
+    }
+
+    #[test]
+    fn withdrawn_after_an_unknown_outcome_does_not_claim_the_file_was_not_posted() {
+        use super::LibraryPostPhase::{Confirm, Failed, Unknown, UnpublishedUnknown};
+        let withdrawn =
+            serde_json::json!({ "status": "error", "code": "withdrawn", "message": "x" });
+        let after_unknown = super::library_post_answer(&Unknown { link: None }, 409, &withdrawn);
+        assert_eq!(after_unknown, UnpublishedUnknown);
+        let view = super::library_post_view(&library_post_fixture(after_unknown));
+        assert_eq!(view.title, "Post not confirmed");
+        assert_eq!(
+            view.lines[1],
+            "Sharing stopped in Library. Check Community to see whether it was posted."
+        );
+        assert!(!view.lines.iter().any(|line| line.contains("not posted")));
+        assert_eq!(
+            super::library_post_answer(&Confirm, 409, &withdrawn),
+            Failed {
+                detail: "Sharing of this file stopped in Library, so it was not posted."
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn library_post_outcome_reports_publication_and_posting_apart() {
+        use super::LibraryPostPhase::{Failed, PostFailed, Posted, Unknown};
+        let publication =
+            serde_json::json!({ "uri": "elastos://bafkreipublished", "cid": "bafkreipublished" });
+        let link = "elastos://bafkreipublished".to_string();
+        assert_eq!(
+            super::library_post_outcome(
+                200,
+                &serde_json::json!({
+                    "status": "ok", "data": { "publication": publication, "posted": true, "name": "notes.txt", "size_bytes": 30 },
+                })
+            ),
+            Posted { link: link.clone() }
+        );
+        let post_failed = serde_json::json!({
+            "status": "error", "code": "post_failed", "message": "send failed",
+            "data": { "publication": publication, "posted": false },
+        });
+        assert_eq!(
+            super::library_post_outcome(502, &post_failed),
+            PostFailed {
+                link: link.clone(),
+                detail: "Posting to Community failed. Retry the post.".to_string()
+            }
+        );
+        assert_eq!(
+            super::library_post_outcome(429, &post_failed),
+            PostFailed {
+                link,
+                detail: "Community is busy. Wait a moment, then retry the post.".to_string()
+            }
+        );
+        for (code, detail) in [
+            ("empty_file", "Empty files can't be shared."),
+            ("too_large", "This file is too large to share. Files up to 8 MiB can be shared."),
+            ("stale_revision", "This file changed. Choose it again in Library."),
+            ("unsupported", "This file can't be posted from here."),
+            ("unavailable", "Sharing isn't available right now. Try again."),
+            ("changed_since_publish", "This file changed after you shared it. Stop sharing it in Library, then post it again."),
+            ("post_failed", "This file could not be posted. Try again."),
+            ("withdrawn", "Sharing of this file stopped in Library, so it was not posted."),
+            ("request_id_reused", "This post can't be sent again. Attach the file again."),
+            ("library_error", "This file could not be posted. Try again."),
+        ] {
+            let body = serde_json::json!({ "status": "error", "code": code, "message": "engine_internal detail" });
+            assert_eq!(super::library_post_outcome(400, &body), Failed { detail: detail.to_string() }, "{code}");
+        }
+        assert_eq!(
+            super::library_post_outcome(
+                200,
+                &serde_json::json!({ "status": "ok", "data": { "posted": false } })
+            ),
+            Failed {
+                detail: "This file could not be posted. Try again.".to_string()
+            }
+        );
+        for (reason, detail) in [
+            ("folder", "Folders can't be posted. Choose a file."),
+            ("protected", "Protected files can't be posted."),
+            ("not_allowed_here", "This file can't be posted from here."),
+        ] {
+            let body = serde_json::json!({ "status": "error", "code": "unsupported", "reason": reason, "message": "x" });
+            assert_eq!(
+                super::library_post_outcome(400, &body),
+                Failed {
+                    detail: detail.to_string()
+                },
+                "{reason}"
+            );
+        }
+        // An answer that is not Home's (a proxy page, an empty reply) leaves the
+        // outcome unknown rather than claiming the file was not posted.
+        assert_eq!(
+            super::library_post_outcome(502, &serde_json::Value::Null),
+            Unknown { link: None }
+        );
+        assert_eq!(
+            super::library_post_outcome(504, &serde_json::json!({ "error": "gateway timeout" })),
+            Unknown { link: None }
+        );
+    }
+
+    #[test]
+    fn library_post_view_asks_once_then_offers_retry_and_library() {
+        use super::LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
+        use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Unknown, Working};
+        let confirm = super::library_post_view(&library_post_fixture(Confirm));
+        assert_eq!(confirm.title, "Post \"notes.txt\" in Community?");
+        assert_eq!(
+            confirm.lines,
+            vec!["Your contacts can get it from the post while your Home is open.".to_string()]
+        );
+        assert_eq!(confirm.actions, &[Cancel, Post]);
+        assert!(super::library_post_view(&library_post_fixture(Working))
+            .actions
+            .is_empty());
+        let link = "elastos://bafkreipublished".to_string();
+        let posted = super::library_post_view(&library_post_fixture(Posted { link: link.clone() }));
+        assert_eq!(
+            posted.lines[1..],
+            [
+                "Shared: elastos://bafkreipublished".to_string(),
+                "Posted in Community.".to_string()
+            ]
+        );
+        assert_eq!(posted.actions, &[OpenLibrary, Close]);
+        let failed_post = super::library_post_view(&library_post_fixture(PostFailed {
+            link: link.clone(),
+            detail: "Posting to Community failed. Retry the post.".to_string(),
+        }));
+        assert_eq!(failed_post.title, "Shared, not posted");
+        assert_eq!(failed_post.lines[1], "Shared: elastos://bafkreipublished");
+        assert_eq!(failed_post.actions, &[Retry, OpenLibrary, Close]);
+        assert_eq!(failed_post.retry_label, "Retry post");
+        assert_eq!(
+            failed_post.lines[3],
+            "Shared from Library. You can stop sharing it there."
+        );
+        let unknown = super::library_post_view(&library_post_fixture(Unknown { link: None }));
+        assert_eq!(unknown.title, "Post not confirmed");
+        assert_eq!(
+            unknown.lines,
+            vec![
+                "notes.txt · 30 bytes".to_string(),
+                "Couldn't confirm the post. Check Community, or try again.".to_string(),
+            ]
+        );
+        assert_eq!(unknown.actions, &[Retry, OpenLibrary, Close]);
+        assert_eq!(unknown.retry_label, "Try again");
+        let unknown_published =
+            super::library_post_view(&library_post_fixture(Unknown { link: Some(link) }));
+        assert_eq!(
+            unknown_published.lines[1],
+            "Shared: elastos://bafkreipublished"
+        );
+        let failed = super::library_post_view(&library_post_fixture(Failed {
+            detail: "x".to_string(),
+        }));
+        assert_eq!(failed.actions, &[Close]);
+        assert_eq!(
+            super::library_folder_uri("localhost://Users/alma/Documents/notes.txt"),
+            "localhost://Users/alma/Documents"
+        );
+    }
+
+    #[test]
+    fn shared_file_links_require_a_canonical_bare_cid() {
+        use TextSegment::{Link, Text};
+        let v0 = "QmYwAPJzv5CZsnAzt8auVZRnGiRAzrxksBuP5xT9H6hQ6D";
+        let v1 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for cid in [v0, v1] {
+            let uri = format!("elastos://{cid}");
+            assert_eq!(split_text_links(&uri), vec![Link(&uri)]);
+            let prose = format!("See ({uri}).");
+            assert_eq!(
+                split_text_links(&prose),
+                vec![Text("See ("), Link(&uri), Text(").")]
+            );
+            for suffix in ["/", "/a", "?x", "#fragment"] {
+                let invalid = format!("{uri}{suffix}");
+                assert_eq!(split_text_links(&invalid), vec![Text(&invalid)]);
+            }
+        }
+        for invalid in [
+            "elastos://peer/invite?token=x".to_string(),
+            "elastos://invalid".to_string(),
+            format!("elastos://{}", v1.to_uppercase()),
+            format!("ELASTOS://{v1}"),
+            format!("elastos://{}", &v0[..45]),
+            "elastos://bafyb".to_string(),
+            format!("elastos:// {v1}"),
+            format!("elastos://{} {}", &v1[..20], &v1[20..]),
+        ] {
+            assert_eq!(
+                split_text_links(&invalid),
+                vec![Text(&invalid)],
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -7621,8 +9154,8 @@ mod tests {
 
         let policy = chat_control_policy(true, true, true, true, CommunityState::Live, true, true);
         assert!(policy.enable_text_send);
-        assert!(!policy.show_attach);
-        assert!(!policy.enable_attach);
+        assert!(policy.show_attach);
+        assert!(policy.enable_attach);
         assert!(!policy.show_browser_requests);
         assert!(!policy.show_room_access_toggle);
         assert!(!policy.show_room_access);
@@ -7647,9 +9180,11 @@ mod tests {
             is_current_session: false,
         };
         assert_eq!(participant_shown_name(&participant), "Owner");
-        assert_eq!(participant_detail(&participant, false, false), "active now");
+        assert_eq!(participant_detail(&participant, false, false), "Active now");
 
         let object = ConversationObjectView {
+            message_id: None,
+            conversation_id: None,
             delivery_state: None,
             sender_ref: None,
             seq: 1,
@@ -7719,6 +9254,8 @@ mod tests {
             ],
             objects: vec![
                 ConversationObjectView {
+                    message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 1,
@@ -7733,6 +9270,8 @@ mod tests {
                     created_at: 1,
                 },
                 ConversationObjectView {
+                    message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 2,
@@ -7747,6 +9286,8 @@ mod tests {
                     created_at: 2,
                 },
                 ConversationObjectView {
+                    message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 3,
@@ -7761,6 +9302,8 @@ mod tests {
                     created_at: 3,
                 },
                 ConversationObjectView {
+                    message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 4,
@@ -8020,6 +9563,23 @@ mod tests {
                 direct_mode: false,
                 participant_count: "Opening conversation".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_conversation_marked_read_loses_its_dot_from_the_list_fetched_before_the_mark() {
+        let view = |id: &str, unread: bool| DirectConversationView {
+            conversation_id: id.to_string(),
+            display_name: id.to_string(),
+            removed: false,
+            unread,
+        };
+        // The list came back before the messages request marked "buddy" read.
+        let mut conversations = vec![view("buddy", true), view("other", true)];
+        super::mark_conversation_read(&mut conversations, "buddy");
+        assert_eq!(
+            conversations,
+            vec![view("buddy", false), view("other", true)]
         );
     }
 
@@ -8349,11 +9909,8 @@ fn chat_control_policy(
     let gateway_surface = room_mode_known && !shell_mode && !configured;
     ChatControlPolicy {
         enable_text_send: session_active && community_state == CommunityState::Live,
-        show_attach: room_mode_known && !configured,
-        enable_attach: room_mode_known
-            && !configured
-            && session_active
-            && community_state == CommunityState::Live,
+        show_attach: room_mode_known,
+        enable_attach: room_mode_known && session_active && community_state == CommunityState::Live,
         show_browser_requests: gateway_surface && has_pending_requests,
         show_room_access_toggle: gateway_surface && session_active,
         show_room_access: gateway_surface && session_active && show_access_controls,
@@ -8386,14 +9943,10 @@ fn format_browser_access_count(count: usize) -> String {
 }
 
 fn format_participant_toggle_label(count: usize, open: bool) -> String {
-    let noun = match count {
-        1 => "1 person".to_string(),
-        _ => format!("{count} people"),
-    };
-    if open {
-        format!("Hide people · {noun}")
-    } else {
-        format!("People · {noun}")
+    match (open, count) {
+        (true, _) => "Hide people".to_string(),
+        (false, 1) => "1 person".to_string(),
+        (false, _) => format!("{count} people"),
     }
 }
 
@@ -8422,30 +9975,12 @@ fn member_display_name(member: &RoomMemberView) -> String {
         .unwrap_or_else(|| UNVERIFIED_ROOM_MEMBER_NAME.to_string())
 }
 
+/// The one fact a People row shows under a name.
 fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode: bool) -> String {
-    let mut parts = Vec::new();
     let local_runtime_participant =
         participant.is_current_session && participant.device_label.trim() == "ElastOS shell";
-    let verified_profile_identity = participant.profile_verified == Some(true);
-    let generic_browser_label = matches!(
-        participant.device_label.trim(),
-        "" | "Browser" | "This browser"
-    );
-    if !participant.device_label.trim().is_empty()
-        && !verified_profile_identity
-        && !local_runtime_participant
-        && !generic_browser_label
-    {
-        parts.push(participant.device_label.clone());
-    }
     if is_local || local_runtime_participant {
-        parts.push("active now".to_string());
-    } else if participant.local_session_count > 1 {
-        parts.push(format!("{} browsers", participant.local_session_count));
-    } else if participant.role.is_some() {
-        parts.push("active now".to_string());
-    } else if participant.local_session_count > 0 {
-        parts.push("web guest".to_string());
+        return "Active now".to_string();
     }
     let remote_card = participant
         .card
@@ -8455,24 +9990,46 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
         // Community members: "Home online" while their Home announces
         // presence, otherwise the time of their last public message.
         if card.active_now {
-            parts.push("Home online".to_string());
-        } else if participant.last_seen_at > 0 {
-            parts.push(last_message_text(participant.last_seen_at));
+            return "Home online".to_string();
         }
-    } else if participant.last_seen_at > 0 && !is_local && !local_runtime_participant && !shell_mode
-    {
-        parts.push(format!("seen {}", format_time(participant.last_seen_at)));
+        if participant.last_seen_at > 0 {
+            return last_message_text(participant.last_seen_at);
+        }
     }
-    parts.join(" · ")
+    if participant.local_session_count > 1 {
+        return format!("{} browsers", participant.local_session_count);
+    }
+    if participant.role.is_some() {
+        return "Active now".to_string();
+    }
+    if participant.local_session_count > 0 {
+        return "Web guest".to_string();
+    }
+    let verified_profile_identity = participant.profile_verified == Some(true);
+    let generic_browser_label = matches!(
+        participant.device_label.trim(),
+        "" | "Browser" | "This browser"
+    );
+    if !verified_profile_identity && !generic_browser_label {
+        return participant.device_label.clone();
+    }
+    if remote_card.is_none() && participant.last_seen_at > 0 && !shell_mode {
+        return format!("Seen {}", format_time(participant.last_seen_at));
+    }
+    String::new()
 }
 
-/// "last message 14:02" today, otherwise with the day.
+/// "Last message 14:02" today, "Last message yesterday", otherwise the date.
 fn last_message_text(timestamp_secs: u64) -> String {
-    let now = (js_sys::Date::now() / 1000.0) as u64;
-    if local_day(timestamp_secs) == local_day(now) {
-        format!("last message {}", format_time(timestamp_secs))
-    } else {
-        format!("last message {}", day_separator_text(timestamp_secs))
+    match viewer_day_label(timestamp_secs) {
+        DayLabel::Today => format!("Last message {}", format_time(timestamp_secs)),
+        DayLabel::Yesterday => "Last message yesterday".to_string(),
+        DayLabel::Date { same_year } => {
+            format!(
+                "Last message {}",
+                local_date_text(timestamp_secs, same_year)
+            )
+        }
     }
 }
 
@@ -8493,6 +10050,29 @@ fn presence_heartbeat_due(
     page_visible: bool,
 ) -> bool {
     community_open && page_visible && matches!(presence, Some("always" | "while_open"))
+}
+
+/// Who may tell Chat whether its frame is on screen: its parent frame (checked
+/// by the caller). In Home that parent is the Home GUI shell, an opaque
+/// sandboxed frame whose origin reads "null"; a page that embeds Chat directly
+/// has the Home origin. Presentation only, as in the shared theme script.
+fn shell_layout_origin_admitted(event_origin: &str, home_origin: &str) -> bool {
+    event_origin == "null" || event_origin == home_origin
+}
+
+/// The Community history fact the header shows in place of "Live": only that
+/// earlier posts cannot be loaded, the one case the person needs to know.
+fn community_history_notice(
+    community_selected: bool,
+    community_state: Option<CommunityState>,
+    history: Option<&RoomHistoryView>,
+) -> Option<&RoomHistoryView> {
+    history.filter(|history| {
+        community_selected
+            && community_state == Some(CommunityState::Live)
+            && history.status == "unavailable"
+            && !history.detail.trim().is_empty()
+    })
 }
 
 /// Chat is on screen: the document is shown and, in the shell, the shell
@@ -8516,12 +10096,6 @@ fn community_presence_view(community_open: bool, presence: Option<&str>) -> (boo
     }
 }
 
-/// The declared direct-conversation attachment policy, stated where the
-/// person meets it. Attachments need object handling and a delivery path of
-/// their own, designed on the unified delivery layer — until then the attach
-/// control in direct mode is visibly unavailable, never silently missing.
-const DIRECT_ATTACHMENTS_UNAVAILABLE: &str = "Direct conversations are text-only for now.";
-
 /// Unconfigured room-control membership may still lack a profile card; keep
 /// that legacy surface unchanged. Configured shared Chat never renders this
 /// marker because it hides room controls and filters person rows earlier.
@@ -8535,25 +10109,63 @@ fn participant_shown_name(participant: &ParticipantView) -> &str {
     &participant.display_name
 }
 
+#[derive(Debug, Deserialize)]
+struct ProfileIdResponse {
+    profile_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContactRequestStatus {
+    Requested,
+    AlreadyRequested,
+    AlreadyContact,
+    PendingFromThem,
+    OwnProfile,
+}
+
+impl ContactRequestStatus {
+    fn relationship(&self) -> &'static str {
+        match self {
+            Self::Requested | Self::AlreadyRequested => "requested",
+            Self::AlreadyContact => "contact",
+            Self::PendingFromThem => "pending",
+            Self::OwnProfile => "you",
+        }
+    }
+}
+
+// The shared POST helper frames HTTP errors as "request failed: STATUS BODY".
+// Runtime supplies public contact refusal copy only for 400 and 409.
+fn contact_failure_message(error: &str, fallback: &str) -> String {
+    error
+        .strip_prefix("request failed: 400 ")
+        .or_else(|| error.strip_prefix("request failed: 409 "))
+        .filter(|body| !body.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Runtime's answer to Add contact: the outcome, and the text to show.
+#[derive(Debug, Deserialize)]
+struct ContactRequestResponse {
+    status: ContactRequestStatus,
+    message: String,
+}
+
 /// The card's status line and its one action (label, action id).
 fn participant_card_copy(
     card: &ParticipantCard,
     can_act: bool,
 ) -> (&'static str, Option<(&'static str, &'static str)>) {
     let (text, action) = match card.relationship.as_str() {
-        "you" => ("This is you.", None),
+        "you" => ("You", None),
         "contact" if card.conversation_id.is_some() => ("Contact", Some(("Message", "message"))),
         "contact" => ("Contact", None),
-        "requested" => ("Contact request sent. Waiting for them to accept.", None),
-        "pending" => (
-            "Wants to add you as a contact.",
-            Some(("Open Inbox", "inbox")),
-        ),
-        _ if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
-        _ => (
-            "To add each other, both of you turn on Discovery in People.",
-            Some(("Open People", "people")),
-        ),
+        "requested" => ("Request sent", None),
+        "pending" => ("Wants to add you", Some(("Open Inbox", "inbox"))),
+        "none" if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
+        _ => ("Relationship unavailable", None),
     };
     (text, if can_act { action } else { None })
 }
@@ -8631,10 +10243,20 @@ fn day_label(day: (u32, u32, u32), today: (u32, u32, u32), yesterday: (u32, u32,
 }
 
 fn day_separator_text(timestamp_secs: u64) -> String {
+    match viewer_day_label(timestamp_secs) {
+        DayLabel::Today => "Today".to_string(),
+        DayLabel::Yesterday => "Yesterday".to_string(),
+        DayLabel::Date { same_year } => local_date_text(timestamp_secs, same_year),
+    }
+}
+
+/// The day label for a timestamp, from today and yesterday in the viewer's
+/// time zone.
+fn viewer_day_label(timestamp_secs: u64) -> DayLabel {
     let now = (js_sys::Date::now() / 1000.0) as u64;
     let yesterday = local_date(now);
     yesterday.set_date(yesterday.get_date() - 1);
-    match day_label(
+    day_label(
         local_day(timestamp_secs),
         local_day(now),
         (
@@ -8642,23 +10264,22 @@ fn day_separator_text(timestamp_secs: u64) -> String {
             yesterday.get_month(),
             yesterday.get_date(),
         ),
-    ) {
-        DayLabel::Today => "Today".to_string(),
-        DayLabel::Yesterday => "Yesterday".to_string(),
-        DayLabel::Date { same_year } => {
-            let options = JsObject::new();
-            let _ = Reflect::set(&options, &"weekday".into(), &"short".into());
-            let _ = Reflect::set(&options, &"month".into(), &"short".into());
-            let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
-            if !same_year {
-                let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
-            }
-            local_date(timestamp_secs)
-                .to_locale_date_string("default", &options)
-                .as_string()
-                .unwrap_or_default()
-        }
+    )
+}
+
+/// "Mon, Mar 9", with the year when it is not this year.
+fn local_date_text(timestamp_secs: u64, same_year: bool) -> String {
+    let options = JsObject::new();
+    let _ = Reflect::set(&options, &"weekday".into(), &"short".into());
+    let _ = Reflect::set(&options, &"month".into(), &"short".into());
+    let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
+    if !same_year {
+        let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
     }
+    local_date(timestamp_secs)
+        .to_locale_date_string("default", &options)
+        .as_string()
+        .unwrap_or_default()
 }
 
 fn format_bytes(size_bytes: u64) -> String {
@@ -8685,17 +10306,24 @@ fn set_hidden(element: &HtmlElement, hidden: bool) -> Result<(), JsValue> {
     }
 }
 
-async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
-    let window = window().ok_or_else(|| "window unavailable".to_string())?;
-    let write_text = Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatCopyInvite"))
+/// Calls one of the Home Clipboard writers chat-chrome.js installs on the
+/// window: `unavailable` when the writer is missing, `failed` when the write is.
+async fn write_home_clipboard(
+    writer: &str,
+    text: &str,
+    unavailable: &str,
+    failed: &str,
+) -> Result<(), String> {
+    let window = window().ok_or_else(|| unavailable.to_string())?;
+    let write = Reflect::get(window.as_ref(), &JsValue::from_str(writer))
         .and_then(|value| value.dyn_into::<Function>())
-        .map_err(|_| "Trusted Home Clipboard is unavailable.".to_string())?;
-    let promise = write_text
+        .map_err(|_| unavailable.to_string())?;
+    let promise = write
         .call1(&JsValue::UNDEFINED, &JsValue::from_str(text))
-        .map_err(js_error)?;
+        .map_err(|_| failed.to_string())?;
     JsFuture::from(Promise::from(promise))
         .await
-        .map_err(js_error)?;
+        .map_err(|_| failed.to_string())?;
     Ok(())
 }
 
@@ -8800,6 +10428,31 @@ async fn api_post_session_json<TReq: Serialize, TResp: DeserializeOwned>(
         .json::<TResp>()
         .await
         .map_err(|err| request_error(err, deadline.as_ref()))
+}
+
+/// Reads the JSON body whatever the HTTP status: attach-library answers a
+/// refusal as JSON with a code, and a failed post with the publication.
+async fn api_post_session_envelope<TReq: Serialize>(
+    path: &str,
+    body: &TReq,
+    extra_headers: &[(&str, String)],
+) -> Result<(u16, serde_json::Value), String> {
+    let mut request = Request::post(path).credentials(RequestCredentials::SameOrigin);
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .json(body)
+        .map_err(|err| err.to_string())?
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    Ok((status, body))
 }
 
 async fn api_get_session_bytes(
@@ -9031,6 +10684,12 @@ fn js_string_field(data: &JsValue, key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn js_number_field(data: &JsValue, key: &str) -> Option<f64> {
+    Reflect::get(data, &JsValue::from_str(key))
+        .ok()
+        .and_then(|value| value.as_f64())
+}
+
 fn js_blob_field(data: &JsValue, key: &str) -> Option<Blob> {
     Reflect::get(data, &JsValue::from_str(key))
         .ok()
@@ -9104,6 +10763,38 @@ mod participant_card_tests {
     }
 
     #[test]
+    fn contact_errors_trust_only_public_refusals_and_name_the_action() {
+        for (error, expected) in [
+            ("request failed: 400 That isn't a DID.", "That isn't a DID."),
+            (
+                "request failed: 409 That's your own DID.",
+                "That's your own DID.",
+            ),
+            (
+                "request failed: 500 private diagnostic",
+                "Could not send the request. Try again.",
+            ),
+            (
+                "request failed: 401 launch token expired",
+                "Could not send the request. Try again.",
+            ),
+            ("Failed to fetch", "Could not send the request. Try again."),
+        ] {
+            assert_eq!(
+                super::contact_failure_message(error, "Could not send the request. Try again."),
+                expected
+            );
+        }
+        assert_eq!(
+            super::contact_failure_message(
+                "Failed to fetch",
+                "DID could not be copied. Try again."
+            ),
+            "DID could not be copied. Try again."
+        );
+    }
+
+    #[test]
     fn participant_card_offers_one_action_per_relationship() {
         assert_eq!(
             participant_card_copy(&card("you", None, false), true).1,
@@ -9114,12 +10805,12 @@ mod participant_card_tests {
             Some(("Message", "message"))
         );
         assert_eq!(
-            participant_card_copy(&card("requested", None, false), true).1,
-            None
+            participant_card_copy(&card("requested", None, false), true),
+            ("Request sent", None)
         );
         assert_eq!(
-            participant_card_copy(&card("pending", None, false), true).1,
-            Some(("Open Inbox", "inbox"))
+            participant_card_copy(&card("pending", None, false), true),
+            ("Wants to add you", Some(("Open Inbox", "inbox")))
         );
         assert_eq!(
             participant_card_copy(&card("none", None, true), true).1,
@@ -9127,13 +10818,37 @@ mod participant_card_tests {
         );
         assert_eq!(
             participant_card_copy(&card("none", None, false), true).1,
-            Some(("Open People", "people"))
+            None
         );
         assert_eq!(
             participant_card_copy(&card("contact", Some("direct:1"), false), false).1,
             None,
             "without a Home token the card only informs"
         );
+    }
+
+    #[test]
+    fn contact_request_outcomes_keep_the_runtime_relationship_and_message() {
+        for (status, relationship) in [
+            ("requested", "requested"),
+            ("already_requested", "requested"),
+            ("already_contact", "contact"),
+            ("pending_from_them", "pending"),
+            ("own_profile", "you"),
+        ] {
+            let response: ContactRequestResponse = serde_json::from_value(serde_json::json!({
+                "status": status, "message": "Runtime's text.",
+            }))
+            .unwrap();
+            assert_eq!(response.status.relationship(), relationship);
+            assert_eq!(response.message, "Runtime's text.");
+        }
+        for unexpected in [
+            serde_json::json!({ "status": "unexpected", "message": "Runtime's text." }),
+            serde_json::json!({ "status": "requested" }),
+        ] {
+            assert!(serde_json::from_value::<ContactRequestResponse>(unexpected).is_err());
+        }
     }
 
     #[test]

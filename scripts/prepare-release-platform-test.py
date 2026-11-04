@@ -169,6 +169,9 @@ class PrepareWorkerTest(unittest.TestCase):
             path = self.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes((SOURCE / name).read_bytes())
+        common = self.repo / "elastos/crates/elastos-common/src/lib.rs"
+        common.parent.mkdir(parents=True, exist_ok=True)
+        common.write_bytes((SOURCE / "elastos/crates/elastos-common/src/lib.rs").read_bytes())
         # The synthetic builder keeps source pins real to exercise archive admission.
         (scripts / "media-tools-build.py").write_text(MOCK_MEDIA_BUILD)
         # Fake binaries cannot establish static linking; only this audit is stubbed.

@@ -5005,9 +5005,17 @@ mod tests {
             )
             .unwrap();
             stream.write_all(&body).unwrap();
-            stream.write_all(b"\r\n").unwrap();
-            if !cut_off {
-                stream.write_all(b"0\r\n\r\n").unwrap();
+            // The worker may close once it holds the whole reply, before the
+            // chunk trailer arrives; only that close is allowed here.
+            let trailer: &[u8] = if cut_off { b"\r\n" } else { b"\r\n0\r\n\r\n" };
+            if let Err(error) = stream.write_all(trailer) {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "{error}"
+                );
             }
         });
         let (update_tx, mut update_rx) = mpsc::channel(1);

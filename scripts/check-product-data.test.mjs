@@ -32,7 +32,8 @@ const publish = parsePublishData(shellPublish, rustPublish);
 
 for (const [name, mutate, message] of [
   ["missing shell default capsule", (_components, lists) => lists.shellDefault = lists.shellDefault.filter((name) => name !== "home-gui"), /shellDefault: published capsules/],
-  ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "services"), /rustHome: published capsules/],
+  ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "people"), /rustHome: published capsules/],
+  ["hidden capsule published as a Home capsule", (_components, lists) => lists.rustHome.push("services"), /rustHome: published capsules/],
   ["missing shell required capsule", (_components, lists) => lists.shellRequired = lists.shellRequired.filter((name) => name !== "wallet-provider"), /shellRequired: missing Home capsule wallet-provider/],
   ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("gba-emulator"), /shellDefault: published capsules/],
   ["Home installation without publication parity", (value) => value.profiles.home.components = value.profiles.home.components.filter((name) => name !== "assistant"), /published capsules/],
@@ -50,13 +51,13 @@ test("publish parser reads declared values and ignores comments", () => {
   assert.deepEqual(parsePublishData(shellPublish.replace("\n    home-gui\n", '\n    "home-gui"\n'), rustPublish), publish);
   assert.throws(() => parsePublishData(shellPublish.replace("DEFAULT_CAPSULES=(", "DEFAULT_CAPSULES=(\n    home"), rustPublish), /duplicate entries/);
   assert.throws(() => parsePublishData(shellPublish.replace("DEFAULT_CAPSULES=(", "DEFAULT_CAPSULES=(\n    $(untrusted)"), rustPublish), /invalid publish capsule data/);
-  assert.throws(() => parsePublishData(shellPublish, rustPublish.replace('"services"', "true")), /invalid publish capsule data/);
+  assert.throws(() => parsePublishData(shellPublish, rustPublish.replace('"people"', "true")), /invalid publish capsule data/);
 });
 
 for (const [name, shell, rust, message] of [
   ["shell default", shellPublish.replace(/(DEFAULT_CAPSULES=\([\s\S]*?)\n    home-gui\n/, "$1\n"), rustPublish, /shellDefault: published capsules/],
   ["shell required", shellPublish.replace(/(REQUIRED_SUPPORTED_CAPSULES=\([\s\S]*?)\n    wallet-provider\n/, "$1\n"), rustPublish, /shellRequired: missing Home capsule/],
-  ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "services",/, "$1"), /rustHome: published capsules/],
+  ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "people",/, "$1"), /rustHome: published capsules/],
 ]) {
   test(`changed ${name} declared publication data is refused`, () => {
     assert.throws(() => validatePublishData(components, manifests, parsePublishData(shell, rust)), message);
@@ -200,7 +201,10 @@ for (const [name, mutate, message] of [
 for (const [name, mutate, message] of [
   ["unknown profile component", (value) => value.profiles.home.components.push("missing-provider"), /unknown component/],
   ["missing Wallet dependency", (value) => value.profiles.home.components = value.profiles.home.components.filter((entry) => entry !== "wallet-provider"), /Wallet\/Browser dependency/],
-  ["duplicate protected dependency", (value) => value.profiles.home.components.push("media-provider"), /must occur once/],
+  ["Elacity Player without its protected providers", (value) => value.profiles.home.components.push("elacity-player"), /must occur once/],
+  ...["services", "wallet-walletconnect", "content-block-graph-provider", "media-tools"].map((name) =>
+    [`hidden ${name} in default Home`, (value) => value.profiles.home.components.push(name), /hidden in 0\.8\.0/]),
+  ["hidden component no longer published", (value) => delete value.external["content-block-graph-provider"], /stays published for --with/],
   ["default public edge service", (value) => value.profiles.home.components.push("tunnel-provider"), /developer --with component/],
   ["custody in default Home", (value) => value.profiles.home.components.push("custody-provider"), /developer --with component/],
   ["second setup profile", (value) => value.profiles.demo = { components: ["shell"] }, /Setup installs one Home/],

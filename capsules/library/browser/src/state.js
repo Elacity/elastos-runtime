@@ -13,7 +13,6 @@ export const MUTATING_PROVIDER_OPS = new Set([
   "publish",
   "unpublish",
   "repair",
-  "share",
 ]);
 
 export function createLibraryState({ queryParams, storage, perfTarget }) {

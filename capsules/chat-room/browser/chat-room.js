@@ -25,6 +25,9 @@
       globalThis.elastosChatCopyInvite = (text) => homeClipboard.writeText(text, {
         purpose: "conversation.invite",
       });
+      globalThis.elastosChatCopyProfileId = (text) => homeClipboard.writeText(text, {
+        purpose: "profile.id",
+      });
       globalThis.elastosChatHomeToken = () => chatHomeToken;
       let pendingReconnect = null;
       globalThis.elastosChatReconnect = () => {

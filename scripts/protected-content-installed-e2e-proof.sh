@@ -1469,6 +1469,16 @@ register_peers() {
         "$ELASTOS_BIN" node peer add --did "$did" --label "$label" --ticket "$ticket" --json >/dev/null \
             || fail "node peer add failed for $did; diagnostic: $ELASTOS_BIN node peer add --did $did --label $label --ticket <ticket-from ${ticket_path}> --json"
     done
+    # Each node keeps this client's content replicas only with this grant.
+    local client_did svc
+    client_did="$("$ELASTOS_BIN" node info --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["did"])')" \
+        || fail "could not read the client DID; diagnostic: $ELASTOS_BIN node info --json"
+    for svc in "${SERVICES[@]}"; do
+        log "+ docker compose -f '$COMPOSE_FILE' exec -T $svc elastos node peer add --did $client_did --allow content.replica"
+        docker compose -f "$COMPOSE_FILE" exec -T "$svc" /home/custody/.local/share/elastos/bin/elastos \
+            node peer add --did "$client_did" --allow content.replica --json >/dev/null \
+            || fail "$svc did not accept the client's replica grant; diagnostic: docker compose -f '$COMPOSE_FILE' exec -T $svc /home/custody/.local/share/elastos/bin/elastos node peer list --json"
+    done
 }
 
 generate_composition() {

@@ -28,6 +28,10 @@ const attachmentRetryPng = Buffer.from(
 );
 const externalLinkUrl = "https://example.invalid/chat-link?from=chat";
 const textLinkUrl = "https://example.invalid/chat-text-link?from=text";
+const sharedDid = "did:key:z6Mka1b2c3";
+const directDid = "did:key:z6Mkd4e5f6";
+const sharedCid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+const sharedUri = `elastos://${sharedCid}`;
 const directLinkUrl = "https://example.invalid/chat-direct-link?from=direct";
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -91,7 +95,7 @@ function directConversation() {
 
 function historyMessage(seq, text, createdAt) {
   return {
-    seq, sender: "Fixture Friend", sender_profile_verified: true,
+    seq, conversation_id: "test-conversation", message_id: `sha256:message-${seq}`, sender: "Fixture Friend", sender_profile_verified: true,
     from_current_session: false, kind: "text", body: text,
     created_at: Math.floor(Date.parse(createdAt) / 1000),
   };
@@ -162,7 +166,9 @@ function startServer(scenario) {
   const communityDeliveryScenario = scenario === "community-delivery-status"
     || communityResponseOrdering || communityNonterminalOrdering;
   const sharedCursorScenario = scenario === "shared-send-intervening-peer" || communitySendOrdering;
-  const contactAcceptance = scenario.startsWith("contact-acceptance");
+  const didOutcome = scenario.startsWith("contact-did-") ? scenario.slice("contact-did-".length).replace(/-phone$/, "") : null;
+  const contactAcceptance = scenario.startsWith("contact-acceptance") || didOutcome !== null;
+  const didLinkScenario = scenario.startsWith("did-link-via-home");
   const historyScenario = scenario === "history-status-order-calendar";
   const unreadScenario = scenario === "direct-unread" || scenario === "visible-read";
   const retryScenario = scenario.startsWith("direct-retry");
@@ -218,6 +224,8 @@ function startServer(scenario) {
     sharedCursorPolls: [],
     peerAccepted: false,
     contactRequested: false,
+    contactRelationship: null,
+    profileCopies: 0,
     contactRequests: 0,
     contactResponses: 0,
     authPosts: 0,
@@ -234,6 +242,7 @@ function startServer(scenario) {
     stallPoll: false,
     stalledMarkerReady: false,
     attachmentRequests: [],
+    uploads: [], attachLibrary: [], sharedChecks: [], sharedGets: [],
     attachmentMarkerReady: false,
     attachmentMarkerPolled: false,
     lastPollSince: null,
@@ -275,6 +284,19 @@ function startServer(scenario) {
         ...(trace.attachmentMarkerReady ? [historyMessage(2, attachmentRetryMarker, "2026-03-09T12:00:01Z")] : []),
       ];
     }
+    if (scenario === "shared-file-via-home" || scenario === "community-attach") {
+      poll.latest_seq = 1;
+      poll.objects = [historyMessage(1, `hello.txt · 30 bytes · ${sharedUri}`, "2026-03-09T12:00:00Z")];
+      if (scenario === "shared-file-via-home") {
+        poll.objects.push({ ...historyMessage(2, "", "2026-03-09T12:01:00Z"), kind: "link", body: null,
+          link: { url: sharedUri, host: sharedCid, title: "Local file link" } });
+        poll.latest_seq = 2;
+      }
+      if (trace.attachLibrary.some(request => request.posted)) {
+        poll.objects.push(historyMessage(3, `attached.txt · 30 bytes · ${sharedUri}`, "2026-03-09T12:02:00Z"));
+        poll.latest_seq = 3;
+      }
+    }
     if (scenario === "external-link-via-home") {
       // A Link object (local mode) and a Community Text message that holds a
       // web address: both must ask Home the same way.
@@ -284,10 +306,15 @@ function startServer(scenario) {
         link: { url: externalLinkUrl, host: "example.com", title: "Example link" },
       }, historyMessage(2, `Read (${textLinkUrl}). <b>not markup</b>`, "2026-03-09T12:01:00Z")];
     }
+    if (didLinkScenario) {
+      poll.latest_seq = 1;
+      poll.objects = [historyMessage(1, `My DID ${sharedDid} ${sharedDid}/path`, "2026-03-09T12:00:00Z")];
+    }
     if (historyScenario) {
+      // As Runtime sends them: only unavailable history has words to show.
       const details = {
-        searching: "Checking recent Community history from online participants.",
-        available: "Recent Community history is available from an online participant.",
+        searching: "",
+        available: "",
         unavailable: "Earlier Community posts cannot be loaded right now.",
       };
       poll.transport.history = { status: trace.historyStatus, detail: details[trace.historyStatus] };
@@ -310,11 +337,19 @@ function startServer(scenario) {
         last_seen_at: 1, local_session_count: 0, is_current_session: false,
         card: {
           participant_ref: "participant:fixture-friend",
-          relationship: trace.peerAccepted ? "contact" : trace.contactRequested ? "requested" : "none",
+          // Runtime projects removed and declined pairs as addable "none" cards.
+          relationship: trace.peerAccepted ? "contact" : trace.contactRequested ? (trace.contactRelationship || "requested") : "none",
           conversation_id: trace.peerAccepted ? directConversation().conversation_id : null,
           can_add_contact: !trace.peerAccepted && !trace.contactRequested, active_now: true,
         },
       });
+      if (scenario === "contact-acceptance-from-message") {
+        poll.objects = [{
+          ...historyMessage(1, "hello from Fixture Friend", "2026-03-09T12:00:00Z"),
+          sender_ref: "participant:fixture-friend",
+        }];
+        poll.latest_seq = 1;
+      }
     }
     return poll;
   }
@@ -329,8 +364,8 @@ function startServer(scenario) {
       if (request.method === "POST" && url.pathname.startsWith("/api/auth/")) trace.authPosts += 1;
       if (request.method === "OPTIONS") {
         response.writeHead(204, {
-          "access-control-allow-headers": "content-type,x-elastos-home-token",
-          "access-control-allow-methods": "GET,POST,OPTIONS",
+          "access-control-allow-headers": "content-type,x-elastos-home-token,x-elastos-upload-offset",
+          "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
           "access-control-allow-origin": "null",
         }).end();
         return;
@@ -339,6 +374,55 @@ function startServer(scenario) {
         const body = await readFile(join(homeLayoutRoot, url.pathname.slice(1)));
         response.writeHead(200, { "content-type":"application/javascript", "content-length":body.length });
         response.end(body); return;
+      }
+      if (url.pathname === "/home-external-link.js") {
+        const body = await readFile(join(repoRoot, "capsules/home/browser/home-external-link.js"));
+        response.writeHead(200, { "content-type": "application/javascript" }); response.end(body); return;
+      }
+      if (url.pathname.startsWith("/api/apps/home/shared-content/")) {
+        let raw = ""; for await (const chunk of request) raw += chunk;
+        const body = JSON.parse(raw);
+        if (url.pathname.endsWith("/check")) {
+          trace.sharedChecks.push({ body, token: request.headers['x-elastos-home-token'] });
+          assert(request.headers['x-elastos-home-token'] === 'home-authority', 'check requires Home authority');
+          assert(body.app_token === 'test-token', 'check requires app_token in its body');
+          assert(Object.keys(body).every(key => ['schema', 'app_token', 'uri', 'source'].includes(key)), 'unknown check field');
+          json(response, { schema: "elastos.home.shared-content.result/v1", cid: sharedCid, uri: sharedUri,
+            sender_display_name: "Alma", size_bytes: 30, state: "sender_offline", check_id: "file-check" });
+        } else {
+          assert(request.headers['x-elastos-home-token'] === 'home-authority', 'get requires Home authority');
+          assert(JSON.stringify(body) === JSON.stringify({ check_id: 'file-check' }), 'get body differs');
+          trace.sharedGets.push(body); json(response, { state: "local" });
+        }
+        return;
+      }
+      if (url.pathname === "/api/apps/chat-room/attach-library" && request.method === "POST") {
+        const chunks = []; for await (const chunk of request) chunks.push(chunk);
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        // Per request id: the first answer is lost behind a proxy error page,
+        // the second reports a failed post after publishing, the third posts.
+        const attempt = trace.attachLibrary.filter(previous => previous.body.request_id === body.request_id).length + 1;
+        const posted = attempt >= 3;
+        trace.attachLibrary.push({ body, posted, token: request.headers['x-elastos-home-token'] });
+        if (attempt === 1) {
+          response.writeHead(502, { "access-control-allow-origin": "null", "content-type": "text/html" }).end("<h1>Bad gateway</h1>");
+          return;
+        }
+        const publication = { object: { uri: body.uri }, uri: sharedUri, cid: sharedCid, published_at: 1780000000 };
+        if (posted) json(response, { status: "ok", data: { publication, posted: true, name: "attached.txt", size_bytes: 30 } });
+        else json(response, { status: "error", code: "post_failed", message: "Community send failed",
+          data: { publication, posted: false } }, 502);
+        return;
+      }
+      if (url.pathname.startsWith("/api/apps/chat-room/upload/")) {
+        const chunks = []; for await (const chunk of request) chunks.push(chunk);
+        const bytes = Buffer.concat(chunks);
+        trace.uploads.push({ path: url.pathname, bytes, offset: request.headers['x-elastos-upload-offset'],
+          token: request.headers['x-elastos-home-token'] });
+        if (url.pathname.endsWith('/start')) json(response, { upload_id: "fixture-upload", chunk_size_bytes: 16 });
+        else if (url.pathname.endsWith('/chunk')) json(response, {});
+        else json(response, { cid: sharedCid, name: "attached.txt", size_bytes: 30 });
+        return;
       }
       if (url.pathname === "/fixture") {
         const homeOrigin = `http://127.0.0.1:${server.address().port}`;
@@ -354,7 +438,63 @@ function startServer(scenario) {
             window.fixtureOpenExternal.push(event.data);
           });
         </script>` : "";
-        const reconnectHost = linkHost + (initialDirectRecovery || sharedRecovery ? `<script>
+        const didHost = didLinkScenario ? `<script>
+          window.fixtureOpenPeople = [];
+          window.addEventListener("message", (event) => {
+            if (event.source !== document.querySelector('iframe[title="Chat"]').contentWindow || event.origin !== "null"
+              || event.data?.type !== "home:open-target" || event.data.target !== "people"
+              || event.data.homeToken !== "test-token") return;
+            window.fixtureOpenPeople.push(event.data);
+            const frame = document.createElement("iframe");
+            frame.title = "People";
+            frame.sandbox = "allow-forms allow-scripts";
+            frame.style = "position:fixed;inset:0;width:100%;height:100%;background:white";
+            const query = new URLSearchParams({ ...event.data.query, home_origin: location.origin });
+            frame.src = "/apps/people/?" + query + "#home_token=test-token";
+            document.body.append(frame);
+          });
+        </script>` : "";
+        const sharedHost = ["shared-file-via-home", "community-attach"].includes(scenario) ? `
+          <section id="shared-sheet" role="dialog" hidden style="position:fixed;inset:20%;background:white;color:black;padding:20px;z-index:10;overflow-wrap:anywhere">
+            <p id="kind"></p><h1 id="title"></h1><p><span id="app"></span><span id="asker"></span></p>
+            <p id="host"></p><p id="address"></p><p id="size"></p><p id="status"></p>
+            <button id="open">Get</button><button id="cancel">Cancel</button>
+          </section><script type="module">
+          import { createHomeExternalLinkPrompt, requestHomeSharedContent } from '/home-external-link.js';
+          const node = id => document.getElementById(id);
+          window.fixtureSharedMessages = []; window.fixtureFileOpens = []; window.fixturePickerReplies = [];
+          window.fixtureLibraryOpens = []; window.fixtureFileSize = 30;
+          const prompt = createHomeExternalLinkPrompt({ root: node('shared-sheet'), appName: node('app'),
+            host: node('host'), address: node('address'), openButton: node('open'), cancelButton: node('cancel'),
+            eyebrow: node('kind'), title: node('title'), asker: node('asker'), size: node('size'), status: node('status'),
+            openSharedFile: async result => window.fixtureFileOpens.push(result) });
+          window.fixturePrompt = prompt;
+          window.addEventListener('message', event => {
+            if (event.source !== document.querySelector('iframe').contentWindow || event.origin !== 'null'
+              || event.data?.homeToken !== 'test-token') return;
+            const data = event.data;
+            if (data.type === 'home:open-uri') {
+              window.fixtureSharedMessages.push(data);
+              requestHomeSharedContent({ context: { kind: 'app-frame', targetId: 'chat-room', homeToken: 'test-token' },
+                data, prompt, fetchJson: async (url, init) => (await fetch(url, { ...init,
+                  headers: { 'content-type': 'application/json', 'x-elastos-home-token': 'home-authority', ...init.headers } })).json() });
+            }
+            if (data.type === 'home:open-target' && data.target === 'library' && data.query?.mode === 'attach') {
+              // Library sends the file's address and revision; the picker message is
+              // delivered twice so a replay can be checked.
+              const selection = { type: 'chat-room:attach-library-item', requestId: data.requestId,
+                documentNonce: data.documentNonce, pickerId: 'picker', deliveryId: 'delivery', fileName: 'attached.txt',
+                mimeType: 'text/plain', objectUri: 'localhost://Users/alma/Documents/attached.txt', revision: 'rev:attached',
+                sizeBytes: window.fixtureFileSize };
+              event.source.postMessage(selection, '*');
+              event.source.postMessage(selection, '*');
+            } else if (data.type === 'home:open-target' && data.target === 'library') {
+              window.fixtureLibraryOpens.push(data.query);
+            }
+            if (data.type === 'home:picker-accepted') window.fixturePickerReplies.push(data);
+          });
+          </script>` : "";
+        const reconnectHost = linkHost + didHost + sharedHost + (initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
             const data = event.data;
@@ -375,6 +515,29 @@ function startServer(scenario) {
           "content-length": body.length,
           "content-type": "text/html; charset=utf-8",
         });
+        response.end(body);
+        return;
+      }
+      if (didLinkScenario && url.pathname.startsWith("/api/apps/people/")) {
+        if (request.method === "POST") {
+          trace.contactRequests += 1;
+          return json(response, { error: "Unexpected automatic contact request" }, 400);
+        }
+        return json(response, {
+          profile_id: "did:key:z6MkLocal",
+          identity: { profile: { display_name: "Local Profile" },
+            profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" } },
+          people: { contacts: [] }, discovery: {},
+        });
+      }
+      if (didLinkScenario && url.pathname.startsWith("/apps/people/")) {
+        const relative = url.pathname === "/apps/people/" ? "index.html" : url.pathname.slice("/apps/people/".length);
+        const root = join(repoRoot, "capsules/people/browser");
+        const path = resolve(root, relative);
+        assert(path.startsWith(`${root}/`), "invalid People asset path");
+        const body = await readFile(path);
+        response.writeHead(200, { "access-control-allow-origin": "null", "content-length": body.length,
+          "content-type": { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" }[extname(path)] });
         response.end(body);
         return;
       }
@@ -535,6 +698,15 @@ function startServer(scenario) {
         }
         return json(response, poll);
       }
+      if (url.pathname === "/api/apps/chat-room/contacts/profile-id" && contactAcceptance) {
+        assert(request.method === "POST", "Copy DID method differs");
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        assert(JSON.parse(body).participant_ref === "participant:fixture-friend", "Copy DID lost its opaque selector");
+        assert(request.headers["x-elastos-home-token"] === "test-token", "Copy DID lost Home authority");
+        trace.profileCopies += 1;
+        return json(response, { profile_id: "did:key:zFixtureFriend" });
+      }
       if (url.pathname === "/api/apps/chat-room/contacts/request" && contactAcceptance) {
         assert(request.method === "POST", "contact request method differs");
         let body = "";
@@ -546,9 +718,16 @@ function startServer(scenario) {
           holds["contact-request"].reached = true;
           await holds["contact-request"].promise;
         }
-        trace.contactRequested = true;
         trace.contactResponses += 1;
-        return json(response, { status: "requested" });
+        if (["refusal", "unlisted"].includes(didOutcome) && trace.contactRequests === 1) {
+          response.writeHead(409, { "access-control-allow-origin": "null", "content-type": "text/plain" });
+          response.end(didOutcome === "unlisted" ? "This person is no longer listed in Community." : "Contact requests can't be delivered right now. Try again later.");
+          return;
+        }
+        const status = ["refusal", "unlisted"].includes(didOutcome) ? "requested" : (didOutcome || "requested");
+        trace.contactRequested = true;
+        trace.contactRelationship = { requested: "requested", already_requested: "requested", already_contact: "contact", pending_from_them: "pending", own_profile: "you" }[status];
+        return json(response, { status, message: `Runtime says ${status}.` });
       }
       if (url.pathname === "/api/apps/chat-room/send") {
         trace.current.sends += 1;
@@ -629,7 +808,9 @@ function startServer(scenario) {
           messages: [{
             message_id: "message:fixture-direct",
             direction: "incoming",
-            text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}` : "hello from direct",
+            text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}`
+              : didLinkScenario ? `hello from direct ${directDid} ${directDid}#key`
+              : scenario === "shared-file-via-home" ? `hello from direct ${sharedUri}` : "hello from direct",
             created_at: 1_725_000_000,
             delivery_state: "received",
           }],
@@ -722,7 +903,6 @@ async function waitForConfiguredChatWithoutLegacyFlash(frame, label) {
         return style.display !== "none" && style.visibility !== "hidden";
       };
       const legacySelectors = [
-        "#attach-button",
         "#browser-access-section",
         "#browser-access-stage",
         "#conversation-invite-create",
@@ -819,7 +999,7 @@ async function runScenario(scenario) {
   const context = await chromium.launchPersistentContext(profile, {
     executablePath: brave,
     headless: true,
-    viewport: { width: 1280, height: 900 },
+    viewport: { width: scenario.endsWith("-phone") ? 375 : 1280, height: 900 },
     ...(scenario === "history-status-order-calendar" ? { timezoneId: "America/New_York" } : {}),
   });
   const page = context.pages()[0] || await context.newPage();
@@ -835,6 +1015,171 @@ async function runScenario(scenario) {
     }
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
+
+    if (scenario.startsWith("did-link-via-home")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "DID link");
+      for (const [mode, did] of [["Community", sharedDid], ["DM", directDid]]) {
+        if (mode === "DM") {
+          await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+          await frame.waitForFunction(() => document.body.dataset.chatMode === "direct"
+            && document.querySelector("#message-list")?.textContent.includes("hello from direct"));
+        }
+        const link = frame.locator('#message-list a.message-link[data-open-external]');
+        await link.waitFor();
+        assert(await link.count() === 1 && await link.innerText() === did, `${mode} must link only the bare DID`);
+        assert(await link.getAttribute("href") === null, "DID link can navigate Chat");
+        if (mode === "Community") await link.click();
+        else { await link.focus(); await link.press("Enter"); }
+        const handle = await page.waitForSelector('iframe[title="People"]');
+        const people = await handle.contentFrame();
+        await people.waitForFunction(did => {
+          const input = document.querySelector("#add-contact-id");
+          return input?.value === did && document.activeElement === input;
+        }, did);
+        assert(await people.locator("#add-contact-form").isVisible(), "People did not open Add by DID");
+        assert(trace.contactRequests === 0, "Opening a DID sent a contact request");
+        const messages = await page.evaluate(() => window.fixtureOpenPeople);
+        const message = messages.at(-1);
+        assert(message.type === "home:open-target" && message.target === "people" && message.homeToken === "test-token"
+          && message.query.did === did && Object.keys(message.query).length === 1,
+          "DID launch changed its parameter", messages);
+        await handle.evaluate(node => node.remove());
+      }
+      assert((await page.evaluate(() => window.fixtureOpenPeople.length)) === 2, "DID activation asked Home twice");
+      return;
+    }
+    if (scenario === "shared-file-via-home") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "shared file");
+      const link = frame.locator('[data-seq="1"] a[data-open-uri]');
+      await link.waitFor({ timeout: 5000 });
+      assert(await link.getAttribute('href') === null, "shared link navigates Chat");
+      assert(await link.getAttribute('data-message-ref') === 'test-conversation/sha256:message-1', "message reference missing");
+      for (const gesture of ['click', 'Enter', ' ']) {
+        if (gesture === 'click') await link.click(); else { await link.focus(); await link.press(gesture); }
+        await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+        assert(await page.locator('#title').innerText() === 'Get this file from Alma?', "contact sheet title differs");
+        assert(await page.locator('#size').innerText() === '30 bytes', "contact sheet size differs");
+        assert(await page.locator('#open').innerText() === 'Get', "contact sheet button differs");
+        for (const hidden of ['#address', '#host', '#kind', '#status']) {
+          assert(!(await page.locator(hidden).isVisible()), `contact sheet shows ${hidden}`);
+        }
+        assert(!(await page.locator('#shared-sheet').innerText()).includes('elastos://'), "sheet shows the raw address");
+        if (gesture === 'click' && process.env.CHAT_LAYOUT_SCREENSHOT_DIR) {
+          await mkdir(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, { recursive: true });
+          await page.screenshot({ path: join(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, 'shared-file-contact.png') });
+        }
+        assert(trace.sharedGets.length === 0, "link fetched before Get");
+        await page.locator('#cancel').click();
+        await page.waitForTimeout(3100);
+      }
+      // A non-contact's file: one plain line and OK, which only closes.
+      await page.evaluate(({ cid, uri }) => {
+        const id = window.fixturePrompt.begin({ homeToken: 'test-token', appId: 'non-contact', kind: 'shared', uri });
+        window.fixturePrompt.show(id, { schema: 'elastos.home.shared-content.result/v1', cid, uri,
+          sender_display_name: 'Alma', size_bytes: 30, state: 'not_contact', check_id: 'none' });
+      }, { cid: sharedCid, uri: sharedUri });
+      await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      assert(await page.locator('#title').innerText() === 'Only contacts can send you files', "non-contact title differs");
+      assert(await page.locator('#status').innerText() === 'Add Alma as a contact to get this file.', "non-contact line differs");
+      assert(!(await page.locator('#open').isVisible()) && !(await page.locator('#size').isVisible()), "non-contact sheet offers Get");
+      assert(await page.locator('#cancel').innerText() === 'OK', "non-contact sheet button differs");
+      if (process.env.CHAT_LAYOUT_SCREENSHOT_DIR) {
+        await page.screenshot({ path: join(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, 'shared-file-non-contact.png') });
+      }
+      await page.locator('#cancel').click();
+      await page.locator('#shared-sheet').waitFor({ state: 'hidden' });
+      assert(trace.sharedGets.length === 0, "non-contact sheet fetched");
+      assert(trace.sharedChecks.every(check => check.token === 'home-authority'
+        && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', app_token: 'test-token', uri: sharedUri,
+          source: { conversation_id: 'test-conversation', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);
+      await frame.locator('[data-seq="2"] a[data-open-uri]').click();
+      await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      await page.waitForTimeout(600); await page.locator('#open').click();
+      await page.waitForFunction(() => window.fixtureFileOpens.length === 1);
+      assert(JSON.stringify(trace.sharedGets) === JSON.stringify([{ check_id: 'file-check' }]), "Get contract differs");
+      // A file post's stated name rides along as a title only; a bare link has none.
+      const sharedNames = await page.evaluate(() => window.fixtureSharedMessages.map(message => message.name ?? null));
+      assert(sharedNames.length === 4 && sharedNames.slice(0, 3).every(name => name === 'hello.txt') && sharedNames[3] === null,
+        "file post name differs", sharedNames);
+      const opened = await page.evaluate(() => window.fixtureFileOpens[0]);
+      assert(opened.cid === sharedCid && opened.name === '', "a bare link must open without a name", opened);
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      const dm = frame.locator('a[data-open-uri]'); await dm.waitFor();
+      await dm.press('Enter'); await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      const dmSource = trace.sharedChecks.at(-1).body.source;
+      assert(dmSource.conversation_id === 'direct:sha256:fixture-conversation' && dmSource.message_id === 'message:fixture-direct', "DM reference missing", dmSource);
+      assert(await frame.locator('#attach-button').isHidden(), "Attach must be hidden in a direct conversation");
+      return;
+    }
+    if (scenario === "community-attach") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "Community Attach");
+      assert(await frame.locator('#community-files-public').count() === 0, "the standing public-files note must be gone");
+      const panel = frame.locator('#library-post');
+      const panelText = () => panel.innerText();
+      for (const [size, error] of [[0, "Empty files can't be sent."], [8 * 1024 * 1024 + 1, "Choose a file of 8 MB or less."]]) {
+        await page.evaluate(size => { window.fixtureFileSize = size; window.fixturePickerReplies = []; }, size);
+        await frame.locator('#attach-button').click();
+        await frame.waitForFunction(error => document.querySelector('#error-text').textContent === error, error);
+        await page.waitForFunction(() => window.fixturePickerReplies.length === 1);
+        assert(await page.evaluate(() => window.fixturePickerReplies[0].accepted === false), "an invalid file was accepted");
+        assert(await panel.isHidden(), "an invalid file must not ask to post");
+      }
+      // Chat acknowledges the picker before it asks, so Home's 30-second delivery
+      // never waits on the person; the replayed delivery is ignored.
+      await page.evaluate(() => { window.fixtureFileSize = 30; window.fixturePickerReplies = []; });
+      await frame.locator('#attach-button').click();
+      await page.waitForFunction(() => window.fixturePickerReplies.some(reply => reply.accepted));
+      await panel.waitFor({ state: 'visible' });
+      assert(await page.evaluate(() => window.fixturePickerReplies.length) === 1, "a replayed picker delivery was answered again");
+      assert(await frame.locator('#library-post-title').innerText() === 'Post "attached.txt" in Community?', "Post confirmation title differs");
+      assert(await frame.locator('#library-post-lines').innerText() === 'Your contacts can get it from the post while your Home is open.',
+        "Post confirmation must have one line");
+      assert(await frame.locator('.library-post-actions button:not([hidden])').allInnerTexts().then((labels) => labels.join('|')) === 'Cancel|Post',
+        "Post confirmation buttons differ");
+      await frame.locator('#library-post-cancel').click();
+      await panel.waitFor({ state: 'hidden' });
+      assert(trace.attachLibrary.length === 0, "Cancel must send nothing");
+
+      await frame.locator('#attach-button').click();
+      await panel.waitFor({ state: 'visible' });
+      await frame.locator('#library-post-confirm').click();
+      // A lost answer is an unknown outcome, never "Not posted", and Try again
+      // reuses the request id so the file cannot be posted twice.
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Post not confirmed');
+      assert((await panelText()).includes("Couldn't confirm the post. Check Community, or try again."), "a lost answer must say the outcome is unknown");
+      assert(await frame.locator('#library-post-retry').innerText() === 'Try again', "a lost answer must offer Try again");
+      assert(trace.attachLibrary.length === 1, "Post must call attach-library once", trace.attachLibrary);
+      const [first] = trace.attachLibrary;
+      assert(first.body.uri === 'localhost://Users/alma/Documents/attached.txt' && first.body.if_revision === 'rev:attached'
+        && typeof first.body.request_id === 'string' && first.body.request_id.length > 0
+        && Object.keys(first.body).sort().join(',') === 'if_revision,request_id,uri', "attach-library body differs", first.body);
+      assert(first.token === 'test-token', "attach-library launch authority missing");
+      await frame.locator('#library-post-retry').click();
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Shared, not posted');
+      assert(trace.attachLibrary.length === 2 && trace.attachLibrary[1].body.request_id === first.body.request_id,
+        "Try again must reuse the request id", trace.attachLibrary);
+      assert((await panelText()).includes(`Shared: ${sharedUri}`), "a failed post must still show the shared link");
+      assert((await panelText()).includes('Shared from Library. You can stop sharing it there.'), "a failed post must point to Library");
+      assert(await frame.locator('#library-post-retry').innerText() === 'Retry post' && await frame.locator('#library-post-open-library').isVisible(),
+        "a failed post must offer Retry post and Open in Library");
+      await frame.locator('#library-post-retry').click();
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Posted in Community');
+      assert(trace.attachLibrary.length === 3 && trace.attachLibrary[2].body.request_id === first.body.request_id,
+        "Retry post must reuse the request id", trace.attachLibrary);
+      assert((await panelText()).includes(`Shared: ${sharedUri}`) && (await panelText()).includes('Posted in Community.'),
+        "publication and posting must show apart");
+      await frame.locator('#library-post-open-library').click();
+      await page.waitForFunction(() => window.fixtureLibraryOpens.length === 1);
+      assert(await page.evaluate(() => JSON.stringify(window.fixtureLibraryOpens[0])) ===
+        JSON.stringify({ uri: 'localhost://Users/alma/Documents' }), "Open in Library must open the file's folder");
+      await frame.locator('#library-post-close').click();
+      await panel.waitFor({ state: 'hidden' });
+      assert(trace.uploads.length === 0, "Community must not upload file bytes");
+      assert(!trace.requests.some(value => value.endsWith('/objects/send')), "Chat duplicated Runtime's post");
+      await notifyChatRuntime(page);
+      await frame.waitForFunction(() => document.querySelector('#message-list').textContent.includes('attached.txt'));
+      return;
+    }
 
     if (scenario === "external-link-via-home") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "external link");
@@ -1284,8 +1629,14 @@ async function runScenario(scenario) {
       const draft = "Keep this draft while recent history is checked";
       await frame.locator("#message-input").fill(draft);
       const historyStatus = async (status) => {
-        await frame.waitForFunction(expected =>
-          document.querySelector("#conversation-detail")?.dataset.historyStatus === expected, status);
+        // Searching and available history leave the header at Live; only
+        // unavailable history is shown.
+        await frame.waitForFunction(expected => {
+          const detail = document.querySelector("#conversation-detail");
+          return expected === "unavailable"
+            ? detail?.dataset.historyStatus === "unavailable"
+            : detail?.textContent === "Live" && detail?.dataset.historyStatus === undefined;
+        }, status);
         assert(await frame.locator("#conversation-detail").isVisible(), "history status is hidden in shell mode");
         assert(await frame.locator("#message-input").isEnabled() && await frame.locator("#send-button").isEnabled()
           && !(await frame.locator("#reconnect-button").isVisible()), "history status changed live session controls");
@@ -1393,7 +1744,10 @@ async function runScenario(scenario) {
         assert(await original.count() === 1 && await frame.locator("#message-input").inputValue() === draft,
           "Send again replaced the original record or current draft");
       } else {
-        await frame.waitForFunction(() => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes("Sent"));
+        await frame.waitForFunction(() => {
+          const node = document.querySelector('[data-direct-message-id="message:retry-original"]');
+          return !!node && !node.textContent.includes("Sending") && !node.querySelector("[data-direct-action]");
+        });
         assert(await original.locator('[data-direct-action]').count() === 0, "settled receipt retains Retry");
         assert(await frame.locator("#message-input").inputValue() === draft, "Retry cleared the current draft");
         assert(trace.retryPosts.length === 1 && trace.retryPosts[0].retry_existing === true, "Retry sent another fresh intent");
@@ -1501,6 +1855,76 @@ async function runScenario(scenario) {
       return;
     }
 
+    if (scenario.startsWith("contact-did-")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "DID contact bootstrap");
+      await frame.locator("#participant-toggle").click();
+      await frame.locator('#participant-list [data-participant-ref="participant:fixture-friend"]').click();
+      assert(await frame.locator("#participant-card-action").innerText() === "Add contact", "Community card needs Discovery");
+      assert(!(await frame.locator("#participant-card").innerText()).includes("Discovery"), "Card still requires Discovery");
+      assert(trace.profileCopies === 0, "DID was fetched before Copy");
+      await page.evaluate(() => {
+        const child = document.querySelector("iframe").contentWindow;
+        const homeToken = "test-token";
+        child.postMessage({ type: "home:clipboard-ready", schema: "elastos.home.clipboard.ready/v1",
+          targetId: "chat-room", homeToken, parentOrigin: location.origin, generation: "fixture:1" }, "*");
+        window.didCopies = [];
+        window.addEventListener("message", event => {
+          const data = event.data;
+          if (event.source !== child || data?.type !== "home:clipboard-request") return;
+          window.didCopies.push(data);
+          const denied = window.didCopies.length === 1;
+          child.postMessage({ type: "home:clipboard-result", schema: "elastos.home.clipboard.result/v1",
+            requestId: data.requestId, targetId: "chat-room", homeToken, parentOrigin: location.origin,
+            generation: "fixture:1", operation: "write", purpose: "profile.id", ok: !denied,
+            ...(denied ? { error: "denied" } : {}) }, "*");
+        });
+      });
+      await frame.locator("#participant-card-copy").click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card-state").textContent === "DID could not be copied. Try again.");
+      await frame.locator("#participant-card-copy").click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card-state").textContent === "DID copied.");
+      const copies = await page.evaluate(() => window.didCopies);
+      assert(trace.profileCopies === 2 && copies.length === 2
+        && copies.every(item => item.text === "did:key:zFixtureFriend" && item.purpose === "profile.id"), "Copy DID bypassed Home", copies);
+      assert(!(await frame.locator("body").innerText()).includes("did:key:"), "Copy exposed a DID in the card");
+      await frame.locator("#participant-card-action").click();
+      const outcome = scenario.slice("contact-did-".length).replace(/-phone$/, "");
+      if (["refusal", "unlisted"].includes(outcome)) {
+        const refusal = outcome === "unlisted" ? "This person is no longer listed in Community." : "Contact requests can't be delivered right now. Try again later.";
+        await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message, refusal);
+        assert(await frame.locator("#participant-card-action").isEnabled(), "Refusal blocked retry");
+        await frame.locator("#participant-card-action").click();
+      }
+      // The card shows Runtime's message verbatim.
+      await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message,
+        `Runtime says ${["refusal", "unlisted"].includes(outcome) ? "requested" : outcome}.`);
+      if (outcome === "pending_from_them") {
+        assert(await frame.locator("#participant-card-action").innerText() === "Open Inbox", "Incoming request has no Inbox action");
+      } else {
+        assert(await frame.locator("#participant-card-action").isHidden(), "Request result kept Add contact");
+      }
+      assert(await frame.locator("#participant-card-copy").isHidden() === (outcome === "own_profile"), "Copy DID visibility differs");
+      const cardBox = await frame.locator("#participant-card").boundingBox();
+      assert(cardBox && cardBox.x >= 0 && cardBox.x + cardBox.width <= page.viewportSize().width + 1, "DID card overflows");
+      return;
+    }
+    if (scenario === "contact-acceptance-from-message") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "message name bootstrap");
+      const sender = frame.locator('#message-list [data-participant-ref="participant:fixture-friend"]');
+      await sender.waitFor({ state: "visible" });
+      assert(await frame.locator("#participant-card").isHidden(), "the profile card opened before a name was chosen");
+      await sender.click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card")?.dataset.participantRef
+        === "participant:fixture-friend");
+      const box = await frame.locator("#participant-card").boundingBox();
+      assert(box && box.width > 0 && box.height > 0 && await frame.locator("#participant-card-close").isVisible(),
+        `a name on a Community message must open a visible profile card. Got ${JSON.stringify(box)}`);
+      assert(await frame.locator("#participant-card-action").innerText() === "Add contact",
+        "the card opened from a message lost its contact action");
+      assert(await frame.evaluate(() => document.activeElement?.id) === "participant-card-close",
+        "the card opened from a message did not take focus");
+      return;
+    }
     if (scenario.startsWith("contact-acceptance")) {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "contact acceptance bootstrap");
       const draft = "Keep this draft while a contact is accepted";
@@ -1519,7 +1943,7 @@ async function runScenario(scenario) {
           "an unchanged poll re-enabled the in-flight contact request");
       } else {
         await frame.waitForFunction(() => document.querySelector("#participant-card-action")?.hidden === true
-          && document.querySelector("#participant-card-state")?.textContent.includes("Waiting"));
+          && document.querySelector("#participant-card-state")?.textContent === "Runtime says requested.");
       }
       await frame.locator("#participant-card-close").focus();
       trace.peerAccepted = true;
@@ -1527,7 +1951,7 @@ async function runScenario(scenario) {
         const card = document.querySelector("#participant-card");
         const action = document.querySelector("#participant-card-action");
         return card?.hidden === false && card.dataset.participantRef === "participant:fixture-friend"
-          && document.querySelector("#participant-card-state")?.textContent === "Contact · Home online"
+          && document.querySelector("#participant-card-state")?.textContent === "Contact"
           && action?.hidden === false && !action.disabled && action.dataset.cardAction === "message"
           && action.textContent === "Message"
           && !!document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
@@ -1544,7 +1968,7 @@ async function runScenario(scenario) {
           window.fixtureCardObserver = new MutationObserver(() => {
             const action = document.querySelector("#participant-card-action");
             window.fixtureCardRegressed ||= card.hidden
-              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Home online"
+              || document.querySelector("#participant-card-state")?.textContent !== "Contact"
               || action?.hidden !== false || action.disabled || action.dataset.cardAction !== "message";
           });
           window.fixtureCardObserver.observe(card, { subtree: true, childList: true, characterData: true, attributes: true });
@@ -1561,7 +1985,7 @@ async function runScenario(scenario) {
           return window.fixtureCardRegressed;
         });
         assert(!regressed, "a held request response briefly reverted accepted contact state");
-        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Home online"
+        assert(await frame.locator("#participant-card-state").innerText() === "Contact"
           && await frame.locator("#participant-card-action").isVisible()
           && await frame.locator("#participant-card-action").innerText() === "Message",
         "a held request response reverted accepted contact state");
@@ -1677,7 +2101,7 @@ async function runScenario(scenario) {
           return state.active
             && state.chatMode === "shared"
             && state.selected === "shared"
-            && state.attachHidden
+            && !state.attachHidden
             ? state
             : false;
         });
@@ -1701,7 +2125,7 @@ async function runScenario(scenario) {
           && switched.conversationTitle === "Community"
           && switched.conversationDetail === "Live"
           && switched.errorText === ""
-          && switched.attachHidden,
+          && !switched.attachHidden,
         "direct-to-shared switch did not leave configured Chat in shared mode",
         { heldBoundary, ...switched, preClickTrace, trace },
       );
@@ -1823,7 +2247,7 @@ async function runScenario(scenario) {
           }, width);
       state.topWidth = topWidth;
       assert(state.active === "true", "configured Chat session did not open", state);
-      assert(state.attachHidden, "configured Chat exposed Attach", state);
+      assert(!state.attachHidden, "Community Attach is unavailable", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
       assert(state.roomSettingsHidden, "configured Chat exposed legacy room settings", state);
       assert(state.textVisible, "configured Chat text composer is unavailable", state);
@@ -1962,6 +2386,10 @@ async function runScenario(scenario) {
 
 async function main() {
   const scenarios = process.env.CHAT_LAYOUT_SCENARIOS?.split(",").map((value) => value.trim()).filter(Boolean) || [
+    "did-link-via-home", "did-link-via-home-phone",
+    "contact-did-requested", "contact-did-requested-phone", "contact-did-already_requested",
+    "contact-did-already_contact", "contact-did-pending_from_them", "contact-did-own_profile", "contact-did-refusal",
+    "contact-did-unlisted",
     "success",
     "single-conversation",
     "session-failure",
@@ -1986,6 +2414,7 @@ async function main() {
     "shared-attachment-retry",
     "contact-acceptance",
     "contact-acceptance-held-request",
+    "contact-acceptance-from-message",
     "history-status-order-calendar",
     "direct-unread",
     "shell-layout-visibility",
@@ -1995,6 +2424,8 @@ async function main() {
     "direct-retry-terminal",
     "direct-retry-unavailable",
     "external-link-via-home",
+    "shared-file-via-home",
+    "community-attach",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);

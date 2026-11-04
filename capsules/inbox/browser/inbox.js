@@ -338,7 +338,7 @@
           source_app: String(route.offer_id || "").startsWith("validation:") ? "system" : "assistant",
           title: `${route.provider || "Hosted model"} ${route.connection ? "connection" : "route"} · ${status}`,
           body: route.connection
-            ? `Provider: ${route.provider || "Hosted model"}\nApproved HTTPS origin: ${route.origin || ""}\nRuntime may check the key and send configured Assistant model prompts or Jev decisions to its pinned provider routes at this origin. Runtime checks each route and effect before dispatch. The key stays on this Home.\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nExpires: ${expires}`
+            ? `Provider: ${route.provider || "Hosted model"}\nApproved HTTPS origin: ${route.origin || ""}\nRuntime may check the key and send configured Assistant model prompts to its pinned provider routes at this origin. Runtime checks each route and effect before dispatch. The key stays on this Home.\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nExpires: ${expires}`
             : `Provider: ${route.provider || "Hosted model"}\nRoute: ${route.method || ""} ${route.origin || ""}${route.path || ""}\nExact URL SHA-256: ${route.url_sha256 || ""}\nOrigin: ${route.origin || ""}\nRecipient: ${route.recipient || ""}\nPayer: ${route.payer || ""}\nPurpose: ${route.purpose || ""}\nExpires: ${expires}`,
           severity: route.status === "pending" ? "attention" : "info",
           read: true,
@@ -499,7 +499,8 @@
 
     function fillEntryActions(actions, entry) {
       const actionId = entry.action_ref && entry.action_ref.action_id;
-      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
+      // A request Inbox decides itself has no other app to open.
+      if (typeof entry.source_app === "string" && entry.source_app.trim() && entry.source_app.trim() !== "inbox") {
         // A direct-message notice opens its own conversation in Chat.
         const query = typeof actionId === "string" && actionId.startsWith("chat-open-direct:")
           ? { conversation_id: actionId.slice("chat-open-direct:".length) } : {};

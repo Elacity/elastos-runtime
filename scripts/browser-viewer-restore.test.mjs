@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import { createBrowserFrameFence } from '../capsules/browser/browser/browser-resize.js';
 import { runtimePageOwner, sameRuntimePageOwner } from '../capsules/browser/browser/browser-page-cleanup.js';
 const source = readFileSync(new URL('../capsules/browser/browser/browser.js', import.meta.url), 'utf8');
 function declaration(name) {
@@ -31,6 +32,8 @@ function harness() {
     runtimeOwnershipTerminallyAbsent: true, selectedBrowserEngineId: '', currentBrowserEngineId: '',
     selectedRemoteExitId: '', currentRemoteExitId: '', currentDisplayMode: '', currentView: null, lastPageStatus: null,
     runtimePageOwner, sameRuntimePageOwner,
+    lastDatachannelInputAt: 0, datachannelDrainedAt: 0, datachannelSendDisplay: null, datachannelSendGeneration: 0,
+    resizeFrameFence: createBrowserFrameFence({}),
     publishRuntimePageForHost: page => calls.push(['publish', page.page_id]),
     syncEngineSelect: () => calls.push(['engine', state.selectedBrowserEngineId]),
     syncExitSelect: () => calls.push(['exit', state.selectedRemoteExitId]),
@@ -54,7 +57,7 @@ function harness() {
       display_session: { mode: 'webrtc_remote_display', width: 1280, height: 720, source: 'diagnostic-status', ice_servers: [{ credential_present: true }] } }; },
   });
   state.globalThis = state;
-  for (const name of ['displayAttachRequestId', 'viewerDisplayAttachTimeoutMs', 'reuseDisplayAttachment', 'terminalDisplayAttachment', 'allocateDisplayAttachRetryId', 'markDisplayAttachRetryNeeded', 'displayAttachRequestForRecovery', 'currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
+  for (const name of ['resetPageInputDelivery', 'displayAttachRequestId', 'viewerDisplayAttachTimeoutMs', 'reuseDisplayAttachment', 'terminalDisplayAttachment', 'allocateDisplayAttachRetryId', 'markDisplayAttachRetryNeeded', 'displayAttachRequestForRecovery', 'currentRuntimePageOwner', 'runtimeViewerOwnerActive', 'recoverableRuntimePage', 'fetchPageStatus', 'attachRecoveredDisplay', 'restoreRuntimePageViewer', 'settleRemoteDisplayFailure']) {
     vm.runInContext(declaration(name), state);
   }
   return { state, calls, failures, requests, restore: value => state.restoreRuntimePageViewer(value) };
@@ -357,7 +360,8 @@ test('summary authority failure reaches startup renewal without a replacement op
     requestRuntimeOpen: async value => opens.push(value),
     isAuthoritySessionError: value => value.status === 401,
     friendlyOpenError: value => value.message,
-    requestHomeRelaunch: value => { renewals.push(value); return true; } });
+    requestHomeRelaunch: value => { renewals.push(value); return true; }, resumeDeferredHomeBrowserWindowClose() {},
+    AbortController, windowCloseAbortControllers: new Set() });
   vm.runInContext(declaration('fetchBrowserSummary'), h.state);
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
   assert.deepEqual(renewals, ['Browser authority expired']);

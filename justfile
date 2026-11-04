@@ -173,6 +173,7 @@ verify:
     just product-ui-source
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-assistant-mark.test.mjs
+    node --test scripts/assistant-markdown.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
     node --test scripts/home-form-factor.test.mjs
@@ -183,6 +184,7 @@ verify:
     node --test scripts/home-sheet-handle.test.mjs
     node --test scripts/home-link-status.test.mjs
     node --test scripts/home-touch-long-press.test.mjs
+    node --test scripts/home-fullscreen-toggle.test.mjs
     node --test scripts/home-phone-home.test.mjs
     node --test scripts/chat-room-enter.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
@@ -210,7 +212,6 @@ product-ui-source:
     node scripts/inbox-product-behavior-smoke.mjs
     node scripts/archive-product-behavior-smoke.mjs
     node scripts/marketplace-product-behavior-smoke.mjs
-    node scripts/documents-product-behavior-smoke.mjs
     node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
@@ -224,6 +225,9 @@ product-ui-browser:
     node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
+    node scripts/library-menu-smoke.mjs
+    node scripts/library-shared-cid-smoke.mjs
+    node scripts/home-library-open-headless-smoke.mjs
     node scripts/browser-product-layout-smoke.mjs
     node scripts/system-uiux-layout-smoke.mjs
     node scripts/system-window-policy-browser-smoke.mjs

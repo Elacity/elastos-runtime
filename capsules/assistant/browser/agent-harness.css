@@ -275,6 +275,12 @@ body.agent-harness-active .taskbar.is-agent-face {
   margin-left: 6px;
 }
 
+/* White lettering vanishes on the light rail; swap to the ink variant
+   (navy lettering), as the Home menubar does. */
+:root[data-el-theme="light"] .agent-harness-brand {
+  content: url("./elastos-logo-ink.svg");
+}
+
 .agent-harness-sidebar-actions {
   display: flex;
   flex: 0 0 auto;
@@ -2372,12 +2378,30 @@ html[data-agent-reasoning="off"] .agent-thinking {
   min-width: 0;
 }
 
+/* Numbers hang outside in the gutter and a message clips its paint
+   (contain: content), so the gutter grows a digit for "10." and "100.". */
+.agent-md-list[data-marker-digits="2"] {
+  padding-inline-start: calc(1.4em + 1ch);
+}
+
+.agent-md-list[data-marker-digits="3"] {
+  padding-inline-start: calc(1.4em + 2ch);
+}
+
+.agent-md-list[data-marker-digits="4"] {
+  padding-inline-start: calc(1.4em + 3ch);
+}
+
 .agent-md-list li {
   margin: 0;
 }
 
 .agent-md-list li + li {
   margin-top: var(--space-1);
+}
+
+.agent-md-list .agent-md-list {
+  margin: var(--space-1) 0 0;
 }
 
 .agent-md-quote {

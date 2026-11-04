@@ -23,6 +23,7 @@ import signal
 import ssl
 import subprocess
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -201,6 +202,50 @@ def shell(script, *args):
         input=HELPERS + "\n" + script,
         text=True, capture_output=True, timeout=15,
     )
+
+
+def shell_on_terminal(script, *args, timeout=30):
+    """shell() with stdout on a pseudo-terminal, as a person running curl | bash sees it."""
+    master, slave = os.openpty()
+    chunks = []
+
+    def drain():
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            chunks.append(chunk)
+
+    reader = threading.Thread(target=drain)
+    reader.start()
+    proc = None
+    try:
+        # Its own process group, so a timeout or error stops the script and all it started.
+        proc = subprocess.Popen([OPTIONS.bash, "--noprofile", "--norc", "-s", "--", *map(str, args)],
+                                stdin=subprocess.PIPE, stdout=slave, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=os.setpgrp)
+        os.close(slave)
+        slave = None
+        _, stderr = proc.communicate(HELPERS + "\n" + script, timeout=timeout)
+    except BaseException:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        raise
+    finally:
+        if slave is not None:
+            os.close(slave)
+        # Every writer has exited, so the reader sees the end of the terminal.
+        reader.join()
+        os.close(master)
+    stdout = b"".join(chunks).decode(errors="replace").replace("\r\n", "\n")
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 class SignatureTests(unittest.TestCase):
@@ -388,6 +433,33 @@ class ShellTests(unittest.TestCase):
         self.assertIn("✓", rich.stdout)
         self.assertNotIn("[OK]", rich.stdout)
 
+    def test_terminal_run_that_times_out_stops_and_reaps_its_processes(self):
+        started, real_popen = [], subprocess.Popen
+
+        def record(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        threads = set(threading.enumerate())
+        with tempfile.TemporaryDirectory(prefix="installer-terminal-") as directory:
+            pid_file = Path(directory, "sleeper")
+            with mock.patch.object(subprocess, "Popen", record), \
+                    self.assertRaises(subprocess.TimeoutExpired):
+                shell_on_terminal('sleep 30 &\nprintf %s "$!" > "$1"\nwait\n', pid_file, timeout=3)
+            sleeper = int(pid_file.read_text())
+        # The script is killed and reaped, its reader thread is joined, and the
+        # process it started in the background is stopped too.
+        self.assertEqual(started[0].returncode, -signal.SIGKILL)
+        self.assertEqual(set(threading.enumerate()), threads)
+        for _ in range(50):
+            try:
+                os.kill(sleeper, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"background process {sleeper} still runs")
+
     def test_installed_version_reads_sources_and_rejects_control_text(self):
         with tempfile.TemporaryDirectory(prefix="installer-version-") as directory:
             sources = Path(directory, "sources.json")
@@ -557,15 +629,18 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
-    def run(self, *options, umask="0022"):
+    def run(self, *options, umask="0022", env=(), terminal=False):
         seen = len(self.requests())
-        result = shell('umask "$6"\n' + '''
+        # SHELL picks the login profile for the PATH line; env entries are "NAME=value".
+        exports = " ".join(shlex.quote(entry) for entry in ("SHELL=/bin/bash", *env))
+        result = (shell_on_terminal if terminal else shell)('umask "$6"\n' + '''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
 export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID=""
-export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
+export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY="" ELASTOS_NO_MODIFY_PATH=""
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
+export ''' + exports + '''
 # Feed the complete stamped script through stdin, as curl | bash does.
 cat "$3" | "$2" --noprofile --norc -s -- "${@:7}"
 ''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask,
@@ -604,7 +679,8 @@ def changed_paths(before, after):
 
 
 class CompletionTests(unittest.TestCase):
-    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux"):
+    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux",
+                       env_extra=None):
         with tempfile.TemporaryDirectory(prefix="installer-completion-") as directory:
             root = Path(directory)
             # Spaces catch accidental reliance on PATH or unquoted install paths.
@@ -632,7 +708,8 @@ class CompletionTests(unittest.TestCase):
             env = dict(os.environ, INSTALL_DIR=str(install_dir), INSTALL_ONLY=install_only,
                        DATA_DIR=str(root / "data"), MOCK_SYSTEM=system,
                        PATH=str(mocks) + os.pathsep + os.environ["PATH"],
-                       CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit))
+                       CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit),
+                       **(env_extra or {}))
             argv = [OPTIONS.bash, "--noprofile", "--norc", str(script)]
             if terminal:
                 import fcntl
@@ -677,10 +754,14 @@ class CompletionTests(unittest.TestCase):
                 self.assertIn("installed\\ runtime/elastos", output)
                 self.assertIn("home --browser", output)
 
-    def test_setup_failure_stops_before_home_and_success_message(self):
+    def test_setup_failure_stops_before_home_and_names_the_setup_command(self):
         status, calls, output = self.run_completion(setup_exit=23)
         self.assertEqual((status, calls), (23, ["setup"]))
         self.assertNotIn("Home is installed", output)
+        self.assertIn("Home setup did not finish. ElastOS is installed, so you do not need to run the whole "
+                      "install again.", output)
+        self.assertIn("a network that blocks UDP port 4433", output)
+        self.assertRegex(output, r"Then run: /\S*/installed\\ runtime/elastos setup\n")
 
     def test_install_only_skips_both_setup_and_home(self):
         for value in ["true", "1"]:
@@ -690,6 +771,19 @@ class CompletionTests(unittest.TestCase):
     def test_terminal_install_sets_up_then_opens_home_with_tty(self):
         status, calls, _ = self.run_completion(terminal=True)
         self.assertEqual((status, calls), (0, ["setup", "home --browser"]))
+
+    def test_linux_without_a_desktop_says_how_to_open_home_from_another_computer(self):
+        tunnel = f"ssh -L 8090:localhost:8090 {getpass.getuser()}@10.0.0.9"
+        ssh = {"SSH_CONNECTION": "10.0.0.5 50000 10.0.0.9 22"}
+        for system, display, shown in [("Linux", {}, True), ("Linux", {"DISPLAY": ":0"}, False),
+                                       ("Linux", {"WAYLAND_DISPLAY": "wayland-0"}, False),
+                                       ("Darwin", {}, False)]:
+            with self.subTest(system=system, display=display):
+                env = {"DISPLAY": "", "WAYLAND_DISPLAY": "", **ssh, **display}
+                status, calls, output = self.run_completion(terminal=True, system=system, env_extra=env)
+                self.assertEqual((status, calls), (0, ["setup", "home --browser"]), output)
+                self.assertEqual(tunnel in output, shown, output)
+                self.assertEqual("open http://localhost:8090/home/ in its browser" in output, shown, output)
 
     def test_home_failure_is_reported(self):
         status, calls, _ = self.run_completion(terminal=True, home_exit=24)
@@ -882,7 +976,7 @@ class InstallationTests(unittest.TestCase):
                     result, requests = sandbox.run(*(["--install-only"] if install_only else []))
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(requests, self.REQUESTS)
-                    self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})
+                    self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos", ".profile"})
                     candidate = sandbox.root / "candidate"
                     self.assertEqual((candidate / "release-head.json").read_bytes(), head)
                     self.assertEqual((candidate / "release.json").read_bytes(), release)
@@ -962,9 +1056,11 @@ class InstallationTests(unittest.TestCase):
 
     def test_python3_that_cannot_run_stops_before_any_download_with_one_next_step(self):
         did, head, release = installable_fixture()
+        rerun = ("curl -fsSL https://test.invalid/install.sh | bash -s -- --maintainer-did "
+                 f"{did} --publisher-gateway https://test.invalid --install-only")
         for system, machine, message in [
             ("Darwin", "arm64", "This Mac needs Apple's Command Line Tools for python3. "
-                                "Run: xcode-select --install, then run the installer again."),
+                                "Run: xcode-select --install, and when it finishes run: " + rerun),
             ("Linux", "x86_64", "python3 is installed but does not run. Repair python3, then run the installer again."),
         ]:
             with self.subTest(system=system), InstallerSandbox(head, release, did, system, machine) as sandbox:
@@ -976,6 +1072,212 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual(requests, [])
                 self.assertIn(message, result.stderr)
                 self.assertNotIn("xcode-select: note", result.stderr)
+
+    def command_line_tools_mocks(self, sandbox, ready_after):
+        # python3 is Apple's stub until the tools exist; `xcode-select -p` reports
+        # them on its Nth call. The real python3 runs once the marker is present.
+        mocks, marker = sandbox.root / "mocks", sandbox.root / "tools-installed"
+        (mocks / "python3").write_text(
+            f'#!/bin/sh\n[ -e {shlex.quote(str(marker))} ] || exit 1\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n')
+        (mocks / "xcode-select").write_text(f'''#!/bin/sh
+printf 'xcode-select %s\\n' "$*" >> "$FIXTURES/tool-calls"
+[ "$1" = -p ] || exit 0
+count=$(grep -c -- '-p' "$FIXTURES/tool-calls")
+[ "$count" -ge {ready_after} ] && touch {shlex.quote(str(marker))}
+[ -e {shlex.quote(str(marker))} ] || exit 2
+echo /Library/Developer/CommandLineTools
+''')
+        for name in ("python3", "xcode-select"):
+            (mocks / name).chmod(0o755)
+        return lambda: (sandbox.root / "tool-calls").read_text().splitlines()
+
+    def test_mac_terminal_install_starts_apples_installer_waits_and_continues(self):
+        did, head, release = installable_fixture()
+        options = ["NO_COLOR=1", "ELASTOS_COMMAND_LINE_TOOLS_POLL_SECONDS=1"]
+        with InstallerSandbox(head, release, did, "Darwin", "arm64") as sandbox:
+            calls = self.command_line_tools_mocks(sandbox, ready_after=2)
+            result, requests = sandbox.run("--install-only", env=options, terminal=True)
+            self.assertIn("Click Install in Apple's window", result.stdout)
+            self.assertIn("Apple's Command Line Tools are installed", result.stdout)
+            self.assertEqual(calls(), ["xcode-select --install", "xcode-select -p", "xcode-select -p"])
+            # It went on to verify the release; this fixture has no Mac binary.
+            self.assertEqual(requests, self.REQUESTS[:2])
+            self.assertIn("No release available for platform: aarch64-darwin", result.stderr)
+
+        with InstallerSandbox(head, release, did, "Darwin", "arm64") as sandbox:
+            calls = self.command_line_tools_mocks(sandbox, ready_after=99)
+            result, requests = sandbox.run(
+                "--install-only", env=[*options, "ELASTOS_COMMAND_LINE_TOOLS_WAIT_SECONDS=2"], terminal=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(requests, [])
+            self.assertEqual(calls()[0], "xcode-select --install")
+            self.assertIn("Apple's Command Line Tools are not installed yet. When Apple's installer finishes, "
+                          "run: curl -fsSL https://test.invalid/install.sh | bash -s --", result.stderr)
+
+    def test_install_adds_one_marked_path_line_to_the_login_profile_and_uninstall_names_it(self):
+        did, head, release = installable_fixture()
+        line = 'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+        # An existing empty ~/.bash_profile is the file bash reads.
+        for system, machine, shell_path, profile, text in [
+                ("Linux", "x86_64", "/bin/bash", ".profile", "export EDITOR=vi"),
+                ("Linux", "x86_64", "/bin/bash", ".bash_profile", ""),
+                ("Darwin", "arm64", "/bin/zsh", ".zprofile", "export EDITOR=vi")]:
+            with self.subTest(system=system, profile=profile), \
+                    InstallerSandbox(head, release, did, system, machine) as sandbox:
+                path = sandbox.home / profile
+                path.write_text(text)
+                kept = text + "\n" if text else ""
+                sandbox.respond("binary", RUNTIME_STUB)
+                if system == "Linux":
+                    outputs = []
+                    for _ in range(2):
+                        result, _ = sandbox.run("--install-only", env=[f"SHELL={shell_path}"])
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        outputs.append(result.stdout)
+                    self.assertIn(f"Added ~/.local/bin to PATH in ~/{profile}", outputs[0])
+                    self.assertIn("To undo, delete the line ending in '# Added by the ElastOS installer'",
+                                  outputs[0])
+                    self.assertNotIn("to PATH in", outputs[1])
+                else:
+                    # The fixture has no Mac binary, so the profile step runs on its own.
+                    for _ in range(2):
+                        result = shell('HOME="$1" SHELL="$2" PLATFORM=aarch64-darwin INSTALL_DIR="$1/.local/bin"\n'
+                                       'add_install_dir_to_login_profile\n', sandbox.home, shell_path)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                # Added once, on its own line, after the existing text.
+                self.assertEqual(path.read_text(), kept + line)
+
+                # Uninstall never edits a profile; it names the line to delete.
+                result, _ = sandbox.run("--uninstall", env=[f"SHELL={shell_path}"])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"To finish, delete this line from ~/{profile}: {line}", result.stdout)
+                self.assertEqual(path.read_text(), kept + line)
+
+    def test_uninstall_names_only_the_selected_install_dirs_path_line(self):
+        did, head, release = installable_fixture()
+        marker = " # Added by the ElastOS installer\n"
+        with InstallerSandbox(head, release, did) as sandbox:
+            other = sandbox.root / "other bin"
+            default_line = 'export PATH="$HOME/.local/bin:$PATH"' + marker
+            other_line = shell('path_export_line "$1"\n', other).stdout + marker
+            hand = "echo mine" + marker
+            profile = sandbox.home / ".profile"
+            profile.write_text("export EDITOR=vi\n" + default_line + other_line + hand)
+            text = profile.read_bytes()
+            # Nothing is installed in either directory: only the selected line is named.
+            result, _ = sandbox.run("--uninstall", "--install-dir", str(other))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("No ElastOS installation found", result.stdout)
+            self.assertIn(f"delete this line from ~/.profile: {other_line}", result.stdout)
+            self.assertNotIn(default_line, result.stdout)
+            result, _ = sandbox.run("--uninstall")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"delete this line from ~/.profile: {default_line}", result.stdout)
+            self.assertNotIn(other_line, result.stdout)
+            self.assertNotIn(hand, result.stdout)
+            self.assertEqual(profile.read_bytes(), text)
+
+    def test_linked_or_shared_profile_is_left_unchanged_with_the_line_to_add(self):
+        did, head, release = installable_fixture()
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        sentinel = '{"sentinel": true}\n'
+        for kind in ("symlink", "hard link"):
+            with self.subTest(kind=kind), InstallerSandbox(head, release, did) as sandbox:
+                # The profile name aliases another file, such as Runtime data.
+                target = sandbox.root / "runtime-data.json"
+                target.write_text(sentinel)
+                profile = sandbox.home / ".profile"
+                if kind == "symlink":
+                    profile.symlink_to(target)
+                else:
+                    os.link(target, profile)
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               'add_install_dir_to_login_profile\n', sandbox.home)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_text(), sentinel)
+                self.assertIn(f"add this line to it yourself: {line}\n", result.stdout)
+                # Uninstall leaves the aliased file unchanged and names the line.
+                shared = sentinel + line + " # Added by the ElastOS installer\n"
+                target.write_text(shared)
+                result, _ = sandbox.run("--uninstall")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_text(), shared)
+                self.assertIn(f"To finish, delete this line from ~/.profile: {line}", result.stdout)
+                self.assertEqual(profile.is_symlink(), kind == "symlink")
+                self.assertTrue(profile.samefile(target))
+
+    def test_profile_swapped_for_a_link_before_the_append_leaves_the_link_target_unchanged(self):
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        sentinel = '{"sentinel": true}\n'
+        # Right before the append opens the profile, a symlink to the sentinel takes its name.
+        hook = ('python3() {\nmv -- "$PROFILE" "$PROFILE.moved" 2>/dev/null\n'
+                'ln -s -- "$SENTINEL" "$PROFILE"\ncommand python3 "$@"\n}\n')
+        for before in ("export EDITOR=vi\n", None):
+            with self.subTest(before=before), \
+                    tempfile.TemporaryDirectory(prefix="installer-profile-swap-") as directory:
+                home, target = Path(directory, "home"), Path(directory, "runtime-data.json")
+                home.mkdir()
+                target.write_text(sentinel)
+                target.chmod(0o604)
+                profile = home / ".profile"
+                if before is not None:
+                    profile.write_text(before)
+                result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                               'PROFILE="$1/.profile" SENTINEL="$2"\n' + hook + 'add_install_dir_to_login_profile\n',
+                               home, target)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((target.read_text(), target.stat().st_mode & 0o777), (sentinel, 0o604))
+                self.assertTrue(profile.is_symlink())
+                self.assertIn(f"add this line to it yourself: {line}\n", result.stdout)
+                if before is not None:
+                    self.assertEqual(Path(f"{profile}.moved").read_text(), before)
+
+    def test_append_keeps_the_profile_inode_mode_and_bytes_and_uninstall_leaves_it(self):
+        line = b'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+        with tempfile.TemporaryDirectory(prefix="installer-profile-inode-") as directory:
+            profile = Path(directory, ".profile")
+            # No trailing newline: the added line must start on its own line.
+            profile.write_bytes(b"export EDITOR=vi")
+            profile.chmod(0o600)
+            inode = profile.stat().st_ino
+            prefix = 'HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+            for script in ('add_install_dir_to_login_profile\n', 'show_login_profile_lines "$HOME/.local/bin"\n'):
+                result = shell(prefix + script, directory)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((profile.read_bytes(), profile.stat().st_ino, profile.stat().st_mode & 0o777),
+                                 (b"export EDITOR=vi\n" + line, inode, 0o600))
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), [".profile"])
+
+    def test_short_append_restores_the_profile_and_prints_the_line_to_add(self):
+        original = b"export EDITOR=vi\n"
+        with tempfile.TemporaryDirectory(prefix="installer-profile-short-") as directory:
+            profile = Path(directory, ".profile")
+            profile.write_bytes(original)
+            inode = profile.stat().st_ino
+            # Only the append's python3 runs with a file size limit 3 bytes past
+            # the profile, so its one write fails or comes up short.
+            limit = len(original) + 3
+            hook = ('python3() {\ncommand python3 -c "import os, resource, sys\n'
+                    f'resource.setrlimit(resource.RLIMIT_FSIZE, ({limit}, {limit}))\n'
+                    'os.execvp(sys.argv[1], sys.argv[1:])" python3 "$@"\n}\n')
+            result = shell('HOME="$1" SHELL=/bin/bash PLATFORM=x86_64-linux INSTALL_DIR="$1/.local/bin"\n'
+                           + hook + 'add_install_dir_to_login_profile\n', directory)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((profile.read_bytes(), profile.stat().st_ino), (original, inode))
+            self.assertIn('add this line to it yourself: export PATH="$HOME/.local/bin:$PATH"\n', result.stdout)
+
+    def test_path_line_is_skipped_when_opted_out_or_already_on_path(self):
+        did, head, release = installable_fixture()
+        for case in ("opted out", "already on PATH"):
+            with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
+                sandbox.respond("binary", RUNTIME_STUB)
+                env = (["ELASTOS_NO_MODIFY_PATH=1"] if case == "opted out" else
+                       [f"PATH={sandbox.home / '.local/bin'}:{sandbox.root / 'mocks'}:{os.environ['PATH']}"])
+                result, _ = sandbox.run("--install-only", env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((sandbox.home / ".profile").exists())
+                self.assertNotIn("to PATH in", result.stdout)
 
     def test_existing_installation_is_reported_before_download(self):
         did, head, release = installable_fixture()
@@ -1049,9 +1351,9 @@ class InstallationTests(unittest.TestCase):
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
         self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node"))
-        # Apart from the stand-in's Runtime, the shell writes no installation file
-        # itself and removes its staged copy.
-        self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})
+        # Apart from the stand-in's Runtime and the login profile's PATH line, the
+        # shell writes no installation file itself and removes its staged copy.
+        self.assertEqual(changed_paths(before, sandbox.home_state()) - {".profile"}, {".local/bin/elastos"})
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_staged_executable_accepts_exact_signed_version(self):
@@ -1073,7 +1375,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual((sandbox.root / "candidate/release-head.json").read_bytes(), head)
             self.assertEqual((sandbox.root / "candidate/release.json").read_bytes(), release)
             self.assertEqual(set(sandbox.home_state()), {
-                ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos"})
+                ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos", ".profile"})
             self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
             self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
@@ -1087,7 +1389,7 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual((sandbox.home / name).stat().st_mode & 0o777, 0o755, name)
             self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
 
-    def test_existing_group_writable_install_dir_is_refused_before_download_with_working_fix(self):
+    def test_existing_world_writable_install_dir_is_refused_before_download_with_working_fix(self):
         did, head, release = installable_fixture()
         for case in ("default", "alias", "alias/"):
             with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
@@ -1099,22 +1401,49 @@ class InstallationTests(unittest.TestCase):
                     bin_dir.mkdir()
                     (sandbox.home / "alias").symlink_to(bin_dir)
                     options = ["--install-dir", str(sandbox.home / case)]
-                bin_dir.chmod(0o775)
+                bin_dir.chmod(0o777)
                 before = sandbox.home_state()
                 sandbox.respond("binary", RUNTIME_STUB)
                 result, requests = sandbox.run("--install-only", *options)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(requests, [])
                 self.assertEqual(sandbox.home_state(), before)
-                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o777)
                 self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
                 self.assertEqual(sandbox.runtime_calls(), [])
                 command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
-                self.assertTrue(command.startswith("chmod go-w "), command)
+                self.assertTrue(command.startswith("chmod o-w "), command)
                 fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
                                        capture_output=True, text=True)
                 self.assertEqual(fixed.returncode, 0, fixed.stderr)
-                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o775)
+
+    def test_owned_group_writable_roots_and_ancestors_are_preserved(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            bin_dir = sandbox.binary.parent
+            bin_dir.mkdir(parents=True)
+            sandbox.data.mkdir(parents=True)
+            for parent in (bin_dir.parent, sandbox.data.parent):
+                parent.chmod(0o775)
+            bin_dir.chmod(0o770)
+            sandbox.data.chmod(0o770)
+            sentinel = sandbox.data / "retained-owner-data"
+            sentinel.write_bytes(b"preserve owner data")
+            before = (bin_dir.stat().st_dev, bin_dir.stat().st_ino,
+                      sandbox.data.stat().st_dev, sandbox.data.stat().st_ino)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(requests, self.REQUESTS)
+            self.assertEqual((bin_dir.stat().st_dev, bin_dir.stat().st_ino,
+                              sandbox.data.stat().st_dev, sandbox.data.stat().st_ino), before)
+            self.assertEqual(bin_dir.stat().st_mode & 0o777, 0o770)
+            self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o770)
+            for parent in (bin_dir.parent, sandbox.data.parent):
+                self.assertEqual(parent.stat().st_mode & 0o777, 0o775)
+            self.assertEqual(sentinel.read_bytes(), b"preserve owner data")
+            self.assertTrue(sandbox.runtime_calls())
 
     def test_root_owned_ancestor_of_the_data_directory_is_accepted(self):
         did, head, release = installable_fixture()
@@ -1126,23 +1455,56 @@ class InstallationTests(unittest.TestCase):
             result, _ = sandbox.run("--install-only")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_group_writable_data_ancestor_is_refused_before_download_with_exact_fix(self):
+    def test_root_owned_group_writable_data_ancestor_is_accepted_unchanged(self):
+        # Debian and Ubuntu ship /var/local as root:staff 2775; nothing here can create one.
+        shared = next((path for path in (Path("/var/local"), Path("/var/mail")) if path.is_dir() and not path.is_symlink()
+                       and path.stat().st_uid == 0 and path.stat().st_mode & 0o020 and not path.stat().st_mode & 0o002), None)
+        if shared is None or os.geteuid() == 0:
+            self.skipTest("no root-owned group-writable folder on this host")
         did, head, release = installable_fixture()
+        before = (shared.stat().st_mode, sorted(child.name for child in shared.iterdir()))
         with InstallerSandbox(head, release, did) as sandbox:
-            unsafe = sandbox.root / "a\\b it's"
-            (unsafe / "xdg-data").mkdir(parents=True)
-            (sandbox.home / "xdg-data").symlink_to(unsafe / "xdg-data")
-            unsafe.chmod(0o775)
-            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.home / "xdg-data").symlink_to(shared)
+            # No binary response: the installer stops at the download, before any write.
             result, requests = sandbox.run("--install-only")
             self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Unsafe", result.stderr)
+            self.assertNotEqual(requests, [])
+        self.assertEqual((shared.stat().st_mode, sorted(child.name for child in shared.iterdir())), before)
+
+    def test_install_dir_owned_by_someone_else_is_refused_without_changing_it(self):
+        if os.geteuid() == 0:
+            self.skipTest("root owns every folder")
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only", "--install-dir", "/usr/bin")
+            self.assertNotEqual(result.returncode, 0)
             self.assertEqual(requests, [])
-            command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
-            self.assertTrue(command.startswith("chmod go-w "), command)
-            fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
-                                   capture_output=True, text=True)
-            self.assertEqual(fixed.returncode, 0, fixed.stderr)
-            self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
+            self.assertIn("is not owned by you. Choose a location you own", result.stderr)
+            for advice in ("sudo", "chown", "chmod"):
+                self.assertNotIn(advice, result.stderr)
+
+    def test_world_writable_data_ancestor_is_refused_before_download(self):
+        did, head, release = installable_fixture()
+        for mode in (0o777, 0o1777):
+            with self.subTest(mode=oct(mode)), InstallerSandbox(head, release, did) as sandbox:
+                unsafe = sandbox.root / "a\\b it's"
+                (unsafe / "xdg-data").mkdir(parents=True)
+                (sandbox.home / "xdg-data").symlink_to(unsafe / "xdg-data")
+                unsafe.chmod(mode)
+                before = sandbox.home_state()
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.home_state(), before)
+                self.assertEqual(unsafe.stat().st_mode & 0o1777, mode)
+                self.assertEqual(sandbox.runtime_calls(), [])
+                self.assertIn("Choose a user-owned location", result.stderr)
+                self.assertNotIn("chmod", result.stderr)
+                self.assertNotIn("chown", result.stderr)
+
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()
@@ -1305,7 +1667,10 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(requests, [])
             self.assertIn("Only your Recovery Kit can restore this identity", result.stdout + result.stderr)
-            self.assertEqual(self.files(sandbox), {})
+            # Uninstall never edits the profile; it names the install's PATH line to delete.
+            line = b'export PATH="$HOME/.local/bin:$PATH" # Added by the ElastOS installer\n'
+            self.assertEqual(self.files(sandbox), {".profile": line})
+            self.assertIn("To finish, delete this line from ~/.profile", result.stdout)
             self.assertFalse(sandbox.data.exists())
             self.assertFalse(sandbox.binary.exists())
 

@@ -32,7 +32,7 @@
 set -euo pipefail
 umask 077
 
-REPO=Elacity/elastos-runtime
+REPO=elastos/elastos-runtime
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORIGIN="${RELEASE_ORIGIN:-https://elastos.elacitylabs.com}"
 WORK_ROOT="${RELEASE_WORK:-$HOME/.local/share/elastos-release}"
@@ -154,7 +154,9 @@ seed_preamble() {
     cat <<EOF
 # On the seed as the service user, with GH_TOKEN allowed to read Actions artifacts:
 set -euo pipefail; umask 077; install -d -m 700 $(q "$1"); cd $(q "$1")
-get() { curl -fsSL -H "Authorization: Bearer \$GH_TOKEN" -o "\$1.zip" "https://api.github.com/repos/$REPO/actions/artifacts/\$2/zip"
+# printf is a shell builtin and curl reads the header from stdin, so the token stays out of every argv.
+get() { printf 'header = "Authorization: Bearer %s"\n' "\$GH_TOKEN" |
+        curl -fsSL -K - -o "\$1.zip" "https://api.github.com/repos/$REPO/actions/artifacts/\$2/zip"
         echo "\$3  \$1.zip" | sha256sum -c --quiet; unzip -q "\$1.zip" -d "\$1"; (cd "\$1" && sha256sum -c --quiet SHA256SUMS); }
 EOF
 }
@@ -320,7 +322,9 @@ policy() {
          max_file_bytes: ($sizes | max), max_snapshot_bytes: ($sizes | add)}
         + if $tag == null then {develop_oid: $develop} else {tag: $tag.name, tag_oid: $tag.oid} end' > "$work/policy.json"
     echo "Policy: $work/policy.json (sha256 $(sha "$work/policy.json")). Sign, typing the DID when asked:"
-    echo "env -i GH_TOKEN=\"\$(gh auth token)\" '$python' -I -S '$signer' --policy '$work/policy.json' --input-root '$input' --output-root '$work/signed'"
+    # The token reaches the signer's environment through file descriptor 3, which env -i keeps,
+    # so no process carries it in an argv. stdin stays the terminal for the DID prompt.
+    echo "env -i /bin/sh -c 'IFS= read -r GH_TOKEN <&3; export GH_TOKEN; exec \"\$0\" -I -S \"\$@\"' '$python' '$signer' --policy '$work/policy.json' --input-root '$input' --output-root '$work/signed' 3< <(gh auth token)"
 }
 
 seed() {

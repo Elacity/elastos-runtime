@@ -25,8 +25,10 @@ NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
-# Developer-only capsules such as GBA are published by the release asset
-# loop below and installed with `elastos setup --with <name>`.
+# Developer-only capsules such as GBA, and the items hidden in 0.8.0
+# (services, wallet-walletconnect, elacity-player, content-block-graph-provider
+# and the protected-content providers), are published by the release asset and
+# support-binary loops below and installed with `elastos setup --with <name>`.
 # availability-provider, drm-provider, rights-provider, key-provider,
 # decrypt-provider, and tunnel-provider are supported direct command assets
 # outside the default managed Home. Runtime-only protected providers are
@@ -42,17 +44,14 @@ DEFAULT_CAPSULES=(
     webspace-provider
     wallet-provider
     object-provider
-    content-block-graph-provider
     ipfs-provider
     home-cli
     home-gui
     home
     system
-    services
     people
     wallet-metamask
     wallet-unisat
-    wallet-walletconnect
     wallet
     browser
     documents
@@ -62,7 +61,6 @@ DEFAULT_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
@@ -77,17 +75,14 @@ REQUIRED_SUPPORTED_CAPSULES=(
     webspace-provider
     wallet-provider
     object-provider
-    content-block-graph-provider
     ipfs-provider
     home-cli
     home-gui
     home
     system
-    services
     people
     wallet-metamask
     wallet-unisat
-    wallet-walletconnect
     wallet
     browser
     documents
@@ -97,7 +92,6 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 SUPPORT_BINARY_ASSETS=(
@@ -623,10 +617,12 @@ create_capsule_tar() {
     local stage_root="$2"
     local capsule_name="$3"
     python3 - "$archive" "$stage_root" "$capsule_name" <<'PY'
-import gzip
+import io
 from pathlib import Path
+import struct
 import sys
 import tarfile
+import zlib
 
 archive, stage_root, capsule_name = sys.argv[1:]
 
@@ -645,12 +641,25 @@ def normalize(info):
     )
     return info
 
-# tarfile sorts recursive entries. The gzip header must also be independent
-# of the output filename and wall clock, on both macOS and Linux.
+# tarfile sorts recursive entries.
+tar = io.BytesIO()
+with tarfile.open(fileobj=tar, mode="w", format=tarfile.PAX_FORMAT) as package:
+    package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+data = tar.getvalue()
+
+# Universal assets must be byte-identical on every build worker. The host's
+# deflate (zlib on Linux, Apple's libz on macOS 15) emits different bytes for
+# the same input, so the gzip member is written here with stored (uncompressed)
+# deflate blocks: fixed header without name or time, blocks of at most 65535
+# bytes, then CRC-32 and length. Any gzip reader accepts it.
 with open(archive, "wb") as output:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+    output.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for index, chunk in enumerate(chunks):
+        last = index == len(chunks) - 1
+        output.write(bytes([1 if last else 0]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF))
+        output.write(chunk)
+    output.write(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
 PY
 }
 
@@ -1077,8 +1086,8 @@ runtime_tunnel_url() {
     token=$(jq -r '.shell_token // empty' "$coords_file" 2>/dev/null || true)
     [[ -n "$api" && -n "$token" ]] || return 1
 
-    response=$(curl -fsS --max-time 3 \
-        -H "Authorization: Bearer ${token}" \
+    # printf is a shell builtin and curl reads the header from stdin, so the token stays out of every argv.
+    response=$(printf 'header = "Authorization: Bearer %s"\n' "${token}" | curl -fsS --max-time 3 -K - \
         -H "Content-Type: application/json" \
         -X POST \
         -d '{}' \

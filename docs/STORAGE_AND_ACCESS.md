@@ -3,7 +3,7 @@
 Status: target architecture and product contract. This document records the
 storage direction. Product support requires implementation and acceptance.
 Current verified behavior and open work belong in
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). The
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues). The
 [implementation guide](OBJECT_PROTECTION_IMPLEMENTATION.md) defines the staged
 provider boundary and acceptance tests.
 

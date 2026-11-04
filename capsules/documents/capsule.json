@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "documents",
   "version": "0.2.0",
-  "description": "Create, edit, and publish markdown documents",
+  "description": "Create, edit, and save markdown and text documents",
   "role": "viewer",
   "window_policy": "hybrid",
   "type": "wasm",
@@ -17,7 +17,7 @@
     {
       "id": "elastos.documents.editor",
       "version": "0.5.0",
-      "description": "Create, edit, and publish markdown documents",
+      "description": "Create, edit, and save markdown and text documents",
       "methods": [
         {
           "id": "document.open",

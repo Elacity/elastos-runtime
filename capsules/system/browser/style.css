@@ -444,8 +444,26 @@ code {
   margin: 10px 0 0;
   font-size: 12px;
   line-height: 1.5;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.runtime-update-changes ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.runtime-update-changes li + li {
+  margin-top: 4px;
+}
+
+.runtime-update-changes-heading {
+  margin: 10px 0 0;
+  font-size: inherit;
+  font-weight: 600;
+}
+
+.runtime-update-changes-heading:first-child {
+  margin-top: 0;
 }
 
 .shell-picker {
@@ -520,17 +538,13 @@ code {
   display: grid;
   gap: 8px;
 }
-.ai-provider-instances[hidden], .ai-provider-form[hidden], #local-models[hidden], #approval-lens[hidden], .model-management[hidden] { display: none; }
+.ai-provider-instances[hidden], .ai-provider-form[hidden], #local-models[hidden], .model-management[hidden] { display: none; }
 .models-row p,
 .ai-provider-form h3,
 .model-management p,
 .model-management h2 { margin: 0; }
 .models-row > p:empty { display: none; }
 .ai-provider-form h3 { font-weight: 600; }
-.approval-lens-pick { flex-wrap: nowrap; }
-.approval-lens-pick .pc2-input { min-width: 0; max-width: 260px; }
-.models-disclosure summary { cursor: pointer; }
-.models-disclosure[open] summary { margin-bottom: 8px; }
 .ai-provider-form .pc2-card-row > .pc2-input { flex: 0 1 320px; min-width: 0; }
 .ai-provider-instances:empty { display: none; }
 .ai-provider-instance { grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid var(--el-hairline); }
@@ -569,7 +583,6 @@ code {
 .model-details summary { cursor: pointer; }
 .model-identity { overflow-wrap: anywhere; }
 @media (max-width: 767.98px) {
-  .approval-lens-pick .pc2-input { max-width: none; }
   .ai-provider-form .pc2-card-row > .pc2-input { flex: none; }
   .ai-provider-instance { grid-template-columns: minmax(0, 1fr); }
   .ai-provider-instance > .system-inline-row { grid-column: 1; grid-row: auto; }
@@ -609,6 +622,15 @@ code {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* The picker's close refocuses the hidden file input; a focused element is
+   scrolled into view, which dragged the whole settings container up when
+   the input sat below the fold. Fixed to the viewport it cannot scroll. */
+input[type="file"].visually-hidden {
+  position: fixed;
+  top: 0;
+  left: 0;
 }
 
 .system-file-button {
@@ -908,20 +930,13 @@ code {
 
 .account-list,
 .network-table-card,
-.inspect-grid,
-.capsule-catalog {
+.inspect-grid {
   margin-top: 10px;
-}
-
-.catalog-row .catalog-actions,
-.catalog-row button {
-  justify-self: start;
 }
 
 .account-empty,
 .network-row-empty,
-.inspect-empty,
-.catalog-empty {
+.inspect-empty {
   padding: 10px 12px;
   border: 1px solid var(--el-hairline);
   border-radius: 8px;
@@ -1467,124 +1482,6 @@ code {
   font-size: 12px;
 }
 
-.catalog-toolbar,
-.catalog-group-heading,
-.catalog-row {
-  display: flex;
-  align-items: center;
-}
-
-.catalog-toolbar {
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.catalog-toolbar h1 {
-  margin-bottom: 2px;
-}
-
-.catalog-status {
-  margin: 0;
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-status[data-tone="error"] {
-  color: var(--el-danger);
-}
-
-.capsule-catalog,
-.catalog-group,
-.catalog-list,
-.catalog-row-body,
-.catalog-facts {
-  display: grid;
-}
-
-.capsule-catalog {
-  gap: 18px;
-}
-
-.catalog-group,
-.catalog-list {
-  gap: 7px;
-}
-
-.catalog-group-heading {
-  justify-content: space-between;
-  border-bottom: 1px solid var(--el-hairline);
-  padding-bottom: 6px;
-}
-
-.catalog-group-title {
-  margin: 0;
-  color: var(--el-text);
-  font-size: 14px;
-}
-
-.catalog-group-count {
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-row {
-  justify-content: space-between;
-  min-width: 0;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--el-hairline);
-  border-radius: 8px;
-  background: var(--el-inset);
-}
-
-.catalog-row-body {
-  min-width: 0;
-  gap: 3px;
-}
-
-.catalog-row h3,
-.catalog-summary {
-  margin: 0;
-}
-
-.catalog-row h3 {
-  color: var(--el-text);
-  font-size: 13px;
-}
-
-.catalog-summary,
-.catalog-facts {
-  color: var(--el-muted);
-  font-size: 12px;
-}
-
-.catalog-facts {
-  gap: 2px;
-  margin: 3px 0 0;
-}
-
-.catalog-facts > div {
-  display: flex;
-  min-width: 0;
-  gap: 6px;
-}
-
-.catalog-facts dt {
-  flex: 0 0 auto;
-  color: var(--el-text);
-  font-weight: 700;
-}
-
-.catalog-facts dd {
-  min-width: 0;
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.catalog-open {
-  flex: 0 0 auto;
-}
-
 .network-table {
   display: grid;
   gap: 6px;
@@ -1896,13 +1793,6 @@ code {
 
 .settings-sidebar-icon-security::before {
   border-radius: 4px 4px 6px 6px;
-}
-
-.settings-sidebar-icon-catalog::before {
-  border-radius: 50%;
-  box-shadow:
-    inset 0 0 0 3px #f9f9f9,
-    0 0 0 1px currentColor;
 }
 
 .settings-sidebar-icon-about::before {

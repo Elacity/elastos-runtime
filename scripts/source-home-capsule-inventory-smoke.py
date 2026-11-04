@@ -393,8 +393,10 @@ def run_smoke():
         raise AssertionError(
             "components.json must install Elacity Player from its capsule tree"
         )
-    if "elacity-player" not in source_components["profiles"]["home"]["components"]:
-        raise AssertionError("profile home must include Elacity Player")
+    # Protected content ships after 0.8.0: a release Home installs the Player
+    # only with `setup --with`; a source Home may still carry it.
+    if "elacity-player" in source_components["profiles"]["home"]["components"]:
+        raise AssertionError("profile home must not include Elacity Player in 0.8.0")
 
     with tempfile.TemporaryDirectory() as temp:
         temp_root = Path(temp)

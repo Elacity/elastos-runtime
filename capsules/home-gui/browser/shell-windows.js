@@ -21,18 +21,18 @@ import {
   targetById,
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
-} from "./shell-core.js?v=home-20260813a";
+  pushUiPreferencesToFrameWindow,
+} from "./shell-core.js?v=home-20261101d";
 import {
   fitWindowBounds,
-  fitWindowToBrowserAspect,
-  fitWindowToLargestBrowserAspect,
+  fitBrowserWindow,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20261101d";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -52,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260813a";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261101d";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261101d";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -346,8 +346,13 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
-// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries.
+// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries. A Browser
+// frame that stops answering is given up after this long without a "pending".
 const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 50_000;
+// Each "pending" extends the close (browser.js repeats it every 10s while Runtime
+// settles an open), up to this cap: above Browser's 5-minute open deadline plus
+// the close retry schedule.
+const BROWSER_WINDOW_CLOSE_CAP_MS = 360_000;
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
 const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
@@ -357,6 +362,12 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
+const DOCUMENTS_PREFERENCES_REQUEST_TYPE =
+  "elastos.documents.preferences.request/v1";
+const DOCUMENTS_PREFERENCES_SET_TYPE =
+  "elastos.documents.preferences.set/v1";
+const DOCUMENTS_PREFERENCES_TYPE =
+  "elastos.documents.preferences/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const HOME_AGENT_TARGET_ID = "assistant";
 const MAX_SESSION_WINDOWS = 24;
@@ -365,8 +376,10 @@ function isSingleWindowTarget(targetId, summary = shellState.currentSummary) {
 }
 
 /** Hybrid supplies a blank window. Multiple capsules own selection-aware
- * commands; absent policy retains the existing generic menu behavior. */
+ * commands; absent policy retains the existing generic menu behavior.
+ * Browser has one window (one live Browser page per user), so no New Window. */
 export function supportsMenuNewWindow(targetId) {
+  if (targetId === "browser") return false;
   const policy = targetById(shellState.currentSummary, targetId)?.window_policy;
   return policy !== "single" && policy !== "multiple";
 }
@@ -396,6 +409,7 @@ const pendingDocumentsWindowCloses = new Map();
 
 window.addEventListener("message", handleBrowserWindowCloseResult);
 window.addEventListener("message", handleDocumentsWindowCloseResult);
+window.addEventListener("message", handleDocumentsPreferenceMessage);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -1151,6 +1165,7 @@ function handleBrowserWindowCloseResult(event) {
     if (!record.lifecycle && hasLifecycle) {
       record.lifecycle = Object.freeze(lifecycle);
     }
+    armBrowserWindowCloseTimeout(record);
     return;
   }
   if (message.state === "error") {
@@ -1241,6 +1256,63 @@ function handleDocumentsWindowCloseResult(event) {
   settleDocumentsWindowClose(record, message.ok === true);
 }
 
+// Documents keeps its "Save automatically" choice in this person's Home
+// layout; its opaque frame owns no storage. A Documents window asks for the
+// choice or changes it; every open Documents window hears the result.
+function documentsPreferenceMessage(homeToken) {
+  return {
+    type: DOCUMENTS_PREFERENCES_TYPE,
+    homeToken,
+    autosave: shellState.shellLayoutState?.documentsAutosave === true,
+  };
+}
+
+function handleDocumentsPreferenceMessage(event) {
+  const message = event.data;
+  if (event.origin !== OPAQUE_CAPSULE_ORIGIN || !message || typeof message !== "object") {
+    return;
+  }
+  const isRequest = message.type === DOCUMENTS_PREFERENCES_REQUEST_TYPE &&
+    hasExactKeys(message, ["type", "homeToken"]);
+  const isUpdate = message.type === DOCUMENTS_PREFERENCES_SET_TYPE &&
+    hasExactKeys(message, ["type", "homeToken", "autosave"]) &&
+    typeof message.autosave === "boolean";
+  if (!isRequest && !isUpdate) {
+    return;
+  }
+  const contexts = [...shellState.windows.values()]
+    .map((entry) => documentsWindowCloseContext(entry))
+    .filter(Boolean);
+  const sender = contexts.find((context) => context.frameWindow === event.source);
+  if (!sender || sender.homeToken !== message.homeToken) {
+    return;
+  }
+  if (isRequest) {
+    sender.frameWindow.postMessage(documentsPreferenceMessage(sender.homeToken), "*");
+    return;
+  }
+  if (!shellState.shellLayoutState) {
+    return;
+  }
+  if (shellState.shellLayoutState.documentsAutosave !== message.autosave) {
+    shellState.shellLayoutState.documentsAutosave = message.autosave;
+    saveShellLayoutState();
+  }
+  for (const context of contexts) {
+    context.frameWindow.postMessage(documentsPreferenceMessage(context.homeToken), "*");
+  }
+}
+
+// The close is given up (Retry) after BROWSER_WINDOW_CLOSE_TIMEOUT_MS without a
+// "pending" from the frame, and never later than BROWSER_WINDOW_CLOSE_CAP_MS.
+function armBrowserWindowCloseTimeout(record) {
+  window.clearTimeout(record.timeout);
+  const remaining = record.startedAt + BROWSER_WINDOW_CLOSE_CAP_MS - Date.now();
+  record.timeout = window.setTimeout(() => {
+    settleBrowserWindowClose(record, false);
+  }, Math.max(0, Math.min(BROWSER_WINDOW_CLOSE_TIMEOUT_MS, remaining)));
+}
+
 function requestBrowserWindowClose(entry) {
   if (entry.browserCloseRequest) {
     return entry.browserCloseRequest.promise;
@@ -1262,10 +1334,9 @@ function requestBrowserWindowClose(entry) {
     requestId,
     resolve: resolveRequest,
     timeout: 0,
+    startedAt: Date.now(),
   };
-  record.timeout = window.setTimeout(() => {
-    settleBrowserWindowClose(record, false);
-  }, BROWSER_WINDOW_CLOSE_TIMEOUT_MS);
+  armBrowserWindowCloseTimeout(record);
   entry.browserCloseRequest = record;
   pendingBrowserWindowCloses.set(requestId, record);
   markBrowserWindowCloseState(entry, "pending");
@@ -1349,11 +1420,49 @@ function postChatNavigate(entry, query) {
   return true;
 }
 
-function postServicesNavigate(entry, query) {
+function postPeopleNavigate(entry, query) {
   const frame = entry.node.querySelector(".window-frame");
   const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
   if (!homeToken || !frame?.contentWindow) return;
-  frame.contentWindow.postMessage({ type: "elastos.services.navigate/v1", homeToken, query }, "*");
+  frame.contentWindow.postMessage({ type: "elastos.people.navigate/v1", homeToken, query }, "*");
+}
+
+const BROWSER_ONE_WINDOW_MESSAGE =
+  "Only one Browser window can be open at a time. Close the other one first.";
+let pendingBrowserWindowCreate = null;
+
+function postBrowserNavigate(entry, url) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) return false;
+  frame.contentWindow.postMessage({ type: "elastos.browser.navigate/v1", homeToken, url }, "*");
+  return true;
+}
+
+/** Mac Browser runs one live page per user, so every new Browser open (Dock,
+ * launcher, New Window, Spotlight, assistant or app links) focuses the
+ * existing Browser window and navigates it to the requested URL. */
+async function openBrowserWindowOnce(options) {
+  let entry = sortWindowEntriesByZOrder(browserWindowEntriesForTarget("browser"))[0] || null;
+  if (!entry && pendingBrowserWindowCreate) {
+    entry = await pendingBrowserWindowCreate.catch(() => null);
+    if (entry && shellState.windows.get(entry.id) !== entry) entry = null;
+  }
+  if (!entry) {
+    const pending = createBrowserTargetWindow("browser", options);
+    pendingBrowserWindowCreate = pending;
+    try {
+      return await pending;
+    } finally {
+      if (pendingBrowserWindowCreate === pending) pendingBrowserWindowCreate = null;
+    }
+  }
+  focusWindow(entry.id);
+  const url = typeof options.query?.url === "string" ? options.query.url : "";
+  if (url && !postBrowserNavigate(entry, url)) {
+    throw Object.assign(new Error(BROWSER_ONE_WINDOW_MESSAGE), { userMessage: BROWSER_ONE_WINDOW_MESSAGE });
+  }
+  return entry;
 }
 
 function browserLaunchAuthority(route) {
@@ -1530,7 +1639,7 @@ function renderTargetLaunchError(targetId, error) {
     id: "shell-launch-error",
     title,
     headline: `Could not open ${title}`,
-    copy: "The app did not start. Close this window and try again.",
+    copy: error?.userMessage || "The app did not start. Close this window and try again.",
     subjectLabel: "App",
     subjectValue: title,
     detail: "",
@@ -1755,6 +1864,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const defaultHybrid = !single && targetById(shellState.currentSummary, targetId)?.window_policy === "hybrid"
     && options.newWindow !== true && !options.authorizedLaunch && !options.restoredPlacement
     && Object.keys(options.query || {}).length === 0;
+  if (targetId === "browser" && !options.authorizedLaunch && !options.restoredPlacement) {
+    return openBrowserWindowOnce(options);
+  }
   // A conversation request (People's Message) goes to the open Chat window.
   if (targetId === "chat-room" && options.newWindow !== true && !options.authorizedLaunch
     && !options.restoredPlacement && isChatConversationQuery(options.query)) {
@@ -1788,8 +1900,8 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   if (targetId === "marketplace" && Object.keys(options.query || {}).length > 0) {
     postMarketplaceNavigate(entry, options.query);
   }
-  if (targetId === "services" && Object.keys(options.query || {}).length > 0) {
-    postServicesNavigate(entry, options.query);
+  if (targetId === "people" && Object.keys(options.query || {}).length > 0) {
+    postPeopleNavigate(entry, options.query);
   }
   if ((targetId === "inbox" || targetId === "wallet") && Object.keys(options.query || {}).length > 0) {
     const ok = await requestSelectionWindow(entry, options.query);
@@ -1851,7 +1963,7 @@ async function createBrowserTargetWindow(targetId, options = {}) {
   } else if (launched.target === "browser" && node.dataset.maximized === "true") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
   }
   const activeSpace = getActiveStageId();
   const entry = {
@@ -1970,6 +2082,8 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    // Each load (first mount and reload) starts from the theme default, so hand it the current preference.
+    pushUiPreferencesToFrameWindow(frame.contentWindow);
     probeHomeNavigation(entry, true);
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);
@@ -1993,7 +2107,7 @@ function fitLaunchedWindow(entry) {
     return;
   }
   if (entry.targetId === "browser") {
-    fitWindowToBrowserAspect(entry.node);
+    fitBrowserWindow(entry.node);
     rememberWindowRestoreBounds(entry.node);
     return;
   }
@@ -2098,6 +2212,29 @@ function hideWindow(id) {
     return;
   }
   hideWindowEntries([entry]);
+}
+
+// Lock and sign-out unload the desktop, so every open Documents window settles
+// its unsaved changes first, one at a time and in view, through the same close
+// handshake: Save, Don't save or Cancel. Cancel or a failed save keeps that
+// window open and stops the lock or sign-out. A window opened while another is
+// asking is asked too, before the session ends. A window whose frame never
+// loaded holds no edits.
+export async function closeDocumentsWindowsBeforeSessionEnd() {
+  const asked = new Set();
+  for (;;) {
+    const entry = [...shellState.windows.values()].find((candidate) =>
+      candidate.targetId === "documents" && !asked.has(candidate) &&
+      documentsWindowCloseContext(candidate));
+    if (!entry) {
+      return true;
+    }
+    asked.add(entry);
+    focusWindow(entry.id);
+    if (!(await requestDocumentsWindowClose(entry))) {
+      return false;
+    }
+  }
 }
 
 export function closeWindow(id) {
@@ -2374,7 +2511,7 @@ function toggleWindowMaximize(id) {
   if (entry.targetId === "browser") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
     focusWindow(id);
     persistBrowserSession();
     return;

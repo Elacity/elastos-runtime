@@ -31,10 +31,9 @@ mod model_provider_egress_decision;
 #[cfg(target_os = "macos")]
 pub use model_provider_config::model_provider_engine_bundle;
 pub(crate) use model_provider_config::{
-    ai_provider_status, any_hosted_model_shared, approval_lens_has_selection,
-    hosted_model_offer_hint, hosted_model_share_cards, load_model_provider_operator_offers,
-    named_jev_hosted_offer, offer_is_shareable, operator_has_hosted_offer, save_hosted_offer,
-    set_hosted_offer_share, HostedAiProvider, HostedModelOfferHint,
+    ai_provider_status, any_hosted_model_shared, hosted_model_offer_hint, hosted_model_share_cards,
+    load_model_provider_operator_offers, offer_is_shareable, operator_has_hosted_offer,
+    save_hosted_offer, set_hosted_offer_share, HostedAiProvider, HostedModelOfferHint,
 };
 pub use model_provider_config::{model_provider_bridge_config, model_provider_config};
 #[cfg(test)]

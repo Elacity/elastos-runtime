@@ -60,6 +60,8 @@
      Apps face grows up out of the dock at the dock's own width. */
   --dock-width-ms: 780ms;
   --shelf-face-ms: 950ms;
+  /* The Apps face (launcher drawer) runs at half the Assistant stretch. */
+  --launcher-face-ms: 475ms;
   --shelf-face-ease: cubic-bezier(0.42, 0, 0.58, 1);
   --desktop-wallpaper: url("./wallpaper.webp");
   /* Shell chrome motion — water, not switches. */
@@ -765,7 +767,7 @@ img {
 }
 
 /* Control Centre: quick projections of state that lives elsewhere (theme,
-   sounds, fullscreen, wallet). Same frosted popover material as the
+   sounds, wallet). Same frosted popover material as the
    notification center; the deep versions stay in the System app. */
 .control-centre-btn {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round'%3E%3Crect x='3' y='5' width='18' height='6' rx='3'/%3E%3Ccircle cx='6.5' cy='8' r='1.4' fill='white' stroke='none'/%3E%3Crect x='3' y='13' width='18' height='6' rx='3'/%3E%3Ccircle cx='17.5' cy='16' r='1.4' fill='white' stroke='none'/%3E%3C/svg%3E");
@@ -1428,69 +1430,6 @@ img {
   overflow-wrap: anywhere;
 }
 
-/* Connector ceremony sheet: same floating card as the wallet rail, stacked
-   above it — a step inside Wallet, not a second desktop app. */
-.connector-sheet {
-  position: fixed;
-  top: calc(var(--stage-top) + 8px);
-  right: 8px;
-  bottom: 8px;
-  z-index: 100130;
-  display: flex;
-  flex-direction: column;
-  width: min(392px, calc(100vw - 16px));
-  border-radius: var(--popover-radius);
-  background: var(--frame-fill);
-  border: 1px solid var(--line);
-  box-shadow: var(--popover-shadow);
-  outline: none;
-  overflow: hidden;
-  animation: wallet-rail-enter 240ms cubic-bezier(0.2, 0, 0, 1) both;
-}
-
-.connector-sheet[hidden] {
-  display: none;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .connector-sheet {
-    animation: none;
-  }
-}
-
-.connector-sheet-head {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 12px 10px 16px;
-  border-bottom: 1px solid var(--line);
-}
-
-.connector-sheet-title {
-  margin: 0;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.connector-sheet-frame {
-  flex: 1 1 auto;
-  width: 100%;
-  border: 0;
-  background: transparent;
-  opacity: 0;
-  transition: opacity 180ms ease;
-}
-
-.connector-sheet-frame.is-ready {
-  opacity: 1;
-}
-
-.connector-sheet-frame[hidden] {
-  display: none;
-}
-
 .setup-sheet {
   position: fixed;
   inset: 0;
@@ -2030,7 +1969,7 @@ body[data-home-link="reconnecting"] .notification-center-link {
 
 .home-notification-copy strong {
   overflow: hidden;
-  color: #fff;
+  color: var(--text);
   font-size: 13px;
   line-height: 1.25;
   text-overflow: ellipsis;
@@ -2069,9 +2008,13 @@ body[data-home-link="reconnecting"] .notification-center-link {
   height: 28px;
   border-radius: 6px;
   background:
-    rgba(255, 255, 255, 0.08)
+    var(--lift)
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E")
     center / 15px 15px no-repeat;
+}
+
+:root[data-el-theme="light"] .home-notification-dismiss {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231d2438' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
 }
 
 .home-notification-action:hover,
@@ -2979,6 +2922,26 @@ body.mission-reorder-space .mission-space-thumb:focus-visible .mission-space-pre
     center / contain no-repeat;
   -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='3' width='7' height='7' rx='1.5' fill='black'/%3E%3Crect x='14' y='3' width='7' height='7' rx='1.5' fill='black'/%3E%3Crect x='3' y='14' width='7' height='7' rx='1.5' fill='black'/%3E%3Crect x='14' y='14' width='7' height='7' rx='1.5' fill='black'/%3E%3C/svg%3E")
     center / contain no-repeat;
+}
+
+/* Full screen: four outward corners to enter, four inward corners to exit. */
+.toolbar-fullscreen-btn[hidden] {
+  display: none;
+}
+
+.toolbar-fullscreen-btn .fullscreen-glyph {
+  width: 14px;
+  height: 14px;
+  display: block;
+  background: currentColor;
+  opacity: 0.92;
+  --fullscreen-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 9V3h6M15 3h6v6M21 15v6h-6M9 21H3v-6'/%3E%3C/svg%3E");
+  mask: var(--fullscreen-glyph) center / contain no-repeat;
+  -webkit-mask: var(--fullscreen-glyph) center / contain no-repeat;
+}
+
+.toolbar-fullscreen-btn[aria-pressed="true"] .fullscreen-glyph {
+  --fullscreen-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 3v6H3M21 9h-6V3M15 21v-6h6M3 15h6v6'/%3E%3C/svg%3E");
 }
 
 .mission-space-thumb[aria-current="true"] .mission-space-preview,
@@ -4066,13 +4029,13 @@ body.dock-reordering .desktop-shortcut-ghost {
    Dark mode → dark-dock (lighter cells). Light mode → light-dock (darker cells). */
 .taskbar-icon-launcher {
   background:
-    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260813a")
+    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20261101d")
       center / contain no-repeat;
 }
 
 :root[data-el-theme="light"] .taskbar-icon-launcher {
   background-image:
-    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260813a");
+    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20261101d");
 }
 
 .taskbar-icon-launcher::before {
@@ -4082,7 +4045,7 @@ body.dock-reordering .desktop-shortcut-ghost {
 
 .taskbar-item-icon[data-icon="bin"] {
   background:
-    url("./icons/bin/icon-64.png?v=home-20260813a")
+    url("./icons/bin/icon-64.png?v=home-20261101d")
       center / contain no-repeat;
 }
 
@@ -4543,7 +4506,7 @@ body.dragging-target {
      (height only, width locked), the content fades in where it lives near the
      end of the stretch; closing lets the content leave first, then collapses.
      This rule's transition is the closing leg (content leave, then height). */
-  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 140ms;
+  transition: max-height var(--launcher-face-ms) var(--shelf-face-ease) 70ms;
 }
 
 .launcher-header,
@@ -4552,9 +4515,9 @@ body.dragging-target {
   transform: translateY(12px) scale(0.97);
   filter: blur(6px);
   transition:
-    opacity 140ms var(--shelf-face-ease),
-    transform 140ms var(--shelf-face-ease),
-    filter 140ms var(--shelf-face-ease);
+    opacity 70ms var(--shelf-face-ease),
+    transform 70ms var(--shelf-face-ease),
+    filter 70ms var(--shelf-face-ease);
 }
 
 /* Opening leg: height now, content enters at 82% of the stretch, header then grid. */
@@ -4564,14 +4527,14 @@ body.dragging-target {
   transform: translateY(0) scale(1);
   filter: blur(0);
   transition:
-    opacity 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
-    transform 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
-    filter 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82);
+    opacity 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82),
+    transform 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82),
+    filter 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82);
 }
 
 .taskbar.is-launcher-face .launcher-scroll {
-  transition-duration: 360ms;
-  transition-delay: calc(var(--shelf-face-ms) * 0.82 + 70ms);
+  transition-duration: 180ms;
+  transition-delay: calc(var(--launcher-face-ms) * 0.82 + 35ms);
 }
 
 .taskbar .launcher[hidden] {
@@ -4583,7 +4546,7 @@ body.dragging-target {
      clipped region so it collapses with the face instead of ticking. */
   max-height: calc(min(56vh, 520px) + 10px);
   pointer-events: auto;
-  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 0ms;
+  transition: max-height var(--launcher-face-ms) var(--shelf-face-ease) 0ms;
 }
 
 .launcher-popover {
@@ -5954,6 +5917,7 @@ body.assistant-space-active #inbox-rail {
   .toolbar-active-title,
   .toolbar-menubar,
   #toolbar-mission-control,
+  #toolbar-fullscreen,
   .toolbar-clock-date {
     display: none;
   }
@@ -6812,6 +6776,7 @@ body.assistant-space-active #inbox-rail {
      pill grows into a phone-height face. */
   :root {
     --shelf-face-ms: 1100ms;
+    --launcher-face-ms: 550ms;
   }
 
   .taskbar-item-assistant .taskbar-item-icon.assistant-mark {

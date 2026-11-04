@@ -286,6 +286,13 @@ async fn run_with_data_dir(
             &fs::canonicalize(&data_dir)?,
         )?)
     };
+    let platform = detect_platform();
+    // First, so a slow or blocked connection below never starts in silence.
+    eprintln!(
+        "ElastOS v{} — setup for {}",
+        env!("ELASTOS_VERSION"),
+        platform
+    );
     let signed_setup = if list {
         None
     } else {
@@ -298,13 +305,6 @@ async fn run_with_data_dir(
             (path, manifest, None)
         }
     };
-    let platform = detect_platform();
-
-    eprintln!(
-        "ElastOS v{} — setup for {}",
-        env!("ELASTOS_VERSION"),
-        platform
-    );
 
     if list {
         list_components(&manifest, &data_dir, &platform);
@@ -400,16 +400,20 @@ async fn run_with_data_dir(
             );
         }
     }
-    let size = if pending_bytes > 0 {
-        format!(" ({})", progress::format_size(pending_bytes))
-    } else {
-        String::new()
-    };
+    let browser_bytes = browser_config::pending_download_bytes(
+        &data_dir,
+        &manifest,
+        &platform,
+        components.iter().any(|name| name == "browser"),
+    );
     println!(
-        "Components: {} selected, {} to install{}",
-        components.len(),
-        pending_count,
-        size
+        "{}",
+        components_summary(
+            components.len(),
+            pending_count,
+            pending_bytes,
+            browser_bytes
+        )
     );
     println!();
 
@@ -615,6 +619,27 @@ async fn run_with_data_dir(
     Ok(())
 }
 
+/// The setup summary line names every byte setup downloads, Browser's included.
+fn components_summary(
+    selected: usize,
+    to_install: usize,
+    component_bytes: u64,
+    browser_bytes: u64,
+) -> String {
+    let size = match (component_bytes, browser_bytes) {
+        (0, 0) => String::new(),
+        (bytes, 0) => format!(" ({})", progress::format_size(bytes)),
+        (0, browser) => format!(" ({} for Browser)", progress::format_size(browser)),
+        (bytes, browser) => format!(
+            " ({} to download: {} for Home, {} for Browser)",
+            progress::format_size(bytes.saturating_add(browser)),
+            progress::format_size(bytes),
+            progress::format_size(browser)
+        ),
+    };
+    format!("Components: {selected} selected, {to_install} to install{size}")
+}
+
 /// True when the component loop in `run` skips this component before any
 /// effect. Keep in step with that loop's skip branches.
 fn skipped_before_install(
@@ -730,6 +755,7 @@ async fn admit_installed_setup_metadata(
     let cid = descriptor["cid"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("signed components CID is missing"))?;
+    println!("Connecting to the release source...");
     // The live source names only its newest release; a signed CID names this one.
     let client = crate::carrier::CarrierClient::connect_trusted_source(source, 15).await?;
     let result = async {
@@ -1330,6 +1356,39 @@ pub(crate) fn admit_installed_components(
         admission,
         _writer: writer,
     }))
+}
+
+/// Each component of the installed signed release whose row for this platform
+/// matches its capsule record, with the publisher DID that signed the record.
+/// Empty for a Home without a signed release (a source or CI Home) and for a
+/// release that lists no records.
+pub(crate) fn installed_release_signers(
+    data_dir: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let Some(source) = installed_release_source(data_dir)? else {
+        return Ok(Default::default());
+    };
+    let binary = fs::canonicalize(&source.install_path)?;
+    let (release, components) =
+        crate::installed_release::read_signed_release(data_dir, &binary, &source, false)?;
+    let (manifest, admission) = crate::capsule_record::admit_release(
+        &release,
+        &source.publisher_dids,
+        &components,
+        crate::update::detect_release_platform(),
+    )?;
+    let Some(records) = admission.records() else {
+        return Ok(Default::default());
+    };
+    let platform = detect_platform();
+    Ok(manifest
+        .external
+        .iter()
+        .filter_map(|(name, component)| {
+            let info = resolve_platform_info(component, &platform)?;
+            Some((name.clone(), records.signer(name, info)?.to_owned()))
+        })
+        .collect())
 }
 
 /// The admitted row `name`/`info` of `admitted`, or, on a Home shown to have no
@@ -4160,9 +4219,15 @@ fn first_party_carrier_bind_addr(
     )
 }
 
+/// The wait before the one retry of a component fetch that found the source
+/// unresponsive. Unit tests use a short wait.
+const FIRST_PARTY_FETCH_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 100 } else { 5_000 });
+
 /// The bytes of one admitted release row from the trusted source over Carrier,
 /// checked against the row's signed checksum and size. Component bytes are
-/// fetched only through an admitted row.
+/// fetched only through an admitted row. A failed transfer is retried once;
+/// bytes that fail the check are not.
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
     row: &crate::capsule_record::AdmittedRow,
@@ -4175,15 +4240,27 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    let bytes = crate::carrier::fetch_file_from_trusted_source_bound(
-        &source,
-        info.cid.as_deref().filter(|cid| !cid.is_empty()),
-        release_path,
-        15,
-        bind_addr,
-        crate::carrier::MAX_DOWNLOAD_BYTES,
-    )
-    .await?;
+    let fetch = || {
+        crate::carrier::fetch_file_from_trusted_source_bound(
+            &source,
+            info.cid.as_deref().filter(|cid| !cid.is_empty()),
+            release_path,
+            15,
+            bind_addr,
+            elastos_common::MAX_WHOLE_CONTENT_BYTES,
+        )
+    };
+    let bytes = match fetch().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "  Download of {name} failed; retrying in {} s ({error:#})",
+                FIRST_PARTY_FETCH_RETRY_DELAY.as_secs_f32()
+            );
+            tokio::time::sleep(FIRST_PARTY_FETCH_RETRY_DELAY).await;
+            fetch().await?
+        }
+    };
     verify_release_bytes(name, &bytes, info)?;
     Ok(bytes)
 }
@@ -4283,6 +4360,8 @@ async fn download_component(
     require_component_not_model(name, dest)?;
     if name == browser_vm_image::NAME {
         browser_vm_image::validate_request(data_dir, platform_info, dest, &detect_platform())?;
+        // Refused here, the sentence is not wrapped as a failed fetch.
+        browser_vm_image::require_space(dest, platform_info)?;
     }
 
     // Every component comes from the trusted source over Carrier.
@@ -4996,6 +5075,27 @@ pub(crate) mod tests {
             &component(Some("bin/a"), serde_json::json!({})),
             InstallState::Installed
         ));
+    }
+
+    #[test]
+    fn components_summary_names_every_download_including_browser() {
+        let mb = 1024 * 1024;
+        assert_eq!(
+            components_summary(30, 30, 110 * mb, 1040 * mb),
+            "Components: 30 selected, 30 to install (1.1 GB to download: 110.0 MB for Home, 1.0 GB for Browser)"
+        );
+        assert_eq!(
+            components_summary(30, 30, 110 * mb, 0),
+            "Components: 30 selected, 30 to install (110.0 MB)"
+        );
+        assert_eq!(
+            components_summary(30, 0, 0, 900 * mb),
+            "Components: 30 selected, 0 to install (900.0 MB for Browser)"
+        );
+        assert_eq!(
+            components_summary(30, 0, 0, 0),
+            "Components: 30 selected, 0 to install"
+        );
     }
 
     #[test]
@@ -5766,33 +5866,27 @@ pub(crate) mod tests {
                 }
             }
         }
-        let protected_home_dependencies = [
-            "chain-provider",
-            "wallet-provider",
-            "kubo",
-            "ipfs-provider",
-            "protected-content-protect-provider",
-            "media-provider",
-            "protected-content-decrypt-provider",
-            "library",
-            "marketplace",
+        // Hidden in 0.8.0: a fresh Home does not install them (no ffmpeg
+        // download either); each stays installable with `setup --with`.
+        let hidden = [
+            "services",
+            "wallet-walletconnect",
+            "content-block-graph-provider",
             "elacity-player",
+            "protected-content-protect-provider",
+            "protected-content-decrypt-provider",
+            "media-provider",
+            "media-tools",
         ];
-        {
-            let profile = &manifest.profiles["home"];
-            let profile_name = "home";
-            for dependency in protected_home_dependencies {
-                assert_eq!(
-                    profile
-                        .components
-                        .iter()
-                        .filter(|component| component.as_str() == dependency)
-                        .count(),
-                    1,
-                    "{profile_name} protected-content Home profile must include {dependency} exactly once"
-                );
-            }
+        for name in hidden {
+            assert!(
+                !selected.iter().any(|component| component == name),
+                "home must not install {name}"
+            );
         }
+        let with = hidden.map(str::to_string);
+        let on_request = resolve_components(&manifest, None, &with, &[]).unwrap();
+        assert_eq!(on_request, hidden);
         // Chain/wallet/DRM development providers stay out of Home and remain
         // reachable only as an explicit developer `--with`.
         let developer_providers = [
@@ -6068,13 +6162,14 @@ pub(crate) mod tests {
             components["external"]["elacity-player"]["install_path"],
             "capsules/elacity-player"
         );
+        // Protected content ships after 0.8.0: the Player installs only with `--with`.
         assert!(
-            components["profiles"]["home"]["components"]
+            !components["profiles"]["home"]["components"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|value| value == "elacity-player"),
-            "home must include the Elacity Player capsule"
+            "home must not install the Elacity Player capsule in 0.8.0"
         );
     }
 

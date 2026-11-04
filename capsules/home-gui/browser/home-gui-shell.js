@@ -12,23 +12,32 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260813a";
+} from "./home-gui.js?v=home-20261101d";
 import {
   acceptHomeBrowserContextId,
+  desktopBackdrop,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261101d";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260813a";
-import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20260813a";
-import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20260813a";
+} from "./home-gui-authority.js?v=home-20261101d";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20261101d";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20261101d";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261101d";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
 const homeToken = fragment.get("home_token") || "";
 const homeOrigin = route.searchParams.get("home_origin") || "";
+const backgroundImage = createHomeBackgroundImage({ homeOrigin, homeToken,
+  apply: (url) => {
+    if (!desktopBackdrop) return;
+    if (url) desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${url}")`);
+    else desktopBackdrop.style.removeProperty("--desktop-wallpaper");
+  },
+});
 const pendingRequests = new Map();
 const HOME_GUI_REQUEST_TIMEOUT_MS = 30_000;
 const consumedAuthorizedAttachmentReceipts = new Set();
@@ -134,6 +143,8 @@ async function applySummary(summary, options = {}) {
     homeGuiWasMounted: previous !== null,
     ...options,
   });
+  backgroundImage.update(summary?.authority?.signed_in === true
+    ? summary?.appearance?.background_image_url : "");
   await restoreSessionWhenReady();
   document.body.dataset.homeStatus = "ready";
 }

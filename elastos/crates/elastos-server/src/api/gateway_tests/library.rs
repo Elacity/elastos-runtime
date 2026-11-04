@@ -1336,6 +1336,70 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     assert_eq!(save["status"], "ok");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_documents_viewer_route_refuses_a_file_reached_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("Secret.txt"), b"outside secret").unwrap();
+    let documents_path = library_object_path(dir.path(), &format!("{root}/Documents"));
+    std::fs::create_dir_all(&documents_path).unwrap();
+    std::os::unix::fs::symlink(outside.path(), documents_path.join("Linked")).unwrap();
+    let uri = format!("{root}/Documents/Linked/Secret.txt");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    for (method, body) in [
+        ("GET", Body::empty()),
+        (
+            "PUT",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"overwritten"),
+                }))
+                .unwrap(),
+            ),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method(method)
+                    .uri(format!(
+                        "/api/viewers/documents/library-object?uri={encoded_uri}"
+                    ))
+                    .header("x-elastos-home-token", documents_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {text}");
+        assert!(text.contains("linked folder"), "{method}: {text}");
+    }
+    assert_eq!(
+        std::fs::read(outside.path().join("Secret.txt")).unwrap(),
+        b"outside secret"
+    );
+}
+
 #[tokio::test]
 async fn test_library_provider_rejects_unknown_operation() {
     let dir = tempfile::tempdir().unwrap();
@@ -1396,6 +1460,95 @@ async fn test_gateway_provider_proxy_rejects_predeclared_runtime_metadata() {
         assert!(message.contains("provider request must not predeclare Runtime metadata field"));
         assert!(message.contains(reserved));
     }
+}
+
+#[tokio::test]
+async fn test_library_public_root_reports_whether_it_holds_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let public_root = |roots: &serde_json::Value| {
+        roots["data"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "public")
+            .cloned()
+            .expect("public Library root")
+    };
+
+    let (status, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let public = public_root(&roots);
+    assert_eq!(public["uri"], format!("{root}/Public"));
+    assert_eq!(public["metadata"]["empty"], true, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 0, "{public}");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Public" }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": format!("{root}/Public/draft.txt"),
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"draft"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let (_, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    let public = public_root(&roots);
+    assert_eq!(public["metadata"]["empty"], false, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 1, "{public}");
+}
+
+#[tokio::test]
+async fn test_library_stat_of_an_untouched_place_is_the_empty_folder_list_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let pictures_uri = format!("{root}/Pictures");
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": pictures_uri })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["data"]["objects"], json!([]), "{list}");
+
+    let (stat_status, stat) =
+        post_library(app.clone(), &token, "stat", json!({ "uri": pictures_uri })).await;
+    assert_eq!(stat_status, StatusCode::OK, "{stat}");
+    let object = &stat["data"]["object"];
+    assert_eq!(object["uri"], pictures_uri, "{stat}");
+    assert_eq!(object["name"], "Pictures", "{stat}");
+    assert_eq!(object["kind"], "directory", "{stat}");
+    assert_eq!(object["modified_at"], 0, "{stat}");
+    assert_eq!(object["created_at"], 0, "{stat}");
+
+    // Only a place stands in for a missing directory; any other missing path
+    // still fails.
+    let (missing_status, missing) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({ "uri": format!("{root}/Pictures/Missing") }),
+    )
+    .await;
+    assert!(
+        missing_status != StatusCode::OK || missing["status"] != "ok",
+        "{missing}"
+    );
 }
 
 #[tokio::test]
@@ -6906,10 +7059,11 @@ async fn test_library_provider_publish_fails_closed_without_content_provider() {
     .await;
     assert_eq!(publish_status, StatusCode::OK);
     assert_eq!(publish["status"], "error");
-    assert!(publish["message"]
-        .as_str()
-        .unwrap()
-        .contains("content provider unavailable"));
+    assert_eq!(publish["code"], "unavailable");
+    assert_eq!(
+        publish["message"],
+        "Publishing isn't available right now. Try again."
+    );
 }
 
 #[tokio::test]
@@ -11526,10 +11680,7 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         .unwrap()
         .starts_with("bafkrei"));
     assert_eq!(unpublish["data"]["object"].get("published_cid"), None);
-    assert_eq!(
-        unpublish["data"]["object"]["availability"],
-        "local_unpinned"
-    );
+    assert_eq!(unpublish["data"]["object"]["availability"], "withdrawn");
 
     let (repair_status, repair) = post_library(
         app.clone(),
@@ -11560,4 +11711,97 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         status["data"]["published"]["availability"]["status"],
         "local_pinned"
     );
+}
+
+#[tokio::test]
+async fn unpublishing_one_persons_publication_keeps_another_persons_identical_bytes_shared() {
+    // Publishes here count in the shared mock Content the protected tests check.
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let alma = passkey_authority_with_name(dir.path(), Some("alma"));
+    let bruno = passkey_authority_with_name_role(
+        dir.path(),
+        Some("bruno"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    assert_ne!(alma.principal_id, bruno.principal_id);
+    let mut people = Vec::new();
+    for authority in [&alma, &bruno] {
+        let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, authority);
+        let root = crate::auth::principal_localhost_root(&authority.principal_id);
+        let uri = format!("{root}/Documents/same.txt");
+        let (_, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"same bytes"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let (_, publish) =
+            post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+        assert_eq!(publish["data"]["cid"], TEST_CIDV1, "{publish}");
+        people.push((token, uri));
+    }
+
+    // Alma withdraws: Bruno's publication of the same CID stays served.
+    let (token, uri) = &people[0];
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert_eq!(unpublish["data"]["availability"]["status"], "withdrawn");
+    assert!(crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
+    let (token, uri) = &people[1];
+    let (_, status) = post_library(app.clone(), token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], true, "{status}");
+
+    // Bruno withdraws last: nothing on this Home shares the CID any more.
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert!(!crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
+}
+
+#[tokio::test]
+async fn a_publication_withdrawn_by_an_older_release_is_not_served_after_the_update() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("alma"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/undo.txt");
+    let (_, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"undo bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write["status"], "ok", "{write}");
+    let (_, publish) = post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+    let cid = publish["data"]["cid"].as_str().unwrap().to_string();
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Undo to alpha.25, which stops sharing and rewrites the record without
+    // the publication id; the index it never knew keeps the old entry.
+    crate::library::withdraw_as_alpha25_for_test(dir.path(), &authority.principal_id, &uri);
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Update back: the start rebuild serves only what an active record backs.
+    crate::library::reconcile_published_cids(dir.path());
+    assert!(!crate::library::cid_is_published_here(dir.path(), &cid));
+    let (_, status) = post_library(app, &token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], false, "{status}");
 }

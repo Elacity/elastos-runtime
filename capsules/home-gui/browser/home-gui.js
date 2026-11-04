@@ -25,14 +25,14 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
-import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261101d";
+import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261101d";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260813a";
+} from "./shell-chrome.js?v=home-20261101d";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -59,16 +59,18 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260813a";
+} from "./shell-surface.js?v=home-20261101d";
 import {
   assistantFaceActive,
   assistantSpaceActive,
   hideAssistantFace,
+  postToAssistantFrame,
   retireAssistantSpace,
-} from "./shell-assistant-face.js?v=home-20260813a";
+} from "./shell-assistant-face.js?v=home-20261101d";
 import {
   attachAuthorizedTarget,
   closeWindow,
+  closeDocumentsWindowsBeforeSessionEnd,
   cleanupBeforeUnload,
   configureWindowHooks,
   handleShellResize,
@@ -80,59 +82,60 @@ import {
   acceptHomeNavigation,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260813a";
+} from "./shell-windows.js?v=home-20261101d";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260813a";
+} from "./shell-keyboard.js?v=home-20261101d";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260813a";
+} from "./shell-spotlight.js?v=home-20261101d";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260813a";
+} from "./shell-notifications.js?v=home-20261101d";
 import {
   bindSetupSheet,
   holdHomeSetupAct,
   syncSetupSheet,
-} from "./shell-setup-sheet.js?v=home-20260813a";
+} from "./shell-setup-sheet.js?v=home-20261101d";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260813a";
+} from "./shell-menubar.js?v=home-20261101d";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260813a";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260813a";
+} from "./shell-quicklook.js?v=home-20261101d";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20261101d";
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
-} from "./shell-stages.js?v=home-20260813a";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261101d";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20261101d";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20260813a";
+} from "./shell-control-centre.js?v=home-20261101d";
 import {
   bindWalletRail,
+  hideWalletRail,
   retireWalletRail,
   showWalletRail,
   syncWalletRailAvailability,
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260813a";
+} from "./shell-wallet-rail.js?v=home-20261101d";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -142,22 +145,13 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20260813a";
-import {
-  attachAuthorizedConnectorSheet,
-  bindConnectorSheet,
-  connectorSheetFrame,
-  connectorSheetTarget,
-  isConnectorSheetTarget,
-  noteConnectorSheetSummaryRefresh,
-  retireConnectorSheet,
-  showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260813a";
-import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
-import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
-import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
-import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
-import { bindTouchLongPress } from "./shell-touch.js?v=home-20260813a";
+} from "./shell-inbox-rail.js?v=home-20261101d";
+import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261101d";
+import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20261101d";
+import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20261101d";
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20261101d";
+import { bindTouchLongPress } from "./shell-touch.js?v=home-20261101d";
+import { bindFullscreenToggle } from "./shell-fullscreen.js?v=home-20261101d";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -177,7 +171,6 @@ bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow 
 bindControlCentre();
 bindWalletRail();
 bindInboxRail();
-bindConnectorSheet();
 
 let homeGuiInteractionsBound = false;
 
@@ -265,7 +258,6 @@ export function retireHomeGuiSurface(options = {}) {
   retireWalletRail();
   retireInboxRail();
   retireAssistantSpace();
-  retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
@@ -360,29 +352,12 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 }
 
 export function openHomeGuiTarget(target, options = {}) {
-  const query = options.query && typeof options.query === "object" ? options.query : {};
-  if (
-    isConnectorSheetTarget(target) &&
-    (query.presentation === "sheet" || walletRailOpen())
-  ) {
-    void showConnectorSheet(target, {
-      ...options,
-      query: { ...query, presentation: "sheet" },
-    }).catch((error) => {
-      console.error("connector sheet open failed", error);
-    });
-    return;
-  }
   if (target !== "inbox") {
     // An Open from the inbox rail must reveal the target, not leave the
     // rail covering it (#92).
     hideInboxRail({ restoreFocus: false });
   }
   openTarget(target, options);
-}
-
-export function noteHomeGuiConnectorSheetSummaryRefresh(homeToken) {
-  noteConnectorSheetSummaryRefresh(homeToken);
 }
 
 export function homeGuiHasWindows() {
@@ -502,7 +477,7 @@ function broadcastHomeGuiUiPreferences(preferences) {
     try {
       frame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
     } catch (_error) {
-      // Frame mid-teardown; the boot push covers the next mount.
+      // Frame mid-teardown; the window's load handler pushes the current preference on its next load.
     }
   }
   try {
@@ -514,6 +489,11 @@ function broadcastHomeGuiUiPreferences(preferences) {
     inboxRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
   } catch (_error) {
     // Rail not mounted.
+  }
+  try {
+    postToAssistantFrame(message);
+  } catch (_error) {
+    // Frame mid-teardown; its ready handler pushes the current preference on the next load.
   }
 }
 
@@ -592,27 +572,6 @@ export function homeGuiMessageContextForSource(source, origin, homeToken) {
         kind: "app-frame",
         targetId: "inbox",
         windowId: "inbox-rail",
-        homeToken,
-      };
-    }
-    return null;
-  }
-  const sheetFrame = connectorSheetFrame();
-  let sheetWindow = null;
-  try {
-    sheetWindow = sheetFrame?.contentWindow || null;
-  } catch (_error) {
-    sheetWindow = null;
-  }
-  if (sheetWindow && sheetWindow === source) {
-    const expectedToken = homeLaunchTokenFromRoute(
-      sheetFrame?.dataset?.route || sheetFrame?.getAttribute("src") || "",
-    );
-    if (expectedToken && expectedToken === homeToken) {
-      return {
-        kind: "app-frame",
-        targetId: connectorSheetTarget() || "wallet-metamask",
-        windowId: "connector-sheet",
         homeToken,
       };
     }
@@ -726,9 +685,9 @@ export function renewHomeGuiChatWindowAuthority(homeToken, launched, homeOrigin,
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
-  if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
-    return attachAuthorizedConnectorSheet(launched);
-  }
+  // Wallet Connect: close the rail as an outside click would, so the connector
+  // window is not opened beneath it.
+  hideWalletRail({ restoreFocus: false });
   return attachAuthorizedTarget(launched);
 }
 
@@ -887,9 +846,6 @@ export function renderHomeGuiShell(summary, options = {}) {
 }
 
 export function syncHomeGuiAppearance(summary) {
-  const imageUrl = typeof summary?.appearance?.background_image_url === "string"
-    ? summary.appearance.background_image_url.trim()
-    : "";
   const overlayEnabled = summary?.appearance?.background_overlay_enabled === true;
   const overlayOpacityRaw = Number(summary?.appearance?.background_overlay_opacity);
   const overlayOpacity = Number.isFinite(overlayOpacityRaw)
@@ -900,11 +856,6 @@ export function syncHomeGuiAppearance(summary) {
   }
   desktopBackdrop.dataset.overlay = overlayEnabled ? "true" : "false";
   desktopBackdrop.style.setProperty("--desktop-overlay-opacity", String(overlayOpacity));
-  if (!imageUrl) {
-    desktopBackdrop.style.removeProperty("--desktop-wallpaper");
-    return;
-  }
-  desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${imageUrl}")`);
 }
 
 function targetsChanged(previous, next) {
@@ -935,17 +886,6 @@ function desktopObjectsSignature(summary) {
       object && object.name,
     ].join(":"))
     .join("|");
-}
-
-function fullscreenElement() {
-  return document.fullscreenElement || document.webkitFullscreenElement || null;
-}
-
-function fullscreenApi() {
-  const root = document.documentElement;
-  const request = root.requestFullscreen || root.webkitRequestFullscreen;
-  const exit = document.exitFullscreen || document.webkitExitFullscreen;
-  return { root, request, exit };
 }
 
 /* About ElastOS: window-chrome close, verified runtime version, and an
@@ -1094,39 +1034,6 @@ function bindAboutOverlay() {
   });
 }
 
-function syncFullscreenButton() {
-  if (!toolbarFullscreenButton) {
-    return;
-  }
-  const active = Boolean(fullscreenElement());
-  const text = active ? "Exit Fullscreen" : "Enter Fullscreen";
-  const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
-  if (label) {
-    label.textContent = text;
-  }
-  toolbarFullscreenButton.setAttribute("aria-label", text);
-  toolbarFullscreenButton.title = text;
-}
-
-async function toggleHomeGuiFullscreen() {
-  hideControlCentre({ restoreFocus: false });
-  const { root, request, exit } = fullscreenApi();
-  try {
-    if (fullscreenElement()) {
-      if (typeof exit === "function") {
-        await exit.call(document);
-      }
-    } else if (typeof request === "function") {
-      await request.call(root);
-    }
-  } catch {
-    // Browser Fullscreen API owns state. Fail closed and resync from the
-    // actual document fullscreen state so the control stays retryable.
-  } finally {
-    syncFullscreenButton();
-  }
-}
-
 function trackPointerDown(event) {
   shellState.lastPointer = {
     x: event.clientX,
@@ -1155,17 +1062,11 @@ function trackPointerMove(event) {
 }
 
 function bindHomeGuiFullscreenControl() {
-  if (!toolbarFullscreenButton || homeGuiFullscreenControlBound) {
+  if (homeGuiFullscreenControlBound) {
     return;
   }
   homeGuiFullscreenControlBound = true;
-  toolbarFullscreenButton.hidden = false;
-  document.addEventListener("fullscreenchange", syncFullscreenButton);
-  document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
-  toolbarFullscreenButton.addEventListener("click", () => {
-    void toggleHomeGuiFullscreen();
-  });
-  syncFullscreenButton();
+  bindFullscreenToggle(toolbarFullscreenButton);
 }
 
 /* Grid/list view for the launcher (macOS Apps panel view control). This is a
@@ -1189,6 +1090,26 @@ function bindLauncherViewToggle() {
     launcherViewMemory = next;
     applyLauncherView(next);
   });
+}
+
+// Lock and sign-out both unload this desktop (Home's host clears the shell
+// frame, home-shell-host.js enterHostAuthGate), so unsaved Documents edits are
+// settled first, while the session still works. Returns whether it went on.
+let sessionEndPending = false;
+async function endHomeSessionAfterDocuments(end) {
+  if (sessionEndPending) {
+    return false;
+  }
+  sessionEndPending = true;
+  try {
+    if (!(await closeDocumentsWindowsBeforeSessionEnd())) {
+      return false;
+    }
+  } finally {
+    sessionEndPending = false;
+  }
+  end();
+  return true;
 }
 
 export function bindHomeGuiInteractions(options = {}) {
@@ -1266,20 +1187,22 @@ export function bindHomeGuiInteractions(options = {}) {
   });
 
   document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
-    homeGuiHostActions.requestHomeUnlock?.();
+    void endHomeSessionAfterDocuments(() => homeGuiHostActions.requestHomeUnlock?.());
   });
 
   bindAboutOverlay();
 
   toolbarSignOutButton?.addEventListener("click", () => {
-    document.body.dataset.homeStatus = "booting";
-    signOut()
-      .catch((error) => {
-        console.error("home-gui sign out failed", error);
-      })
-      .finally(() => {
-        window.location.reload();
-      });
+    void endHomeSessionAfterDocuments(() => {
+      document.body.dataset.homeStatus = "booting";
+      signOut()
+        .catch((error) => {
+          console.error("home-gui sign out failed", error);
+        })
+        .finally(() => {
+          window.location.reload();
+        });
+    });
   });
 
   document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {

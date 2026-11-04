@@ -202,3 +202,14 @@ test("Library identifiers are bounded, write-only, and not arbitrary text", () =
     false,
   );
 });
+
+for (const target of ["people", "chat-room"]) {
+  test(`${target} can copy a bounded Profile DID but cannot read the clipboard`, () => {
+    assert.equal(homeClipboardOperationAllowed(target, "profile.id", "write"), true);
+    assert.equal(homeClipboardOperationAllowed(target, "profile.id", "read"), false);
+    assert.equal(homeClipboardValidWriteText(target, "profile.id", "did:key:zProfile"), true);
+    assert.equal(homeClipboardValidWriteText(target, "profile.id", "x".repeat(2049)), false);
+    assert.equal(homeClipboardValidWriteText(target, "profile.id", "did:key:zProfile\nextra"), false);
+    assert.equal(homeClipboardOperationAllowed("browser", "profile.id", "write"), false);
+  });
+}

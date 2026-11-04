@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +10,7 @@ const preflight = fs.readFileSync(new URL("./browser-vm-artifact-preflight.sh", 
 const hostReadiness = preflight.slice(preflight.indexOf('if mode == "--host-readiness":'),
   preflight.indexOf("\nif launch_ready:"));
 const control = fs.readFileSync(new URL("./browser-vm-control-service.mjs", import.meta.url), "utf8");
-const readiness = control.slice(control.indexOf("let verifiedHostReadiness ="),
+const readiness = control.slice(control.indexOf("let readyHostReadiness ="),
   control.indexOf("const OPEN_REQUEST_ENV ="));
 const ready = { schema: "elastos.browser.engine-readiness/v1", readiness: { state: "ready" } };
 const unavailable = (reason = "preparation_required") => ({ ...ready, readiness: { state: "unavailable", reason } });
@@ -34,19 +34,28 @@ function fixture(t) {
   return { root, launcher, turn, env };
 }
 
-function probe(env, imageReason = null) {
+function probe(env, imageReason = null, hostProbe = "ready") {
   // Execute the actual host-readiness branch with real executable-file checks.
-  // Image hashing is covered by the artifact smoke; host eligibility is a fixture.
+  // Image hashing and the supervisor process are covered by the artifact smoke.
+  // Stub host eligibility so suite load cannot exhaust its two-second deadline.
   const program = `import json, os, pathlib, platform as host_platform, subprocess, sys
+from types import SimpleNamespace
 host_platform.system = lambda: "Darwin"
 host_platform.machine = lambda: "arm64"
 platform = os.environ["ELASTOS_BROWSER_VM_PLATFORM"]
 mode = "--host-readiness"
 vz_supervisor = os.environ["ELASTOS_BROWSER_VM_VZ_SUPERVISOR"]
+def host_probe(command, **options):
+    assert command == [vz_supervisor, "--host-capabilities"]
+    assert options == dict(capture_output=True, text=True, timeout=2, check=True)
+    if sys.argv[2] == "timeout":
+        raise subprocess.TimeoutExpired(command, options["timeout"])
+    return SimpleNamespace(stdout=json.dumps({"schema": "elastos.browser.vm-host-capabilities/v1", "available": True}))
+subprocess.run = host_probe
 verify_image_set = lambda: json.loads(sys.argv[1])
 local_substrate_artifacts_ready = True
 ${hostReadiness}`;
-  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason)], {
+  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason), hostProbe], {
     env: { PATH: process.env.PATH, ...env }, encoding: "utf8", timeout: 5000,
   });
   assert.equal(child.status, 0, child.stderr || String(child.error));
@@ -70,6 +79,11 @@ for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "dir
   });
 }
 
+test("a supervisor timeout keeps host readiness unavailable", t => {
+  const f = fixture(t);
+  assert.deepEqual(probe(f.env, null, "timeout"), unavailable("readiness_unsupported"));
+});
+
 test("TURN readiness does not replace image integrity or host compatibility checks", t => {
   const f = fixture(t);
   assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
@@ -79,19 +93,23 @@ test("TURN readiness does not replace image integrity or host compatibility chec
   assert.deepEqual(probe(f.env), unavailable("host_unsupported"));
 });
 
+// The probe mock below reports ready unless the TURN or host checks refuse, so
+// the cache tests prove probe sharing and keying mechanics, not image admission.
 function controller(t, { linux = false, delayed = false } = {}) {
   const f = fixture(t);
   if (linux) {
     f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
     delete f.env[turnKey];
   }
-  const probes = [], stats = [], networkChecks = [], messages = [];
-  const context = vm.createContext({ path, process: { env: f.env, platform: linux ? "linux" : "darwin",
-    stderr: { write: message => messages.push(message) } },
+  const probes = [], stats = [], networkChecks = [], messages = [], events = [];
+  const proc = { env: f.env, platform: linux ? "linux" : "darwin", arch: process.arch,
+    stderr: { write: message => messages.push(message) } };
+  const context = vm.createContext({ path, os, process: proc,
+    logEvent: (event, fields) => events.push({ event, ...fields }),
     fs: { statSync(file, options) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
-    } },
+    }, accessSync: fs.accessSync, constants: fs.constants },
     execFileSync(command, args) {
       assert.equal(command, "python3");
       assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
@@ -108,7 +126,7 @@ function controller(t, { linux = false, delayed = false } = {}) {
     },
   });
   const api = vm.runInContext(`${readiness}\n({engineReadiness})`, context);
-  return { ...f, probes, stats, networkChecks, messages,
+  return { ...f, proc, probes, stats, networkChecks, messages, events,
     read: async (launcher = f.launcher) => JSON.parse(JSON.stringify(await api.engineReadiness({ launcher_program: launcher }))),
   };
 }
@@ -121,6 +139,138 @@ test("unchanged TURN and image identities reuse successful readiness", async t =
   fs.writeFileSync(path.join(c.root, "bin/vmlinux"), "changed kernel identity");
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 2);
+});
+
+test("mechanics (mock probe): service start and the first open share one readiness probe", async t => {
+  const c = controller(t, { delayed: true });
+  const prewarm = c.read();
+  const open = c.read();
+  assert.equal(c.probes.length, 1);
+  c.probes[0].finish();
+  assert.deepEqual(await prewarm, ready);
+  assert.deepEqual(await open, ready);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1);
+  assert.deepEqual(c.events.map(e => [e.event, e.source, e.state]), [["host_readiness", "probe", "ready"]]);
+});
+
+test("a platform switch on the same Darwin host re-probes and stays unsupported", async t => {
+  const c = controller(t);
+  assert.deepEqual(await c.read(), ready);
+  c.env.ELASTOS_BROWSER_VM_PLATFORM = "darwin-amd64";
+  assert.deepEqual(await c.read(), unavailable("host_unsupported"), "an arm64 ready result must not admit darwin-amd64");
+  assert.deepEqual(await c.read(), unavailable("host_unsupported"));
+  assert.equal(c.probes.length, 3, "an unsupported result is never cached");
+});
+
+test("mechanics (mock probe): a host architecture change re-probes", async t => {
+  const c = controller(t);
+  assert.deepEqual(await c.read(), ready);
+  c.proc.arch = c.proc.arch === "arm64" ? "x64" : "arm64";
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 2);
+});
+
+for (const tool of ["debugfs", "python3"]) {
+  test(`mechanics (mock probe): replacing ${tool} found through PATH re-probes`, async t => {
+    const c = controller(t);
+    const tools = path.join(c.root, "tools");
+    fs.mkdirSync(tools);
+    const real = spawnSync("sh", ["-c", "command -v python3"], { encoding: "utf8" }).stdout.trim();
+    const write = () => {
+      const next = path.join(tools, `${tool}.new`);
+      fs.writeFileSync(next, tool === "python3" ? `#!/bin/sh\nexec "${real}" "$@"\n` : "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      fs.renameSync(next, path.join(tools, tool)); // Same name on PATH, new inode.
+    };
+    write();
+    c.env.PATH = `${tools}:${process.env.PATH}`;
+    assert.deepEqual(await c.read(), ready);
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 1);
+    write();
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 2, `a new ${tool} on the same PATH must not reuse readiness`);
+  });
+}
+
+test("mechanics (mock probe): an empty PATH entry resolves debugfs in the current directory", async t => {
+  const c = controller(t);
+  const cwd = process.cwd();
+  const here = path.join(c.root, "cwd");
+  fs.mkdirSync(here);
+  const write = () => {
+    fs.writeFileSync(path.join(here, "debugfs.new"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.renameSync(path.join(here, "debugfs.new"), path.join(here, "debugfs"));
+  };
+  write();
+  c.env.PATH = `:${process.env.PATH}`;
+  process.chdir(here);
+  try {
+    assert.deepEqual(await c.read(), ready);
+    write();
+    assert.deepEqual(await c.read(), ready);
+    assert.equal(c.probes.length, 2, "the shell runs ./debugfs for an empty PATH entry");
+  } finally {
+    process.chdir(cwd);
+  }
+});
+
+test("mechanics (mock probe): a PATH file this user cannot execute is not the resolved debugfs", async t => {
+  const c = controller(t);
+  const tools = path.join(c.root, "tools");
+  fs.mkdirSync(tools);
+  const write = () => {
+    // Group/other execute bits only: the shell skips it for this user.
+    fs.writeFileSync(path.join(tools, "debugfs.new"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(path.join(tools, "debugfs.new"), 0o611);
+    fs.renameSync(path.join(tools, "debugfs.new"), path.join(tools, "debugfs"));
+  };
+  write();
+  c.env.PATH = `${tools}:${process.env.PATH}`;
+  assert.deepEqual(await c.read(), ready);
+  write();
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1, "replacing a file the preflight would not run is not a new input");
+});
+
+test("mechanics (mock probe): a configured but absent debugfs keeps a successful probe ready", async t => {
+  const c = controller(t);
+  c.env.ELASTOS_DEBUGFS_BIN = path.join(c.root, "absent-debugfs");
+  assert.deepEqual(await c.read(), ready, "optional debugfs absence must not turn ready into preparation_required");
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1);
+  fs.writeFileSync(c.env.ELASTOS_DEBUGFS_BIN, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 2, "a debugfs that appears is a new input");
+});
+
+test("the control service probes readiness when it starts, before any request", async t => {
+  const f = fixture(t);
+  const child = spawn(process.execPath, [new URL("./browser-vm-control-service.mjs", import.meta.url).pathname], {
+    env: { ...f.env, PATH: process.env.PATH, ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG: JSON.stringify({
+      schema: "elastos.browser.vm-control-service.config/v1", control_socket_path: path.join(f.root, "c.sock"),
+      launcher_program: f.launcher, launcher_args: [] }) },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const closed = new Promise(resolve => child.once("close", resolve));
+  let stderr = "";
+  try {
+    const event = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no startup probe: ${stderr}`)), 5000);
+      child.stderr.on("data", chunk => {
+        stderr += chunk;
+        const line = stderr.split("\n").find(entry => entry.includes('"host_readiness"'));
+        if (line) { clearTimeout(timer); resolve(JSON.parse(line)); }
+      });
+    });
+    // The fixture preflight is not executable, so the eager probe reports it.
+    assert.equal(event.source, "probe");
+    assert.equal(event.reason, "preparation_required");
+  } finally {
+    // Stop the service before the fixture directory is removed.
+    child.kill("SIGKILL");
+    await closed;
+  }
 });
 
 for (const kind of ["unset", "different-path", "remove", "replace", "chmod", "retarget-symlink"]) {

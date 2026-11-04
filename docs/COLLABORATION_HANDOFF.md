@@ -1,7 +1,7 @@
 # Collaboration handoff
 
 This document defines the People and Chat boundary and its acceptance sequence.
-Current refs, source evidence and release scope live in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Current refs, source evidence and release scope live in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 
 ## Evidence boundary
 
@@ -122,7 +122,7 @@ cover:
 - narrow-window People and Chat checks;
 - final Profile-name and identity scans.
 
-Current source and platform CI checkpoints are recorded in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Current source and platform CI checkpoints are recorded in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 Each final candidate requires its own checks and installed acceptance.
 
 The Carrier dependency-generation check verifies a coordinated transport

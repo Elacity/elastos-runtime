@@ -1,3 +1,6 @@
+export const BROWSER_ONE_WINDOW_MESSAGE =
+  "Only one Browser window can be open at a time. Close the other one first.";
+
 export function requestedDisplayMode(paramsArg = params, debugMetricsArg = debugMetrics) {
   const value = paramsArg.get("display_mode") || paramsArg.get("display") || "webrtc_remote_display";
   if (["webrtc_remote_display", "native_surface"].includes(value)) {
@@ -93,6 +96,14 @@ export function friendlyOpenError(error) {
       case "engine_unavailable":
         return "Browser Engine is unavailable. Choose an available approved Engine.";
     }
+  }
+  if (
+    error?.payload?.code === "browser_capacity_unavailable" &&
+    ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"].includes(outcome?.state) &&
+    outcome.effects.page_acquired === false &&
+    outcome.effects.vm_acquired === false
+  ) {
+    return BROWSER_ONE_WINDOW_MESSAGE;
   }
   if (
     error?.payload?.code === "profile_recovery_required" &&

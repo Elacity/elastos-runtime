@@ -72,12 +72,13 @@ pub(super) enum DirectDeliveryState {
 }
 
 impl DirectDeliveryState {
-    pub(super) fn label(self) -> &'static str {
+    /// The state a message line shows instead of its time; settled and
+    /// received messages show their time.
+    pub(super) fn label(self) -> Option<&'static str> {
         match self {
-            Self::Received => "Received",
-            Self::Pending => "Sending",
-            Self::ReceiptSettled => "Sent",
-            Self::Expired => "Expired",
+            Self::Pending => Some("Sending"),
+            Self::Expired => Some("Expired"),
+            Self::Received | Self::ReceiptSettled => None,
         }
     }
 }
@@ -415,7 +416,7 @@ mod tests {
             state.messages[0].direction,
             DirectMessageDirection::Outgoing
         );
-        assert_eq!(state.messages[0].delivery_state.label(), "Sent");
+        assert_eq!(state.messages[0].delivery_state.label(), None);
 
         // Without a receipt, expiry leaves delivery unconfirmed.
         let expired: DirectMessageList = serde_json::from_value(serde_json::json!({
@@ -434,7 +435,7 @@ mod tests {
             state.messages[0].delivery_state,
             DirectDeliveryState::Expired
         );
-        assert_eq!(state.messages[0].delivery_state.label(), "Expired");
+        assert_eq!(state.messages[0].delivery_state.label(), Some("Expired"));
     }
 
     #[test]
@@ -514,7 +515,7 @@ mod tests {
             messages.messages[0].request_id.as_deref(),
             Some("chat-message:one")
         );
-        assert_eq!(messages.messages[0].delivery_state.label(), "Sending");
+        assert_eq!(messages.messages[0].delivery_state.label(), Some("Sending"));
         let legacy: DirectConversationList =
             serde_json::from_value(serde_json::json!({"conversations":[]})).unwrap();
         assert_eq!(legacy.community_unread, None);

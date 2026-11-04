@@ -18,7 +18,7 @@ as the supported authoring contract, not as evidence of product adoption.
 The commands in this guide create capsule source packages. A source package is
 an authoring and build input, not a complete signed Digital Capsule. Source
 packages may omit `signature` during local development. The owning
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues) record
 first-party signing and distribution acceptance. The source-home setup copies these
 packages into its local data home, and local development may launch them. Their
 presence or successful launch does not prove signed distribution, portable
@@ -45,12 +45,12 @@ The seed operator can read hosted data, wallet keys and recovery material.
 Passkeys control sign-in; stored data and keys remain accessible to the Runtime
 account and root while Home is locked. Protection against hosted operators and
 root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+is the target of [hosted protection](https://github.com/elastos/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/elastos/elastos-runtime/issues/210).
 An unlocked self-hosted Home trusts its owner and their host software. Recovery
 from a stolen device or profile key requires a new identity.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.

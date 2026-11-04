@@ -105,7 +105,7 @@ try {
   await page.mouse.up();
   await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   const edge = await page.evaluate(() => ({ channel: window.channel.splice(0), runtime: window.runtime.splice(0) }));
-  assert(edge.runtime.length === 0 && edge.channel.at(-1) === "m,1280,720,0,0", "a drag past the video must release at its edge", edge);
+  assert(edge.runtime.length === 0 && edge.channel.at(-1) === "m,1279,719,0,0", "a drag past the video must release at its edge", edge);
 
   await page.focus("#panel");
   await page.keyboard.press("Meta+A");

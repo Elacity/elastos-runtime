@@ -177,8 +177,6 @@ struct PeopleStatus {
     contact_count: usize,
     #[serde(default)]
     contacts: Vec<PeopleContactStatus>,
-    #[serde(default)]
-    service_offer_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -162,6 +162,21 @@ class PlatformInputTest(unittest.TestCase):
                                           for name, data in payloads.items()]))
         return package
 
+    def test_macos_floor_refuses_a_binary_above_its_floor(self):
+        def load_commands(*commands):
+            return "binary:\n" + "".join(f"Load command {n}\n      cmd {c}\n  cmdsize 32\n {k} {v}\n"
+                                          for n, (c, k, v) in enumerate(commands))
+        rust = load_commands(("LC_SEGMENT_64", "segname", "__TEXT"), ("LC_BUILD_VERSION", "minos", "11.0"),
+                             ("LC_BUILD_VERSION", "sdk", "15.5"))
+        self.assertEqual(inputs.macos_minos(rust), (11, 0))
+        inputs.check_macos_floor(rust, "11.0", "elastos-aarch64-darwin")
+        helper = load_commands(("LC_BUILD_VERSION", "minos", "15.0"))
+        with self.assertRaisesRegex(ValueError, "turnserver: requires macOS 15.0, above its 14.0 floor"):
+            inputs.check_macos_floor(helper, "14.0", "turnserver")
+        inputs.check_macos_floor(load_commands(("LC_VERSION_MIN_MACOSX", "version", "12.0")), "12.0", "ffmpeg")
+        with self.assertRaisesRegex(ValueError, "no macOS minimum"):
+            inputs.macos_minos(load_commands(("LC_SEGMENT_64", "segname", "__TEXT")))
+
     def test_browser_scripts_require_reviewed_bytes_and_executable_mode(self):
         source = inputs.SOURCE_ROOT / "scripts/browser-vm-control-service.mjs"
         source.parent.mkdir()
@@ -555,6 +570,9 @@ class PlatformInputTest(unittest.TestCase):
         for name in ("release-platform-input.py", "components-release-integrity-check.py", "release-platforms.json", "release-signer.py",
                      "publish-release.sh", "check-versioning.sh", "install.sh", "browser-host-release.py"):
             shutil.copyfile(Path(__file__).with_name(name), source / "scripts" / name)
+        common = "elastos/crates/elastos-common/src/lib.rs"
+        (source / common).parent.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).resolve().parent.parent / common, source / common)
         for args in (("init", "-q"), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                       "commit", "-qm", "controlled publisher fixture")):
@@ -984,6 +1002,21 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.refresh(root)
         with self.assertRaisesRegex(ValueError, "expected executable"):
             inputs.verify(root)
+
+    def test_artifact_over_the_whole_content_ceiling_rejects(self):
+        root = self.bundles["aarch64-darwin"]
+        largest = max((path for path in (root / "artifacts").rglob("*") if path.is_file()),
+                      key=lambda path: path.stat().st_size)
+        size = largest.stat().st_size
+        with patch.object(inputs, "WHOLE_CONTENT_CEILING", size):
+            inputs.verify(root)
+        with patch.object(inputs, "WHOLE_CONTENT_CEILING", size - 1):
+            with self.assertRaisesRegex(ValueError, f"{re.escape(largest.name)}: {size} bytes exceed"):
+                inputs.verify(root)
+
+    def test_whole_content_ceiling_admits_the_largest_published_artifact(self):
+        # elastos-x86_64-linux in the 0.8.0-alpha.24 signed set.
+        self.assertGreaterEqual(inputs.WHOLE_CONTENT_CEILING, 115_118_616)
 
     def test_home_cli_requires_a_delivered_native_renderer(self):
         platform = "aarch64-darwin"
@@ -1713,6 +1746,122 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
                 self.prepare_signing_fixture(fixture)
         self.assertFalse(fixture.output.exists())
         self.assertFalse(list(self.root.glob(".signing-input-*")))
+
+
+# Release-notes rules (#507). System shows every bullet of a release's Added,
+# Changed, Fixed, Removed and Security subsections, without its heading, to the
+# person deciding whether to update. Sections dated from NOTES_RULES_FROM on must
+# pass; older published sections keep the words they shipped with.
+NOTES_RULES_FROM = "2026-10-31"
+NOTES_SHOWN = {"added", "changed", "fixed", "removed", "security"}
+NOTES_HEADING = re.compile(r"\[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\] - (\d{4}-\d{2}-\d{2})")
+NOTES_MARKUP = re.compile(r"`|\*\*|\[[^\]]*\]\([^)]*\)|<[A-Za-z/!][^>]*>| -- |[\u2192\u2014\u2013\u2018\u2019\u201c\u201d]")
+NOTES_BANNED_WORDS = re.compile(
+    r"\b(now|seamless|seamlessly|easily|simply|robust|additionally|crucial|enhance|leverage|ensure|ensures)\b", re.I)
+NOTES_INTERNAL_TERMS = re.compile(
+    r"\b(capsules?|gateways?|providers?|carrier|seeds?|origin|tls|principals?|operators?|sidecars?|endpoints?"
+    r"|cargo|canary)\b|\.(?:rs|py|js)\b", re.I)
+NOTES_LIMIT = re.compile(r"\b(known issue|not|cannot|can't|still)\b", re.I)
+
+
+def release_note_bullets(body):
+    """Shown bullets of one section as (text joined to one line, physical line count)."""
+    bullets, include, continuing = [], True, False
+    for line in body.split("\n"):
+        subsection = re.match(r"^###\s+(\S+)", line)
+        if subsection:
+            include, continuing = subsection[1].casefold() in NOTES_SHOWN, False
+            continue
+        bullet = re.match(r"^[-*] (.*)$", line)
+        if include and bullet:
+            bullets.append([bullet[1].strip(), 1])
+            continuing = True
+        elif include and continuing and line.startswith((" ", "\t")) and line.strip():
+            bullets[-1][0] += " " + line.strip()
+            bullets[-1][1] += 1
+        else:
+            continuing = False
+    return [tuple(bullet) for bullet in bullets]
+
+
+def release_notes_findings(text, rules_from=NOTES_RULES_FROM):
+    """(versions checked, [(rule number, message)]) for the CHANGELOG text."""
+    sections = [(heading.strip(), body) for heading, _, body in
+                (section.partition("\n") for section in re.split(r"(?m)^## ", text)[1:])
+                if heading.strip().strip("[]").casefold() != "unreleased"]
+    dates = [match[2] if (match := NOTES_HEADING.fullmatch(heading)) else None for heading, _ in sections]
+    checked, findings = [], []
+    for index, (heading, body) in enumerate(sections):
+        date = dates[index]
+        if date is None:
+            if index == 0:
+                findings.append((7, f"newest section '## {heading}' must read '## [X.Y.Z] - YYYY-MM-DD'"))
+            continue
+        if date < rules_from:
+            continue
+        version = NOTES_HEADING.fullmatch(heading)[1]
+        checked.append(version)
+        later = [older for older in dates[index + 1:] if older and older > date]
+        if later:
+            findings.append((7, f"[{version}] is dated {date}, earlier than an older section's {max(later)}"))
+        bullets = release_note_bullets(body)
+        total = sum(len(note.encode("utf-8")) for note, _ in bullets)
+        if len(bullets) > 32 or total > 8192:
+            findings.append((1, f"[{version}] has {len(bullets)} bullets and {total} bytes; at most 32 and 8192"))
+        for number, (note, lines) in enumerate(bullets, 1):
+            where = f"[{version}] bullet {number}"
+            if len(note.encode("utf-8")) > 500:
+                findings.append((1, f"{where} is over 500 bytes"))
+            if match := NOTES_MARKUP.search(note):
+                findings.append((2, f"{where} is not plain text: {match[0]!r}; menu paths use ' > '"))
+            if match := NOTES_BANNED_WORDS.search(note):
+                findings.append((3, f"{where} uses the banned word {match[0]!r}"))
+            if match := NOTES_INTERNAL_TERMS.search(note):
+                findings.append((4, f"{where} uses the internal term {match[0]!r}"))
+            if re.search(r"#\d+", note) and not NOTES_LIMIT.search(note):
+                findings.append((5, f"{where} names an issue but states no limit"))
+            if lines != 1 or not re.match(r"[A-Z]", note) or not note.endswith("."):
+                findings.append((6, f"{where} must be one line that starts with a capital letter and ends with '.'"))
+    return checked, findings
+
+
+class ReleaseNotesRulesTest(unittest.TestCase):
+    changelog = (Path(__file__).resolve().parents[1] / "elastos/CHANGELOG.md").read_text(encoding="utf-8")
+
+    def test_newest_release_notes_follow_the_rules(self):
+        checked, findings = release_notes_findings(self.changelog)
+        newest = NOTES_HEADING.search(self.changelog.split("\n## ", 2)[2].partition("\n")[0])
+        self.assertIn(newest[1], checked)
+        self.assertEqual(findings, [])
+
+    def test_notes_published_before_the_rules_break_them(self):
+        # 2.0.0-rc.1 shipped the earlier 2.0.0 wording, which these rules replace.
+        body = self.changelog.split("\n## [2.0.0-rc.1] - 2026-10-30\n", 1)[1].split("\n## ", 1)[0]
+        checked, findings = release_notes_findings("## [2.0.0-rc.1] - 2026-10-30\n" + body, rules_from="0000-00-00")
+        self.assertEqual(checked, ["2.0.0-rc.1"])
+        self.assertEqual({rule for rule, _ in findings}, {2, 4, 5})
+
+    def test_each_rule_refuses_its_case(self):
+        good = "Home shows plain notes."
+        cases = {
+            1: [["x" * 501 + "."], [good] * 33, ["y" * 300 + "."] * 28],
+            2: [["Open System \u2192 About."], ["Run `elastos update`."], ["See [docs](https://x)."], ["It is \u201cdone\u201d."]],
+            3: [["Home updates seamlessly."], ["It is now faster."]],
+            4: [["The capsule starts."], ["Carrier connects."], ["The seed node runs."], ["Reads main.rs."]],
+            5: [["Library is faster (#481)."]],
+            6: [["lowercase start."], ["No full stop"], ["Two lines\n  in the file."]],
+        }
+        for rule, examples in cases.items():
+            for bullets in examples:
+                with self.subTest(rule=rule, bullet=bullets[0][:40]):
+                    text = "## [Unreleased]\n\n## [9.0.0] - 2026-12-01\n\n### Fixed\n\n" + \
+                        "".join(f"- {bullet}\n" for bullet in bullets)
+                    self.assertIn(rule, {found for found, _ in release_notes_findings(text)[1]})
+        _, findings = release_notes_findings(
+            "## [Unreleased]\n\n## [9.0.0] - 2026-11-01\n- Known issue: Library can lose a save (#480).\n"
+            "\n### Developer detail\n- `elastos serve` uses the gateway (#1)\n\n## [8.0.0] - 2026-11-02\n- Old.\n")
+        self.assertEqual([rule for rule, _ in findings], [7])
+        self.assertEqual(release_notes_findings("## [Unreleased]\n\n## 9.0.0\n- " + good + "\n")[1][0][0], 7)
 
 
 class SourceRecordTest(unittest.TestCase):

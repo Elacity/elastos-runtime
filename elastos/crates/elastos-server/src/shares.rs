@@ -3,7 +3,7 @@
 use crate::crypto::{decode_did_key, encode_did_key};
 use crate::ipfs::{collect_files_for_ipfs, find_viewer_dir};
 use crate::sources::default_data_dir;
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use elastos_runtime::signature;
 use sha2::Digest;
 use std::path::PathBuf;
@@ -714,7 +714,7 @@ pub fn verify_provenance(prov_bytes: &[u8], expected_cid: &str) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("Invalid Ed25519 signature: {}", e))?;
 
     verifying_key
-        .verify(&digest, &sig)
+        .verify_strict(&digest, &sig)
         .map_err(|_| anyhow::anyhow!("Signature verification failed"))?;
 
     Ok(prov)
@@ -837,7 +837,7 @@ pub fn verify_channel_head(head_bytes: &[u8]) -> anyhow::Result<ChannelHead> {
         .map_err(|e| anyhow::anyhow!("Invalid Ed25519 signature: {}", e))?;
 
     verifying_key
-        .verify(&digest, &sig)
+        .verify_strict(&digest, &sig)
         .map_err(|_| anyhow::anyhow!("Head signature verification failed"))?;
 
     Ok(head)

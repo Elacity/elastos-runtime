@@ -796,3 +796,24 @@ fn setup_reader_requires_exact_guard_current_source_and_pending_free_binary() {
         assert_eq!(fixture.snapshot(), before, "{case}");
     }
 }
+
+#[test]
+fn data_root_accepts_owned_group_writable_mode_and_descendants_stay_strict() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let child = data.join("installation");
+    fs::create_dir_all(&child).unwrap();
+    let set =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    set(&child, 0o755);
+    set(&data, 0o770);
+    check_data_root(&data).unwrap();
+    check_parents(&data, &child, false).unwrap();
+    set(&child, 0o775);
+    assert!(check_parents(&data, &child, false).is_err());
+    set(&child, 0o755);
+    set(&data, 0o777);
+    assert!(check_data_root(&data).is_err());
+    assert!(check_parents(&data, &child, false).is_err());
+    set(&data, 0o700);
+}

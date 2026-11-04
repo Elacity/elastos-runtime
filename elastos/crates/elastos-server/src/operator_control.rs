@@ -36,6 +36,9 @@ pub const OPERATOR_ACTION_ROOM_READ: &str = "room.read";
 pub const OPERATOR_ACTION_ROOM_APPROVE: &str = "room.approve";
 pub const OPERATOR_ACTION_ROOM_DENY: &str = "room.deny";
 pub const OPERATOR_ACTION_ROOM_OPEN: &str = "room.open";
+/// Lets a Carrier peer place content replicas on this node. It is a
+/// storage permission for the peer, not a remote operator command.
+pub const OPERATOR_ACTION_CONTENT_REPLICA: &str = "content.replica";
 
 const OPERATOR_CONFIG_SCHEMA: &str = "elastos.operator-control/v1";
 const OPERATOR_REQUEST_DOMAIN: &str = "elastos.operator.request.v1";
@@ -369,6 +372,7 @@ pub fn supported_actions() -> &'static [&'static str] {
         OPERATOR_ACTION_ROOM_APPROVE,
         OPERATOR_ACTION_ROOM_DENY,
         OPERATOR_ACTION_ROOM_OPEN,
+        OPERATOR_ACTION_CONTENT_REPLICA,
     ]
 }
 
@@ -426,6 +430,17 @@ pub fn upsert_peer(data_dir: &Path, mut peer: OperatorPeer) -> Result<OperatorPe
     config.peers.sort_by(|a, b| a.did.cmp(&b.did));
     save_operator_control(data_dir, &config)?;
     Ok(peer)
+}
+
+/// The actions the owner granted to `did` in the operator peer store, or
+/// `None` when the peer is not registered (or the store cannot be read).
+pub fn granted_peer_actions(data_dir: &Path, did: &str) -> Option<Vec<String>> {
+    load_operator_control(data_dir)
+        .ok()?
+        .peers
+        .into_iter()
+        .find(|peer| peer.did == did)
+        .map(|peer| peer.allow)
 }
 
 pub fn remove_peer(data_dir: &Path, did: &str) -> Result<Option<OperatorPeer>> {
@@ -1141,6 +1156,11 @@ fn verify_request_envelope(
     envelope_bytes: &[u8],
     expected_requesters: &[String],
 ) -> Result<OperatorRequestPayload> {
+    // The envelope check treats an empty trusted set as "any signer"; an
+    // operator request verifies only against a configured peer.
+    if expected_requesters.is_empty() {
+        anyhow::bail!("requester DID is not configured for operator control");
+    }
     let (value, signer_did) = verify_release_envelope_against_dids(
         envelope_bytes,
         OPERATOR_REQUEST_DOMAIN,
@@ -1238,6 +1258,7 @@ async fn handle_operator_connection(
     conn: iroh::endpoint::Connection,
     ctx: OperatorRuntimeContext,
 ) -> Result<()> {
+    let peer = conn.remote_id();
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -1245,7 +1266,7 @@ async fn handle_operator_connection(
         };
         let stream_ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx).await {
+            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx, peer).await {
                 tracing::debug!("operator control stream error: {:#}", err);
             }
         });
@@ -1257,6 +1278,7 @@ async fn handle_operator_stream(
     send: &mut iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     ctx: &OperatorRuntimeContext,
+    peer: iroh::EndpointId,
 ) -> Result<()> {
     let line = crate::carrier::read_peer_line(
         &mut BufReader::new(recv),
@@ -1286,30 +1308,39 @@ async fn handle_operator_stream(
     let expected_requesters: Vec<String> =
         config.peers.iter().map(|peer| peer.did.clone()).collect();
 
-    let response = match verify_request_envelope(line.trim().as_bytes(), &expected_requesters) {
+    let verified = verify_request_envelope(line.trim().as_bytes(), &expected_requesters);
+    let authenticated = verified.is_ok();
+    let response = match verified {
         Ok(request) => build_operator_response(ctx, &config, request).await,
-        Err(err) => OperatorResponsePayload {
-            version: 1,
-            request_id,
-            accepted: false,
-            target_did: ctx.local_did.clone(),
-            ts: now_ts(),
-            result: serde_json::Value::Null,
-            error: Some(err.to_string()),
-        },
+        Err(err) => {
+            tracing::debug!("operator control request from {peer} did not verify");
+            OperatorResponsePayload {
+                version: 1,
+                request_id,
+                accepted: false,
+                target_did: ctx.local_did.clone(),
+                ts: now_ts(),
+                result: serde_json::Value::Null,
+                error: Some(err.to_string()),
+            }
+        }
     };
 
-    append_audit_entry(
-        &ctx.data_dir,
-        AuditEntry {
-            ts: response.ts,
-            request_id: response.request_id.clone(),
-            requester_did,
-            action,
-            accepted: response.accepted,
-            error: response.error.clone(),
-        },
-    );
+    // Requests whose envelope verified are audited, accepted or denied; the
+    // audit file is also the replay record for read-only actions.
+    if authenticated {
+        append_audit_entry(
+            &ctx.data_dir,
+            AuditEntry {
+                ts: response.ts,
+                request_id: response.request_id.clone(),
+                requester_did,
+                action,
+                accepted: response.accepted,
+                error: response.error.clone(),
+            },
+        );
+    }
 
     let (signing_key, _did) = elastos_identity::load_or_create_did(&ctx.data_dir)?;
     let envelope = sign_envelope(&signing_key, OPERATOR_RESPONSE_DOMAIN, &response)?;
@@ -2193,7 +2224,15 @@ mod tests {
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");
         std::fs::create_dir_all(&identity_dir).unwrap();
-        std::fs::write(identity_dir.join("device.key"), key).unwrap();
+        let path = identity_dir.join("device.key");
+        std::fs::write(&path, key).unwrap();
+        // The identity store refuses a device key that others can read, and
+        // the operator handler loads it to sign every answer.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     async fn start_ticket_provider(
@@ -2276,8 +2315,9 @@ mod tests {
     }
 
     #[test]
-    fn supported_actions_include_update_apply() {
+    fn supported_actions_include_update_apply_and_content_replica() {
         assert!(supported_actions().contains(&OPERATOR_ACTION_UPDATE_APPLY));
+        assert!(supported_actions().contains(&"content.replica"));
     }
 
     #[test]
@@ -2472,6 +2512,137 @@ mod tests {
         assert!(answer.is_empty());
         assert!(started.elapsed() >= OPERATOR_REQUEST_WAIT - Duration::from_millis(100));
         drop(send);
+    }
+
+    #[tokio::test]
+    async fn operator_stream_audits_verified_requests_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [14u8; 32];
+        write_test_device_key(dir.path(), &key);
+        let (sk, did) = elastos_identity::derive_did(&key);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
+        let addr = decode_ticket_endpoints(&ticket).remove(0);
+        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+            .await
+            .unwrap();
+        let audit_path = dir.path().join(OPERATOR_AUDIT_FILE);
+
+        let (requester_sk, requester_did) = elastos_identity::derive_did(&[15u8; 32]);
+
+        // With no operator peers configured (the default), a request signed
+        // by any key is denied and leaves no audit entry.
+        let unconfigured = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-unconfigured-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unconfigured).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert_eq!(
+            denied.error.as_deref(),
+            Some("requester DID is not configured for operator control")
+        );
+        assert!(!audit_path.exists());
+
+        upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: requester_did.clone(),
+                label: "requester".to_string(),
+                connect_ticket: String::new(),
+                allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+            },
+        )
+        .unwrap();
+
+        // An unsigned request is denied and leaves no audit entry.
+        let unsigned = serde_json::json!({
+            "payload": {
+                "version": 1,
+                "request_id": "r".repeat(32 * 1024),
+                "requester_did": requester_did,
+                "target_did": did,
+                "ts": now_ts(),
+                "action": OPERATOR_ACTION_STATUS_READ,
+                "args": null,
+            },
+            "signature": "",
+            "signer_did": requester_did,
+        });
+        let answer = client.send_request(&unsigned).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert!(!audit_path.exists());
+
+        // A signed request is audited, and repeating it is refused as a replay.
+        let request = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-status-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &request).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let accepted = verify_response_envelope(&answer, &did).unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.error);
+        assert!(audit_contains_request_id(
+            dir.path(),
+            &requester_did,
+            &request.request_id
+        ));
+
+        let answer = client.send_request(&signed).await.unwrap();
+        let replayed = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!replayed.accepted);
+        assert_eq!(
+            replayed.error.as_deref(),
+            Some("operator request replay detected")
+        );
+
+        // A verified request for an action the peer may not run is denied
+        // and still audited, as is the refused repeat above.
+        let unallowed = OperatorRequestPayload {
+            request_id: "req-check-1".to_string(),
+            action: OPERATOR_ACTION_UPDATE_CHECK.to_string(),
+            ts: now_ts(),
+            ..request.clone()
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unallowed).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let refused = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!refused.accepted);
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let entries: Vec<(String, bool)> = audit
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    entry["request_id"].as_str().unwrap().to_string(),
+                    entry["accepted"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("req-status-1".to_string(), true),
+                ("req-status-1".to_string(), false),
+                ("req-check-1".to_string(), false),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -103,9 +103,11 @@ async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: us
 
 // Keep this paused clock under the test's explicit control while other test
 // runtimes hold the shared Browser registry lock. An idle runtime would otherwise
-// advance lifecycle deadlines during those unrelated lock waits.
+// advance lifecycle deadlines during those unrelated lock waits. The real-time
+// bound only catches a hung test. Full-suite runs can wait on that lock for long
+// stretches: two of these tests exceeded 30 seconds in gate runs and passed elsewhere.
 async fn with_manual_test_clock(test: impl std::future::Future<Output = ()>) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     tokio::select! {
         biased;
         () = test => {}
@@ -113,7 +115,7 @@ async fn with_manual_test_clock(test: impl std::future::Future<Output = ()>) {
             while std::time::Instant::now() < deadline {
                 tokio::task::yield_now().await;
             }
-        } => panic!("manual-clock Browser test exceeded its 30-second real-time bound"),
+        } => panic!("manual-clock Browser test exceeded its 120-second real-time bound"),
     }
 }
 

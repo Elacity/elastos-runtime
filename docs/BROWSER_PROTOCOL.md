@@ -9,7 +9,7 @@ The executable wire definitions shared by Runtime and the Engine provider live
 in [browser_protocol.rs](../elastos/crates/elastos-common/src/browser_protocol.rs).
 The [Browser architecture](BROWSER_CAPSULE.md) describes provider implementation,
 the [support matrix](BROWSER_SUPPORT.md) describes qualification, and
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record remaining work.
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues) record remaining work.
 
 ## Contract identity and ownership
 

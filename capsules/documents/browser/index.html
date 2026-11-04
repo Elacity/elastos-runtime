@@ -60,8 +60,7 @@
 
 :root[data-el-theme="light"] .document-list-item:hover,
 :root[data-el-theme="light"] .share-doc-link:hover,
-:root[data-el-theme="light"] .outline-item:hover,
-:root[data-el-theme="light"] .history-item:hover {
+:root[data-el-theme="light"] .outline-item:hover {
   background: var(--el-lift);
 }
 
@@ -76,19 +75,6 @@
 .workspace-tab[aria-pressed="true"] {
   background: var(--accent-soft);
   border-color: rgba(95, 118, 216, 0.18);
-}
-
-:root[data-el-theme="light"] .document-list-item.published {
-  background: color-mix(in srgb, var(--el-accent-soft) 70%, transparent);
-}
-
-:root[data-el-theme="light"] .document-list-item.published:hover,
-:root[data-el-theme="light"] .document-list-item.published.active {
-  background: var(--el-lift-strong);
-}
-
-:root[data-el-theme="light"] .document-list-published-icon {
-  background: rgba(95, 118, 216, 0.14);
 }
 
 :root[data-el-theme="light"] .action-danger {
@@ -186,14 +172,14 @@ a {
   background: var(--bg);
 }
 
-/* Collapsed: keep leading chrome column so traffic lights stay over material.
-   The phone drawer always shows the list, whatever the desktop chose. */
+/* Collapsed (desktop): the list leaves and the page takes the room; the Show
+   list control at the title's leading edge brings it back. The phone drawer
+   always shows the list, whatever the desktop chose. */
 :root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] {
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
-:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
-:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-list {
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-sidebar {
   display: none;
 }
 
@@ -279,6 +265,33 @@ a {
   gap: var(--sidebar-compose-gap);
 }
 
+.sidebar-panel-toggle {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0.6rem;
+  background: transparent;
+  color: var(--sidebar-muted);
+}
+
+.sidebar-panel-toggle:hover,
+.sidebar-panel-toggle:focus-visible {
+  background: var(--panel-soft);
+  color: var(--ink);
+}
+
+#sidebar-show {
+  display: none;
+}
+
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] #sidebar-show {
+  display: inline-grid;
+}
+
 .sidebar-create {
   display: inline-grid;
   width: var(--sidebar-compose-size);
@@ -329,39 +342,6 @@ a {
   padding: 0;
 }
 
-.documents-list-section {
-  margin: 0.55rem 0 0.2rem;
-  color: var(--sidebar-muted);
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0;
-  text-transform: uppercase;
-}
-
-.document-list-marks {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  flex: 0 0 auto;
-}
-
-.document-list-pin-icon {
-  flex: 0 0 auto;
-  width: 0.85rem;
-  height: 0.85rem;
-  color: var(--sidebar-muted);
-}
-
-.document-list-pin-icon svg {
-  width: 100%;
-  height: 100%;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.9;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
 .context-menu {
   position: fixed;
   z-index: 80;
@@ -384,7 +364,7 @@ a {
   display: none;
 }
 
-.context-menu .menu-item {
+.context-menu .context-menu-item {
   display: flex;
   align-items: center;
   gap: 0.65rem;
@@ -401,41 +381,13 @@ a {
   color: inherit;
 }
 
-.context-menu .menu-item:hover:not(:disabled) {
+.context-menu .context-menu-item:hover:not(:disabled) {
   background: #0a84ff;
   color: #fff;
 }
 
-.context-menu .menu-item:disabled {
+.context-menu .context-menu-item:disabled {
   opacity: 0.45;
-}
-
-.context-menu .menu-item-icon {
-  flex: 0 0 auto;
-  width: 0.95rem;
-  height: 0.95rem;
-  opacity: 0.9;
-}
-
-.context-menu .menu-item-icon svg {
-  width: 100%;
-  height: 100%;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.context-menu .menu-item-label {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.context-menu .menu-divider {
-  height: 1px;
-  margin: 4px 8px;
-  background: var(--line);
 }
 
 .document-list-item,
@@ -467,15 +419,6 @@ a {
   font-weight: 600;
 }
 
-.document-list-item.published {
-  background: color-mix(in srgb, var(--el-accent-soft) 55%, transparent);
-}
-
-.document-list-item.published:hover,
-.document-list-item.published.active {
-  background: var(--el-lift-strong);
-}
-
 .document-list-title-row {
   display: flex;
   align-items: center;
@@ -504,39 +447,13 @@ a {
   font-size: 0.82rem;
 }
 
-.document-list-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.7rem;
-  margin-top: 0.4rem;
-}
-
-.document-list-updated {
-  color: var(--sidebar-muted);
-  font-size: 0.77rem;
-}
-
-.document-list-published-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.35rem;
-  min-width: 1.35rem;
-  height: 1.35rem;
-  border-radius: 999px;
-  background: rgba(125, 149, 240, 0.2);
-  color: var(--accent-deep);
-}
-
-.document-list-published-icon svg {
-  width: 0.86rem;
-  height: 0.86rem;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2.2;
+/* A dot after the title marks a document with unsaved changes. */
+.document-list-unsaved {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--warning);
 }
 
 .sidebar-note {
@@ -556,6 +473,9 @@ a {
 }
 
 .documents-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -580,10 +500,6 @@ a {
   justify-content: flex-end;
   flex: 0 0 auto;
   min-width: max-content;
-}
-
-.sidebar-toggle {
-  min-width: 0;
 }
 
 .action-primary,
@@ -622,20 +538,6 @@ a {
   stroke-width: 1.9;
   stroke-linecap: round;
   stroke-linejoin: round;
-}
-
-.copy-link-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.42rem;
-  min-height: 2.35rem;
-  padding: 0 0.82rem;
-  color: var(--accent-deep);
-}
-
-.copy-link-button .action-icon {
-  width: 1rem;
-  height: 1rem;
 }
 
 .action-danger {
@@ -685,12 +587,8 @@ a {
 }
 
 .status-text {
-  color: var(--muted);
-  font-size: 0.88rem;
-}
-
-.status-text.warning {
   color: var(--warning);
+  font-size: 0.88rem;
 }
 
 .find-bar {
@@ -833,6 +731,61 @@ a {
   color: var(--accent-deep);
 }
 
+/* Text controls in the toolbar row: as tall as the icon buttons. */
+.toolbar-text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  height: 2.35rem;
+  padding: 0 0.9rem;
+  white-space: nowrap;
+}
+
+.switch-track {
+  position: relative;
+  width: 1.9rem;
+  height: 1.1rem;
+  border-radius: 999px;
+  background: var(--line);
+  transition: background 120ms ease;
+}
+
+/* Save shows a dot while the open document has unsaved changes. */
+#save-button {
+  position: relative;
+}
+
+#save-button.has-unsaved::after {
+  content: "";
+  position: absolute;
+  top: 0.28rem;
+  right: 0.28rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.switch-knob {
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  background: #f8fbff;
+  transition: transform 120ms ease;
+}
+
+.autosave-switch[aria-checked="true"] .switch-track {
+  background: var(--accent);
+}
+
+.autosave-switch[aria-checked="true"] .switch-knob {
+  transform: translateX(0.8rem);
+}
+
 .view-toggle-button .action-icon,
 .workspace-tab .action-icon {
   width: 1rem;
@@ -937,23 +890,20 @@ a {
   padding: 1rem;
 }
 
-.outline-list,
-.history-list {
+.outline-list {
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
 }
 
-.outline-item,
-.history-item {
+.outline-item {
   padding: 0.8rem 0.9rem;
   border-radius: var(--radius-md);
   background: var(--panel-strong);
   border: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-.outline-item:hover,
-.history-item:hover {
+.outline-item:hover {
   background: rgba(255, 255, 255, 0.08);
   border-color: var(--line);
 }
@@ -964,8 +914,7 @@ a {
   color: var(--text);
 }
 
-.outline-kicker,
-.history-kicker {
+.outline-kicker {
   display: block;
   color: var(--muted);
   font-size: 0.74rem;
@@ -974,35 +923,13 @@ a {
   text-transform: uppercase;
 }
 
-.outline-title,
-.history-title {
+.outline-title {
   display: block;
   margin-top: 0.18rem;
   font-size: 0.92rem;
   font-weight: 600;
 }
 
-.history-meta {
-  display: block;
-  margin-top: 0.22rem;
-  color: var(--muted);
-  font-size: 0.8rem;
-}
-
-.history-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  margin-top: 0.45rem;
-  padding: 0;
-  background: transparent;
-  color: var(--accent);
-  font-size: 0.82rem;
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.history-link:hover,
 .outline-link:hover {
   text-decoration: underline;
 }
@@ -1183,7 +1110,7 @@ a {
   margin: 0.2rem 0;
 }
 
-.markdown-body .task-label {
+.markdown-body .task-item-label {
   display: flex;
   align-items: flex-start;
   gap: 0.55rem;
@@ -1199,12 +1126,12 @@ a {
   cursor: pointer;
 }
 
-.markdown-body .task-text {
+.markdown-body .task-item-label > span {
   min-width: 0;
   flex: 1 1 auto;
 }
 
-.markdown-body .task-item:has(.task-checkbox:checked) .task-text {
+.markdown-body .task-item:has(.task-checkbox:checked) .task-item-label > span {
   color: var(--muted);
   text-decoration: line-through;
   text-decoration-thickness: 1px;
@@ -1325,11 +1252,6 @@ a {
 
   .toolbar-actions::-webkit-scrollbar {
     display: none;
-  }
-
-  .document-list-row {
-    flex-direction: column;
-    align-items: flex-start;
   }
 
   .documents-workspace {
@@ -1460,8 +1382,22 @@ a {
   font-weight: 500;
 }
 
-:root[data-el-form-factor="phone"] .action-icon-button,
-:root[data-el-form-factor="phone"] .copy-link-button {
+:root[data-el-form-factor="phone"] .toolbar-text-button {
+  height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .more-menu .autosave-switch {
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+:root[data-el-form-factor="phone"] .action-icon-button {
   width: var(--el-touch-target);
   height: var(--el-touch-target);
   min-height: var(--el-touch-target);
@@ -1511,7 +1447,10 @@ a {
     <aside id="documents-sidebar" class="documents-sidebar" data-el-drawer>
       <div class="sidebar-controls">
         <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document" data-el-drawer-close>+</button>
-        <input id="sidebar-search" class="sidebar-search" type="search" placeholder="Search documents" spellcheck="false">
+        <input id="sidebar-search" class="sidebar-search" type="search" placeholder="Search" aria-label="Search documents" spellcheck="false">
+        <button id="sidebar-toggle" class="sidebar-panel-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar">
+          <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
+        </button>
       </div>
       <div id="documents-list" class="documents-list" data-el-drawer-close></div>
     </aside>
@@ -1520,6 +1459,9 @@ a {
       <header class="documents-toolbar">
         <div class="documents-identity">
           <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="documents-sidebar" aria-label="Show documents"></button>
+          <button id="sidebar-show" class="sidebar-panel-toggle" type="button" aria-label="Show list" title="Show list" aria-controls="documents-sidebar">
+            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m13 9 3 3-3 3"></path></svg>
+          </button>
           <input id="title-input" class="title-input" type="text" placeholder="Untitled document" spellcheck="false">
         </div>
         <div class="toolbar-actions">
@@ -1538,6 +1480,7 @@ a {
             <button id="save-button" class="action-primary action-icon-button" type="button" aria-label="Save" title="Save">
               <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"></path><path d="M8 4v6h8V4"></path><path d="M8 20v-6h8v6"></path></svg>
             </button>
+            <button id="save-to-library" class="action-primary toolbar-text-button hidden" type="button">Save to Library</button>
           </div>
           <div class="toolbar-more">
             <button id="more-button" class="action-secondary action-icon-button more-button" type="button" aria-label="More actions" title="More actions" aria-expanded="false" aria-controls="more-menu">
@@ -1545,36 +1488,29 @@ a {
             </button>
             <div id="more-menu" class="more-menu" role="group" aria-label="More actions">
               <div class="toolbar-group">
-                <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
-                </button>
-                <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
-                </button>
-                <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"></path><path d="m7 11 5 5 5-5"></path><path d="M5 20h14"></path></svg>
+                <button id="autosave-toggle" class="action-secondary toolbar-text-button autosave-switch" type="button" role="switch" aria-checked="false">
+                  <span class="switch-label">Autosave</span>
+                  <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
                 </button>
               </div>
               <div class="toolbar-group">
-                <button id="copy-published-link" class="action-secondary action-icon-button copy-link-button hidden" type="button" aria-label="Copy Published Link" title="Copy Published Link" disabled>
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>
+                <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
                 </button>
+              </div>
+              <div class="toolbar-group">
                 <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path><path d="M10.5 11v5"></path><path d="M13.5 11v5"></path></svg>
                 </button>
               </div>
             </div>
           </div>
-          <div class="toolbar-group">
-            <button id="sidebar-toggle" class="action-secondary action-icon-button sidebar-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar" aria-expanded="true">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
-            </button>
-          </div>
         </div>
       </header>
 
       <div id="status-row" class="status-row hidden">
         <span id="status-text" class="status-text"></span>
+        <button id="status-action" class="action-secondary toolbar-text-button hidden" type="button"></button>
       </div>
 
       <div id="find-bar" class="find-bar hidden" aria-label="Find in document">
@@ -1608,14 +1544,12 @@ a {
             <div class="pane-tabs">
               <button id="pane-preview" class="pane-tab active" type="button">Preview</button>
               <button id="pane-outline" class="pane-tab" type="button">Outline</button>
-              <button id="pane-history" class="pane-tab" type="button">History</button>
             </div>
           </div>
           <div id="preview-panel" class="preview-scroll">
             <article id="preview" class="markdown-body"></article>
           </div>
           <div id="outline-panel" class="inspector-scroll hidden"></div>
-          <div id="history-panel" class="inspector-scroll hidden"></div>
         </section>
       </div>
     </main>

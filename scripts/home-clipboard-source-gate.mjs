@@ -100,7 +100,7 @@ const canonicalClientImports = Object.freeze({
   "capsules/wallet-walletconnect/browser/wallet-walletconnect.js":
     "targetId: CONNECTOR_ID",
   "capsules/library/browser/src/app.js": 'targetId: "library"',
-  "capsules/documents/browser/documents.js": 'targetId: "documents"',
+  "capsules/people/browser/people.js": 'targetId: "people"',
   "capsules/system/browser/system.js": 'targetId: "system"',
   "capsules/chat-room/browser/chat-room.js": 'targetId: "chat-room"',
   "capsules/assistant/browser/home-agent.js": 'targetId: "assistant"',
@@ -163,7 +163,8 @@ assert(
 assert(
   protocolSource.includes('"conversation.invite"') &&
     hostSource.includes('"chat-room:conversation.invite:write"') &&
-    chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyInvite")') &&
+    /write_home_clipboard\(\s*"elastosChatCopyInvite",/.test(chatRoomUiSource) &&
+    /async fn write_home_clipboard\([\s\S]*?Reflect::get\(window\.as_ref\(\), &JsValue::from_str\(writer\)\)/.test(chatRoomUiSource) &&
     !chatRoomUiSource.includes('JsValue::from_str("clipboard")'),
   "Chat invite copies must use the canonical trusted Home Clipboard path",
 );
@@ -192,7 +193,7 @@ assert(
   "Clipboard wire schemas and target policy must have only one source of truth",
 );
 assert(
-  libraryAppSource.includes("Copy Content CID") &&
+  !libraryAppSource.includes("Copy Content CID") &&
     libraryAppSource.includes('purpose: "resource.identifier"') &&
     libraryAppSource.includes('{ purpose: "resource.uri" }') &&
     libraryActionsSource.includes('purpose === "resource.identifier"') &&
@@ -201,16 +202,8 @@ assert(
     libraryDialogSource.includes(
       '"content ID", "resource.identifier"',
     ) &&
-    libraryDialogSource.includes(
-      '"published CID", "resource.identifier"',
-    ) &&
-    libraryDialogSource.includes(
-      '"object head", "resource.identifier"',
-    ) &&
-    libraryDialogSource.includes(
-      '"resolver target", "resource.identifier"',
-    ),
-  "Library identifier and resource URI actions must remain distinct canonical Home Clipboard callers",
+    libraryDialogSource.includes('copyableValue(object.uri, "object URI")'),
+  "Library Properties Details must copy the content ID as an identifier and the object URI as a resource URI, through the canonical Home Clipboard",
 );
 
 process.stdout.write(

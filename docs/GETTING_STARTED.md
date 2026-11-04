@@ -14,12 +14,12 @@ later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts
-have separate identities. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+have separate identities. [Install/update acceptance](https://github.com/elastos/elastos-runtime/issues/89)
 owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
-Services, Wallet, Documents, Library, Marketplace, Archive, and Inbox. On Apple Silicon
-Macs it also exposes Browser; Linux Homes do not show Browser in 0.8.0.
+Wallet, Documents, Library, Marketplace, and Inbox. On Apple Silicon
+Macs it also exposes Browser; Linux Homes do not show Browser in 2.0.0.
 
 Welcome to Home lists the first steps in order: create your Profile and save
 the Recovery Kit, join Community in Chat, get a model and ask the Assistant,
@@ -45,7 +45,7 @@ Open Documents or Library from Home to work with your files. The source Home
 profile includes these apps and their content backend. For an installed release,
 its signed manifest determines the available components.
 
-In 0.8.0, Library can lose a save when the same file is saved from two places at
+In 2.0.0, Library can lose a save when the same file is saved from two places at
 once, or renamed, moved or deleted while it saves (#480). Edit a file in one
 window at a time, and let a save or upload finish before you rename, move or
 delete it.

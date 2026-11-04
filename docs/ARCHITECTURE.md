@@ -1,6 +1,6 @@
 # ElastOS architecture
 
-This document describes the intended system architecture. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues)
+This document describes the intended system architecture. [GitHub issues](https://github.com/elastos/elastos-runtime/issues)
 own current status and proof; [COMMAND_MATRIX.md](COMMAND_MATRIX.md) defines
 command expectations and [SECURITY.md](../SECURITY.md) records security findings.
 
@@ -23,12 +23,12 @@ The seed operator can read hosted data, wallet keys and recovery material.
 Passkeys control sign-in; stored data and keys remain accessible to the Runtime
 account and root while Home is locked. Protection against hosted operators and
 root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+is the target of [hosted protection](https://github.com/elastos/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/elastos/elastos-runtime/issues/210).
 An unlocked self-hosted Home trusts its owner and their host software. Recovery
 from a stolen device or profile key requires a new identity.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -90,7 +90,7 @@ candidate's bounded People discovery uses the same Runtime-owned path. Wider
 discovery rendezvous and the old Services remote-Exit social/contact path remain
 separate work.
 
-Sequencing and incomplete work belong in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues).
+Sequencing and incomplete work belong in [GitHub issues](https://github.com/elastos/elastos-runtime/issues).
 This document defines the following authority and recovery invariants:
 
 - A passkey proves local principal authority. It is not a DID, wallet key,
@@ -104,7 +104,7 @@ This document defines the following authority and recovery invariants:
   revoke replaced sessions, and leave an audit trail. It must not fall back to
   a device-global key.
 - Protection configured, root encrypted, and root recoverable are separate
-  claims. [Private-data acceptance](https://github.com/Elacity/elastos-runtime/issues/209) owns coverage and exclusions.
+  claims. [Private-data acceptance](https://github.com/elastos/elastos-runtime/issues/209) owns coverage and exclusions.
 
 ### Identity and object claims
 
@@ -205,7 +205,7 @@ separate capsule contracts or support claims.
 Capsules depend on the Capsule Runtime contract, not a presentation host. A web
 projection declares its browser entrypoint and projection metadata; the host
 adapter decides how to present it. See [INSTALL.md](INSTALL.md) for the contract
-and [install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89) for platform evidence.
+and [install/update acceptance](https://github.com/elastos/elastos-runtime/issues/89) for platform evidence.
 
 Keep these concerns separate:
 

@@ -76,7 +76,8 @@ impl CollaborationChatProductPort {
             community_recovery_exhausted: Arc::new(AtomicBool::new(false)),
             history_status: Arc::new(Mutex::new(crate::room_service::RoomHistoryView {
                 status: "searching".to_string(),
-                detail: "Checking recent Community history from online participants.".to_string(),
+                // Chat says Live while history is searched or available.
+                detail: String::new(),
             })),
         })
     }
@@ -157,6 +158,17 @@ impl CollaborationChatProductPort {
     #[cfg(test)]
     pub(crate) fn test_live_unresolved_outgoing(&self) -> anyhow::Result<usize> {
         Ok(self.core.summary()?.live_unresolved_outgoing)
+    }
+
+    /// Whether `profile` may post one more Chat message now (the send rate
+    /// limit), checked without sending.
+    pub(crate) fn check_message_allowed(
+        &self,
+        profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.core
+            .check_community_send_allowed(&profile.document().profile_did, now)
     }
 
     /// Durably prepare one fixed Chat message. The Runtime request binding is
@@ -275,6 +287,22 @@ impl CollaborationChatProductPort {
         self.core.conversation_scope()
     }
 
+    /// The devices that signed the Community posts this Home retains,
+    /// including its own, leaving out one that is also the post's Profile
+    /// DID. Only the signature is evidence of a device; a DID a Profile
+    /// merely declares is not. Read only.
+    pub(crate) fn community_device_dids(&self, now: u64) -> anyhow::Result<Vec<String>> {
+        let mut dids = Vec::new();
+        for envelope in self.core.conversation_history(now)? {
+            let message = self.core.authorize_stored_product_message(&envelope)?;
+            let signer = &message.message().envelope().signer_did;
+            if *signer != message.sender_profile().document().profile_did {
+                dids.push(signer.clone());
+            }
+        }
+        Ok(dids)
+    }
+
     pub(crate) fn local_device_did(&self) -> String {
         self.core.local_device_did()
     }
@@ -362,8 +390,7 @@ impl CollaborationChatProductPort {
     pub(crate) fn set_history_searching(&self) {
         if let Ok(mut status) = self.history_status.lock() {
             status.status = "searching".to_string();
-            status.detail =
-                "Checking recent Community history from online participants.".to_string();
+            status.detail = String::new();
         }
     }
 
@@ -384,7 +411,7 @@ impl CollaborationChatProductPort {
             }
             .to_string();
             status.detail = if available {
-                "Recent Community history is available from an online participant."
+                ""
             } else {
                 "Earlier Community posts cannot be loaded right now."
             }

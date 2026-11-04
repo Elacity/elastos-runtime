@@ -190,6 +190,7 @@ mode = model_path.with_suffix('.mode').read_text(encoding='utf-8').strip()
 events = model_path.with_suffix('.events')
 unresponsive = model_path.with_suffix('.unresponsive')
 wrong_alias = model_path.with_suffix('.wrong-alias')
+release = model_path.with_suffix('.release')
 
 if mode == 'mutable_readiness':
     unresponsive.unlink(missing_ok=True)
@@ -203,7 +204,11 @@ def terminate(_signum, _frame):
     record('term')
     raise SystemExit(0)
 
+term_ignored = False
+
 def ignore_termination(_signum, _frame):
+    global term_ignored
+    term_ignored = True
     record('term_ignored')
 
 if mode in ('ignore_term', 'timeout_ignore_term', 'stream_then_stall_ignore_term'):
@@ -224,8 +229,10 @@ if mode in ('healthy_with_subtree', 'stream_then_stall_with_subtree'):
     ])
     record('subtree:' + str(subtree.pid))
 if mode in ('timeout', 'timeout_ignore_term'):
-    while True:
-        time.sleep(1)
+    # Never healthy. An ignored termination lasts until the test releases it.
+    while not (term_ignored and release.exists()):
+        time.sleep(0.025)
+    raise SystemExit(0)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
@@ -317,7 +324,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     if mode == 'active_after_disconnect':
                         record('disconnected:stall')
-                        release = model_path.with_suffix('.release')
                         while not release.exists():
                             time.sleep(0.025)
                         active.unlink()

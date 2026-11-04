@@ -54,7 +54,7 @@ function fixture({ debugMetrics = true, audio = true } = {}) {
     close() { this.connectionState = 'closed'; this.signalingState = 'closed'; }
   }
   let timerId = 0;
-  const context = vm.createContext({ Audio: Media, MediaStream: Stream, RTCPeerConnection: Peer, Blob,
+  const context = vm.createContext({ Audio: Media, MediaStream: Stream, RTCPeerConnection: Peer, Blob, AbortController,
     console: { info() {} },
     window: {
       setTimeout(callback, delay) { timers.set(++timerId, { callback, delay }); return timerId; },

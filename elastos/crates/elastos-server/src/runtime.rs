@@ -200,7 +200,7 @@ impl Runtime {
         for did in installed.iter().flat_map(|source| &source.publisher_dids) {
             let key = crate::crypto::decode_did_key(did)
                 .map_err(|e| ElastosError::InvalidManifest(e.to_string()))?;
-            verifier.add_trusted_key(key);
+            verifier.add_trusted_key(key)?;
         }
         let trusted_key_count = verifier.trusted_key_count();
         let unsigned = match (installed, dev_mode) {

@@ -148,6 +148,24 @@ test("saved hosted card labels only states that need attention", async () => {
   const labels = f.node("#ai-provider-instances").children
     .map(node => node.children[0].children.map(child => child.textContent));
   assert.deepEqual(labels, [["Hosted approval ended"], ["External HTTPS paused"], []]);
+  // Services is hidden, so a card shared by an earlier version offers no way into it.
+  const shared = f.node("#ai-provider-instances").children[2];
+  assert.deepEqual([...shared.children[2].children, ...shared.children[3].children[1].children].map(node => node.textContent),
+    ["Use in Assistant", "Edit", "End hosted approval", "Disconnect"]);
+});
+
+test("a decision model saved by an earlier release is listed so it can be disconnected", async () => {
+  const f = fixture([{
+    id: "model:hosted-dddddddddddddddddddddddddddddddd", name: "Jev", provider: "openrouter",
+    processor_label: "OpenRouter", selected_model: "typesafe/jev-1.13", connected: true,
+    operation: "decision.evaluate", egress_state: "consent_required",
+  }]);
+  await new Promise(setImmediate);
+  const [card] = f.node("#ai-provider-instances").children;
+  assert.equal(card?.dataset.offerId, "model:hosted-dddddddddddddddddddddddddddddddd");
+  // It cannot run Assistant prompts, so it offers no Use in Assistant.
+  assert.deepEqual([...card.children[2].children, ...card.children[3].children[1].children].map(node => node.textContent),
+    ["Edit", "Disconnect"]);
 });
 
 test("Inbox approval prompts are neutral; real failures are errors", async () => {
@@ -174,16 +192,25 @@ test("guest setup does not keep an entered key or offer an unusable Add form", a
   assert.equal(f.node("#ai-provider-key").value, "");
   assert.equal(f.node("#ai-provider-add").hidden, true);
   assert.equal(f.node("#ai-provider-form").hidden, true);
-  assert.equal(f.node("#approval-lens").hidden, true);
   assert.match(f.messages.at(-1), /not available for this account/);
   assert.equal(f.attempts.length, 0);
+});
+
+test("System Models offers no Approval Lens evaluator choice", () => {
+  const page = readFileSync(new URL("../capsules/system/browser/index.html", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../capsules/system/browser/style.css", import.meta.url), "utf8");
+  for (const text of [page, source, styles]) {
+    assert.doesNotMatch(text, /approval-lens(?!\/revoke)|Approval Lens|evaluator/i);
+  }
+  // Ending a hosted approval still uses the shared revoke route.
+  assert.match(source, /\/api\/apps\/system\/approval-lens\/revoke/);
 });
 
 test("hosted Save keeps one identity and entered key across activation failure and retry", async () => {
   const f = fixture();
   f.node("#ai-provider-add").handlers.click();
-  f.node("#ai-provider-name").value = "Jev";
-  f.node("#ai-provider-model").value = "typesafe/jev-1.13";
+  f.node("#ai-provider-name").value = "Chat";
+  f.node("#ai-provider-model").value = "fixture/model";
   f.node("#ai-provider-key").value = "fixture-key";
   await f.node("#ai-provider-save").handlers.click();
   const first = f.attempts[0];
@@ -327,7 +354,7 @@ test("an Inbox decision reaches open System through Home's inbox event or System
   const venice = veniceCard();
   const f = fixture([venice]);
   await new Promise(setImmediate);
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
   const reads = f.reads.length;
   Object.assign(venice, APPROVED); // The person approves the new request in Inbox.
   f.message({ source: f.top, origin: "https://foreign.example", data: INBOX_CHANGED });
@@ -337,12 +364,12 @@ test("an Inbox decision reaches open System through Home's inbox event or System
     data: homeEvents({ scope: "chat-room", kind: "chat-room.changed" }, { scope: "people", kind: "people.changed" }) });
   await f.runTimers();
   assert.equal(f.reads.length, reads, "foreign, framed-sibling, malformed and unrelated messages do not read");
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
   f.message({ source: f.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   f.message({ source: f.top, origin: HOME_ORIGIN, data: homeEvents({ scope: "inbox", kind: "inbox.changed" }) });
   await f.runTimers();
   assert.equal(f.reads.length, reads + 1, "a burst of Inbox events shares one read");
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
   Object.assign(venice, ENDED); // Ended in another window while System was hidden.
   f.document.hidden = true;
   f.shown();
@@ -353,7 +380,7 @@ test("an Inbox decision reaches open System through Home's inbox event or System
   f.shown();
   await f.runTimers();
   assert.equal(f.reads.length, reads + 2);
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
 });
 
 test("a live refresh waits for the person's open form and for the page's own request", async () => {
@@ -375,7 +402,7 @@ test("a live refresh waits for the person's open form and for the page's own req
   f.node("#ai-provider-cancel").handlers.click();
   await f.runTimers();
   assert.equal(f.reads.length, reads + 1, "closing the form catches up once");
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
 
   const card = f.node("#ai-provider-instances").children[0];
   const end = accessControls(f).find(node => node.textContent === "End hosted approval");
@@ -392,7 +419,7 @@ test("a live refresh waits for the person's open form and for the page's own req
   await f.runTimers();
   assert.deepEqual(f.revoked, [venice.id]);
   assert.equal(f.reads.length, reads + 3, "End reads once, then the held Inbox event reads once");
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
 });
 
 test("a key the provider rejects is not kept staged; a check waiting for Inbox keeps its key behind Close", async () => {
@@ -500,7 +527,7 @@ test("a live refresh that changes the cards clears an earlier success line; a ne
   Object.assign(venice, APPROVED);
   f.message({ source: f.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   await f.runTimers();
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
   assert.equal(f.messages.at(-1), "", "the success line no longer describes the cards");
 
   const other = { ...veniceCard(), ...APPROVED };
@@ -513,7 +540,7 @@ test("a live refresh that changes the cards clears an earlier success line; a ne
   g.message({ source: g.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   await g.runTimers();
   assert.equal(g.reads.length, 3, "the Inbox request changed the card");
-  assert.deepEqual(accessLabels(g), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(g), ["End hosted approval", "Disconnect"]);
   assert.equal(g.messages.at(-1), ended, "a neutral line stays");
 });
 
@@ -564,6 +591,7 @@ function updateFixture(overrides = {}) {
     readText: value => typeof value === "string" ? value.trim() : "",
     setTextFields: (field, value) => fields.set(field, value),
     setHiddenFields: (field, value) => hiddenFields.set(field, value),
+    setUpdateNotes: items => fields.set("update-changes", items.map(item => item.text).join("\n")),
     shellHeaders: extra => ({ "x-elastos-home-token": "system-token", ...extra }),
     requestPasskeyStepUp: async (operation, intent) => { approvals.push({ operation, intent: JSON.parse(JSON.stringify(intent)) }); return "approved-exact-choice"; },
     fetchJson: async (url, init) => {
@@ -615,7 +643,7 @@ test("Home update requires a verified complete offer and a controller that can a
     assert.equal(f.button.hidden, false, phase);
   }
   f.context.renderRuntimeUpdate({ ...f.offer, changes: [] });
-  assert.equal(f.fields.get("update-changes"), "Publisher has not supplied change notes.");
+  assert.equal(f.fields.get("update-changes"), "");
   f.context.renderRuntimeUpdate({ ...f.offer, available: false, message: "Home is up to date." });
   assert.equal(f.hiddenFields.get("update-changes"), true);
   assert.equal(f.status.textContent, "Home is up to date.");
@@ -627,6 +655,46 @@ test("Home update requires a verified complete offer and a controller that can a
   assert.equal(f.hiddenFields.get("update-publisher-row"), true, "progress does not invent a publisher");
   f.context.renderRuntimeUpdate(null);
   assert.equal(f.timers.size, 0, "source Home without an installed controller has no update polling");
+});
+
+test("update notes draw as text lists under headings without Markdown marks", () => {
+  const f = updateFixture();
+  const items = f.context.updateNoteItems([
+    "### Security", "- Run `elastos update` from **System**.", "See [the guide](https://example.com/a_(b)).",
+    "*Also* _this_ keeps snake_case and 2 * 3.", "", "  ", 7, "# ", "Plain line.", "### Fixed", "Another line.",
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(items)), [
+    { heading: true, text: "Security" },
+    { heading: false, text: "Run elastos update from System." },
+    { heading: false, text: "See the guide." },
+    { heading: false, text: "Also this keeps snake_case and 2 * 3." },
+    { heading: false, text: "Plain line." },
+    { heading: true, text: "Fixed" },
+    { heading: false, text: "Another line." },
+  ]);
+  assert.equal(f.context.updateNoteItems(Array(40).fill("Note.")).length, 32);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.context.updateNoteItems("Not a list."))), []);
+
+  const element = tag => ({ tag, className: "", children: [], text: "",
+    set textContent(value) { this.children = []; this.text = value; },
+    get textContent() { return this.text + this.children.map(child => child.textContent).join(""); },
+    append(child) { this.children.push(child); },
+    replaceChildren() { this.children = []; this.text = ""; } });
+  const node = element("div");
+  const draw = vm.createContext({ document: { querySelectorAll: () => [node], createElement: element } });
+  vm.runInContext(source.slice(source.indexOf("function setUpdateNotes("), source.indexOf("function setHiddenFields(")), draw);
+  draw.setUpdateNotes(items);
+  const shape = child => child.tag === "ul" ? { ul: child.children.map(entry => entry.textContent) }
+    : { [child.tag]: child.textContent, className: child.className };
+  assert.deepEqual(node.children.map(shape), [
+    { h4: "Security", className: "runtime-update-changes-heading" },
+    { ul: ["Run elastos update from System.", "See the guide.", "Also this keeps snake_case and 2 * 3.", "Plain line."] },
+    { h4: "Fixed", className: "runtime-update-changes-heading" },
+    { ul: ["Another line."] },
+  ]);
+  draw.setUpdateNotes([]);
+  assert.equal(node.textContent, "Publisher has not supplied change notes.");
+  assert.equal(node.children.length, 0);
 });
 
 test("guest System summary keeps update controls and discovery polling hidden", async () => {
@@ -1043,18 +1111,17 @@ test("System startup and recovery stay ready while the background Carrier check 
       refreshAccountList: async () => calls.push("accounts"),
       refreshRecoveryStatus: async () => calls.push("recovery"),
       refreshChainNetworks: async () => calls.push("chains"),
-      refreshCapsuleCatalog: async () => calls.push("catalogue"),
     });
     for (const name of ["configureSettingsTabs", "configureSettingsSearch", "activateSettingsTab",
       "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess", "configureCommunityMembership", "configureCommunityPresence",
       "configureAiProvider", "configurePasskeyAccess", "configureRecoveryAccess", "configureChainAccess",
-      "configureActiveShell", "configureCapsuleCatalog", "configureTechnicalDetails", "configureDeviceDidCopy",
+      "configureActiveShell", "configureTechnicalDetails", "configureDeviceDidCopy",
       "configureRuntimeUpdate", "configureHomeRecoverySave"]) context[name] = () => {};
     vm.runInContext(boot, context);
     await context.boot();
     await context.initialRecoveryState;
     assert.deepEqual(calls, [checking ? "summary-checking" : "summary-offline",
-      "shell", "accounts", "recovery", "chains", "catalogue"]);
+      "shell", "accounts", "recovery", "chains"]);
   }
 });
 

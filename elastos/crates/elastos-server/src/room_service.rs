@@ -50,6 +50,8 @@ const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_OBJECTS: usize = 500;
 pub(crate) const MAX_OBJECT_BODY_LEN: usize = 2_000;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// What Chat says when someone tries to send an empty file.
+pub(crate) const EMPTY_FILE_REFUSAL: &str = "Empty files can't be sent.";
 pub const ATTACHMENT_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
 pub const ROOM_ACCESS_CAPABILITY: &str = "room.access";
 
@@ -96,6 +98,10 @@ pub struct BrowserAccessRequestOutput {
     pub requested_at: u64,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Browser-held secret that authorizes status reads. Never serialized:
+    /// the gateway delivers it only as an HttpOnly cookie.
+    #[serde(skip)]
+    pub status_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +149,14 @@ pub struct SessionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationObjectView {
     pub seq: u64,
+    /// The verified Community envelope id (`sha256:…`). Present only on
+    /// Community rows; local-room rows have no envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// The Community conversation the row belongs to; a link opened from the
+    /// row cites it with `message_id`. Present only on Community rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub sender: String,
     /// Profile attribution for collaboration senders. `Some(true)`: the
     /// sender's verified device is bound to an accepted signed Profile head
@@ -748,6 +762,9 @@ struct BrowserAccessRequestRecord {
     session_token: Option<String>,
     #[serde(default)]
     session_expires_at: Option<u64>,
+    /// SHA-256 of the status secret; requests without one cannot be read.
+    #[serde(default)]
+    status_secret_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1933,6 +1950,7 @@ pub fn request_browser_access(
     with_locked_state(data_dir, |_, state| {
         ensure_browser_access_allowed_for_member(state, host_member_did.as_deref())?;
         let now = now_ts();
+        let status_secret = random_hex(32);
         let request = BrowserAccessRequestRecord {
             request_id: random_hex(16),
             display_name,
@@ -1945,6 +1963,9 @@ pub fn request_browser_access(
             denial_reason: None,
             session_token: None,
             session_expires_at: None,
+            status_secret_sha256: Some(hex::encode(browser_request_status_secret_digest(
+                &status_secret,
+            ))),
         };
         let out = BrowserAccessRequestOutput {
             request_id: request.request_id.clone(),
@@ -1952,6 +1973,7 @@ pub fn request_browser_access(
             status: "pending".to_string(),
             requested_at: request.requested_at,
             capabilities,
+            status_secret,
         };
         state.pending_requests.push(request);
         Ok(out)
@@ -1961,6 +1983,7 @@ pub fn request_browser_access(
 pub fn browser_access_status(
     data_dir: &Path,
     request_id: &str,
+    status_secret: &str,
 ) -> anyhow::Result<BrowserAccessStatusOutput> {
     with_locked_state(data_dir, |_, state| {
         let request = state
@@ -1968,6 +1991,9 @@ pub fn browser_access_status(
             .iter()
             .find(|item| item.request_id == request_id)
             .ok_or_else(|| anyhow::anyhow!("web guest request not found"))?;
+        if !browser_request_status_secret_matches(request, status_secret) {
+            anyhow::bail!("web guest request is not bound to this browser");
+        }
 
         Ok(BrowserAccessStatusOutput {
             request_id: request.request_id.clone(),
@@ -1979,6 +2005,27 @@ pub fn browser_access_status(
             capabilities: request.capabilities.clone(),
         })
     })
+}
+
+fn browser_request_status_secret_digest(secret: &str) -> [u8; 32] {
+    sha2::Sha256::digest(format!("elastos.room.browser-request-status.v1:{secret}").as_bytes())
+        .into()
+}
+
+fn browser_request_status_secret_matches(
+    request: &BrowserAccessRequestRecord,
+    status_secret: &str,
+) -> bool {
+    use subtle::ConstantTimeEq as _;
+    let Some(expected) = request
+        .status_secret_sha256
+        .as_deref()
+        .and_then(|digest| hex::decode(digest).ok())
+    else {
+        return false;
+    };
+    let presented = browser_request_status_secret_digest(status_secret);
+    bool::from(expected.as_slice().ct_eq(&presented))
 }
 
 pub fn start_local_runtime_session(
@@ -3055,6 +3102,60 @@ pub(crate) fn collaboration_latest_remote_message_seq(
     })
 }
 
+/// The verified people a configured Community poll lists, without a session,
+/// as (Profile DID, signed Profile display name): the people a Chat profile
+/// card can act on, named as the card names them.
+pub(crate) fn collaboration_verified_members(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(participant_views_from_state(state, None, Some(&scope))
+            .into_iter()
+            .filter_map(|participant| Some((participant.member_did?, participant.display_name)))
+            .collect())
+    })
+}
+
+/// One verified Community text row, found by its envelope id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollaborationTextRow {
+    pub(crate) sender_profile_did: String,
+    pub(crate) sender_display_name: String,
+    pub(crate) body: String,
+}
+
+/// The verified Community text row `message_id` in this scope, when one exists
+/// and its sender's Profile attribution verifies.
+pub(crate) fn collaboration_text_row(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Option<CollaborationTextRow>> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.event_id == message_id
+                    && item.kind == ConversationObjectKind::Text
+            })
+            .find_map(|item| {
+                let profile = verified_collaboration_sender_profile(item)?;
+                Some(CollaborationTextRow {
+                    sender_profile_did: item.sender_member_did.clone()?,
+                    sender_display_name: profile.display_name.clone(),
+                    body: item.body.clone()?,
+                })
+            }))
+    })
+}
+
 pub(crate) fn collaboration_room_poll(
     data_dir: &Path,
     token: &str,
@@ -3368,7 +3469,7 @@ pub fn append_attachment_object_with_transport(
     let file_name = normalize_file_name(file_name);
     let mime_type = normalize_mime_type(mime_type);
     if bytes.is_empty() {
-        anyhow::bail!("attachment must not be empty");
+        anyhow::bail!(EMPTY_FILE_REFUSAL);
     }
     if bytes.len() > MAX_ATTACHMENT_BYTES {
         anyhow::bail!("attachment exceeds {} bytes", MAX_ATTACHMENT_BYTES);
@@ -3418,7 +3519,7 @@ pub fn start_attachment_upload(
     let file_name = normalize_file_name(file_name);
     let mime_type = normalize_mime_type(mime_type);
     if size_bytes == 0 {
-        anyhow::bail!("attachment must not be empty");
+        anyhow::bail!(EMPTY_FILE_REFUSAL);
     }
     if size_bytes > MAX_ATTACHMENT_BYTES as u64 {
         anyhow::bail!("attachment exceeds {} bytes", MAX_ATTACHMENT_BYTES);
@@ -4633,10 +4734,19 @@ fn object_view_from_record(
             session.member_did.is_some() && session.member_did == object.sender_member_did
         })
         .and(object.delivery_state);
+    let (message_id, conversation_id) = match &object.collaboration_scope {
+        Some(scope) => (
+            Some(object.event_id.clone()),
+            Some(scope.conversation_id.clone()),
+        ),
+        None => (None, None),
+    };
     ConversationObjectView {
         delivery_state,
         sender_profile_verified,
         seq: object.seq,
+        message_id,
+        conversation_id,
         sender: verified_sender_profile
             .map(|profile| profile.display_name.clone())
             .unwrap_or(object.sender),
@@ -5804,7 +5914,8 @@ mod tests {
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.pending_count, 1);
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "pending");
     }
 
@@ -5837,7 +5948,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(approved.request_id, second.request_id);
-        let first_status = browser_access_status(tmp.path(), &first.request_id).unwrap();
+        let first_status =
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret).unwrap();
         assert_eq!(first_status.status, "pending");
     }
 
@@ -5854,14 +5966,16 @@ mod tests {
         let _ = approve_request(tmp.path(), &second.request_id)
             .unwrap()
             .unwrap();
-        let first_token = browser_access_status(tmp.path(), &first.request_id)
-            .unwrap()
-            .token
-            .unwrap();
-        let second_token = browser_access_status(tmp.path(), &second.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let first_token =
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
+        let second_token =
+            browser_access_status(tmp.path(), &second.request_id, &second.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
 
         let revoked = revoke_session(tmp.path(), &first_token).unwrap().unwrap();
         assert_eq!(revoked.display_name, "Alice");
@@ -5869,13 +5983,13 @@ mod tests {
         assert_eq!(summary.active_session_count, 1);
         assert_eq!(summary.active_sessions[0].display_name, "Bob");
         assert_eq!(
-            browser_access_status(tmp.path(), &first.request_id)
+            browser_access_status(tmp.path(), &first.request_id, &first.status_secret)
                 .unwrap()
                 .status,
             "expired"
         );
         assert_eq!(
-            browser_access_status(tmp.path(), &second.request_id)
+            browser_access_status(tmp.path(), &second.request_id, &second.status_secret)
                 .unwrap()
                 .token,
             Some(second_token)
@@ -6946,7 +7060,8 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         let token = status.token.unwrap();
         assert_eq!(status.status, "approved");
         assert_eq!(status.expires_at, Some(approved.expires_at));
@@ -7030,10 +7145,11 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Guest", "Browser", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let guest_token = browser_access_status(tmp.path(), &request.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let guest_token =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
+                .unwrap()
+                .token
+                .unwrap();
 
         let poll = room_poll(tmp.path(), &guest_token, 0).unwrap();
         assert!(poll.participants.iter().any(
@@ -7246,7 +7362,7 @@ mod tests {
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7270,7 +7386,7 @@ mod tests {
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7431,7 +7547,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7458,7 +7574,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7485,7 +7601,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7518,7 +7634,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7558,7 +7674,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7586,7 +7702,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7597,7 +7713,8 @@ mod tests {
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "expired");
         assert!(status.token.is_none());
     }
@@ -7633,7 +7750,8 @@ mod tests {
             request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
         let denied = deny_next_request(tmp.path(), "No").unwrap().unwrap();
         assert_eq!(denied.display_name, "Bob");
-        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
+        let status =
+            browser_access_status(tmp.path(), &request.request_id, &request.status_secret).unwrap();
         assert_eq!(status.status, "denied");
         assert_eq!(status.denial_reason.as_deref(), Some("No"));
     }
@@ -7644,7 +7762,7 @@ mod tests {
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let _token = browser_access_status(tmp.path(), &request.request_id)
+        let _token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7658,29 +7776,40 @@ mod tests {
     #[test]
     fn revoke_all_sessions_clears_room_and_appends_system_objects() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut request_ids = Vec::new();
+        let mut requests = Vec::new();
         for (display_name, device_label) in [("Alice", "Phone"), ("Bob", "Safari")] {
             let request = request_browser_access(
                 tmp.path(),
                 browser_request(display_name, device_label, None),
             )
             .unwrap();
-            request_ids.push(request.request_id.clone());
+            requests.push(request.clone());
             let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-            let _token = browser_access_status(tmp.path(), &request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
+            let _token =
+                browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
+                    .unwrap()
+                    .token
+                    .unwrap();
         }
 
         let revoked = revoke_all_sessions(tmp.path()).unwrap().unwrap();
         assert_eq!(revoked.revoked_count, 2);
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let first_status = browser_access_status(tmp.path(), &request_ids[0]).unwrap();
+        let first_status = browser_access_status(
+            tmp.path(),
+            &requests[0].request_id,
+            &requests[0].status_secret,
+        )
+        .unwrap();
         assert_eq!(first_status.status, "expired");
         assert!(first_status.token.is_none());
-        let second_status = browser_access_status(tmp.path(), &request_ids[1]).unwrap();
+        let second_status = browser_access_status(
+            tmp.path(),
+            &requests[1].request_id,
+            &requests[1].status_secret,
+        )
+        .unwrap();
         assert_eq!(second_status.status, "expired");
         assert!(second_status.token.is_none());
 
@@ -7711,7 +7840,7 @@ mod tests {
         let _ = approve_request(tmp.path(), &request.request_id)
             .unwrap()
             .unwrap();
-        let token = browser_access_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id, &request.status_secret)
             .unwrap()
             .token
             .unwrap();
@@ -7975,6 +8104,15 @@ mod tests {
         .unwrap();
         assert_eq!(second_feed.objects.len(), 1);
         assert_eq!(second_feed.objects[0].seq, second.seq);
+        // Community rows name their verified envelope; Chat links cite it.
+        assert_eq!(
+            second_feed.objects[0].message_id.as_deref(),
+            Some(second_hash.as_str())
+        );
+        assert_eq!(
+            second_feed.objects[0].conversation_id.as_deref(),
+            Some("conversation-two")
+        );
         assert_eq!(second_feed.objects[0].sender_profile_verified, Some(true));
         assert_eq!(second_feed.objects[0].sender, "Remote");
         assert_eq!(second_feed.participants.len(), 1);
@@ -7988,6 +8126,10 @@ mod tests {
 
         let legacy_feed = conversation_feed(tmp.path(), &session.token, 0).unwrap();
         assert_eq!(legacy_feed.objects.len(), 2);
+        assert!(legacy_feed
+            .objects
+            .iter()
+            .all(|object| object.message_id.is_none() && object.conversation_id.is_none()));
         assert!(legacy_feed
             .objects
             .iter()

@@ -3748,7 +3748,7 @@ fn write_chain_provider_config(data_dir: &Path, config: &Value) {
 #[cfg(unix)]
 fn safe_ancestor_tempdir() -> tempfile::TempDir {
     // The media prerequisite import walks every ancestor of the source tool
-    // path and rejects group/world-writable directories. std temp lives under
+    // path and rejects world-writable directories. std temp lives under
     // /tmp (mode 1777) on Linux, so fixtures built there are structurally
     // unsafe; anchor them under the build target dir, whose ancestors are
     // developer- or runner-owned.
@@ -3960,6 +3960,38 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
 
 #[cfg(unix)]
 #[test]
+fn media_source_accepts_group_writable_ancestors_and_keeps_file_guards() {
+    let temp = safe_ancestor_tempdir();
+    let shared = temp.path().join("group-shared");
+    owner_only_dir(&shared);
+    let tools = shared.join("tools");
+    owner_only_dir(&tools);
+    let tool = tools.join("ffmpeg");
+    write_media_prerequisite(&tool, b"private executable", 0o700);
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+    let mut source = super::open_runtime_media_tool(&tools, "ffmpeg").unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut source.file, &mut bytes).unwrap();
+    assert_eq!(bytes, b"private executable");
+    assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o1777, 0o775);
+    drop(source);
+
+    for mode in [0o720, 0o777] {
+        fs::set_permissions(&tool, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(super::open_runtime_media_tool(&tools, "ffmpeg").is_err());
+        assert_eq!(fs::metadata(&tool).unwrap().mode() & 0o777, mode);
+    }
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+    for mode in [0o777, 0o1777] {
+        fs::set_permissions(&shared, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(super::open_runtime_media_tool(&tools, "ffmpeg").is_err());
+        assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o1777, mode);
+    }
+    assert_eq!(fs::read(&tool).unwrap(), b"private executable");
+}
+
+#[cfg(unix)]
+#[test]
 fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config() {
     let temp = safe_ancestor_tempdir();
     let missing_data = temp.path().join("missing-data");
@@ -4030,7 +4062,7 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_parent_tools);
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
-    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o777)).unwrap();
     let refusal = prepare_runtime_media_provider_prerequisite(
         &unsafe_parent_data,
         &unsafe_parent_tools,
@@ -4038,28 +4070,19 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap_err()
     .to_string();
-    let fix = format!(
-        "chmod go-w '{}'",
-        fs::canonicalize(&unsafe_parent_tools).unwrap().display()
-    );
     assert!(
         refusal.contains("prerequisite parent is unsafe"),
         "{refusal}"
     );
-    assert!(refusal.contains(&fix), "{refusal}");
-    assert!(std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&fix)
-        .status()
-        .unwrap()
-        .success());
+    assert!(!refusal.contains("chmod"), "{refusal}");
+    assert!(!refusal.contains("chown"), "{refusal}");
     assert_eq!(
         fs::metadata(&unsafe_parent_tools)
             .unwrap()
             .permissions()
             .mode()
             & 0o777,
-        0o755
+        0o777
     );
 
     let linked_data = temp.path().join("linked-data");
@@ -5001,6 +5024,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_1
     ));
     assert!(matches!(
@@ -5008,6 +5032,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_2
     ));
 
@@ -5022,10 +5047,12 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_1.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_2.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );
@@ -5098,6 +5125,7 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: actual,
                 timeout_ms: None,
+                reply_wait_ms: None,
             }) if actual == peer_did
         ));
     }
@@ -5112,14 +5140,17 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[0].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[1].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[2].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );

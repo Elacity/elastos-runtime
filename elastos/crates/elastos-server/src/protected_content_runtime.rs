@@ -2078,21 +2078,15 @@ fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::
         let metadata = dir.metadata().map_err(|_| {
             invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
         })?;
-        let quoted = crate::install_transaction::shell_quote_path(display);
         if metadata.uid() != 0 && metadata.uid() != uid {
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
+                "{name} prerequisite parent is unsafe: {} is not owned by you or root. Choose a user-owned location with safe parents",
                 display.display()
             )));
         }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            let sudo = if metadata.uid() == 0 && uid != 0 {
-                "sudo "
-            } else {
-                ""
-            };
+        if metadata.permissions().mode() & 0o002 != 0 {
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
+                "{name} prerequisite parent is unsafe: {} is world-writable. Choose a user-owned location with safe parents",
                 display.display()
             )));
         }
@@ -2689,6 +2683,7 @@ fn load_runtime_custody_composition_config(
                 ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: canonical_peer_did,
                     timeout_ms: None,
+                    reply_wait_ms: None,
                 })
             }
         };

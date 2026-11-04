@@ -335,6 +335,10 @@
       backface-visibility: hidden;
     }
 
+    .place[hidden] {
+      display: none;
+    }
+
     .place[draggable="true"]:hover {
       cursor: grab;
     }
@@ -949,7 +953,7 @@
       margin: 8px 10px 0;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.62);
+      background: var(--panel);
       padding: 10px;
     }
 
@@ -1198,24 +1202,10 @@
       line-height: 1;
     }
 
-    .item-props-tabview {
-      display: flex;
-      flex-direction: column;
-      min-height: 240px;
-      padding: 10px;
-    }
-
-    .item-props-tab {
-      min-height: 36px;
-      white-space: nowrap;
-    }
-
-    .item-props-tab-content {
-      display: none;
-      flex-grow: 1;
+    .item-props-body {
       max-height: min(58vh, 430px);
-      margin-top: -1px;
-      padding: 5px 10px;
+      margin: 10px;
+      padding: 10px 10px 0;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 3px;
@@ -1223,35 +1213,12 @@
       color: var(--ink);
     }
 
-    .item-props-tab-content-selected {
-      display: block;
-      background: var(--panel-soft);
-    }
-
-    .item-props-tab-btn {
-      display: inline-block;
-      margin-right: 10px;
-      margin-bottom: -1px;
-      padding: 10px 15px;
-      cursor: pointer;
-      border: 1px solid transparent;
-      border-top-left-radius: 3px;
-      border-top-right-radius: 3px;
+    .item-props-details > summary {
+      padding-bottom: 10px;
       color: var(--muted);
-      font-size: 0.84rem;
-    }
-
-    .item-props-tab-btn:hover {
-      color: var(--ink);
-    }
-
-    .item-props-tab-selected {
-      position: relative;
-      margin-bottom: -1px;
-      border: 1px solid var(--line);
-      border-bottom: none;
-      background: var(--panel-soft);
-      color: var(--ink);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
     }
 
     .item-props-tbl {
@@ -1339,16 +1306,6 @@
       color: #155724;
     }
 
-    .item-prop-badge-shared {
-      background: #dbeafe;
-      color: #1e3a8a;
-    }
-
-    .item-prop-badge-staged {
-      background: #e0f2fe;
-      color: #075985;
-    }
-
     .item-prop-badge-private {
       background: #eceff4;
       color: #374151;
@@ -1359,14 +1316,11 @@
       color: #856404;
     }
 
-    .item-prop-badge-writable {
-      background: #e0f2fe;
-      color: #075985;
-    }
-
-    .item-prop-badge-neutral {
-      background: #eceff4;
-      color: #374151;
+    .item-prop-hint {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
     }
 
     .properties-window-actions {
@@ -1397,46 +1351,18 @@
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.68);
+      background: var(--panel-soft);
       padding: 10px;
       color: var(--ink);
       white-space: pre-wrap;
       word-break: break-word;
     }
 
-    .share-options {
-      display: grid;
-      gap: 8px;
-    }
-
-    .share-option {
-      display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
-      gap: 10px;
-      align-items: start;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.72);
-      padding: 10px;
-      cursor: pointer;
-    }
-
-    .share-option input {
-      margin-top: 2px;
-    }
-
-    .share-option:has(input:disabled) {
-      cursor: not-allowed;
-      opacity: 0.62;
-    }
-
-    .share-option span,
     .dialog-field {
       display: grid;
       gap: 4px;
     }
 
-    .share-option small,
     .dialog-hint,
     .dialog-error {
       color: var(--muted);
@@ -1454,7 +1380,7 @@
       min-width: 0;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.84);
+      background: var(--panel-soft);
       padding: 9px;
       color: var(--ink);
       font: inherit;
@@ -1492,16 +1418,14 @@
 
     .preview-frame img,
     .preview-frame video,
-    .preview-frame audio,
-    .preview-frame iframe {
+    .preview-frame audio {
       display: block;
       width: 100%;
       border: 0;
     }
 
     .preview-frame img,
-    .preview-frame video,
-    .preview-frame iframe {
+    .preview-frame video {
       max-height: min(62vh, 620px);
     }
 

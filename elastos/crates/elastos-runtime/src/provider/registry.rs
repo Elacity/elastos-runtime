@@ -344,6 +344,9 @@ pub enum ProviderCarrierRoute {
         peer_did: String,
         /// Optional per-hop timeout. Runtime rejects zero-duration values.
         timeout_ms: Option<u64>,
+        /// Optional bound on the wait for the peer's answer. When set it
+        /// replaces the Carrier's open-ended answer wait for this call.
+        reply_wait_ms: Option<u64>,
     },
 }
 
@@ -1884,10 +1887,20 @@ fn validate_provider_transfer_contract(
                     ));
                 }
             }
-            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+            ProviderCarrierRoute::PeerDid {
+                peer_did,
+                reply_wait_ms,
+                ..
+            } => {
                 if peer_did.trim().is_empty() {
                     return Err(ProviderError::Provider(
                         "Carrier provider invocation requires peer_did".to_string(),
+                    ));
+                }
+                if *reply_wait_ms == Some(0) {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation reply_wait_ms must be greater than zero"
+                            .to_string(),
                     ));
                 }
             }
@@ -2355,7 +2368,7 @@ fn provider_stream_response_bytes(
     data: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<u8>, ProviderError> {
     if let Some(stream) = data.get("stream") {
-        return decode_provider_stream_payload(stream);
+        return decode_provider_stream_payload(stream, usize::MAX);
     }
     let encoded = data
         .get("data")
@@ -2375,7 +2388,13 @@ fn provider_stream_response_bytes(
         })
 }
 
-fn decode_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>, ProviderError> {
+/// Decodes a completed `elastos.provider.stream/v1` payload: chunks in order,
+/// each at its offset and length, matching the stated total. A payload past
+/// `max_bytes` is refused before the chunk that crosses it is kept.
+pub fn decode_provider_stream_payload(
+    stream: &serde_json::Value,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProviderError> {
     let object = stream.as_object().ok_or_else(|| {
         ProviderError::Provider("provider stream payload must be an object".to_string())
     })?;
@@ -2459,6 +2478,11 @@ fn decode_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>,
                     "provider stream chunk {index} has invalid base64 data: {err}"
                 ))
             })?;
+        if bytes.len().saturating_add(decoded.len()) > max_bytes {
+            return Err(ProviderError::Provider(format!(
+                "provider stream payload exceeds {max_bytes} bytes"
+            )));
+        }
         if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
             if length != decoded.len() as u64 {
                 return Err(ProviderError::Provider(format!(
@@ -2993,7 +3017,18 @@ mod tests {
     }
 
     fn decode_test_stream_response(response: &serde_json::Value) -> Vec<u8> {
-        decode_provider_stream_payload(&response["data"]["stream"]).unwrap()
+        decode_provider_stream_payload(&response["data"]["stream"], usize::MAX).unwrap()
+    }
+
+    #[test]
+    fn provider_stream_decoding_refuses_a_payload_past_its_bound() {
+        let stream = provider_stream_payload(&[7u8; 10]);
+        assert_eq!(
+            decode_provider_stream_payload(&stream, 10).unwrap(),
+            vec![7u8; 10]
+        );
+        let err = decode_provider_stream_payload(&stream, 9).unwrap_err();
+        assert!(err.to_string().contains("exceeds 9 bytes"), "{err}");
     }
 
     #[derive(Default)]
@@ -3185,6 +3220,7 @@ mod tests {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: "did:key:zFixture".into(),
                 timeout_ms: Some(5000),
+                reply_wait_ms: None,
             }),
         ] {
             let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
@@ -3303,6 +3339,7 @@ mod tests {
                 ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: "did:key:zFixture".into(),
                     timeout_ms: Some(5000),
+                    reply_wait_ms: None,
                 }),
             ] {
                 let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
@@ -3539,6 +3576,7 @@ mod tests {
                 ProviderCarrierRoute::PeerDid {
                     peer_did,
                     timeout_ms,
+                    ..
                 } => (None, Some(peer_did.as_str()), *timeout_ms),
             };
             self.requests.lock().await.push(serde_json::json!({
@@ -3931,6 +3969,7 @@ mod tests {
         let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: "did:key:zFixture".into(),
             timeout_ms: Some(5000),
+            reply_wait_ms: None,
         });
         let (mut raw, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
         raw.transport = route.clone();
@@ -4057,6 +4096,7 @@ mod tests {
         let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: "did:key:zFixture".into(),
             timeout_ms: Some(5000),
+            reply_wait_ms: None,
         });
         // Content carries the bound inside its request; the holder's Runtime
         // applies it, so the hop reaches the Carrier invoker unchanged.
@@ -4519,6 +4559,7 @@ mod tests {
                 transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: "did:key:zPeer".to_string(),
                     timeout_ms: Some(2_000),
+                    reply_wait_ms: None,
                 }),
             })
             .await

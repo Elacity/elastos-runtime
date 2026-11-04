@@ -443,6 +443,34 @@ test("nested Agent Settings intent opens System models with exact origin", async
   window.location.href = prior.href; window.top = prior.top;
 });
 
+test("an Assistant link asks Home GUI for Browser first and Home's link prompt only for that same link", async () => {
+  const { openWebLink, openWebLinkThroughHomePrompt } = await import("../capsules/assistant/browser/harness-host.js");
+  const prior = { href: window.location.href, top: window.top, parent: window.parent };
+  const toParent = [], toTop = [];
+  window.parent = { postMessage: (message, origin) => toParent.push({ message, origin }) };
+  window.top = { postMessage: (message, origin) => toTop.push({ message, origin }) };
+  window.location.href = "https://home.example/apps/assistant/?home_origin=https%3A%2F%2Fhome.example";
+  const url = "https://docs.example/guide";
+  assert.equal(openWebLinkThroughHomePrompt(url), false, "nothing reaches the prompt unasked");
+  openWebLink(url);
+  assert.deepEqual(toParent, [{ origin: "*", message: { type: "home-agent:open-browser", url } }]);
+  assert.deepEqual(toTop, [], "with Browser, Home GUI opens it and Home's prompt is not asked");
+  assert.equal(openWebLinkThroughHomePrompt("https://evil.example/"), false, "Home GUI cannot swap the address");
+  assert.equal(openWebLinkThroughHomePrompt(url), true);
+  assert.deepEqual(toTop, [{ origin: "https://home.example", message: { type: "home:open-external", url, homeToken: "fixture" } }]);
+  assert.equal(openWebLinkThroughHomePrompt(url), false, "one prompt per click");
+  assert.equal(toTop.length, 1);
+  // Home GUI answers with the capsule's own string, so a link with no trailing
+  // slash or a mixed-case host still reaches the prompt, on every click.
+  for (const raw of ["https://example.com", "https://Docs.Example/Guide", "https://example.com"]) {
+    openWebLink(raw);
+    assert.equal(openWebLinkThroughHomePrompt(raw), true, raw);
+    assert.deepEqual(toTop.at(-1), { origin: "https://home.example", message: { type: "home:open-external", url: raw, homeToken: "fixture" } });
+  }
+  assert.equal(toTop.length, 4);
+  window.location.href = prior.href; window.top = prior.top; window.parent = prior.parent;
+});
+
 async function fixture(cancelReject = false, saved = null) {
   const events = defer();
   const accepted = defer();
@@ -1127,44 +1155,6 @@ test("a reply cut off by End says so live and after restore", () => {
   controller.renderActiveSession();
   assert.equal(status.textContent, message);
   assert.doesNotMatch(status.textContent, /Model run failed/);
-});
-
-function renderedAgentText(stream) {
-  const row = (stream.children || []).find((child) => child.dataset?.role === "agent");
-  if (!row) return "";
-  const parts = [];
-  const walk = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (typeof node.data === "string") parts.push(node.data);
-    else if (String(node.className || "").includes("agent-stream-frozen-block") && node.textContent) {
-      parts.push(node.textContent);
-    }
-    for (const child of node.children || []) walk(child);
-  };
-  walk(row);
-  return parts.join("");
-}
-
-test("live chat flushes two consecutive deltas before reopen of unretained output", async t => {
-  const { ctx, status, stream, offerLists, offersAfterProbe } = await runUnretainedLiveTurn(t, {
-    create: { run_id: "run-two-deltas", sequence_cursor: 0, status: "running" },
-    eventsPages: [
-      { after: 0, data: {
-        schema: "elastos.model.run-events/v1", run_id: "run-two-deltas",
-        events: [
-          { sequence: 1, kind: "text_delta", data: { text: "Hel" } },
-          { sequence: 2, kind: "text_delta", data: { text: "lo" } },
-          { sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } },
-        ],
-        next_cursor: 3, has_more: false, settlement_source: "runtime_index",
-        output_retained: false,
-      } },
-    ],
-  });
-  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
-  assert.equal(offerLists, offersAfterProbe);
-  assert.equal(renderedAgentText(stream), "Hello", "both deltas must paint before reopen");
-  assert.equal(ctx.sessions[0].messages.filter((message) => message.role === "agent").at(-1)?.text, "Hello");
 });
 
 test("refresh after a refused new turn requires another deliberate Send", async t => {

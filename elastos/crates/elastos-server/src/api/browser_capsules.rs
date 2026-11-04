@@ -12,8 +12,8 @@ use super::capsule_inventory::{
     load_capsule_manifest,
 };
 use super::gateway::{
-    capsule_icon_variants, content_type, ensure_wallet_connector_configured, request_uses_tls,
-    validate_file_path, GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
+    capsule_icon_variants, capsule_is_offered, content_type, request_uses_tls, validate_file_path,
+    GatewayState, HOME_CAPSULE_ID, HOME_ROUTE,
 };
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
@@ -212,7 +212,7 @@ async fn serve_browser_capsule_asset(
     requested_path: Option<&str>,
     raw_query: Option<&str>,
 ) -> Response {
-    if ensure_wallet_connector_configured(data_dir, app).is_err() {
+    if !capsule_is_offered(data_dir, app) {
         return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
     }
 
@@ -427,7 +427,7 @@ fn list_launchable_browser_capsules_for(
         if !manifest.role.is_shell_launchable() {
             continue;
         }
-        if ensure_wallet_connector_configured(data_dir, &manifest.name).is_err() {
+        if !capsule_is_offered(data_dir, &manifest.name) {
             continue;
         }
         if manifest.name == "browser" && !crate::setup::browser_available(platform) {
