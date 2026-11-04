@@ -274,6 +274,50 @@ def prepare_transport(transport):
             raise RuntimeError('Install the root-owned /usr/bin/bwrap before Browser setup')
 
 
+def setup_data_dir(user, data_dir=None):
+    if data_dir is None:
+        state = STATE / f'{user.pw_uid}.json'
+        if state.exists():
+            data_dir = trusted_json(state).get('data_dir')
+    directory = Path(data_dir) if data_dir else Path(user.pw_dir) / '.local/share/elastos'
+    if not directory.is_absolute():
+        raise RuntimeError('Browser data directory must be absolute')
+    return directory
+
+
+def require_userspace_backend(user, data_dir=None):
+    # Runtime admits and executes this binary as the Home user. Root only checks
+    # its presence; it never executes code from the Home's data directory.
+    binary = setup_data_dir(user, data_dir) / 'bin/vhost-device-vsock'
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError(f'Install the admitted executable {binary} before Browser setup')
+
+
+def select_transport(user, transport=None, data_dir=None):
+    if transport is not None:
+        return transport
+    state = STATE / f'{user.pw_uid}.json'
+    if state.exists():
+        return saved_transport(trusted_json(state))
+    try:
+        prepare_vsock_device()
+        return 'kernel-vsock'
+    except (OSError, RuntimeError) as kernel_error:
+        missing = []
+        try:
+            prepare_transport('userspace-vsock')
+        except (OSError, RuntimeError) as error:
+            missing.append(str(error))
+        try:
+            require_userspace_backend(user, data_dir)
+        except (OSError, RuntimeError) as error:
+            missing.append(str(error))
+        if missing:
+            raise RuntimeError(f'Browser transport unavailable: kernel vhost-vsock ({kernel_error}); '
+                               f'userspace-vsock requires: {"; ".join(missing)}') from kernel_error
+        return 'userspace-vsock'
+
+
 def restore(user):
     uid, pool = user.pw_uid, networks(user.pw_uid)
     transport = saved_transport(trusted_json(STATE / f'{uid}.json'))
@@ -313,7 +357,7 @@ def restore(user):
                                 ifindices=[int((SYSFS / n['tapName'] / 'ifindex').read_text()) for n in pool]))
 
 
-def configure(user, remove=False, transport='kernel-vsock'):
+def configure(user, remove=False, transport=None, data_dir=None):
     uid = user.pw_uid
     unit = f'elastos-browser-network-{uid}.service'
     unit_path = Path('/etc/systemd/system') / unit
@@ -372,9 +416,13 @@ def configure(user, remove=False, transport='kernel-vsock'):
         for command in ['ip', 'iptables', 'ip6tables', 'setfacl', 'getfacl', 'systemctl', 'udevadm']:
             if not shutil.which(command):
                 raise RuntimeError(f'Install {command} before Browser network setup')
-        prepare_transport(transport)
+        transport = select_transport(user, transport, data_dir)
         if state.exists() and saved_transport(trusted_json(state)) != transport:
             raise RuntimeError('Remove the previous Browser host setup before changing transport')
+        prepare_transport(transport)
+        data_dir = setup_data_dir(user, data_dir)
+        if transport == 'userspace-vsock':
+            require_userspace_backend(user, data_dir)
         STATE.mkdir(mode=0o755, exist_ok=True)
         trusted_path(STATE)
         if not state.exists():
@@ -385,6 +433,7 @@ def configure(user, remove=False, transport='kernel-vsock'):
         # admitted device as the Home user, and removal restores this UID's ACL.
         saved = trusted_json(state)
         saved['transport'] = transport
+        saved['data_dir'] = str(data_dir)
         if transport == 'kernel-vsock' and 'previous_vsock_acl' not in saved:
             acl = run('getfacl', '-cpn', '/dev/vhost-vsock').stdout.splitlines()
             saved['previous_vsock_acl'] = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
@@ -410,7 +459,7 @@ def configure(user, remove=False, transport='kernel-vsock'):
         run('systemctl', 'restart', unit)
 
 
-def repair_command(user):
+def repair_command(user, data_dir=None):
     prerequisite = ''
     try:
         trusted_path(HELPER)
@@ -418,19 +467,24 @@ def repair_command(user):
             raise RuntimeError('helper is not a regular file')
     except (OSError, RuntimeError):
         prerequisite = f'Install the reviewed root-owned helper at {HELPER} first. '
-    transport = 'kernel-vsock'
+    options = ''
     state = STATE / f'{user.pw_uid}.json'
     if state.exists():
-        transport = saved_transport(trusted_json(state))
-    return f'{prerequisite}As root, run: python3 {shlex.quote(str(HELPER))} setup --user {shlex.quote(user.pw_name)} --transport {transport}'
+        saved = trusted_json(state)
+        options += f' --transport {saved_transport(saved)}'
+        data_dir = saved.get('data_dir', data_dir)
+    if data_dir is not None:
+        options += f' --data-dir {shlex.quote(str(data_dir))}'
+    return f'{prerequisite}As root, run: python3 {shlex.quote(str(HELPER))} setup --user {shlex.quote(user.pw_name)}{options}'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['setup', 'remove', 'restore', 'invalidate', 'check', 'lease'])
     parser.add_argument('--user')
-    parser.add_argument('--transport', choices=TRANSPORTS, default='kernel-vsock',
-                        help='setup only: kernel device or the admitted confined userspace backend')
+    parser.add_argument('--transport', choices=TRANSPORTS,
+                        help='setup only: override automatic kernel or confined userspace selection')
+    parser.add_argument('--data-dir', help='Home data directory (default: saved setup or the user data directory)')
     args = parser.parse_args()
     user = pwd.getpwnam(args.user) if args.user else pwd.getpwuid(os.getuid())
     if args.action in ['check', 'lease']:
@@ -444,7 +498,7 @@ def main():
         except SlotsBusy:
             raise
         except (OSError, ValueError, KeyError, IndexError, TypeError, RuntimeError) as error:
-            raise RuntimeError(f'Browser network is unavailable ({error}). {repair_command(user)}') from error
+            raise RuntimeError(f'Browser network is unavailable ({error}). {repair_command(user, args.data_dir)}') from error
         return
     if os.getuid() != 0 or not args.user or user.pw_uid == 0:
         raise RuntimeError('Run setup/removal as root with --user naming the ordinary Home account')
@@ -452,14 +506,14 @@ def main():
         raise RuntimeError('Browser network setup requires a Linux host')
     if args.action in ['setup', 'remove']:
         verb = 'Remove' if args.action == 'remove' else 'Create/repair'
-        transport = saved_transport(trusted_json(STATE / f'{user.pw_uid}.json')) if args.action == 'remove' else args.transport
+        transport = saved_transport(trusted_json(STATE / f'{user.pw_uid}.json')) if args.action == 'remove' else select_transport(user, args.transport, args.data_dir)
         devices = 'KVM and vhost-vsock' if transport == 'kernel-vsock' else 'KVM'
-        print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, {devices} user ACLs, device udev rules and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
+        print(f'Browser transport: {transport}.\n{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, {devices} user ACLs, device udev rules and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
         for n in networks(user.pw_uid):
             print(f"  {n['tapName']}: host {n['hostIp']}/30, guest {n['guestIp']}; relay TCP 19091, TURN TCP/UDP 41000 and {RELAY_PORTS}; relayed UDP reaches only those TURN ports")
         if input('Continue? [y/N] ').lower() != 'y':
             return
-        configure(user, remove=args.action == 'remove', transport=args.transport)
+        configure(user, remove=args.action == 'remove', transport=transport, data_dir=args.data_dir)
     else:
         invalidate(user)
         if args.action == 'restore':

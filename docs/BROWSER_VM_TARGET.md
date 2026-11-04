@@ -407,8 +407,14 @@ install -D -o root -g root -m 755 <reviewed-checkout>/scripts/browser-vm-linux-n
 python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user <home-user>
 ```
 
-The script lists the devices, addresses and policy, then asks for `y` before
-it changes the host. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
+Setup selects `kernel-vsock` when `/dev/vhost-vsock` is available, loading its
+module if needed. Otherwise it selects `userspace-vsock` when the root-owned
+`/usr/bin/bwrap` and admitted `bin/vhost-device-vsock` are present. Use
+`--data-dir <home-data-dir>` for a custom Home data directory. `--transport`
+provides an explicit override. Repair retains the saved transport.
+
+The script lists the selected transport, devices, addresses and policy, then
+asks for `y` before it creates network state. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
 tools (`setfacl`, `getfacl`), systemd and udev, plus `/dev/kvm` and `/dev/net/tun`.
 It creates TAPs owned by the numeric UID, adds their host addresses and
 confinement rules, grants that user read/write KVM access through a named ACL,
@@ -535,11 +541,13 @@ generator/stager for:
 
 - `bin/browser-vm-engine-supervisor`
 - `bin/browser-vm-control-service`
-- `bin/browser-vm-local-crosvm-launcher`
 - `bin/browser-vm-remote-vz-launcher`
-- `bin/browser-vm-prepare-rootfs-pool`
-- `bin/browser-vz-engine-supervisor` on macOS after the VZ helper is built
+- `bin/browser-vz-engine-supervisor` for Linux ARM64 and macOS
 - verified links to an existing rootfs, kernel, initrd and matching build manifest
+
+Linux uses the native supervisor and a disposable qcow2 overlay for each
+launch. The installer removes the retired `browser-vm/rootfs-pool` image copies
+as their ordinary owner and reports the removed path.
 
 For already-provisioned targets, `scripts/browser-vm-target-refresh.sh` is the
 host-helper maintenance path. Guest drift requires a rebuilt image set. Runtime

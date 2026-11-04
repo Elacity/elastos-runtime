@@ -1761,6 +1761,43 @@ class UninstallTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
+    def test_browser_setup_removes_only_retired_rootfs_pool(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            pool = root / 'browser-vm/rootfs-pool'
+            pool.mkdir(parents=True)
+            (pool / 'copy.raw').write_text('retired system copy')
+            image = root / 'browser-vm/rootfs.raw'
+            image.write_text('system image')
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(pool.exists())
+            self.assertEqual(image.read_text(), 'system image')
+            self.assertIn(f'Removed retired Browser rootfs pool: {pool}', result.stdout)
+            again = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertNotIn('Removed', again.stdout)
+
+    def test_browser_pool_cleanup_preserves_link_targets(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            data, outside = root / 'data', root / 'outside'
+            (data / 'browser-vm').mkdir(parents=True)
+            outside.mkdir()
+            (outside / 'keep').write_text('keep')
+            pool = data / 'browser-vm/rootfs-pool'
+            pool.symlink_to(outside)
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(pool.is_symlink())
+            self.assertEqual((outside / 'keep').read_text(), 'keep')
+            (data / 'browser-vm').rmdir()
+            (data / 'browser-vm').symlink_to(outside)
+            (outside / 'rootfs-pool').mkdir()
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((outside / 'rootfs-pool').is_dir())
+
     def test_browser_host_step_is_installer_only_and_handles_decline_or_unavailable_host(self):
         function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
         function = "prepare_browser_linux_host() {" + function
@@ -1774,7 +1811,11 @@ class DataPathTests(unittest.TestCase):
             script = function + '''
 DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
 uname() { printf '%s\\n' "$SYSTEM"; }
-fixture_python() { [[ "$READY" == yes ]]; }
+fixture_python() {
+    [[ "$READY" != yes ]] || return 0
+    printf 'As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user %s --transport userspace-vsock --data-dir %s\\n' "$(id -un)" "$DATA_DIR"
+    return 1
+}
 sudo() { printf 'ROOT_STEP:%s\\n' "$*"; [[ "$ROOT_RESULT" != 0 ]] || READY=yes; return "$ROOT_RESULT"; }
 prepare_browser_linux_host
 '''
@@ -1798,7 +1839,7 @@ prepare_browser_linux_host
                     root_helper = '/usr/local/lib/elastos/browser-vm-linux-network.py'
                     user = getpass.getuser()
                     install = f'install -D -o root -g root -m 755 {helper} {root_helper}'
-                    run = f'fixture_python -I {root_helper} setup --user {user}'
+                    run = f'fixture_python -I {root_helper} setup --user {user} --data-dir {root}'
                     if case == 'setup':
                         # sudo runs only the root-owned copy, never the user-writable helper.
                         self.assertEqual(
@@ -1808,7 +1849,8 @@ prepare_browser_linux_host
                         self.assertIn(f'fixture_python -I {root_helper} remove --user ', result.stdout)
                     if case == 'headless':
                         self.assertIn('Run from a terminal', result.stdout)
-                        self.assertIn(f'  sudo {install}\n  sudo {run}\n', result.stdout)
+                        self.assertIn(f'  sudo {install}\n', result.stdout)
+                        self.assertIn(f'setup --user {user} --transport userspace-vsock --data-dir {root}', result.stdout)
                     if case == 'unavailable':
                         self.assertIn('virtualization is unavailable', result.stdout)
 
