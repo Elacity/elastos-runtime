@@ -128,7 +128,7 @@ class NetworkTest(unittest.TestCase):
         with patch.object(network.sys, 'argv', ['network', 'check']), patch.object(network.pwd, 'getpwuid', return_value=user), \
                 patch.object(network.os, 'getuid', return_value=self.uid), \
                 patch.object(network, 'check', side_effect=FileNotFoundError('missing TAP')):
-            with self.assertRaisesRegex(RuntimeError, r'As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent'):
+            with self.assertRaisesRegex(RuntimeError, r'As root, run:\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent'):
                 network.main()
 
     def test_down_tap_allows_repair_locks_without_reading_carrier(self):
@@ -183,11 +183,55 @@ class NetworkTest(unittest.TestCase):
 
     def test_repair_uses_only_a_trusted_root_helper(self):
         user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
-        with patch.object(network, 'trusted_path', side_effect=RuntimeError('user-writable helper')):
-            message = network.repair_command(user)
+        with patch.object(network, 'trusted_path', side_effect=RuntimeError('user-writable helper')), \
+                patch.object(network.sys, 'argv', ['network', 'check']), \
+                patch.object(network.pwd, 'getpwuid', return_value=user), \
+                patch.object(network.os, 'getuid', return_value=self.uid), \
+                patch.object(network, 'check', side_effect=RuntimeError('fixture refusal')):
+            with self.assertRaises(RuntimeError) as refusal:
+                network.main()
+        message = str(refusal.exception)
         self.assertIn('Install the reviewed root-owned helper', message)
-        self.assertIn(f'As root, run: python3 {network.HELPER} setup --user elastos-agent', message)
+        self.assertIn(f'/usr/bin/python3 -I {network.HELPER} setup --user elastos-agent', message)
         self.assertNotIn(str(Path(network.__file__).parent), message)
+
+    def test_repair_command_is_pasteable_with_an_isolated_absolute_interpreter(self):
+        user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
+        data = network.RUN.parent / "Home's data"
+        with patch.object(network, 'STATE', network.RUN.parent / 'absent-state'):
+            command = network.repair_command(user, data)
+        self.assertEqual(shlex.split(command), ['/usr/bin/python3', '-I', str(network.HELPER),
+            'setup', '--user', user.pw_name, '--data-dir', str(data)])
+
+    def test_unusable_saved_kernel_transport_names_removal_before_automatic_setup(self):
+        user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
+        state = network.RUN.parent / 'state'
+        state.mkdir()
+        (state / f'{self.uid}.json').write_text('{}')
+        data = str(network.RUN.parent / "Home's saved data")
+        self.receipt['data_dir'] = data
+        real_stat = network.os.stat
+        for failure in ('missing', 'regular file', 'inaccessible'):
+            def device_stat(path, **kwargs):
+                if str(path) == '/dev/vhost-vsock':
+                    if failure == 'missing':
+                        raise FileNotFoundError(path)
+                    return SimpleNamespace(st_mode=stat.S_IFREG if failure == 'regular file' else stat.S_IFCHR)
+                return real_stat(path, **kwargs)
+            with self.subTest(failure=failure), patch.object(network, 'STATE', state), \
+                    patch.object(network.os, 'stat', side_effect=device_stat), \
+                    patch.object(network.os, 'access', return_value=failure != 'inaccessible'), \
+                    patch.object(network.sys, 'argv', ['network', 'check', '--data-dir', '/caller/data']), \
+                    patch.object(network.pwd, 'getpwuid', return_value=user), \
+                    patch.object(network.os, 'getuid', return_value=self.uid), \
+                    patch.object(network, 'check', side_effect=RuntimeError('kernel device unusable')):
+                with self.assertRaises(RuntimeError) as refusal:
+                    network.main()
+                commands = [shlex.split(line) for line in str(refusal.exception).splitlines()
+                            if line.startswith('/usr/bin/python3 -I ')]
+                self.assertEqual(commands, [
+                    ['/usr/bin/python3', '-I', str(network.HELPER), action,
+                     '--user', user.pw_name, '--data-dir', data] for action in ('remove', 'setup')])
 
     def test_userspace_repair_and_removal_use_the_saved_transport(self):
         self.receipt['transport'] = 'userspace-vsock'

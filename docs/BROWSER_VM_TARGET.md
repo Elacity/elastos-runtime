@@ -421,8 +421,9 @@ confinement rules, grants that user read/write KVM access through a named ACL,
 and installs a KVM udev rule. An existing named KVM ACL is saved for removal.
 This gives `elastos-agent` KVM access without changing its groups.
 
-Root stores ACL state in `/var/lib/elastos-browser/<uid>.json`, copies the
-setup helper to `/usr/local/lib/elastos/browser-vm-linux-network.py`, and
+Root stores the ACL state and data directory in
+`/var/lib/elastos-browser/<uid>.json`, copies the setup helper to
+`/usr/local/lib/elastos/browser-vm-linux-network.py`, and
 enables `elastos-browser-network-<uid>.service`. This oneshot service restores
 the devices and rules after each boot, following host firewall services. The
 unit shares stop/restart and reload events with `nftables`, `firewalld`, `ufw`

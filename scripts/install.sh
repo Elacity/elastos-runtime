@@ -1083,6 +1083,7 @@ show_remote_open_hint() {
 # their ordinary owner, before requesting any privileged host setup.
 retire_browser_rootfs_pool() {
     /usr/bin/python3 -I - "$DATA_DIR" <<'PY_RETIRED_BROWSER_POOL'
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -1092,6 +1093,13 @@ parent = root / 'browser-vm'
 if root.is_symlink() or parent.is_symlink():
     sys.exit('Browser pool cleanup requires plain data and browser-vm directories')
 pool = parent / 'rootfs-pool'
+for path in (parent, pool):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if metadata.st_uid != os.geteuid():
+        sys.exit(f'{path} belongs to another user')
 if pool.is_symlink():
     pool.unlink()
 elif pool.is_dir():
@@ -1110,7 +1118,7 @@ prepare_browser_linux_host() {
     BROWSER_LINUX_HOST_READY=false
     [[ "$(uname -s)" == Linux ]] || return 0
     retire_browser_rootfs_pool || return $?
-    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user check_result
+    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user check_result line
     # sudo runs only a root-owned copy, never the user-writable helper.
     local root_helper=/usr/local/lib/elastos/browser-vm-linux-network.py
     [[ -f "$helper" ]] || return 0
@@ -1130,7 +1138,12 @@ prepare_browser_linux_host() {
     else
         info "Browser needs one-time administrator setup. Run from a terminal:"
         printf '  sudo install -D -o root -g root -m 755 %q %q\n' "$helper" "$root_helper"
-        printf '%s\n' "$check_result"
+        while IFS= read -r line; do
+            case "$line" in
+                '/usr/bin/python3 -I '*) printf '  sudo %s\n' "$line" ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done <<<"$check_result"
         return 0
     fi
     BROWSER_LINUX_HOST_READY=true

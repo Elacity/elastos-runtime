@@ -460,22 +460,28 @@ def configure(user, remove=False, transport=None, data_dir=None):
 
 
 def repair_command(user, data_dir=None):
-    prerequisite = ''
-    try:
-        trusted_path(HELPER)
-        if not stat.S_ISREG(HELPER.lstat().st_mode):
-            raise RuntimeError('helper is not a regular file')
-    except (OSError, RuntimeError):
-        prerequisite = f'Install the reviewed root-owned helper at {HELPER} first. '
     options = ''
+    remove_first = False
     state = STATE / f'{user.pw_uid}.json'
     if state.exists():
         saved = trusted_json(state)
-        options += f' --transport {saved_transport(saved)}'
+        transport = saved_transport(saved)
+        if transport == 'kernel-vsock':
+            try:
+                remove_first = not (stat.S_ISCHR(os.stat('/dev/vhost-vsock').st_mode)
+                                    and os.access('/dev/vhost-vsock', os.R_OK | os.W_OK))
+            except OSError:
+                remove_first = True
+        if not remove_first:
+            options += f' --transport {transport}'
         data_dir = saved.get('data_dir', data_dir)
-    if data_dir is not None:
-        options += f' --data-dir {shlex.quote(str(data_dir))}'
-    return f'{prerequisite}As root, run: python3 {shlex.quote(str(HELPER))} setup --user {shlex.quote(user.pw_name)}{options}'
+    data_option = f' --data-dir {shlex.quote(str(data_dir))}' if data_dir is not None else ''
+    interpreter = f'/usr/bin/python3 -I {shlex.quote(str(HELPER))}'
+    user_option = f' --user {shlex.quote(user.pw_name)}'
+    setup = f'{interpreter} setup{user_option}{options}{data_option}'
+    if remove_first:
+        return f'{interpreter} remove{user_option}{data_option}\n{setup}'
+    return setup
 
 
 def main():
@@ -498,7 +504,15 @@ def main():
         except SlotsBusy:
             raise
         except (OSError, ValueError, KeyError, IndexError, TypeError, RuntimeError) as error:
-            raise RuntimeError(f'Browser network is unavailable ({error}). {repair_command(user, args.data_dir)}') from error
+            prerequisite = ''
+            try:
+                trusted_path(HELPER)
+                if not stat.S_ISREG(HELPER.lstat().st_mode):
+                    raise RuntimeError('helper is not a regular file')
+            except (OSError, RuntimeError):
+                prerequisite = f' Install the reviewed root-owned helper at {HELPER} first.'
+            raise RuntimeError(f'Browser network is unavailable ({error}).{prerequisite}\n'
+                               f'As root, run:\n{repair_command(user, args.data_dir)}') from error
         return
     if os.getuid() != 0 or not args.user or user.pw_uid == 0:
         raise RuntimeError('Run setup/removal as root with --user naming the ordinary Home account')
