@@ -14,7 +14,7 @@ function sourceFunction(name) {
   return hostSource.slice(hostSource.slice(start - 6, start) === "async " ? start - 6 : start, hostSource.indexOf("\n}", start) + 2);
 }
 function fixture(target = "chat-room", enabled = true) {
-  const listeners = new Map(), timers = new Map(), frames = new Map(), commands = [];
+  const listeners = new Map(), timers = new Map(), frames = new Map(), commands = [], launchQueries = [];
   let next = 0, receive, launches = 0, refreshed = 0, currentToken = "old-frame", holdPrepare = false;
   const authority = { signed_in: true, principal_id: "alice", proof_binding_id: "proof:alice" };
   const shell = {}, home = { location: { origin: homeOrigin, href: homeOrigin },
@@ -57,8 +57,9 @@ function fixture(target = "chat-room", enabled = true) {
     },
     refreshHomeSession: async () => { refreshed++; }, refreshShellSummary: async () => shellState.currentSummary,
     isHomeAuthError: () => false,
-    launchHomeTarget: async requested => {
+    launchHomeTarget: async (requested, query) => {
       launches++;
+      launchQueries.push(query);
       if (!authority.signed_in) throw Object.assign(new Error("Sign in"), { status: 401 });
       frames.set("fresh-frame", { targetId: requested, source: null, origin: "null", parentOrigin: homeOrigin, expiresAt: 120_000 });
       return { target: requested, attach_kind: "iframe", expires_at: 120,
@@ -75,7 +76,7 @@ function fixture(target = "chat-room", enabled = true) {
   vm.runInContext(hostSource.slice(start, hostSource.indexOf("\n});", start) + 4), context);
   const client = createHomeNavigationClient({ homeToken: currentToken, homeOrigin, target, enabled, windowRef,
     onHomeToken(token) { currentToken = token; } });
-  return { client, context, frames, message, receipt, commands, authority, frame, old, timers, home, windowRef,
+  return { client, context, frames, message, receipt, commands, launchQueries, authority, frame, old, timers, home, windowRef,
     hold() { holdPrepare = true; }, token: () => currentToken, launches: () => launches, refreshed: () => refreshed,
     close() { context.retireLaunchedAppContext("old-frame"); },
   };
@@ -105,6 +106,30 @@ test("A stolen frame token, wrong origin or another target cannot request renewa
   assert.equal(f.launches(), 0);
   assert.equal(f.token(), "old-frame");
 });
+
+for (const target of ["chat-room", "people", "documents", "assistant", "library"]) {
+  test(`${target} renewal refuses unexpected query keys and picker authority`, async () => {
+    for (const query of [{ unexpected: "value" }, { pickerRequestId: "foreign-picker" }]) {
+      const f = fixture(target);
+      f.client.setQuery(query);
+      await assert.rejects(f.client.renewAuthority(), /could not reconnect/);
+      assert.equal(f.launches(), 0);
+      assert.equal(f.token(), "old-frame");
+    }
+  });
+}
+
+for (const [target, query] of [["chat-room", { conversation_id: "direct:fixture" }],
+  ["documents", { doc: "did:fixture" }], ["documents", { objectUri: "library://fixture/file" }],
+  ["library", { uri: "library://fixture/folder" }]]) {
+  test(`${target} renewal accepts its ${Object.keys(query)[0]} selector`, async () => {
+    const f = fixture(target);
+    f.client.setQuery(query);
+    await f.client.renewAuthority();
+    assert.equal(f.token(), "fresh-frame");
+    assert.deepEqual(JSON.parse(JSON.stringify(f.launchQueries[0])), query);
+  });
+}
 
 test("Home's own refused authority leaves the registered app unchanged", async () => {
   const f = fixture(); f.authority.signed_in = false;
@@ -166,6 +191,27 @@ function pickerFixture(renewTarget, openerTarget = "chat-room") {
     opener.pickerRequest = record; picker.pickerOwner = record;
   }
   return { ...f, record, delivered, opener, picker };
+}
+
+test("Library renewal accepts only its own in-flight picker without acquiring picker authority", async () => {
+  const f = pickerFixture("library");
+  f.client.setQuery({ pickerRequestId: f.record.id });
+  await f.client.renewAuthority();
+  assert.equal(f.token(), "fresh-frame");
+  assert.deepEqual(JSON.parse(JSON.stringify(f.launchQueries[0])), {});
+  assert.equal(f.frames.get("fresh-frame").pickerOwner, f.record);
+});
+
+for (const invalidation of ["foreign token", "retired", "foreign record"]) {
+  test(`Library renewal refuses a picker with ${invalidation}`, async () => {
+    const f = pickerFixture("library");
+    if (invalidation === "foreign token") f.record.pickerToken = "another-frame";
+    if (invalidation === "retired") f.record.phase = "retired";
+    if (invalidation === "foreign record") f.old.pickerOwner = { ...f.record };
+    f.client.setQuery({ pickerRequestId: f.record.id });
+    await assert.rejects(f.client.renewAuthority(), /could not reconnect/);
+    assert.equal(f.launches(), 0);
+  });
 }
 
 for (const target of ["chat-room", "library"]) {

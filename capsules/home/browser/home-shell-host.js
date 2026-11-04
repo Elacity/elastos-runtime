@@ -1837,11 +1837,18 @@ window.addEventListener("message", (event) => {
     if (context.kind === "app-frame" && ["chat-room", "people", "documents", "assistant", "library"].includes(context.targetId)) {
       const query = data.query;
       const keys = query && typeof query === "object" && !Array.isArray(query) ? Object.keys(query) : null;
-      const validQuery = keys && (context.targetId === "chat-room"
-        ? keys.length === 0 || (keys.length === 1 && keys[0] === "conversation_id"
-          && typeof query.conversation_id === "string" && /^[A-Za-z0-9:._-]{1,512}$/.test(query.conversation_id))
-        : keys.length <= 8 && keys.every(key =>
-          /^[A-Za-z0-9_]{1,64}$/.test(key) && typeof query[key] === "string" && query[key].length <= 4096));
+      const allowedKeys = {
+        "chat-room": ["conversation_id"], people: [], assistant: [],
+        documents: ["doc", "objectUri"], library: ["uri", "pickerRequestId"],
+      }[context.targetId];
+      const picker = launchedAppContexts.get(context.homeToken)?.pickerOwner;
+      const validQuery = keys && keys.length <= (context.targetId === "library" ? 2 : 1)
+        && keys.every(key => allowedKeys.includes(key) && typeof query[key] === "string"
+          && query[key].length > 0 && query[key].length <= 2048)
+        && (context.targetId !== "chat-room" || !keys.length || /^[A-Za-z0-9:._-]{1,512}$/.test(query.conversation_id))
+        && (!keys.includes("pickerRequestId") || (currentLibraryPicker(picker)
+          && picker.id === query.pickerRequestId && picker.pickerToken === context.homeToken
+          && ["ready", "delivering"].includes(picker.phase)));
       if (!hasExactMessageKeys(data, ["type", "requestId", "target", "query", "homeToken"])
         || !/^[A-Za-z0-9-]{1,64}$/.test(requestId) || requestId !== data.requestId
         || target !== context.targetId || target !== data.target || data.homeToken !== context.homeToken || !validQuery) {
@@ -1865,7 +1872,10 @@ window.addEventListener("message", (event) => {
         settleFrameRenewal(old, record, new Error("Home could not reopen this app in time"));
       }, 25000);
       let createdToken = "";
-      launchHomeTarget(target, query).then((launched) => {
+      // Transfer the existing picker with the frame; a renewal does not open a picker.
+      const launchQuery = { ...query };
+      delete launchQuery.pickerRequestId;
+      launchHomeTarget(target, launchQuery).then((launched) => {
         const freshToken = homeLaunchTokenFromRoute(launched?.route || "");
         createdToken = freshToken;
         const fresh = launchedAppContexts.get(freshToken);
