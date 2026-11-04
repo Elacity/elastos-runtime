@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import vm from "node:vm";
 import test from "node:test";
@@ -34,9 +35,9 @@ function networkApi(result) {
 }
 
 test("missing Linux setup refuses launch with one root command", () => {
-  const api = networkApi({ status: 1, stderr: "Browser network setup is required. As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent\n" });
+  const api = networkApi({ status: 1, stderr: "Browser network setup is required.\nAs root, run:\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent\n" });
   assert.throws(() => api.requireLinuxNetwork("/fixture/bin/browser-vm-local-crosvm-launcher.mjs"),
-    /As root, run: python3 .* setup --user elastos-agent/);
+    /As root, run:\n\/usr\/bin\/python3 -I \/usr\/local\/lib\/elastos\/browser-vm-linux-network\.py setup --user elastos-agent/);
   assert.equal(api.calls.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(api.calls[0])), ["python3", ["/fixture/scripts/browser-vm-linux-network.py", "check"]]);
 });
@@ -44,7 +45,7 @@ test("missing Linux setup refuses launch with one root command", () => {
 test("a failed helper command names the root-owned repair copy", () => {
   const api = networkApi({ status: 1, stderr: "" });
   assert.throws(() => api.requireLinuxNetwork("/fixture/bin/browser-vm-local-crosvm-launcher.mjs"),
-    /As root, run: python3 \/usr\/local\/lib\/elastos\/browser-vm-linux-network.py setup --user elastos-agent/);
+    /As root, run:\n\/usr\/bin\/python3 -I \/usr\/local\/lib\/elastos\/browser-vm-linux-network\.py setup --user elastos-agent/);
 });
 
 test("existing Browser CI step runs the Linux network tests", () => {
@@ -139,7 +140,11 @@ test("real launcher stops before VM commands when setup is absent", async t => {
   });
   assert.equal(result.status, 1, result.stderr);
   // A root-run CI uses the explicit ordinary-user refusal instead.
-  assert.match(result.stderr, process.getuid() === 0 ? /Run Browser as its ordinary Home user/ : /As root, run: python3 .* setup --user /);
+  if (process.getuid() === 0) {
+    assert.match(result.stderr, /Run Browser as its ordinary Home user/);
+  } else {
+    assert.ok(result.stderr.includes(`As root, run:\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user ${os.userInfo().username}`), result.stderr);
+  }
   assert.equal(result.stdout, "");
   assert.deepEqual(fs.readdirSync(path.join(root, "sessions")), []);
 });
