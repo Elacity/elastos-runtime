@@ -1382,12 +1382,15 @@ pub(super) mod tests {
     }
 
     pub(crate) fn record_lock_open(file: &File, caller: &std::panic::Location<'_>) {
-        let fd = file.as_raw_fd();
-        let mut owner = format!("LockFile opened at {caller}");
-        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_some() {
-            owner.push_str(&format!("\n{}", std::backtrace::Backtrace::force_capture()));
-            eprintln!("LockFile open pid={} fd={fd} {owner}", std::process::id());
+        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_none() {
+            return;
         }
+        let fd = file.as_raw_fd();
+        let owner = format!(
+            "LockFile opened at {caller}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        eprintln!("LockFile open pid={} fd={fd} {owner}", std::process::id());
         lock_objects()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1395,14 +1398,15 @@ pub(super) mod tests {
     }
 
     pub(crate) fn record_lock_drop(file: &File) {
+        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_none() {
+            return;
+        }
         let fd = file.as_raw_fd();
         let owner = lock_objects()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&fd);
-        if std::env::var_os("ELASTOS_TEST_LOCK_TRACE").is_some() {
-            eprintln!("LockFile drop pid={} fd={fd} {owner:?}", std::process::id());
-        }
+        eprintln!("LockFile drop pid={} fd={fd} {owner:?}", std::process::id());
     }
 
     pub(crate) fn slot_lock_holders(slot: &File) -> String {
