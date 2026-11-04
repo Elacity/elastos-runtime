@@ -557,7 +557,13 @@ function localSelection(platform, transport) {
     for (const name of names) {
         const component = manifest.external?.[name];
         const entry = component?.platforms?.[platform] || component?.platforms?.[platform === "linux-arm64" ? "aarch64-linux" : "macos-arm64"];
-        if (!entry || (entry.install_path || component.install_path) !== `bin/${name}`) {
+        // A direct binary is installed at bin/<name>; the executable of an
+        // archive package is reached through the bin/<name> link setup makes.
+        const selected = entry && (entry.install_path || component.install_path);
+        const bound = selected && (entry.extract_path
+            ? fs.realpathSync(path.join(data, "bin", name)) === fs.realpathSync(path.join(data, selected, entry.binary_path || component.binary_path || ""))
+            : selected === `bin/${name}`);
+        if (!bound) {
             throw new Error(`Native component receipt must bind its selected path: ${name}`);
         }
     }

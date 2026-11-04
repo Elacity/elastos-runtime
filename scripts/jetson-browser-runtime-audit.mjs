@@ -199,7 +199,13 @@ export function verifyNativeComponents(dataDir, sourceDir, transport) {
     for (const name of components) {
       const component = manifest.external?.[name];
       const entry = component?.platforms?.["linux-arm64"] || component?.platforms?.["aarch64-linux"];
-      if (!entry || (entry.install_path || component.install_path) !== "bin/" + name) {
+      // A direct binary is installed at bin/<name>; an archive package's
+      // executable is reached through the bin/<name> link setup makes.
+      const selected = entry && (entry.install_path || component.install_path);
+      const bound = selected && (entry.extract_path
+        ? fs.realpathSync(dataDir + "/bin/" + name) === fs.realpathSync(dataDir + "/" + selected + "/" + (entry.binary_path || component.binary_path || ""))
+        : selected === "bin/" + name);
+      if (!bound) {
         throw new Error("Native component receipt must bind its selected path: " + name);
       }
     }
