@@ -1694,10 +1694,6 @@ done
 install_browser_runtime_helpers
 retire_legacy_browser_runtime_turn
 stamp_source_home_capsule_artifacts_manifest
-if [[ -n "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-}" || -n "${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-}" ]]; then
-    start_browser_runtime_turn
-    install_browser_source_home_config
-fi
 prepare_source_home_setup
 python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --manifest "${DATA_DIR}/components.json" \
@@ -1705,6 +1701,10 @@ python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --profile source-home \
     --source-root "${ROOT}" \
     --source-home-data-dir "${DATA_DIR}"
+if [[ -n "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-}" || -n "${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-}" ]]; then
+    start_browser_runtime_turn
+    install_browser_source_home_config
+fi
 install_collaboration_startup_config
 # On Linux cargo hardlinks target/release/elastos to its deps/ twin, and the
 # installer's artifact gate rejects any multi-link source (hardlink-swap

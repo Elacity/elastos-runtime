@@ -339,10 +339,12 @@ def assert_setup_order():
         main.index("stamp_source_home_capsule_artifacts_manifest\n"),
         main.index("prepare_source_home_setup\n"),
         main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
+        main.index("start_browser_runtime_turn\n"),
     ]
     if positions != sorted(positions):
         raise AssertionError(
-            "source-home component, capsule and Runtime setup must finish before the integrity check"
+            "source-home component, capsule and Runtime setup must finish before the integrity check, "
+            "and the integrity check must finish before Browser TURN starts"
         )
     install_function = setup.split("install_content_publish_backend() {", 1)[1].split(
         "\n}\n\necho \"[setup-source-home] repo:", 1

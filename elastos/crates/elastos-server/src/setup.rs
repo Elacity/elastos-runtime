@@ -7841,66 +7841,82 @@ pub(crate) mod tests {
     #[test]
     fn test_write_installed_manifest_preserves_source_home_fields() {
         let tmp = tempfile::tempdir().unwrap();
-        let platform = "darwin-arm64";
         let binary = tmp.path().join("bin/vmlinux");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(&binary, b"local-kernel").unwrap();
         let source: serde_json::Value =
             serde_json::from_str(include_str!("../../../../components.json")).unwrap();
-        let mut kubo = source["external"]["kubo"].clone();
-        kubo["platforms"][platform]["checksum"] =
-            serde_json::json!(format!("sha256:{}", "a".repeat(64)));
-        kubo["platforms"][platform]["size"] = serde_json::json!(12345);
-        kubo["platforms"][platform]["build_receipt"] = serde_json::json!({"verified": true});
-        kubo["content_backend"] = serde_json::json!({"name": "ipfs"});
-        kubo["capsule_metadata"] = serde_json::json!({
-            "role": "content",
-            "type": "data",
-            "install_path": "capsules/kubo",
-            "platforms": {platform: {
-                "checksum": format!("sha256:{}", "b".repeat(64)),
-                "extract_path": "kubo",
+        let kubo = source["external"]["kubo"].clone();
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            assert!(
+                kubo["platforms"].get(platform).is_some(),
+                "missing Kubo platform {platform}"
+            );
+            let mut kubo = kubo.clone();
+            kubo["platforms"][platform]["checksum"] =
+                serde_json::json!(format!("sha256:{}", "a".repeat(64)));
+            kubo["platforms"][platform]["size"] = serde_json::json!(12345);
+            kubo["capsule_metadata"] = serde_json::json!({
+                "role": "content",
+                "type": "data",
                 "install_path": "capsules/kubo",
-                "release_path": "kubo-darwin-arm64.tar.gz",
-                "size": 37212060,
-                "build_receipt": {"verified": true}
-            }}
-        });
-        let input = serde_json::json!({
-            "schema": source["schema"],
-            "external": {
-                "kubo": kubo,
-                "vmlinux": {"platforms": {platform: {
-                    "strategy": "local-copy",
-                    "source": "source/Image",
-                    "install_path": "bin/vmlinux",
-                    "checksum": "sha256:stale",
-                    "size": 1
-                }}}
-            },
-            "capsules": {"fixture": {
-                "cid": "fixture-cid",
-                "sha256": "fixture-sha256",
-                "size": 1,
-                "platforms": [platform],
-                "receipt": {"verified": true}
-            }},
-            "profiles": {"source-home": {
-                "components": ["kubo", "vmlinux"],
-                "receipt": {"verified": true}
-            }}
-        });
-        let manifest: ComponentsManifest = serde_json::from_value(input.clone()).unwrap();
-        let stamped = write_installed_manifest(tmp.path(), &manifest, platform).unwrap();
-        assert_eq!(stamped, vec!["vmlinux"]);
-        let installed: serde_json::Value =
-            serde_json::from_slice(&fs::read(tmp.path().join("components.json")).unwrap()).unwrap();
-        let mut expected = input;
-        expected["external"]["vmlinux"]["platforms"][platform]["checksum"] =
-            serde_json::json!(compute_sha256_checksum(&binary).unwrap());
-        expected["external"]["vmlinux"]["platforms"][platform]["size"] =
-            serde_json::json!(b"local-kernel".len());
-        assert_eq!(installed, expected);
+                "platforms": {platform: {
+                    "checksum": format!("sha256:{}", "b".repeat(64)),
+                    "extract_path": "kubo",
+                    "install_path": "capsules/kubo",
+                    "release_path": format!("kubo-{platform}.tar.gz"),
+                    "size": 37212060
+                }}
+            });
+            let input = serde_json::json!({
+                "schema": source["schema"],
+                "external": {
+                    "kubo": kubo,
+                    "vmlinux": {"platforms": {platform: {
+                        "strategy": "local-copy",
+                        "source": "source/Image",
+                        "install_path": "bin/vmlinux",
+                        "checksum": "sha256:stale",
+                        "size": 1
+                    }}}
+                },
+                // Match stamp-source-home-capsule-metadata.py's Kubo source entry.
+                "capsules": {"kubo": {
+                    "cid": "",
+                    "sha256": "",
+                    "size": 0,
+                    "platforms": [platform],
+                    "install_path": "capsules/kubo",
+                    "entrypoint": "ipfs",
+                    "entrypoint_sha256": format!("sha256:{}", "a".repeat(64)),
+                    "entrypoint_size": 12345,
+                    "runtime_abi": null,
+                    "execution": null,
+                    "bus_contract": null,
+                    "wit_world_sha256": null,
+                    "projections": ["content"],
+                    "role": "content",
+                    "type": "data",
+                    "viewer": null,
+                    "browser_assets": []
+                }},
+                "profiles": {"source-home": {
+                    "components": ["kubo", "vmlinux"]
+                }}
+            });
+            let manifest: ComponentsManifest = serde_json::from_value(input.clone()).unwrap();
+            let stamped = write_installed_manifest(tmp.path(), &manifest, platform).unwrap();
+            assert_eq!(stamped, vec!["vmlinux"]);
+            let installed: serde_json::Value =
+                serde_json::from_slice(&fs::read(tmp.path().join("components.json")).unwrap())
+                    .unwrap();
+            let mut expected = input;
+            expected["external"]["vmlinux"]["platforms"][platform]["checksum"] =
+                serde_json::json!(compute_sha256_checksum(&binary).unwrap());
+            expected["external"]["vmlinux"]["platforms"][platform]["size"] =
+                serde_json::json!(b"local-kernel".len());
+            assert_eq!(installed, expected, "platform {platform}");
+        }
     }
 
     #[test]
