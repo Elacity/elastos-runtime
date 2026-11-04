@@ -3048,6 +3048,7 @@ fn open_lifetime_lock(path: &Path, create: bool) -> Result<LockFile, String> {
     Ok(file)
 }
 
+#[cfg_attr(test, track_caller)]
 fn try_lock_exclusive(file: &LockFile) -> Result<bool, String> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
@@ -3055,6 +3056,13 @@ fn try_lock_exclusive(file: &LockFile) -> Result<bool, String> {
     }
     let error = std::io::Error::last_os_error();
     if error.kind() == ErrorKind::WouldBlock {
+        #[cfg(all(test, target_os = "linux"))]
+        eprintln!(
+            "lock refusal at {} path={:?}\n{}",
+            std::panic::Location::caller(),
+            fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())),
+            linux::tests::slot_lock_holders(file)
+        );
         return Ok(false);
     }
     Err(error.to_string())
