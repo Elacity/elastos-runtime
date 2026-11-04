@@ -1367,7 +1367,70 @@ fn connect_userspace_with_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn slot_lock_holders(slot: &File) -> String {
+        fn process_identity(pid: i32) -> String {
+            let root = PathBuf::from(format!("/proc/{pid}"));
+            let stat = fs::read_to_string(root.join("stat")).unwrap_or_default();
+            let ppid = stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+                .unwrap_or("unavailable");
+            let cmdline = fs::read(root.join("cmdline"))
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            format!(
+                "pid={pid} ppid={ppid} this_test_process={} cmdline={cmdline:?}",
+                pid == std::process::id() as i32
+            )
+        }
+
+        let metadata = slot.metadata().unwrap();
+        let dev = metadata.dev();
+        let inode = metadata.ino();
+        let mut report = format!("slot.lock dev={dev} inode={inode}\n");
+        for process in fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = process
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(fds) = fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                if fs::metadata(fd.path())
+                    .is_ok_and(|metadata| metadata.dev() == dev && metadata.ino() == inode)
+                {
+                    report.push_str(&format!(
+                        "slot holder fd={} {}\n",
+                        fd.file_name().to_string_lossy(),
+                        process_identity(pid)
+                    ));
+                }
+            }
+        }
+        let lock_identity = format!("{:02x}:{:02x}:{inode}", libc::major(dev), libc::minor(dev));
+        match fs::read_to_string("/proc/locks") {
+            Ok(locks) => {
+                for line in locks.lines() {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    if let Some(index) = fields.iter().position(|field| *field == lock_identity) {
+                        let pid = fields[index - 1].parse::<i32>().unwrap_or(-1);
+                        report.push_str(&format!(
+                            "slot /proc/locks {line} {}\n",
+                            process_identity(pid)
+                        ));
+                    }
+                }
+            }
+            Err(error) => report.push_str(&format!("/proc/locks unavailable: {error}\n")),
+        }
+        report
+    }
 
     fn fixture(root: &std::path::Path) -> (CrosvmBrowserProvider, VmConfig) {
         let config = VzConfig {
@@ -2129,7 +2192,11 @@ mod tests {
         assert_eq!(provider.guest_state_label(&handle).await, "Stopped");
         assert!(!super::super::try_lock_exclusive(&slot).unwrap());
         assert!(provider.release_terminal_native_vm(&handle).await);
-        assert!(super::super::try_lock_exclusive(&slot).unwrap());
+        assert!(
+            super::super::try_lock_exclusive(&slot).unwrap(),
+            "{}",
+            slot_lock_holders(&slot)
+        );
     }
 
     #[tokio::test]
