@@ -3696,7 +3696,17 @@ fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str, in
 
 #[cfg(test)]
 fn attach_browser_profile_disk(vm_config: &mut VmConfig, request: &Value) -> Result<(), String> {
-    let profile_disk = prepare_browser_profile_disk(request)?;
+    let profile_disk = prepare_browser_profile_disk(request);
+    #[cfg(target_os = "linux")]
+    let profile_disk = profile_disk.map_err(|error| {
+        if let Some(path) = request["profile"]["disk_path"].as_str() {
+            if let Ok(lock) = File::open(disk_lifetime_lock_path(Path::new(path))) {
+                return format!("{error}\n{}", linux::tests::slot_lock_holders(&lock));
+            }
+        }
+        error
+    });
+    let profile_disk = profile_disk?;
     vm_config.data_disk_path = Some(profile_disk.path);
     append_browser_profile_boot_arg(
         &mut vm_config.boot_args,

@@ -1365,11 +1365,11 @@ fn connect_userspace_with_budget(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    fn slot_lock_holders(slot: &File) -> String {
+    pub(crate) fn slot_lock_holders(slot: &File) -> String {
         fn process_identity(pid: i32) -> String {
             let root = PathBuf::from(format!("/proc/{pid}"));
             let stat = fs::read_to_string(root.join("stat")).unwrap_or_default();
@@ -1390,6 +1390,7 @@ mod tests {
         let dev = metadata.dev();
         let inode = metadata.ino();
         let mut report = format!("slot.lock dev={dev} inode={inode}\n");
+        let locks = fs::read_to_string("/proc/locks");
         for process in fs::read_dir("/proc").unwrap().flatten() {
             let Some(pid) = process
                 .file_name()
@@ -1414,7 +1415,7 @@ mod tests {
             }
         }
         let lock_identity = format!("{:02x}:{:02x}:{inode}", libc::major(dev), libc::minor(dev));
-        match fs::read_to_string("/proc/locks") {
+        match locks {
             Ok(locks) => {
                 for line in locks.lines() {
                     let fields = line.split_whitespace().collect::<Vec<_>>();
