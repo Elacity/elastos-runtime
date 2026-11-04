@@ -980,14 +980,6 @@ function tcpBindAbsent(host, port) {
   });
 }
 
-function bindTcpExclusive(host, port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", (error) => reject(error));
-    server.listen({ host, port, exclusive: true }, () => resolve(server));
-  });
-}
-
 function bindUdpExclusive(host, port) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket({
@@ -1003,24 +995,18 @@ async function turnListenerPortAbsent(turn) {
   return tcpBindAbsent(turn.listen_host, turn.listen_port);
 }
 
+// TURN runs with no-tcp-relay, so its relays are UDP only. A TCP socket on a
+// relay port (for example a loopback connection's ephemeral port) is not a
+// relay and must not hold Close; the native owner checks the same way.
 async function turnRelayPortsAbsent(turn) {
   const held = [];
   try {
     for (let port = turn.relay_port_min; port <= turn.relay_port_max; port += 1) {
-      let tcp;
-      let udp;
       try {
-        tcp = await bindTcpExclusive(turn.relay_host, port);
+        held.push(await bindUdpExclusive(turn.relay_host, port));
       } catch {
         return false;
       }
-      held.push(tcp);
-      try {
-        udp = await bindUdpExclusive(turn.relay_host, port);
-      } catch {
-        return false;
-      }
-      held.push(udp);
     }
     return true;
   } finally {
@@ -1110,7 +1096,7 @@ async function exactTransportCleanupEffects(binding, termination) {
   // Supervisor connects to those paths and proves its own bridges by session
   // absence plus a graceful or already-terminal owned launcher exit.
   // Native browser-vz-engine-supervisor owns TURN child cleanup.
-  // Port binds prove only listen and declared TCP/UDP relay absence.
+  // Port binds prove only TCP listener and UDP relay absence (no-tcp-relay).
   const probeTurnPorts =
     binding.transport_receipt.effects.turn_launch_owned === true;
   const turnListenerAbsent = probeTurnPorts
