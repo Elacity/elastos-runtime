@@ -41,6 +41,66 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing_subscriber::{fmt, EnvFilter};
 
+/// Serializes every child fork-through-exec with every lock descriptor close.
+/// Keep this section limited to Command::spawn: prepare commands beforehand,
+/// and drop commands, owners and lock files after releasing the gate. pre_exec
+/// callbacks use only async-signal-safe syscalls and never acquire this mutex.
+static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+trait SpawnGated {
+    fn spawn_gated(&mut self) -> std::io::Result<process::Child>;
+}
+
+impl SpawnGated for process::Command {
+    fn spawn_gated(&mut self) -> std::io::Result<process::Child> {
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+        // Rust's Unix spawn waits on its CLOEXEC error channel until exec or
+        // failed-child reaping; its posix_spawn path also completes exec first.
+        self.spawn()
+    }
+}
+
+/// Every local copy of a flock description closes under the spawn gate,
+/// including temporary duplicates and files on early-return/error paths.
+#[derive(Debug)]
+struct LockFile(Option<File>);
+
+impl LockFile {
+    fn new(file: File) -> Self {
+        Self(Some(file))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_clone(&self) -> std::io::Result<Self> {
+        self.0
+            .as_ref()
+            .expect("open lock file")
+            .try_clone()
+            .map(Self::new)
+    }
+}
+
+impl std::ops::Deref for LockFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        self.0.as_ref().expect("open lock file")
+    }
+}
+
+impl AsRawFd for LockFile {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_ref().expect("open lock file").as_raw_fd()
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+        drop(self.0.take());
+    }
+}
+
 // Chromium allows up to 128 sockets per proxy, and pre-opened idle streams
 // count against the slot pool, so the web bridge must not starve page loads.
 const WEB_EGRESS_MAX_SESSIONS: usize = 128;
@@ -2139,7 +2199,7 @@ impl LaunchTurn {
             });
         }
         let mut child = command
-            .spawn()
+            .spawn_gated()
             .map_err(|err| format!("Browser VZ TURN process failed to start: {err}"))?;
         let mut log_threads = Vec::with_capacity(2);
         if let Some(stdout) = child.stdout.take() {
@@ -2454,7 +2514,8 @@ fn verify_virtualization_entitlement(executable: &Path) -> Result<(), String> {
         let verified = Command::new("/usr/bin/codesign")
             .args(["--verify", "--strict"])
             .arg(executable)
-            .status()
+            .spawn_gated()
+            .and_then(|mut child| child.wait())
             .map_err(|err| format!("Browser VZ codesign verification failed: {err}"))?;
         if !verified.success() {
             return Err("Browser VZ supervisor signature verification failed".to_string());
@@ -2462,7 +2523,11 @@ fn verify_virtualization_entitlement(executable: &Path) -> Result<(), String> {
         let entitlements = Command::new("/usr/bin/codesign")
             .args(["-d", "--entitlements", ":-"])
             .arg(executable)
-            .output()
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn_gated()
+            .and_then(|child| child.wait_with_output())
             .map_err(|err| format!("Browser VZ entitlement inspection failed: {err}"))?;
         let mut text = String::from_utf8_lossy(&entitlements.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&entitlements.stderr));
@@ -2920,12 +2985,13 @@ fn remove_directory_if_present(path: &Path) -> Result<(), String> {
 #[derive(Debug)]
 struct LifetimeFileLock {
     _path: PathBuf,
-    file: File,
+    file: LockFile,
 }
 
 #[cfg(not(target_os = "linux"))]
 impl Drop for LifetimeFileLock {
     fn drop(&mut self) {
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -2958,7 +3024,7 @@ fn disk_lifetime_lock_path(disk_path: &Path) -> PathBuf {
     PathBuf::from(lock_path)
 }
 
-fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
+fn open_lifetime_lock(path: &Path, create: bool) -> Result<LockFile, String> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -2970,7 +3036,7 @@ fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
         }
         options.create(true).mode(0o600);
     }
-    let file = options.open(path).map_err(|err| err.to_string())?;
+    let file = LockFile::new(options.open(path).map_err(|err| err.to_string())?);
     let metadata = file.metadata().map_err(|err| err.to_string())?;
     if !metadata.is_file() || metadata.nlink() != 1 {
         return Err("Browser lifetime lock requires a regular file with one link".into());
@@ -2982,7 +3048,7 @@ fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
     Ok(file)
 }
 
-fn try_lock_exclusive(file: &File) -> Result<bool, String> {
+fn try_lock_exclusive(file: &LockFile) -> Result<bool, String> {
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         return Ok(true);
@@ -3323,7 +3389,8 @@ fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn_gated()
+        .and_then(|mut child| child.wait())
         .map_err(|err| format!("debugfs rm guest Browser control service failed: {err}"))?;
     if !rm.success() {
         let _ = fs::remove_file(&staging);
@@ -3344,7 +3411,8 @@ fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn_gated()
+        .and_then(|mut child| child.wait())
         .map_err(|err| format!("debugfs write guest Browser control service failed: {err}"))?;
     let _ = fs::remove_file(&staging);
     if !write.success() {
@@ -3430,7 +3498,8 @@ fn overlay_guest_file(rootfs: &Path, source: &Path, guest_path: &str) -> Result<
         .args(["-w", "-R", &format!("rm {guest_path}"), rootfs_text])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn_gated()
+        .and_then(|mut child| child.wait())
         .map_err(|err| format!("debugfs rm {guest_path} failed: {err}"))?;
     if !rm.success() {
         let _ = fs::remove_file(&staging);
@@ -3445,7 +3514,8 @@ fn overlay_guest_file(rootfs: &Path, source: &Path, guest_path: &str) -> Result<
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn_gated()
+        .and_then(|mut child| child.wait())
         .map_err(|err| format!("debugfs write {guest_path} failed: {err}"))?;
     let _ = fs::remove_file(&staging);
     if !write.success() {
@@ -3500,7 +3570,7 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
             .arg("-c")
             .arg(source)
             .arg(destination)
-            .status(),
+            .spawn_gated().and_then(|mut child| child.wait()),
         Ok(status) if status.success()
     );
     #[cfg(not(target_os = "macos"))]
@@ -5249,7 +5319,11 @@ fn shutdown_signal_sender_comm(sender_pid: u32) -> String {
     }
     let output = process::Command::new("ps")
         .args(["-p", &sender_pid.to_string(), "-o", "comm="])
-        .output();
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn_gated()
+        .and_then(|child| child.wait_with_output());
     match output {
         Ok(output) if output.status.success() => {
             let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -6296,7 +6370,7 @@ mod tests {
         ));
         owner.transport.secret["binding_hash"] = owner.transport.authority["binding_hash"].clone();
         owner.identity = VzLaunchIdentity::from_launch(&launch_for_transport(&owner.transport));
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn_gated().unwrap();
         child.wait().unwrap();
         let error = LaunchTurn {
             child,
@@ -6324,7 +6398,7 @@ mod tests {
     #[test]
     fn failed_turn_start_retains_its_unfinished_log_reader() {
         let root = tempfile::tempdir().unwrap();
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn_gated().unwrap();
         child.wait().unwrap();
         let (release_tx, release_rx) = mpsc::channel();
         let config_path = root.path().join("turn.conf");
@@ -8062,16 +8136,72 @@ mod tests {
     }
 
     fn assert_disk_inode_is_unlocked(disk_path: &Path) {
-        let disk = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(disk_path)
-            .unwrap();
+        let disk = LockFile::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(disk_path)
+                .unwrap(),
+        );
         assert!(
             try_lock_exclusive(&disk).unwrap(),
             "disk inode should remain available to Virtualization.framework"
         );
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
+    #[test]
+    fn shared_owner_reacquires_profile_during_sibling_spawns_200_times() {
+        const ROUNDS: usize = 200;
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile.ext4");
+        let (mut ready, child_ready) = UnixStream::pair().unwrap();
+        let child_ready_fd = child_ready.as_raw_fd();
+        let (next_tx, next_rx) = mpsc::sync_channel(0);
+        let spawner = thread::spawn(move || {
+            for () in next_rx {
+                let mut command = process::Command::new("/usr/bin/true");
+                unsafe {
+                    command.pre_exec(move || {
+                        // Signal after fork and widen the inherited-fd window.
+                        // These are async-signal-safe syscalls only.
+                        let byte = 1u8;
+                        if libc::write(child_ready_fd, (&byte as *const u8).cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let pause = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 5_000_000,
+                        };
+                        libc::nanosleep(&pause, std::ptr::null_mut());
+                        Ok(())
+                    });
+                }
+                assert!(command.spawn_gated().unwrap().wait().unwrap().success());
+            }
+            drop(child_ready);
+        });
+        let mut owner = LifetimeFileLock::acquire_disk_sidecar(&profile, "profile").unwrap();
+        for _ in 0..ROUNDS {
+            next_tx.send(()).unwrap();
+            ready.read_exact(&mut [0]).unwrap();
+            drop(owner);
+            // One production acquisition, with no retry. Without the gate on
+            // Linux the paused child still owns the old flock description.
+            match LifetimeFileLock::acquire_disk_sidecar(&profile, "profile") {
+                Ok(next) => owner = next,
+                Err(error) => {
+                    // Settle the child before reporting a failed acquisition.
+                    drop(next_tx);
+                    spawner.join().unwrap();
+                    panic!("profile reacquisition failed during sibling spawn: {error}");
+                }
+            }
+        }
+        drop(owner);
+        drop(next_tx);
+        spawner.join().unwrap();
     }
 
     #[test]
@@ -8115,7 +8245,7 @@ mod tests {
             .arg("--nocapture")
             .env("ELASTOS_TEST_LIFETIME_LOCK_PATH", &lock_path)
             .stdout(std::process::Stdio::piped())
-            .spawn()
+            .spawn_gated()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut lines = std::io::BufReader::new(stdout).lines();

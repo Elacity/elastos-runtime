@@ -1,6 +1,7 @@
 //! Linux substrate for the shared Browser transport/lifecycle supervisor.
 //! Only this module launches crosvm. The parent owns bootstrap, streams, TURN
 //! policy, profile durability and the exact terminal settlement.
+use super::{LockFile, SpawnGated};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -134,7 +135,7 @@ pub(super) fn create_rootfs_overlay(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     own_process_group(&mut command, Vec::new());
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = command.spawn_gated().map_err(|e| e.to_string())?;
     let deadline = Instant::now() + ROOTFS_OVERLAY_CREATE_BUDGET;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -274,7 +275,7 @@ fn setup_check() -> Result<(), String> {
 
 fn run_setup_check(mut command: Command, budget: Duration) -> Result<(), String> {
     own_process_group(&mut command, Vec::new());
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = command.spawn_gated().map_err(|e| e.to_string())?;
     let pgid = child.id() as i32;
     let deadline = Instant::now() + budget;
     let timed_out = loop {
@@ -310,19 +311,21 @@ fn run_setup_check(mut command: Command, budget: Duration) -> Result<(), String>
     }
 }
 
-fn acquire_slot(transport: &Transport) -> Result<File, String> {
+fn acquire_slot(transport: &Transport) -> Result<LockFile, String> {
     setup_check()?;
     let uid = unsafe { libc::getuid() };
     let root = Path::new(SETUP_ROOT);
     trusted_root_path(root)?;
     for slot in 0..4 {
         let path = root.join(format!("ebv{uid:x}s{slot}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
+        let file = LockFile::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|e| e.to_string())?,
+        );
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if !metadata.is_file()
             || metadata.nlink() != 1
@@ -360,7 +363,7 @@ fn acquire_slot(transport: &Transport) -> Result<File, String> {
         if fd < 0 {
             return Err(io::Error::last_os_error().to_string());
         }
-        return Ok(unsafe { File::from_raw_fd(fd) });
+        return Ok(LockFile::new(unsafe { File::from_raw_fd(fd) }));
     }
     Err("All four Browser host slots are in use. Close a Browser session and retry.".into())
 }
@@ -453,7 +456,7 @@ struct Vm {
     socket_dir: PathBuf,
     state: AtomicU8,
     stop: AtomicBool,
-    writer_locks: Mutex<Vec<File>>,
+    writer_locks: Mutex<Vec<LockFile>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     /// Set before STOPPED when crosvm or its backend exited unrequested.
     exit: Mutex<Option<String>>,
@@ -512,7 +515,7 @@ impl CrosvmBrowserProvider {
         &self,
         config: VmConfig,
         manifest: CapsuleManifest,
-        lease: File,
+        lease: LockFile,
     ) -> Result<CapsuleHandle, String> {
         if !config.network_disabled
             || config.network.is_some()
@@ -565,7 +568,7 @@ impl CrosvmBrowserProvider {
     pub(super) fn retain_writer_locks(
         &self,
         handle: &CapsuleHandle,
-        locks: Vec<File>,
+        locks: Vec<LockFile>,
     ) -> Result<(), String> {
         let vm = self.vm(handle)?;
         if vm.state.load(Ordering::Acquire) != LOADED {
@@ -579,7 +582,7 @@ impl CrosvmBrowserProvider {
             if fd < 0 {
                 return Err(io::Error::last_os_error().to_string());
             }
-            retained.push(unsafe { File::from_raw_fd(fd) });
+            retained.push(LockFile::new(unsafe { File::from_raw_fd(fd) }));
         }
         vm.writer_locks
             .lock()
@@ -896,7 +899,7 @@ fn run_owned_vm(
 ) {
     let backend = backend_command(&vm, &state_dir).and_then(|command| {
         command
-            .map(|mut command| command.spawn().map_err(|e| e.to_string()))
+            .map(|mut command| command.spawn_gated().map_err(|e| e.to_string()))
             .transpose()
     });
     let mut backend = match backend {
@@ -908,7 +911,7 @@ fn run_owned_vm(
         }
     };
     let child = command(&vm, binary, socket, state_dir.clone())
-        .and_then(|mut command| command.spawn().map_err(|e| e.to_string()));
+        .and_then(|mut command| command.spawn_gated().map_err(|e| e.to_string()));
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
@@ -1366,33 +1369,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn run_lock_test_in_subprocess() -> bool {
-        let current = thread::current();
-        let name = current.name().expect("named test thread");
-        const ISOLATED_TEST: &str = "ELASTOS_TEST_ISOLATED_CROSVM_LOCK_TEST";
-        if std::env::var(ISOLATED_TEST).as_deref() == Ok(name) {
-            return false;
-        }
-        // CLOEXEC closes a sibling's inherited lock fds at exec, not fork.
-        // Other tests can fork during our last close and keep its flock alive
-        // until they exec. A separate process gives this test the production
-        // supervisor's single-launch ownership, while keeping parallel tests.
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture", "--test-threads=1"])
-            .env(ISOLATED_TEST, name)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-            "isolated {name} failed ({}):\n{}\n{}",
-            output.status,
-            stdout,
-            String::from_utf8_lossy(&output.stderr),
-        );
-        true
-    }
-
     fn fixture(root: &std::path::Path) -> (CrosvmBrowserProvider, VmConfig) {
         let config = VzConfig {
             state_dir: root.join("state"),
@@ -1427,7 +1403,7 @@ mod tests {
         assert!(fd >= 64);
         let handle = provider
             .load_reserved_vm(config, super::super::browser_vm_manifest(2048, 2), unsafe {
-                File::from_raw_fd(fd)
+                LockFile::new(File::from_raw_fd(fd))
             })
             .unwrap();
         let profile =
@@ -1516,9 +1492,6 @@ mod tests {
 
     #[tokio::test]
     async fn owned_crosvm_exit_reaps_worker_before_releasing_writer_lock() {
-        if run_lock_test_in_subprocess() {
-            return;
-        }
         let root = tempfile::tempdir().unwrap();
         let (provider, config) = fixture(root.path());
         fs::write(&provider.binary, "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > \"$3.child\"\nprintf '%s' \"$$\" > \"$3.pid\"\nwait\n").unwrap();
@@ -1555,7 +1528,7 @@ mod tests {
                 }
             });
         }
-        let mut unrelated = unrelated_command.spawn().unwrap();
+        let mut unrelated = unrelated_command.spawn_gated().unwrap();
         unsafe {
             libc::kill(leader, libc::SIGKILL);
         }
@@ -1571,10 +1544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sibling_fork_keeps_cloexec_leases_until_exec_after_vm_release() {
-        if run_lock_test_in_subprocess() {
-            return;
-        }
+    async fn vm_release_waits_for_sibling_exec_before_closing_cloexec_leases() {
         let root = tempfile::tempdir().unwrap();
         let (provider, config) = fixture(root.path());
         let handle = load_fixture(&provider, config);
@@ -1606,19 +1576,31 @@ mod tests {
                     Ok(())
                 });
             }
-            let spawned = command.spawn();
+            let spawned = command.spawn_gated();
             drop(child);
             spawned.unwrap()
         });
         let mut inherited = [0];
         parent.read_exact(&mut inherited).unwrap();
-        // The sibling is now paused after fork, before CLOEXEC takes effect.
-        // No Arc<Vm> or lease descriptor remains in this test after release.
-        let released = provider.release_terminal_native_vm(&handle).await;
-        let closed = unsafe { libc::fcntl(lease_fd, libc::F_GETFD) } == -1
-            && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+        // The child holds an inherited CLOEXEC lease until exec. Release on
+        // another thread: it must wait at the gate rather than report success.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let release = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            started_tx.send(()).unwrap();
+            let released = runtime.block_on(provider.release_terminal_native_vm(&handle));
+            released_tx.send(released).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let before_exec = released_rx.recv_timeout(Duration::from_millis(50));
         let held_before_exec = !super::super::try_lock_exclusive(&contender).unwrap();
+        // Always unblock the child before assertions so failures can settle.
         parent.write_all(&[1]).unwrap();
+        let released = released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.join().unwrap();
         let mut sibling = spawn.join().unwrap();
         let alive_after_exec = sibling.try_wait().unwrap().is_none();
         let free_after_exec = super::super::try_lock_exclusive(&contender).unwrap();
@@ -1627,7 +1609,10 @@ mod tests {
         assert!(sibling.wait().unwrap().success());
         assert_eq!(inherited, [1], "sibling inherited the CLOEXEC lease fd");
         assert!(released);
-        assert!(closed, "release closed the supervisor's lease fd");
+        assert!(
+            matches!(before_exec, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "release must wait for the sibling to exec"
+        );
         assert!(held_before_exec, "fork retained the same flock description");
         assert!(alive_after_exec);
         assert!(free_after_exec, "CLOEXEC closed the sibling's lease fd");
@@ -1635,7 +1620,7 @@ mod tests {
 
     #[test]
     fn exit_observation_keeps_leader_identity_until_final_reap() {
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("/bin/true").spawn_gated().unwrap();
         let pid = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !observe_exit(pid).unwrap() && Instant::now() < deadline {
@@ -1656,14 +1641,14 @@ mod tests {
         let mut leader = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
-            .spawn()
+            .spawn_gated()
             .unwrap();
         let pgid = leader.id() as i32;
         // Cleanup, not std, reaps this worker.
         let worker = Command::new("/bin/sleep")
             .arg("30")
             .process_group(pgid)
-            .spawn()
+            .spawn_gated()
             .unwrap()
             .id() as i32;
         // With hidepid=1, another user's live (PID 1) or exited (i32::MAX)
@@ -1710,7 +1695,7 @@ mod tests {
         let settle = Arc::new(AtomicBool::new(false));
         let ready = settle.clone();
         let owned = vm.clone();
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("/bin/true").spawn_gated().unwrap();
         *vm.worker.lock().unwrap() = Some(thread::spawn(move || {
             retire_owned_child(&owned, &mut child, Duration::ZERO, || {
                 if ready.load(Ordering::Acquire) {
@@ -1947,7 +1932,7 @@ mod tests {
         }
         command.args(&args[split..]).stdin(Stdio::null());
         own_command(&mut command, &vm).unwrap();
-        let mut child = ChildCleanup(Some(command.spawn().unwrap()));
+        let mut child = ChildCleanup(Some(command.spawn_gated().unwrap()));
         let pgid = child.0.as_ref().unwrap().id() as i32;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !provider.socket_dir.join("u/ready").exists() {
