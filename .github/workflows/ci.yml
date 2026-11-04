@@ -764,6 +764,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: free hosted runner disk
+        # ARM64 shares these steps; only the Ubuntu x86-64 job needs this cleanup.
+        if: github.job == 'source-home-linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -Pk .
       - name: configure Rust compile cache
         if: env.CI_USE_CACHE == 'true'
         uses: ./.github/actions/rust-compile-cache
