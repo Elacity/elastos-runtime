@@ -272,8 +272,9 @@ capsules, provider config, and `components.json`.
 ## Review And Commit Discipline
 
 - Before every non-trivial code change, put a short **Deepen notes** block at
-  the top of the PR description. Answer these four questions before changing
-  the code, then adjust the plan to match:
+  the top of the PR description (`.github/pull_request_template.md` starts
+  every new PR with it). Answer these four questions before changing the code,
+  then adjust the plan to match:
   1. **Expert view:** What would a top engineer in this area do here that the
      task does not ask for?
   2. **Raw material:** What is the rawest source to start from: code at a pinned
