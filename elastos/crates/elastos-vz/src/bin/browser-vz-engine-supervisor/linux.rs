@@ -660,11 +660,16 @@ impl CrosvmBrowserProvider {
         let Ok(vm) = self.vm(handle) else {
             return false;
         };
-        if !matches!(vm.state.load(Ordering::Acquire), LOADED | STOPPED) {
-            return false;
-        }
         let worker = match vm.worker.lock() {
-            Ok(mut worker) => worker.take(),
+            Ok(mut worker) => {
+                // Start checks LOADED under this same mutex. Retire a loaded
+                // VM here so a retained reference cannot start after release.
+                if !matches!(vm.state.load(Ordering::Acquire), LOADED | STOPPED) {
+                    return false;
+                }
+                vm.state.store(STOPPED, Ordering::Release);
+                worker.take()
+            }
             Err(_) => return false,
         };
         if let Some(worker) = worker {
@@ -1816,7 +1821,9 @@ pub(super) mod tests {
         let observer = thread::spawn(move || {
             ready_tx.send(()).unwrap();
             finish_rx.recv().unwrap();
+            let state = vm.state.load(Ordering::Acquire);
             drop(vm);
+            state
         });
         ready_rx.recv().unwrap();
         let slot = super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
@@ -1838,8 +1845,9 @@ pub(super) mod tests {
         };
         // Settle the observer even when an assertion will fail.
         finish_tx.send(()).unwrap();
-        observer.join().unwrap();
+        let state = observer.join().unwrap();
         assert!(released);
+        assert_eq!(state, STOPPED, "retired VM reference can still start");
         assert!(
             slot_free && profile_free,
             "release retained VM leases:\n{holders}"
