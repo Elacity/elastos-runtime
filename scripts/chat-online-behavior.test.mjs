@@ -8,13 +8,18 @@ import { checkArtifacts } from "./check-chat-ui-artifacts.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const read = path => readFileSync(resolve(root, path), "utf8");
-async function fixture(t, direct = false) {
+assert.ok(process.env.BROWSER_OPERATOR_PLAYWRIGHT_CORE,
+  "Run ./scripts/test-behaviour.sh inputs and use the pinned BROWSER_OPERATOR_PLAYWRIGHT_CORE input");
+const sdkPath = resolve(process.env.BROWSER_OPERATOR_PLAYWRIGHT_CORE);
+const metadata = JSON.parse(readFileSync(resolve(sdkPath, "package.json"), "utf8"));
+assert.equal(metadata.name, "playwright-core");
+assert.equal(metadata.version, "1.59.1");
+const { chromium } = await import(pathToFileURL(resolve(sdkPath, "index.mjs")).href);
+const serverSecret = "provider-secret-sk-session-start-fixture";
+const boundedStartFailure = "Chat session bootstrap failed. Reopen Chat from Home.";
+async function fixture(t, direct = false, { startFault = null } = {}) {
   checkArtifacts(); // Execute the committed WASM only when its source stamp matches.
-  const specifier = process.env.ELASTOS_PLAYWRIGHT_MODULE || process.env.NODE_PATH && resolve(process.env.NODE_PATH, "playwright/index.js") || resolve(root,
-    "elastos/tools/browser-playwright-engine/node_modules/playwright/index.js");
-  const imported = await import(pathToFileURL(specifier).href);
-  const { chromium } = imported.default || imported;
-  const state = { now: 0, tokenExpiry: 60, roomExpiry: 60, fault: null,
+  const state = { now: 0, tokenExpiry: 60, roomExpiry: 60, fault: null, startFault,
     polls: [], accepted: 0, starts: 0, renewals: 0, errors: [] };
   const transport = { configured: true, available: true, community_joined: true };
   const poll = () => ({ room_slug: "chat-room", display_name: "Owner", latest_seq: 41,
@@ -48,7 +53,9 @@ async function fixture(t, direct = false) {
         ] } : poll()); return;
       }
       if (url.pathname.endsWith("/session/start")) {
-        state.starts++; state.roomExpiry = state.now + 60; json(200, { poll: poll(), expires_at: state.roomExpiry }); return;
+        state.starts++;
+        if (state.startFault) { json(state.startFault, { error: serverSecret }); return; }
+        state.roomExpiry = state.now + 60; json(200, { poll: poll(), expires_at: state.roomExpiry }); return;
       }
       if (url.pathname.endsWith("/summary")) {
         json(200, { room_slug: "chat-room", pending_count: 0, active_session_count: 1, transport }); return;
@@ -70,11 +77,21 @@ async function fixture(t, direct = false) {
   t.after(async () => { await browser?.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  await page.addInitScript(secret => {
+    window.sessionStartSecretLeaks = [];
+    new MutationObserver(() => {
+      if (document.documentElement?.outerHTML.includes(secret)) window.sessionStartSecretLeaks.push(true);
+    }).observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+  }, serverSecret);
   page.on("pageerror", error => state.errors.push(error.message));
   await page.route("**/*", route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
   await page.clock.install({ time: new Date(0) });
   await page.goto(origin);
   const frame = page.frames().find(frame => frame.url().includes("/apps/chat-room/"));
+  if (startFault) {
+    await frame.waitForFunction(() => document.body.textContent.includes("session bootstrap") || document.body.textContent.includes("provider-secret"));
+    return { state, page, frame };
+  }
   if (direct) await frame.getByText("Kept history", { exact: true }).waitFor();
   else await frame.waitForSelector('body[data-room-session-active="true"]', { state: "attached", timeout: 10000 });
   await frame.locator("#message-input").fill("Keep this draft");
@@ -91,6 +108,30 @@ async function fixture(t, direct = false) {
   if (!direct) assert.equal(state.polls.at(-1).since, 41);
   assert.deepEqual(state.errors, []);
   return { state, page, frame, tick };
+}
+
+for (const path of ["initial bootstrap", "room renewal", "Home recovery"]) {
+  test(`Chat bounds session-start server errors during ${path}`, { timeout: 30000 }, async t => {
+    const { state, frame, tick } = await fixture(t, false,
+      path === "initial bootstrap" ? { startFault: 503 } : {});
+    if (tick) {
+      const starts = state.starts;
+      state.startFault = 503;
+      if (path === "room renewal") state.now = 31;
+      else state.fault = 401;
+      await tick(2);
+      state.fault = null;
+      await tick(35);
+      assert.ok(state.starts > starts, "the session-start call site reached the failing server");
+    }
+    assert.ok(state.starts > 0);
+    const ui = await frame.locator("html").evaluate(element => element.outerHTML);
+    assert.ok(!ui.includes(serverSecret), "server response secret must never enter rendered UI state");
+    assert.deepEqual(await frame.evaluate(() => window.sessionStartSecretLeaks), [],
+      "all rendered UI transitions keep the server body private");
+    assert.ok(ui.includes(boundedStartFailure), "the call site renders only the bounded failure detail");
+    assert.deepEqual(state.errors, []);
+  });
 }
 
 for (const direct of [false, true]) for (const failure of (direct

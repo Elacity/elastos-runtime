@@ -1264,10 +1264,10 @@ impl App {
             if renew_room {
                 let guard = current_selection_guard(&self.state.borrow());
                 if let Err(error) = self.ensure_shell_session_for_guard(&guard).await {
-                    if is_session_error(&error) {
+                    if error == ShellSessionBootstrapFailure::Unauthorized {
                         self.handle_session_loss(self.session_loss_detail());
                     }
-                    self.set_transient_error(Some(error));
+                    self.set_transient_error(Some(error.detail().to_string()));
                     self.recovery_failed();
                     let _ = self.render();
                     return;
@@ -2768,7 +2768,9 @@ impl App {
                 }
             }
             let guard = current_selection_guard(&self.state.borrow());
-            self.ensure_shell_session_for_guard(&guard).await?;
+            self.ensure_shell_session_for_guard(&guard)
+                .await
+                .map_err(|error| error.detail().to_string())?;
             if self.selection_guard_is_current(&guard)
                 && self.state.borrow().session_active
                 && guard.selected_conversation_id.is_some()
@@ -2927,7 +2929,7 @@ impl App {
                     .map(|_| ());
                 if let Err(err) = bootstrap {
                     if app.selection_guard_is_current(&shared_guard) {
-                        app.set_error(Some(err));
+                        app.set_error(Some(err.detail().to_string()));
                     }
                 } else if app.selection_guard_is_current(&shared_guard)
                     && app.state.borrow().session_active
@@ -3022,7 +3024,10 @@ impl App {
         Ok(())
     }
 
-    async fn ensure_shell_session_for_guard(&self, guard: &SelectionGuard) -> Result<bool, String> {
+    async fn ensure_shell_session_for_guard(
+        &self,
+        guard: &SelectionGuard,
+    ) -> Result<bool, ShellSessionBootstrapFailure> {
         let room_current = {
             let state = self.state.borrow();
             state.session_active
@@ -3040,7 +3045,8 @@ impl App {
             &self.room_api_url("/summary"),
             &self.home_token_headers(),
         )
-        .await?;
+        .await
+        .map_err(|error| ShellSessionBootstrapFailure::from_request_error(&error))?;
         if !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
@@ -3075,7 +3081,8 @@ impl App {
             &self.home_token_headers(),
             Some(REQUEST_DEADLINE_MS),
         )
-        .await?;
+        .await
+        .map_err(|error| ShellSessionBootstrapFailure::from_request_error(&error))?;
         if !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
@@ -3958,7 +3965,7 @@ impl App {
             if choice == "shared" {
                 if let Err(error) = app.ensure_shell_session_for_guard(&selection_guard).await {
                     if app.selection_guard_is_current(&selection_guard) {
-                        app.set_error(Some(error));
+                        app.set_error(Some(error.detail().to_string()));
                     }
                 }
             } else if let Err(status) = app
