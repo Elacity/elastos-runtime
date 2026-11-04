@@ -994,3 +994,57 @@ test('prepare refuses a custodian directory that holds other files', t => {
   assert.deepEqual(runtimeCalls(f), []);
   assertUnsignable(f);
 });
+
+// Any local account reads another process's command line, so the printed commands keep the
+// GitHub token in a pipe or a file descriptor and never in an argv (#528).
+test('the printed seed download and signing commands keep the GitHub token out of every argv', t => {
+  const f = fixture(t);
+  assert.equal(f.prepare().status, 0);
+  const token = 'gho_FIXTURE_TOKEN_0123456789';
+  const bin = join(f.root, 'argv-bin');
+  const argvLog = join(f.root, 'argv.log');
+  const stdinLog = join(f.root, 'curl-stdin.log');
+  const envLog = join(f.root, 'signer-env.log');
+  const realPython = run('which', ['python3']).stdout.trim();
+  mkdirSync(bin);
+  // Every fake records its own command line; the real tool then does the work.
+  const record = `{ printf '%s' "$0"; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; } >> '${argvLog}'`;
+  const fake = (name, body) => writeFileSync(join(bin, name), `#!/bin/sh\n${record}\n${body}\n`, { mode: 0o755 });
+  fake('curl', `cat >> '${stdinLog}'`);
+  fake('gh', `[ "$1 $2" = 'auth token' ] && { printf '%s\\n' '${token}'; exit 0; }\nexec '${join(f.root, 'bin/gh')}' "$@"`);
+  fake('env', 'exec /usr/bin/env "$@"');
+  fake('python3', `[ "$1" = -c ] && { printf '%s\\n' '${join(bin, 'python3')}'; exit 0; }\n`
+    + `case " $* " in *' --policy '*) /usr/bin/env >> '${envLog}' ;; esac\nexec '${realPython}' "$@"`);
+  const env = { ...f.env, PATH: `${bin}:${f.env.PATH}`, FIXTURE_CALLER_SECRET: 'caller environment' };
+
+  // The seed download: run the printed get() with a fake token and the recording curl.
+  writeState(f.env.RELEASE_SEED_DATA, {});
+  const printedSeed = run('bash', [f.script, 'seed', '1.2.3-alpha.1', signedSet(f, { signer_did: did })], { env: f.env }).stdout;
+  const lines = printedSeed.split('\n');
+  const start = lines.findIndex(line => line.startsWith('get() {'));
+  const end = lines.findIndex((line, index) => index >= start && line.trimEnd().endsWith('; }'));
+  assert.ok(start >= 0 && end >= start, printedSeed);
+  spawnSync('bash', ['-c', `${lines.slice(start, end + 1).join('\n')}\nget package 7 ${'0'.repeat(64)}`],
+    { encoding: 'utf8', cwd: f.root, input: '', env: { ...env, GH_TOKEN: token } });
+
+  // The signing launch: run the printed command with the recording env, gh and pinned Python.
+  const signer = join(f.root, 'fixture-signer.py');
+  const key = join(f.root, 'fixture-key');
+  writeFileSync(signer, '# fixture signer');
+  writeFileSync(key, 'fixture key');
+  const printedPolicy = run('bash', [f.script, 'policy', '1.2.3-alpha.1', signer, key, run('which', ['openssl']).stdout.trim()], { env }).stdout;
+  const launch = printedPolicy.trim().split('\n').at(-1);
+  const signed = spawnSync('bash', ['-c', launch], { encoding: 'utf8', cwd: f.root, env });
+  assert.equal(signed.status, 0, signed.stderr);
+
+  // Both tools ran, and neither they nor any process that started them carried the token.
+  const argv = readFileSync(argvLog, 'utf8');
+  assert.ok(argv.includes('/actions/artifacts/7/zip'), argv);
+  assert.ok(argv.includes(`-S ${signer} --policy`), argv);
+  assert.equal(argv.includes(token), false, argv);
+  // The token still reaches curl, and the signer's environment holds it and nothing else of the caller's.
+  assert.match(readFileSync(stdinLog, 'utf8'), new RegExp(`Authorization: Bearer ${token}`));
+  const signerEnv = readFileSync(envLog, 'utf8');
+  assert.match(signerEnv, new RegExp(`^GH_TOKEN=${token}$`, 'm'));
+  assert.equal(signerEnv.includes('FIXTURE_CALLER_SECRET'), false, signerEnv);
+});

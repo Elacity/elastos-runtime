@@ -763,6 +763,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           targets: wasm32-unknown-unknown
+      - name: free hosted runner disk
+        # ARM64 shares these steps; only the Ubuntu x86-64 job needs this cleanup.
+        if: github.job == 'source-home-linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -Pk .
       - name: configure Rust compile cache
         if: env.CI_USE_CACHE == 'true'
         uses: ./.github/actions/rust-compile-cache
@@ -1025,7 +1031,7 @@ jobs:
   source-home-macos:
     name: source-home-macos
     runs-on: macos-15
-    # The two hop builds may take 30 minutes and the update journey step 75.
+    # The two hop builds have a 70-minute step budget and the update journey 75.
     timeout-minutes: 150
     needs: source-gate
     env:
@@ -1212,7 +1218,8 @@ jobs:
           key: previous-release-${{ hashFiles('scripts/update-hop-previous-release.json') }}
       - name: build two actual Runtime versions
         # This source compiled twice (new and next) over the restored intermediates.
-        timeout-minutes: 30
+        # Allow 60 minutes for builds plus verification and cleanup.
+        timeout-minutes: 70
         run: |
           set -euo pipefail
           CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
@@ -1342,7 +1349,7 @@ jobs:
   update-hop-linux:
     name: update-hop-linux
     runs-on: ubuntu-24.04
-    # Source-home with the hop builds may take 45 minutes and the update journey 75.
+    # The two hop builds have a 70-minute step budget and the update journey 75.
     timeout-minutes: 150
     needs: source-gate
     env:
@@ -1472,7 +1479,8 @@ jobs:
           python3 scripts/update-hop-compare.py install-previous-release \
             "$RUNNER_TEMP/previous-release-home" "$RUNNER_TEMP/previous-release"
       - name: build two actual Runtime versions
-        timeout-minutes: 30
+        # Allow 60 minutes for builds plus verification and cleanup.
+        timeout-minutes: 70
         run: |
           set -euo pipefail
           CI_HOP_ROOT="$HOME/.local/share/elastos-ci-update-hop"
