@@ -675,6 +675,12 @@ impl CrosvmBrowserProvider {
                 return false;
             }
         }
+        // Terminal worker settlement owns lease release. A stream operation
+        // or state observer can retain Arc<Vm> after this call returns.
+        match vm.writer_locks.lock() {
+            Ok(mut locks) => locks.clear(),
+            Err(_) => return false,
+        }
         match self.vms.lock() {
             Ok(mut vms) => {
                 vms.remove(&handle.id.0);
@@ -1817,12 +1823,23 @@ pub(super) mod tests {
         let released = provider.release_terminal_native_vm(&handle).await;
         let slot_free = super::super::try_lock_exclusive(&slot).unwrap();
         let profile_free = super::super::try_lock_exclusive(&profile).unwrap();
-        let holders = format!("{}{}", slot_lock_holders(&slot), slot_lock_holders(&profile));
+        let holders = if slot_free && profile_free {
+            String::new()
+        } else {
+            format!(
+                "{}{}",
+                slot_lock_holders(&slot),
+                slot_lock_holders(&profile)
+            )
+        };
         // Settle the observer even when an assertion will fail.
         finish_tx.send(()).unwrap();
         observer.join().unwrap();
         assert!(released);
-        assert!(slot_free && profile_free, "release retained VM leases:\n{holders}");
+        assert!(
+            slot_free && profile_free,
+            "release retained VM leases:\n{holders}"
+        );
     }
 
     #[tokio::test]
@@ -1867,7 +1884,6 @@ pub(super) mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(provider.release_terminal_native_vm(&handle).await);
-        drop(vm);
         assert!(super::super::try_lock_exclusive(&contender).unwrap());
         assert!(super::super::try_lock_exclusive(&slot).unwrap());
     }
