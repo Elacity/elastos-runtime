@@ -264,6 +264,19 @@ class NativeSourceHomeTest(unittest.TestCase):
                 self.manifest['external'][bundle]['version'] = 'pin'
                 self.save_manifest()
 
+    def test_whole_setup_leaves_an_unpinned_prior_package_unretained(self):
+        # A Home set up before retention recorded its packages without pins.
+        info = {'strategy': 'source-build', 'install_path': 'libexec/browser/node/pin',
+                'release_path': f'node-{PLATFORM}.tar.gz', 'extract_path': 'node-pin', 'binary_path': 'bin/node'}
+        self.manifest['external']['node'] = {'version': 'pin', 'platforms': {PLATFORM: info}}
+        write(self.data / info['install_path'] / 'bin/node', 'node')
+        self.save_manifest()
+        write(self.data / 'components.json', json.dumps({'external': {'node': {'version': 'pin', 'platforms': {PLATFORM: dict(info)}}}}))
+        self.assert_ok(self.run_setup())
+        manifest = json.loads((self.data / 'components.json').read_text())
+        self.assertNotIn('node', manifest['profiles']['source-home']['components'])
+        self.assertNotIn('checksum', manifest['external']['node']['platforms'][PLATFORM])
+
     def test_legacy_turn_retirement_preserves_records_under_linked_parents(self):
         outside = self.root / 'outside-turn'
         outside.mkdir()

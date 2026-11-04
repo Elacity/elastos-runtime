@@ -1312,18 +1312,19 @@ for name in ("node", "python3", "debugfs", "turnserver", "crosvm", "vhost-device
         continue
     relative = info.get("install_path", component.get("install_path"))
     installed = data_dir / relative
-    if not installed.exists():
+    checksum, size = prior.get("checksum"), prior.get("size")
+    # A Home set up before retention (or by a source build) has no admitted pin
+    # for this package: it is not retained, and setup handles it as before.
+    if (not installed.exists()
+        or not isinstance(checksum, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", checksum)
+        or type(size) is not int or size <= 0
+        or prior.get("strategy") not in (None, "prebuilt", "browser-vm-image")):
         continue
     if component.get("version") != prior_component.get("version") or any(
         info.get(field) != prior.get(field)
         for field in ("install_path", "release_path", "extract_path", "binary_path")
     ):
         raise SystemExit(f"{name} installed package belongs to different source inputs")
-    checksum, size = prior.get("checksum"), prior.get("size")
-    if (not isinstance(checksum, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", checksum)
-        or type(size) is not int or size <= 0
-        or prior.get("strategy") not in (None, "prebuilt", "browser-vm-image")):
-        raise SystemExit(f"{name} prior package lacks a verified artifact pin")
     for field in ("checksum", "size", "cid"):
         if info.get(field) not in (None, "", 0, prior.get(field)):
             raise SystemExit(f"{name} source and installed {platform} pins conflict")
