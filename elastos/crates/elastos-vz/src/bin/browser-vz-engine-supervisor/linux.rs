@@ -1796,6 +1796,36 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_release_frees_leases_before_last_vm_observer_drops() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        let handle = load_fixture(&provider, config);
+        let vm = provider.vm(&handle).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let observer = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            drop(vm);
+        });
+        ready_rx.recv().unwrap();
+        let slot = super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+            .unwrap();
+        let profile =
+            super::super::open_lifetime_lock(&provider.socket_dir.join("profile.lock"), false)
+                .unwrap();
+        let released = provider.release_terminal_native_vm(&handle).await;
+        let slot_free = super::super::try_lock_exclusive(&slot).unwrap();
+        let profile_free = super::super::try_lock_exclusive(&profile).unwrap();
+        let holders = format!("{}{}", slot_lock_holders(&slot), slot_lock_holders(&profile));
+        // Settle the observer even when an assertion will fail.
+        finish_tx.send(()).unwrap();
+        observer.join().unwrap();
+        assert!(released);
+        assert!(slot_free && profile_free, "release retained VM leases:\n{holders}");
+    }
+
+    #[tokio::test]
     async fn delayed_retirement_keeps_owner_and_writer_lock_until_settlement() {
         let root = tempfile::tempdir().unwrap();
         let (provider, config) = fixture(root.path());
