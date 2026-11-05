@@ -9,6 +9,176 @@ use super::*;
 const UPDATE_APPLY_ROUTE: &str = "/api/apps/system/summary";
 const UPDATE_APPLY_OPERATION: &str = "system.update.apply";
 
+const CHANNEL_ROUTE: &str = "/api/apps/system/update-channel";
+const CHANNEL_OPERATION: &str = "system.source.switch-channel";
+
+#[tokio::test]
+async fn system_channel_choice_requires_owner_and_exact_fresh_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    configure_update_summary(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let intent = json!({"source_name":"update-fixture", "channel":"canary"});
+    for refusal in [
+        "guest",
+        "wrong capsule",
+        "unknown",
+        "retired",
+        "missing",
+        "expired",
+        "wrong operation",
+        "changed channel",
+        "changed source",
+    ] {
+        let approval = match refusal {
+            "missing" => String::new(),
+            "expired" => stale_step_up_token_for_app_context(
+                dir.path(),
+                SYSTEM_CAPSULE_ID,
+                &owner.system_token,
+                CHANNEL_OPERATION,
+                &intent,
+            ),
+            _ => step_up_token_for_app_context(
+                dir.path(),
+                SYSTEM_CAPSULE_ID,
+                &owner.system_token,
+                if refusal == "wrong operation" {
+                    UPDATE_APPLY_OPERATION
+                } else {
+                    CHANNEL_OPERATION
+                },
+                &intent,
+            ),
+        };
+        let mut body = intent.clone();
+        body["step_up_token"] = json!(approval);
+        match refusal {
+            "unknown" => body["channel"] = json!("nightly"),
+            "retired" => body["channel"] = json!("jetson-test"),
+            "changed channel" => body["channel"] = json!("stable"),
+            "changed source" => body["source_name"] = json!("another source"),
+            _ => {}
+        }
+        let token = match refusal {
+            "guest" => &guest.system_token,
+            "wrong capsule" => &owner.people_token,
+            _ => &owner.system_token,
+        };
+        let before = std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap();
+        let (status, _) = home_test_post_json(&app, CHANNEL_ROUTE, token, "null", body).await;
+        let expected = match refusal {
+            "guest" | "missing" | "expired" | "wrong operation" | "changed channel"
+            | "changed source" => StatusCode::FORBIDDEN,
+            "wrong capsule" => StatusCode::UNAUTHORIZED,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        assert_eq!(status, expected, "{refusal}");
+        assert_eq!(
+            std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap(),
+            before,
+            "{refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_channel_choice_changes_admission_preserves_install_and_retires_jetson() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    configure_update_summary(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let mut config = crate::sources::load_trusted_sources(dir.path()).unwrap();
+    let source = config.source_named_mut(None).unwrap();
+    source.channel = "jetson-test".into();
+    source.installed_version = "2.1.0-rc.1".into();
+    source.discovery_uri = "elastos://source/jetson-test/fixture".into();
+    crate::sources::save_trusted_sources(dir.path(), &config).unwrap();
+    let original = config.default_source().unwrap().clone();
+    assert!(crate::update::verify_source_channel(&original, "canary").is_err());
+    {
+        let _writer = crate::install_transaction::InstallationGuard::acquire(dir.path()).unwrap();
+        let intent = json!({"source_name":"update-fixture", "channel":"canary"});
+        let approval = step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            CHANNEL_OPERATION,
+            &intent,
+        );
+        let mut body = intent;
+        body["step_up_token"] = json!(approval);
+        let before = std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap();
+        let (status, _) =
+            home_test_post_json(&app, CHANNEL_ROUTE, &owner.system_token, "null", body).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an installation writer owns the release state"
+        );
+        assert_eq!(
+            std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap(),
+            before
+        );
+    }
+    for channel in ["canary", "stable"] {
+        let intent = json!({"source_name":"update-fixture", "channel":channel});
+        let approval = step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            CHANNEL_OPERATION,
+            &intent,
+        );
+        let mut body = intent;
+        body["step_up_token"] = json!(approval);
+        let (status, payload) = home_test_post_json(
+            &app,
+            CHANNEL_ROUTE,
+            &owner.system_token,
+            "null",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let config = crate::sources::load_trusted_sources(dir.path()).unwrap();
+        let source = config.default_source().unwrap();
+        assert_eq!(source.channel, channel);
+        assert_eq!(source.installed_version, original.installed_version);
+        assert_eq!(source.install_path, original.install_path);
+        assert_eq!(source.publisher_dids, original.publisher_dids);
+        assert!(source
+            .discovery_uri
+            .starts_with(&format!("elastos://source/{channel}/")));
+        assert_eq!(
+            crate::update::verify_source_channel(source, "canary").is_ok(),
+            channel == "canary"
+        );
+        let mut offer = cached_offer();
+        offer.channel = "canary".into();
+        offer.current_version = source.installed_version.clone();
+        assert_eq!(check_matches_source(source, &offer), channel == "canary");
+        crate::update::verify_source_channel(source, "stable").unwrap();
+        assert_eq!(
+            crate::update::compare_release_versions(&source.installed_version, "2.0.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            crate::update::compare_release_versions(&source.installed_version, "2.1.0").unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_update_stays_unqueued(dir.path());
+        let (status, _) =
+            home_test_post_json(&app, CHANNEL_ROUTE, &owner.system_token, "null", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "approval replay");
+    }
+}
+
 fn update_intent() -> Value {
     json!({
         "action": "apply", "request_id": "c".repeat(32),

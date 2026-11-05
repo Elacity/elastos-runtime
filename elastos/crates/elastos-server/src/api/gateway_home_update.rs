@@ -1,9 +1,90 @@
-//! The existing System owner/passkey surface queues one exact signed update.
+//! System owners choose an update channel or queue one exact signed update.
 
 use super::*;
 
 const UPDATE_OPERATION: &str = "system.update.apply";
+const CHANNEL_OPERATION: &str = "system.source.switch-channel";
 const CHECK_CACHE_SECONDS: u64 = 30;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemSourceChannelRequest {
+    source_name: String,
+    channel: String,
+    step_up_token: String,
+}
+
+pub(super) async fn system_source_switch_channel(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<SystemSourceChannelRequest>,
+) -> Response {
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(_) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error":"Open System from Home and sign in again."
+                    })),
+                )
+                    .into_response()
+            }
+        };
+    if require_admin_principal(&state.data_dir, &launch.context).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Ask the Home owner to choose the update channel."
+            })),
+        )
+            .into_response();
+    }
+    if crate::sources::validate_update_channel(&input.channel).is_err()
+        || input.source_name.is_empty()
+        || input.source_name.len() > 512
+        || input.source_name.chars().any(char::is_control)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error":"Choose a configured source and a supported update channel."
+            })),
+        )
+            .into_response();
+    }
+    let intent = serde_json::json!({"source_name":input.source_name, "channel":input.channel});
+    if consume_passkey_step_up_token(
+        &state.data_dir,
+        &input.step_up_token,
+        &launch,
+        180,
+        CHANNEL_OPERATION,
+        &intent,
+    )
+    .is_err()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"Verify your passkey again to change the update channel."
+            })),
+        )
+            .into_response();
+    }
+    match crate::sources::switch_source_channel(&state.data_dir, Some(&input.source_name),
+        &input.channel, crate::sources::source_discovery_uri)
+    {
+        Ok(source) => Json(serde_json::json!({
+            "source_name":source.name, "channel":source.channel,
+            "installed_version":source.installed_version,
+        })).into_response(),
+        Err(_) => (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error":"The update channel could not be saved. Wait for any Home update to finish, then open System and try again."
+        }))).into_response(),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

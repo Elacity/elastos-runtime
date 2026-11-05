@@ -137,6 +137,11 @@ pub fn save_trusted_sources(
     config: &TrustedSourcesConfig,
 ) -> anyhow::Result<()> {
     let _writer = crate::install_transaction::acquire_installed_writer(data_dir)?;
+    write_trusted_sources(data_dir, config)
+}
+
+// Callers hold the installed writer for the complete read/change/save operation.
+fn write_trusted_sources(data_dir: &Path, config: &TrustedSourcesConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(trusted_sources_path(data_dir), json)?;
@@ -160,6 +165,31 @@ pub fn load_trusted_sources(data_dir: &std::path::Path) -> anyhow::Result<Truste
     Ok(TrustedSourcesConfig::empty())
 }
 
+pub fn source_discovery_uri(publisher_did: &str, channel: &str) -> String {
+    use sha2::Digest;
+    let channel = normalize_release_channel(channel);
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(publisher_did.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("elastos://source/{}/{}", channel, &digest[..32])
+}
+
+fn normalize_release_channel(channel: &str) -> String {
+    let mut normalized = String::new();
+    for ch in channel.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            normalized.push(ch);
+        } else {
+            normalized.push('-');
+        }
+    }
+    if normalized.is_empty() {
+        "stable".to_string()
+    } else {
+        normalized
+    }
+}
+
 pub fn normalize_gateways(gateways: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for gateway in gateways {
@@ -181,6 +211,39 @@ fn validate_release_channel(channel: &str) -> anyhow::Result<()> {
             ALLOWED_RELEASE_CHANNELS.join(", ")
         );
     }
+}
+
+pub fn validate_update_channel(channel: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(channel, "stable" | "canary"),
+        "Unsupported update channel. Choose stable or canary."
+    );
+    Ok(())
+}
+
+/// Change only a source's subscription and its canonical discovery route.
+/// Keep installation metadata under the same writer lock as installed updates.
+pub fn switch_source_channel(
+    data_dir: &Path,
+    name: Option<&str>,
+    channel: &str,
+    discovery_uri: fn(&str, &str) -> String,
+) -> anyhow::Result<TrustedSource> {
+    validate_update_channel(channel)?;
+    let _writer = crate::install_transaction::acquire_installed_writer(data_dir)?;
+    let mut config = load_trusted_sources(data_dir)?;
+    let source = config
+        .source_named_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("Trusted source not found"))?;
+    source.channel = channel.to_string();
+    if source.discovery_uri.is_empty() || source.discovery_uri.starts_with("elastos://source/") {
+        if let Some(publisher) = source.publisher_dids.first() {
+            source.discovery_uri = discovery_uri(publisher, channel);
+        }
+    }
+    let source = source.clone();
+    write_trusted_sources(data_dir, &config)?;
+    Ok(source)
 }
 
 pub fn local_session_owner(data_dir: &std::path::Path) -> anyhow::Result<String> {
@@ -463,24 +526,15 @@ fn run_source_command_with_confirmation(
             }
         }
         SourceCommand::SwitchChannel { name, channel } => {
-            validate_release_channel(&channel)?;
-            let source = config
-                .source_named_mut(name.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("Trusted source not found"))?;
-            source.channel = channel.clone();
-            if source.discovery_uri.is_empty()
-                || source.discovery_uri.starts_with("elastos://source/")
-            {
-                if let Some(publisher) = source.publisher_dids.first() {
-                    source.discovery_uri = source_discovery_uri_fn(publisher, &channel);
-                }
-            }
-            let source_name = source.name.clone();
-            save_trusted_sources(data_dir, &config)?;
-
+            let source = switch_source_channel(
+                data_dir,
+                name.as_deref(),
+                &channel,
+                source_discovery_uri_fn,
+            )?;
             println!(
                 "Trusted source '{}' now tracks channel '{}'.",
-                source_name, channel
+                source.name, source.channel
             );
         }
         SourceCommand::Verify { name } => {
@@ -1086,6 +1140,33 @@ mod tests {
         assert_eq!(
             std::fs::read(trusted_sources_path(dir.path())).unwrap(),
             persisted
+        );
+    }
+
+    #[test]
+    fn system_channel_choice_cli_preserves_other_settings_and_rejects_retired_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        save_fixture(dir.path(), fixture_source());
+        let before = load_trusted_sources(dir.path()).unwrap();
+        let switch = |channel: &str| {
+            run_source_command_with_confirmation(
+                SourceCommand::SwitchChannel {
+                    name: Some("fixture".into()),
+                    channel: channel.into(),
+                },
+                discovery_uri,
+                dir.path(),
+                |_, _| panic!("channel changes keep the publisher"),
+            )
+        };
+        assert!(switch("jetson-test").is_err());
+        switch("stable").unwrap();
+        let mut expected = serde_json::to_value(&before).unwrap();
+        expected["sources"][0]["channel"] = serde_json::json!("stable");
+        expected["sources"][0]["discovery_uri"] = discovery_uri(OLD_DID, "stable").into();
+        assert_eq!(
+            serde_json::to_value(load_trusted_sources(dir.path()).unwrap()).unwrap(),
+            expected
         );
     }
 

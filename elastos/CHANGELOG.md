@@ -6,6 +6,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- System, About lets you choose Stable or test versions for updates.
+
 ### Fixed
 
 - Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.

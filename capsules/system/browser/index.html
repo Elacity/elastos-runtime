@@ -437,7 +437,12 @@
                     <div class="pc2-card-sublabel" data-field="source-policy"></div>
                   </div>
                   <span class="pc2-card-value" data-field="source-status" hidden></span>
+                  <select id="source-channel-choice" class="pc2-input" aria-label="Update channel" hidden disabled>
+                    <option value="stable">Stable</option>
+                    <option value="canary"></option>
+                  </select>
                 </div>
+                <p id="source-channel-status" class="pc2-card-sublabel" role="status" aria-live="polite"></p>
                 <dl class="system-fields compact-proof">
                   <div><dt>Channel</dt><dd data-field="source-channel"></dd></div>
                   <div><dt>Installed version</dt><dd data-field="source-installed-version"></dd></div>
