@@ -753,6 +753,8 @@ mod tests {
             include_str!("../../../../../../capsules/browser/capsule.json"),
         )
         .unwrap();
+        std::fs::write(root.path().join("components.json"),
+            r#"{"profiles":{},"external":{"browser":{"install_path":"capsules/browser","platforms":{}}}}"#).unwrap();
         let catalog = super::capsule_catalog_summary_for(root.path(), "linux-arm64");
         let browser = catalog
             .capsules

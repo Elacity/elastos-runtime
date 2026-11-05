@@ -203,8 +203,9 @@ mod tests {
     fn linux_browser_opt_in_retires_only_owned_pool_without_following_links() {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        let outside = temp.path().join("outside");
+        let base = temp.path().canonicalize().unwrap();
+        let data = base.join("data");
+        let outside = base.join("outside");
         let pool = data.join("browser-vm/rootfs-pool");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
@@ -226,7 +227,7 @@ mod tests {
         retire_rootfs_pool(&data).unwrap();
         assert!(pool.symlink_metadata().is_err());
         // A linked parent is refused; its target and the owner's profile stay.
-        let linked = temp.path().join("linked");
+        let linked = base.join("linked");
         std::fs::create_dir(&linked).unwrap();
         symlink(&outside, linked.join("browser-vm")).unwrap();
         assert!(retire_rootfs_pool(&linked).is_err());
