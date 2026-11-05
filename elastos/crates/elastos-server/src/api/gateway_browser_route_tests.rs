@@ -1064,8 +1064,12 @@ async fn test_browser_open_fails_closed_without_attached_engine_transport() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let message = String::from_utf8(body.to_vec()).unwrap();
-    assert!(message.contains("adapter_ipc"));
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["message"],
+        "Browser Engine failed to start cleanly."
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("adapter_ipc"));
 }
 
 #[tokio::test]
