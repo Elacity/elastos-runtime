@@ -51,6 +51,42 @@ function openError(state, effects) {
   return error;
 }
 
+test("space refusal reports required and available decimal GB after safe cleanup", () => {
+  for (const state of ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"]) {
+    const error = openError(state);
+    error.payload.refusal = {
+      code: "insufficient_free_space", required_bytes: 8589934592, available_bytes: 8589934591,
+    };
+    error.payload.message = "private engine error text";
+    assert.equal(friendlyOpenError(error), "Browser needs 8.6 GB free on this computer to open; 8.5 GB are free. Free some space, then open Browser again.");
+  }
+});
+
+test("invalid, unknown and pending refusals keep the generic failure", () => {
+  const error = openError("terminal_post_effect_cleanup");
+  const generic = friendlyOpenError(error);
+  error.message = "Browser needs 8.6 GB free on this computer to open; 8.5 GB are free. Free some space, then open Browser again.";
+  assert.equal(friendlyOpenError(error), generic, "message text grants no refusal code");
+  for (const refusal of [
+    undefined,
+    { code: "unknown", required_bytes: 20, available_bytes: 10 },
+    { code: "insufficient_free_space", required_bytes: "20", available_bytes: 10 },
+    { code: "insufficient_free_space", required_bytes: 10, available_bytes: 20 },
+    { code: "insufficient_free_space", required_bytes: 20, available_bytes: -1 },
+    { code: "insufficient_free_space", required_bytes: 2 ** 53, available_bytes: 10 },
+    { code: "insufficient_free_space", required_bytes: 20, available_bytes: 10, message: "private" },
+  ]) {
+    error.payload.refusal = refusal;
+    assert.equal(friendlyOpenError(error), generic);
+  }
+  error.payload.refusal = { code: "insufficient_free_space", required_bytes: 20, available_bytes: 10 };
+  error.payload.outcome.state = "cleanup_pending";
+  assert.match(friendlyOpenError(error), /finishing cleanup/);
+  error.payload.outcome.state = "terminal_post_effect_cleanup";
+  error.payload.outcome.effects.vm_acquired = true;
+  assert.equal(friendlyOpenError(error), generic);
+});
+
 test("pre-effect open failure never claims a missing terminal close", () => {
   const error = openError("terminal_pre_effect_failure");
 

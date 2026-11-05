@@ -27,15 +27,16 @@ const INVOCATION_ONLY_VM_ENV = new Set([
 ]);
 
 class BrowserLaunchError extends Error {
-  constructor(code, message, launchSettlementResult = undefined) {
+  constructor(code, message, launchSettlementResult = undefined, refusal = undefined) {
     super(message);
     this.code = code;
     this.launch_settlement_result = launchSettlementResult;
+    this.refusal = refusal;
   }
 }
 
-function launchError(code, message, launchSettlementResult = undefined) {
-  return new BrowserLaunchError(code, message, launchSettlementResult);
+function launchError(code, message, launchSettlementResult = undefined, refusal = undefined) {
+  return new BrowserLaunchError(code, message, launchSettlementResult, refusal);
 }
 
 function fail(error) {
@@ -45,6 +46,7 @@ function fail(error) {
       schema: "elastos.browser.engine.launch-error/v1",
       code: error.code,
       message,
+      ...(error.refusal === undefined ? {} : { refusal: error.refusal }),
       ...(error.launch_settlement_result === undefined
         ? {}
         : { launch_settlement_result: error.launch_settlement_result }),
@@ -473,7 +475,7 @@ function collectPreflight({ dataDir, platform }) {
   };
 }
 
-function postJsonOverUnix(socketPath, requestPath, body, timeoutMs) {
+export function postJsonOverUnix(socketPath, requestPath, body, timeoutMs) {
   validateAbsolutePath(socketPath, CONTROL_SOCKET_ENV);
   const bytes = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
@@ -507,6 +509,7 @@ function postJsonOverUnix(socketPath, requestPath, body, timeoutMs) {
                     parsed.code || "engine_process_unavailable",
                     parsed.message || parsed.error || `Browser VM control returned ${response.statusCode}`,
                     parsed.launch_settlement_result,
+                    parsed.refusal,
                   )
                 : new Error(parsed.error || parsed.message || `Browser VM control returned ${response.statusCode}`),
             );

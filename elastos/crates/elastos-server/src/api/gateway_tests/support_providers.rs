@@ -3943,6 +3943,22 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "launch_settlement_result": settlement,
                     }));
                 }
+                if request["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("space-refusal.invalid"))
+                {
+                    let mut refusal = json!({"code": "insufficient_free_space", "required_bytes": 8589934592_u64, "available_bytes": 8589934591_u64});
+                    if request["url"].as_str().unwrap().contains("unknown") {
+                        refusal["code"] = json!("unknown");
+                    }
+                    if request["url"].as_str().unwrap().contains("counts") {
+                        refusal["available_bytes"] = json!(-1);
+                    }
+                    return Ok(json!({
+                        "status": "error", "code": "launch_refused",
+                        "message": "private engine diagnostic", "refusal": refusal,
+                    }));
+                }
                 if matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
@@ -4553,9 +4569,7 @@ struct MockBitcoinChallenge {
 /// capsules/wallet-provider), so a caller holding a newer launch of the same
 /// session is refused exactly as it is live; the session binding alone would
 /// let that case through.
-fn mock_wallet_authority_binding(
-    authority: &elastos_wallet_contract::WalletAuthorityV2,
-) -> String {
+fn mock_wallet_authority_binding(authority: &elastos_wallet_contract::WalletAuthorityV2) -> String {
     let bytes = serde_json::to_vec(&json!({
         "principal_id": authority.principal_id,
         "session_id": authority.session_id,
@@ -6514,8 +6528,12 @@ impl MockWalletProvider {
                 }
                 // The real wallet binds the outcome to the approval's ORIGINAL authority
                 // (validate_chain_outcome_target): a later launch must not attach it.
-                if approval.get("authority_binding").and_then(|value| value.as_str())
-                    != request.get("authority_binding").and_then(|value| value.as_str())
+                if approval
+                    .get("authority_binding")
+                    .and_then(|value| value.as_str())
+                    != request
+                        .get("authority_binding")
+                        .and_then(|value| value.as_str())
                 {
                     return Ok(json!({
                         "status": "error",

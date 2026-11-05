@@ -964,7 +964,11 @@ async fn execute_browser_open(
                 &message,
             )
             .await;
-            return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
+            return Err(BrowserOpenFailure::text(
+                status,
+                "Browser Engine failed to start cleanly.".to_string(),
+            )
+            .with_outcome(outcome));
         }
     };
     if engine_response
@@ -988,6 +992,37 @@ async fn execute_browser_open(
             &engine_response,
         )
         .await;
+        if let Some(refusal) = engine_response
+            .get("refusal")
+            .and_then(elastos_common::browser_protocol::BrowserLaunchRefusal::from_value)
+        {
+            let outcome = match exact_did_not_act {
+                Some(outcome) => outcome,
+                None => {
+                    reconcile_dispatched_browser_launch_failure(
+                        state,
+                        &launch_reservation,
+                        &context.principal_id,
+                        authority.verified_context().launch_id(),
+                        &engine_stream_id,
+                        stream_cleanup.clone(),
+                        "Browser launch refused",
+                    )
+                    .await
+                }
+            };
+            return Err(BrowserOpenFailure::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "schema": "elastos.browser.open-error/v1",
+                    "ok": false,
+                    "code": "launch_refused",
+                    "message": "Browser cannot open.",
+                    "refusal": refusal,
+                }),
+            )
+            .with_outcome(outcome));
+        }
         if matches!(
             code,
             "engine_unavailable" | "byte_transport_unavailable" | "display_session_unavailable"
@@ -1009,7 +1044,7 @@ async fn execute_browser_open(
             };
             return Err(BrowserOpenFailure::provider(
                 "browser-engine",
-                anyhow::anyhow!("browser-engine provider unavailable: {}", message),
+                anyhow::anyhow!("Browser Engine is unavailable."),
             )
             .with_outcome(outcome));
         }
@@ -1038,7 +1073,7 @@ async fn execute_browser_open(
                     "schema": "elastos.browser.open-error/v1",
                     "ok": false,
                     "code": code,
-                    "message": message,
+                    "message": "Browser launch refused.",
                 }),
             )
             .with_outcome(outcome));
@@ -1060,7 +1095,7 @@ async fn execute_browser_open(
         };
         return Err(BrowserOpenFailure::provider(
             "browser-engine",
-            anyhow::anyhow!(message.to_string()),
+            anyhow::anyhow!("Browser Engine failed to start cleanly."),
         )
         .with_outcome(outcome));
     }
@@ -1075,10 +1110,11 @@ async fn execute_browser_open(
             &message,
         )
         .await;
-        return Err(
-            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
-                .with_outcome(outcome),
-        );
+        return Err(BrowserOpenFailure::provider(
+            "browser-engine",
+            anyhow::anyhow!("Browser Engine failed to start cleanly."),
+        )
+        .with_outcome(outcome));
     }
     let raw_engine_page = match provider_response_data(&engine_response) {
         Some(data) => data,

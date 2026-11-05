@@ -3184,6 +3184,72 @@ async fn test_exact_terminal_vz_settlement_releases_restart_reconciliation_oblig
 }
 
 #[tokio::test]
+async fn test_browser_space_refusal_preserves_counts_and_cleanup_ownership() {
+    for (suffix, valid, terminal) in [
+        ("", true, true),
+        ("", true, false),
+        ("unknown", false, true),
+        ("counts", false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_browser_vz_transport_test_config(dir.path());
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+            dir.path(),
+            if terminal {
+                MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+            } else {
+                MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+            },
+        )
+        .await;
+        let response = gateway_router(state).oneshot(
+            test_browser_request("localhost:61180", "null").method("POST")
+                .uri("/api/apps/browser/open").header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({
+                    "url": format!("https://space-refusal.invalid/{suffix}"),
+                    "reason": "space refusal keeps cleanup ownership",
+                    "display_mode": "webrtc_remote_display", "guarantee_level": "mechanism_microvm",
+                }).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("private engine diagnostic"));
+        if valid {
+            assert_eq!(
+                payload["refusal"],
+                serde_json::json!({"code": "insufficient_free_space", "required_bytes": 8589934592_u64, "available_bytes": 8589934591_u64})
+            );
+        } else {
+            assert!(payload.get("refusal").is_none());
+        }
+        assert_eq!(
+            payload["outcome"]["state"],
+            if terminal {
+                "terminal_post_effect_cleanup"
+            } else {
+                "cleanup_pending"
+            }
+        );
+        if terminal {
+            assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
+            assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+        }
+        assert_eq!(reconciliation_calls.count(), 1);
+        assert!(close_calls.snapshot().await.is_empty());
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(dir.path()).await,
+            usize::from(!terminal)
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_browser_profile_recovery_requires_exact_terminal_settlement() {
     for (failure, terminal) in [
         (

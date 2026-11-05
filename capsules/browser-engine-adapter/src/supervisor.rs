@@ -25,6 +25,7 @@ pub(super) struct SupervisorLaunchError {
     pub(super) code: String,
     pub(super) message: String,
     pub(super) launch_settlement_result: Option<Value>,
+    pub(super) refusal: Option<elastos_common::browser_protocol::BrowserLaunchRefusal>,
 }
 
 impl SupervisorLaunchError {
@@ -33,6 +34,7 @@ impl SupervisorLaunchError {
             code: "engine_process_unavailable".to_string(),
             message: message.into(),
             launch_settlement_result: None,
+            refusal: None,
         }
     }
 }
@@ -45,6 +47,8 @@ struct TypedSupervisorLaunchError {
     message: String,
     #[serde(default)]
     launch_settlement_result: Option<Value>,
+    #[serde(default)]
+    refusal: Option<Value>,
 }
 
 fn supervisor_launch_error(
@@ -67,6 +71,10 @@ fn supervisor_launch_error(
             code: error.code,
             message: error.message,
             launch_settlement_result,
+            refusal: error
+                .refusal
+                .as_ref()
+                .and_then(elastos_common::browser_protocol::BrowserLaunchRefusal::from_value),
         };
     }
     SupervisorLaunchError::process(format!(
