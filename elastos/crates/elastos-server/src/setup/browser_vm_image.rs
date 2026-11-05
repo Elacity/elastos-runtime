@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub(super) const NAME: &str = "browser-vm-image";
 pub(super) const INSTALL_PATH: &str = "browser-vm/image-set";
@@ -44,8 +44,77 @@ struct VerifiedSetKey {
 
 struct VerifiedSet {
     key: VerifiedSetKey,
+    verification: Arc<ImageVerification>,
+}
+
+#[derive(Default)]
+struct ImageVerification {
     // These digests come only from bytes hashed by this Runtime process.
-    digests: [String; 3],
+    result: OnceLock<Result<[String; 3], String>>,
+    changed: Mutex<()>,
+    ready: Condvar,
+}
+
+impl ImageVerification {
+    fn wait(&self, cancelled: Option<&AtomicBool>) -> anyhow::Result<[String; 3]> {
+        let mut changed = self.changed.lock().unwrap_or_else(|err| err.into_inner());
+        loop {
+            check_cancelled(cancelled)?;
+            if let Some(result) = self.result.get() {
+                return result.clone().map_err(anyhow::Error::msg);
+            }
+            changed = self
+                .ready
+                .wait_timeout(changed, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|err| err.into_inner())
+                .0;
+        }
+    }
+}
+
+struct VerificationOwner<'a> {
+    cache: &'a Mutex<VecDeque<VerifiedSet>>,
+    verification: Arc<ImageVerification>,
+}
+
+impl VerificationOwner<'_> {
+    fn publish(&self, result: Result<[String; 3], String>) {
+        {
+            let _changed = self
+                .verification
+                .changed
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let _ = self.verification.result.set(result);
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|err| err.into_inner());
+        cache.retain(|entry| !entry.verification.result.get().is_some_and(Result::is_err));
+        while cache
+            .iter()
+            .filter(|entry| entry.verification.result.get().is_some())
+            .count()
+            > VERIFIED_SET_CACHE_LIMIT
+        {
+            let oldest = cache
+                .iter()
+                .position(|entry| entry.verification.result.get().is_some())
+                .unwrap();
+            cache.remove(oldest);
+        }
+        drop(cache);
+        self.verification.ready.notify_all();
+    }
+}
+
+impl Drop for VerificationOwner<'_> {
+    fn drop(&mut self) {
+        if self.verification.result.get().is_none() {
+            self.publish(Err(
+                "Browser image not verified: verification worker stopped; retry Browser open"
+                    .into(),
+            ));
+        }
+    }
 }
 
 fn verified_sets() -> &'static Mutex<VecDeque<VerifiedSet>> {
@@ -67,14 +136,19 @@ fn verified_seed_identity_in(
     rootfs: &Path,
     platform: &str,
 ) -> anyhow::Result<BrowserVmSeedIdentity> {
-    let cache = cache.lock().unwrap_or_else(|err| err.into_inner());
     let identity = BrowserVmSeedIdentity::read(rootfs)?;
+    let keys = cache
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .filter(|entry| entry.verification.result.get().is_some_and(Result::is_ok))
+        .map(|entry| entry.key.clone())
+        .collect::<Vec<_>>();
     ensure!(
-        cache.iter().any(|entry| {
-            entry.key.platform == platform
-                && entry.key.identities[1].1 == identity.target
-                && image_identities(&entry.key.paths)
-                    .is_ok_and(|current| current == entry.key.identities)
+        keys.iter().any(|key| {
+            key.platform == platform
+                && key.identities[1].1 == identity.target
+                && image_identities(&key.paths).is_ok_and(|current| current == key.identities)
         }),
         "Browser rootfs seed has no current Runtime admission; retry Browser open"
     );
@@ -102,11 +176,20 @@ fn verify_cached_payload(
     paths: &[PathBuf; 4],
     platform: &str,
     release: &str,
+    cancelled: Option<&AtomicBool>,
     verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
 ) -> anyhow::Result<[String; 3]> {
-    verify_cached_payload_in(verified_sets(), paths, platform, release, verify)
+    verify_cached_payload_in_with_cancel(
+        verified_sets(),
+        paths,
+        platform,
+        release,
+        cancelled,
+        verify,
+    )
 }
 
+#[cfg(test)]
 fn verify_cached_payload_in(
     cache: &Mutex<VecDeque<VerifiedSet>>,
     paths: &[PathBuf; 4],
@@ -114,20 +197,57 @@ fn verify_cached_payload_in(
     release: &str,
     verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
 ) -> anyhow::Result<[String; 3]> {
-    // Background startup and blocking open callers share this lock. A cold
-    // open waits for the in-progress hash and then rechecks the file identities.
-    let mut cache = cache.lock().unwrap_or_else(|err| err.into_inner());
+    verify_cached_payload_in_with_cancel(cache, paths, platform, release, None, verify)
+}
+
+fn verify_cached_payload_in_with_cancel(
+    cache: &Mutex<VecDeque<VerifiedSet>>,
+    paths: &[PathBuf; 4],
+    platform: &str,
+    release: &str,
+    cancelled: Option<&AtomicBool>,
+    verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
+) -> anyhow::Result<[String; 3]> {
+    check_cancelled(cancelled)?;
     let key = VerifiedSetKey {
         paths: paths.clone(),
         platform: platform.to_owned(),
         release: release.to_owned(),
         identities: image_identities(paths)?,
     };
+    // Only a caller for this exact set waits for its hash. The process cache
+    // lock protects memory operations; hashing and filesystem reads run outside it.
+    let (verification, owner) = {
+        let mut cache = cache.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(entry) = cache.iter().find(|entry| entry.key == key) {
+            (entry.verification.clone(), false)
+        } else {
+            cache.retain(|entry| {
+                entry.key.paths != key.paths || entry.verification.result.get().is_none()
+            });
+            let verification = Arc::new(ImageVerification::default());
+            cache.push_back(VerifiedSet {
+                key: key.clone(),
+                verification: verification.clone(),
+            });
+            (verification, true)
+        }
+    };
+    if !owner {
+        let digests = verification.wait(cancelled)?;
+        ensure!(
+            image_identities(paths)? == key.identities,
+            "Browser image set changed during verification; retry preparation"
+        );
+        return Ok(digests);
+    }
+    let owner = VerificationOwner {
+        cache,
+        verification,
+    };
     let checked = (|| -> anyhow::Result<[String; 3]> {
-        let digests = match cache.iter().find(|entry| entry.key == key) {
-            Some(entry) => entry.digests.clone(),
-            None => verify()?,
-        };
+        let digests = verify()?;
+        check_cancelled(cancelled)?;
         // Replacement during verification fails this admission and invalidates
         // any earlier successful entry before another caller can use it.
         ensure!(
@@ -136,16 +256,13 @@ fn verify_cached_payload_in(
         );
         Ok(digests)
     })();
-    cache.retain(|entry| entry.key.paths != key.paths);
-    let digests = checked?;
-    cache.push_back(VerifiedSet {
-        key,
-        digests: digests.clone(),
-    });
-    while cache.len() > VERIFIED_SET_CACHE_LIMIT {
-        cache.pop_front();
-    }
-    Ok(digests)
+    owner.publish(
+        checked
+            .as_ref()
+            .map(Clone::clone)
+            .map_err(|err| format!("Browser image not verified: {err}")),
+    );
+    checked
 }
 
 /// A Home owns this read-only warmup until gateway shutdown. It uses a dedicated
@@ -216,7 +333,10 @@ pub(crate) fn start_background_verification(
     data: &Path,
     platform: &str,
 ) -> Option<BackgroundVerification> {
-    if !super::browser_config::local_vm_selected(data, platform).unwrap_or(false) {
+    if !super::browser_config::local_vm_configured(data, platform).unwrap_or(false)
+        || !(data.join(INSTALL_PATH).join("rootfs.ext4").is_file()
+            || data.join("browser-vm/rootfs.ext4").is_file())
+    {
         return None;
     }
     let data = data.to_path_buf();
@@ -423,7 +543,7 @@ fn verify_legacy_with_cancel(
         kernel,
         data.join(image_aliases[3].0),
     ];
-    verify_cached_payload(&paths, platform, "legacy", || verify_payload_paths_with_cancel(&paths, platform, cancelled))
+    verify_cached_payload(&paths, platform, "legacy", cancelled, || verify_payload_paths_with_cancel(&paths, platform, cancelled))
         .map(|_| ())
         .map_err(|err| anyhow::anyhow!("Browser image release package metadata is unavailable and the installed image set requires preparation ({err}); install a release with browser-vm-image metadata or select an approved remote Engine"))
 }
@@ -554,9 +674,13 @@ fn verify_installed_with_cancel(
         "Browser image receipt identity is stale"
     );
     let paths = FILES.map(|name| dest.join(name));
-    verify_cached_payload(&paths, platform, &serde_json::to_string(info)?, || {
-        verify_payload_with_cancel(&dest, platform, cancelled)
-    })
+    verify_cached_payload(
+        &paths,
+        platform,
+        &serde_json::to_string(info)?,
+        cancelled,
+        || verify_payload_with_cancel(&dest, platform, cancelled),
+    )
     .map(|_| ())
 }
 
@@ -1719,6 +1843,78 @@ mod tests {
         FILES.map(|name| path.join(name))
     }
 
+    #[test]
+    fn browser_image_startup_skips_unconfigured_or_missing_images() {
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let temp = tempfile::tempdir().unwrap();
+            assert!(start_background_verification(temp.path(), platform).is_none());
+            fs::create_dir_all(temp.path().join("config")).unwrap();
+            fs::write(temp.path().join("config/browser-engine-adapter.json"),
+                br#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"browser-vm-launcher"}}]}"#).unwrap();
+            assert!(start_background_verification(temp.path(), platform).is_none());
+            let (bytes, info) = archive(&fixture(b"startup-image"));
+            install_archive(temp.path(), &bytes, &info, platform).unwrap();
+            fs::remove_file(temp.path().join("config/browser-engine-adapter.json")).unwrap();
+            assert!(start_background_verification(temp.path(), platform).is_none());
+            fs::write(
+                temp.path().join("config/browser-engine-adapter.json"),
+                br#"{"adapters":[]}"#,
+            )
+            .unwrap();
+            assert!(start_background_verification(temp.path(), platform).is_none());
+        }
+    }
+
+    #[test]
+    fn browser_image_verification_keeps_other_homes_and_missing_opens_independent() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let first = cache_fixture(&temp.path().join("first"));
+        let second = cache_fixture(&temp.path().join("second"));
+        let missing = FILES.map(|name| temp.path().join("missing").join(name));
+        let cache = Mutex::new(VecDeque::new());
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let (cache, first) = (&cache, &first);
+            let hashing = scope.spawn(move || {
+                verify_cached_payload_in(cache, first, "darwin-arm64", "legacy", || {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    verify_payload_paths(first, "darwin-arm64")
+                })
+            });
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            let other = scope.spawn(move || {
+                let digests =
+                    verify_cached_payload_in(cache, &second, "darwin-arm64", "legacy", || {
+                        verify_payload_paths(&second, "darwin-arm64")
+                    })
+                    .unwrap();
+                verified_seed_identity_in(cache, &second[1], "darwin-arm64").unwrap();
+                assert!(verify_cached_payload_in(
+                    cache,
+                    &missing,
+                    "darwin-arm64",
+                    "legacy",
+                    || { panic!("an absent image returns before hashing") }
+                )
+                .is_err());
+                done.send(digests).unwrap();
+            });
+            let independent = finished.recv_timeout(Duration::from_millis(500));
+            release.send(()).unwrap();
+            hashing.join().unwrap().unwrap();
+            other.join().unwrap();
+            assert!(
+                independent.is_ok(),
+                "one Home held another Home's admission: {independent:?}"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn browser_image_background_verification_and_open_share_one_hash_on_each_host() {
         use std::sync::{atomic::AtomicUsize, mpsc};
@@ -1769,10 +1965,6 @@ mod tests {
                     digests
                 });
                 opened.recv_timeout(Duration::from_secs(5)).unwrap();
-                assert!(matches!(
-                    cache.try_lock(),
-                    Err(std::sync::TryLockError::WouldBlock)
-                ));
                 assert!(
                     matches!(finished.try_recv(), Err(mpsc::TryRecvError::Empty)),
                     "open must wait for background verification"
@@ -1798,6 +1990,9 @@ mod tests {
                 let data = temp.path();
                 let (bytes, info) = archive(&fixture(b"startup-image"));
                 install_archive(data, &bytes, &info, platform).unwrap();
+                fs::create_dir_all(data.join("config")).unwrap();
+                fs::write(data.join("config/browser-engine-adapter.json"),
+                    br#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"browser-vm-launcher"}}]}"#).unwrap();
                 if released {
                     let manifest = json!({"external": {NAME: {"install_path": INSTALL_PATH,
                         "platforms": {platform: info}}}, "profiles": {}});
@@ -1825,7 +2020,7 @@ mod tests {
                 } else {
                     "legacy".into()
                 };
-                let digests = verify_cached_payload(&paths, platform, &release, || {
+                let digests = verify_cached_payload(&paths, platform, &release, None, || {
                     panic!("Home startup must fill the same cache used by Browser open")
                 })
                 .unwrap();
@@ -1864,6 +2059,120 @@ mod tests {
         finished.try_recv().unwrap();
     }
 
+    #[test]
+    fn browser_image_waiters_are_released_when_verifier_cancels_or_panics() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        for panic in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = cache_fixture(temp.path());
+            let cache = Arc::new(Mutex::new(VecDeque::new()));
+            let (entered, started) = mpsc::channel();
+            let (background_cache, background_paths) = (cache.clone(), paths.clone());
+            let mut worker =
+                BackgroundVerification::spawn("darwin-arm64".into(), move |cancelled| {
+                    verify_cached_payload_in_with_cancel(
+                        &background_cache,
+                        &background_paths,
+                        "darwin-arm64",
+                        "legacy",
+                        Some(cancelled),
+                        || {
+                            entered.send(()).unwrap();
+                            while !cancelled.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            assert!(!panic, "fixture verifier panic");
+                            verify_payload_paths_with_cancel(
+                                &background_paths,
+                                "darwin-arm64",
+                                Some(cancelled),
+                            )
+                        },
+                    )
+                    .map(|_| ())
+                })
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::scope(|scope| {
+                let open = scope.spawn(|| {
+                    verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
+                        panic!("a waiter receives the active verifier's failure")
+                    })
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Arc::strong_count(&cache.lock().unwrap()[0].verification) < 3 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Browser open did not join its verifier"
+                    );
+                    std::thread::yield_now();
+                }
+                let join = worker.worker.take().unwrap();
+                drop(worker);
+                assert_eq!(join.join().is_err(), panic);
+                let error = open.join().unwrap().unwrap_err().to_string();
+                assert!(error.contains("not verified"), "{error}");
+            });
+            assert!(cache.lock().unwrap().is_empty());
+            verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
+                verify_payload_paths(&paths, "darwin-arm64")
+            })
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_image_cancelled_background_waiter_leaves_foreground_hash_running() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = cache_fixture(temp.path());
+        let cache = Arc::new(Mutex::new(VecDeque::new()));
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (foreground_cache, foreground_paths) = (cache.clone(), paths.clone());
+        let foreground = std::thread::spawn(move || {
+            verify_cached_payload_in(
+                &foreground_cache,
+                &foreground_paths,
+                "darwin-arm64",
+                "legacy",
+                || {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    verify_payload_paths(&foreground_paths, "darwin-arm64")
+                },
+            )
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let background_cache = cache.clone();
+        let worker = BackgroundVerification::spawn("darwin-arm64".into(), move |cancelled| {
+            verify_cached_payload_in_with_cancel(
+                &background_cache,
+                &paths,
+                "darwin-arm64",
+                "legacy",
+                Some(cancelled),
+                || panic!("background startup joins the foreground hash"),
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&cache.lock().unwrap()[0].verification) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "background verifier did not join"
+            );
+            std::thread::yield_now();
+        }
+        let stopped = tokio::time::timeout(Duration::from_millis(500), worker.shutdown()).await;
+        release.send(()).unwrap();
+        foreground.join().unwrap().unwrap();
+        assert!(stopped.is_ok(), "shutdown waited for another worker's hash");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn browser_image_background_linux_priority_is_thread_local_and_idle() {
@@ -1892,7 +2201,7 @@ mod tests {
     fn browser_image_concurrent_opens_share_one_verification() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc, TryLockError,
+            mpsc,
         };
         let temp = tempfile::tempdir().unwrap();
         let paths = cache_fixture(temp.path());
@@ -1917,14 +2226,9 @@ mod tests {
                     verify_payload_paths(&paths, "darwin-arm64")
                 })
             });
-            let serialized = matches!(cache.try_lock(), Err(TryLockError::WouldBlock));
             release.send(()).unwrap();
             first.join().unwrap().unwrap();
             second.join().unwrap().unwrap();
-            assert!(
-                serialized,
-                "a concurrent cold miss must share the in-flight verification"
-            );
         });
         assert_eq!(count.load(Ordering::SeqCst), 1);
         verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {

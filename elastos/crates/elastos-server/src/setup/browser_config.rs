@@ -148,6 +148,14 @@ pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<b
     )
 }
 
+/// Startup only warms an Engine the Home has already configured. Setup may
+/// select a default for a fresh Home through `local_vm_selected`.
+pub(super) fn local_vm_configured(data: &Path, platform: &str) -> anyhow::Result<bool> {
+    let inline = std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").ok();
+    Ok(read_engine_selection(data, inline.as_deref())?.is_some()
+        && local_vm_selected_with_override(data, platform, inline.as_deref())?)
+}
+
 fn read_engine_selection(
     data: &Path,
     inline: Option<&str>,
