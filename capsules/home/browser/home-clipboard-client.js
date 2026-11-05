@@ -461,6 +461,7 @@ export function createHomeClipboardClient({
   }
 
   return {
+    setHomeToken(value) { homeToken = value; },
     canRequest: available,
     cancel,
     handleMessage,

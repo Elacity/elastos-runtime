@@ -947,6 +947,7 @@ enum HomeTargetKind {
 
 #[derive(Serialize)]
 struct HomeLaunchResponse {
+    expires_at: u64,
     target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     window_policy: Option<elastos_common::CapsuleWindowPolicy>,

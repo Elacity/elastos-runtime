@@ -30,7 +30,9 @@ const state = {
 // address. Decided once here; the current address may change later.
 const DOCUMENTS_INSIDE_HOME = window.top !== window && !!state.homeToken;
 const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
-const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin });
+const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin, target: "documents",
+  onHomeToken(token) { state.homeToken = token; },
+});
 const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =

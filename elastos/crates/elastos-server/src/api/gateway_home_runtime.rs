@@ -111,15 +111,22 @@ pub(super) async fn home_launch(
         .viewer
         .as_deref()
         .unwrap_or(target_summary.target.as_str());
-    let route = append_home_launch_token(
+    let token = issue_home_projection_launch_token_with_context(
         &state.data_dir,
-        &target_summary.route,
         &target_summary.target,
         executable_actor,
-        &req.query,
         &context,
     )
     .map_err(gateway_internal_error)?;
+    let expires_at = gateway_home_token::require_carried_home_launch_token(
+        &state.data_dir,
+        &token,
+        &[executable_actor],
+    )
+    .map_err(gateway_internal_error)?
+    .expires_at;
+    let route = append_home_launch_token_to_route(&target_summary.route, &req.query, &token)
+        .map_err(gateway_internal_error)?;
     let route =
         crate::api::browser_capsules::canonical_browser_capsule_route(&route).map_err(|error| {
             (
@@ -129,6 +136,7 @@ pub(super) async fn home_launch(
         })?;
 
     Ok(Json(HomeLaunchResponse {
+        expires_at,
         target: target_summary.target,
         window_policy: target_summary.window_policy,
         title: target_summary.title,
