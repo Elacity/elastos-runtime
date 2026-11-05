@@ -40,6 +40,9 @@ exec(compile(PYTHON, str(INSTALLER) + ":embedded-verifier", "exec"), CRYPTO)
 PROCESS_SOURCE = SOURCE.split("<<'PY_RUNTIME_CONTROL'\n", 1)[1].split("\nPY_RUNTIME_CONTROL", 1)[0]
 PROCESSES = {"__name__": "installer_test"}
 exec(compile(PROCESS_SOURCE, str(INSTALLER) + ":runtime-control", "exec"), PROCESSES)
+PERMISSION_SOURCE = SOURCE.split("<<'PY_INSTALL_PERMISSIONS'\n", 1)[1].split("\nPY_INSTALL_PERMISSIONS", 1)[0]
+PERMISSIONS = {"__name__": "installer_test"}
+exec(compile(PERMISSION_SOURCE, str(INSTALLER) + ":permissions", "exec"), PERMISSIONS)
 UNINSTALL_SOURCE = SOURCE.split("<<'PY_UNINSTALL'\n", 1)[1].split("\nPY_UNINSTALL", 1)[0]
 # Published maintainer constant, checked by test_pinned_publisher_did_conversion.
 PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
@@ -866,7 +869,161 @@ validate_release_identity "$1" "$2"
         self.assertNotEqual(head["release_sha256"], hashlib.sha256(release + b"\n").hexdigest())
 
 
+class PermissionRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix="installer's permissions ", dir=Path(__file__).resolve().parent.parent)
+        self.addCleanup(self.scratch.cleanup)
+        self.home = Path(self.scratch.name)
+        self.data = self.home / "data"
+        self.data.mkdir()
+        self.binary = self.home / "bin/elastos"
+        self.binary.parent.mkdir()
+        self.binary.write_bytes(b"old runtime")
+        self.binary.chmod(0o775)
+        self.components = self.data / "components.json"
+        self.components.write_bytes(b"old manifest")
+        self.components.chmod(0o664)
+
+    def repair(self):
+        PERMISSIONS["repair_permissions"](str(self.home), str(self.data), str(self.binary))
+
+    def root_owned(self, path):
+        original = os.stat
+        def metadata(name, *args, **kwargs):
+            found = original(name, *args, **kwargs)
+            if str(name) == path.name and kwargs.get("dir_fd") is not None:
+                values = list(found)
+                values[4] = 0
+                return os.stat_result(values)
+            return found
+        return mock.patch.object(os, "stat", side_effect=metadata)
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_file_names_one_quoted_command_and_repairs_nothing(self):
+        with self.root_owned(self.components), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "Restore ownership") as raised:
+                self.repair()
+            changes.assert_not_called()
+        command = str(raised.exception).split(": ", 1)[1]
+        self.assertEqual(shlex.split(command), ["sudo", "chown", "-R", getpass.getuser() + ":", str(self.data)])
+        self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_data_root_names_its_command_before_opening_it(self):
+        with self.root_owned(self.data), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "sudo chown -R") as raised:
+                self.repair()
+            changes.assert_not_called()
+        self.assertEqual(shlex.split(str(raised.exception).split(": ", 1)[1])[-1], str(self.data))
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_binary_and_metadata_share_one_repair_command(self):
+        with self.root_owned(self.components), self.root_owned(self.binary), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "sudo chown -R") as raised:
+                self.repair()
+            changes.assert_not_called()
+        command = str(raised.exception).split(": ", 1)[1]
+        self.assertEqual(command.count("sudo chown"), 1)
+        self.assertEqual(set(shlex.split(command)[4:]), {str(self.data), str(self.binary)})
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_foreign_owned_binary_outside_home_is_preserved_without_chown_advice(self):
+        with self.root_owned(self.binary), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "not owned by you") as raised:
+                PERMISSIONS["repair_permissions"](str(self.data), str(self.data), str(self.binary))
+            changes.assert_not_called()
+        self.assertNotIn("chown", str(raised.exception))
+
+    def test_symlink_and_hardlink_targets_preserve_both_files(self):
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                self.components.unlink()
+                if kind == "symlink":
+                    self.components.symlink_to(self.binary)
+                else:
+                    os.link(self.binary, self.components)
+                with mock.patch.object(os, "fchmod") as changes:
+                    with self.assertRaisesRegex(ValueError, "Unsafe installation"):
+                        self.repair()
+                    changes.assert_not_called()
+                self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    def test_changed_device_or_inode_stops_before_repair(self):
+        original = os.fstat
+        for index in (1, 2):  # inode, device
+            def changed(descriptor):
+                found = original(descriptor)
+                if found.st_ino == self.binary.stat().st_ino:
+                    values = list(found)
+                    values[index] += 1
+                    return os.stat_result(values)
+                return found
+            with self.subTest(field=index), mock.patch.object(os, "fstat", side_effect=changed), mock.patch.object(os, "fchmod") as changes:
+                with self.assertRaisesRegex(ValueError, "path changed"):
+                    self.repair()
+                changes.assert_not_called()
+
+    def test_symlink_replacement_during_open_preserves_target(self):
+        original = os.open
+        def swapped(name, flags, *args, **kwargs):
+            if name == self.components.name and kwargs.get("dir_fd") is not None:
+                self.components.unlink()
+                self.components.symlink_to(self.binary)
+            return original(name, flags, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=swapped), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaises(OSError):
+                self.repair()
+            changes.assert_not_called()
+        self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    def test_private_release_and_coordinates_repairs_keep_bytes_and_identity(self):
+        directory = self.data / "installation"
+        directory.mkdir(mode=0o770)
+        directory.chmod(0o770)
+        private = [directory / "release-head.json", directory / "release.json", self.data / "runtime-coords.json"]
+        for path in private:
+            path.write_bytes(b"private bytes")
+            path.chmod(0o660)
+        before = {path: (path.stat().st_dev, path.stat().st_ino, path.read_bytes()) for path in private}
+        self.repair()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        for path in private:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino, path.read_bytes()), before[path])
+
+
 class InstallationTests(unittest.TestCase):
+    def test_older_group_writable_installation_is_repaired_before_writer(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            paths = [sandbox.binary, sandbox.data / "components.json", sandbox.data / "sources.json",
+                     sandbox.data / "ElastOS/SystemServices/Publisher/release-head.json"]
+            for path in paths:
+                path.chmod(0o775 if path == sandbox.binary else 0o664)
+            publisher = paths[-1].parent
+            publisher.chmod(0o775)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for path in [*paths, publisher]:
+                self.assertFalse(path.stat().st_mode & 0o022, path)
+                self.assertIn("Repaired permissions: " + shlex.quote(str(path)), result.stdout)
+
+    def test_world_writable_installation_file_stops_before_any_repair(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            sandbox.binary.chmod(0o775)
+            (sandbox.data / "components.json").chmod(0o666)
+            before = sandbox.home_state()
+            result, requests = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("world-writable", result.stderr)
+            self.assertEqual(requests, [])
+            self.assertEqual(sandbox.home_state(), before)
+            self.assertEqual(sandbox.runtime_calls(), [])
+
     """The complete installer against served artifact bytes inside one disposable sandbox."""
 
     REQUESTS = ["https://test.invalid/release-head.json", "https://test.invalid/release.json",

@@ -379,6 +379,105 @@ sha256_file() {
     fi
 }
 
+installer_repair_permissions() {
+    python3 - "$@" <<'PY_INSTALL_PERMISSIONS'
+import os
+import pwd
+import shlex
+import stat
+import sys
+
+
+def repair_permissions(home, data, binary):
+    home, data, binary = map(os.path.abspath, (home, data, binary))
+    targets = [(os.path.dirname(binary), True, 0), (data, True, 0),
+               (binary, False, 0o022),
+               (os.path.join(os.path.dirname(binary), ".elastos.install.lock"), False, 0o077)]
+    for name in ("components.json", "sources.json", "runtime-coords.json",
+                 "home-runtime-coords.json", "gateway-runtime-coords.json"):
+        targets.append((os.path.join(data, name), False, 0o077 if "coords" in name else 0o022))
+    for directory in ("installation", "ElastOS", "ElastOS/SystemServices", "ElastOS/SystemServices/Publisher"):
+        targets.append((os.path.join(data, directory), True, 0o077 if directory == "installation" else 0o022))
+    for directory in ("installation", "ElastOS/SystemServices/Publisher"):
+        for name in ("release-head.json", "release.json"):
+            targets.append((os.path.join(data, directory, name), False,
+                            0o077 if directory == "installation" else 0o022))
+    target_paths = {path for path, _, _ in targets}
+    descriptors, bindings, repairs, root_owned = {}, [], [], set()
+
+    def identity(metadata):
+        return (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode, metadata.st_nlink)
+
+    def open_path(path, directory):
+        if path in descriptors:
+            return descriptors[path]
+        parent, name = os.path.split(path)
+        parent_fd = open_path(parent, True)
+        if parent_fd is None:
+            return None
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        expected = stat.S_ISDIR if directory else stat.S_ISREG
+        if not expected(before.st_mode):
+            raise ValueError("Unsafe installation path: " + shlex.quote(path) + "; use a regular file or directory without symlinks")
+        if before.st_uid == 0 and os.geteuid() != 0 and os.path.commonpath((home, path)) == home:
+            root_owned.add(data if os.path.commonpath((data, path)) == data else path)
+            return None
+        if path in target_paths and before.st_uid != os.geteuid():
+            raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is not owned by you. Choose a location you own")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if directory else 0)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        descriptors[path] = descriptor
+        if identity(before) != identity(os.fstat(descriptor)):
+            raise ValueError("Installation path changed: " + shlex.quote(path))
+        bindings.append((parent_fd, name, before, path))
+        return descriptor
+
+    try:
+        descriptors["/"] = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for path, directory, refused in targets:
+            if not os.path.lexists(path):
+                continue
+            descriptor = open_path(path, directory)
+            if descriptor is None:
+                continue
+            metadata = os.fstat(descriptor)
+            if metadata.st_uid != os.geteuid():
+                raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is not owned by you. Choose a location you own")
+            if metadata.st_mode & 0o002:
+                raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is world-writable; fix with: chmod o-w " + shlex.quote(path))
+            if not directory and (metadata.st_nlink != 1 or metadata.st_mode & 0o6000):
+                raise ValueError("Unsafe installation file: " + shlex.quote(path))
+            if metadata.st_mode & 0o020 and refused:
+                repairs.append((descriptor, stat.S_IMODE(metadata.st_mode) & ~refused, path))
+        if root_owned:
+            command = "sudo chown -R " + shlex.quote(pwd.getpwuid(os.geteuid()).pw_name + ":")
+            command += " " + " ".join(shlex.quote(path) for path in sorted(root_owned))
+            raise ValueError("Restore ownership of this Home, then run the installer again: " + command)
+        # Validate the complete set before the first change. Keep every parent
+        # open, compare device and inode, and apply modes through descriptors.
+        for parent, name, before, path in bindings:
+            if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity(before):
+                raise ValueError("Installation path changed: " + shlex.quote(path))
+        for descriptor, mode, path in repairs:
+            os.fchmod(descriptor, mode)
+            print("Repaired permissions: " + shlex.quote(path) + " (" + format(mode, "04o") + ")")
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+if __name__ == "__main__":
+    try:
+        repair_permissions(*sys.argv[1:])
+    except (ValueError, OSError) as error:
+        print("Error: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_INSTALL_PERMISSIONS
+}
+
 installer_runtime_control() {
     # All callers stop verified processes before changing the selected install.
     # Smoke cleanup can disable the binary scan when using a shared branch binary.
@@ -1415,8 +1514,11 @@ require_safe_existing_dir() {
     local dir="$1" real
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    if [[ ! -O "$dir" ]]; then
+        installer_repair_permissions "$HOME" "$DATA_DIR" "${INSTALL_DIR}/elastos" || exit 1
+        die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not owned by you. Choose a location you own"
+    fi
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you. Choose a location you own"
     if [[ -n "$(find "$real" -maxdepth 0 -perm -o+w)" ]]; then
         die_exact "Unsafe installation directory: $(printf '%q' "$real") is world-writable; fix with: chmod o-w $(printf '%q' "$real")"
     fi
@@ -1452,6 +1554,7 @@ require_safe_parent_chain() {
 require_safe_existing_dir "$INSTALL_DIR"
 require_safe_existing_dir "$DATA_DIR"
 require_safe_parent_chain "$DATA_DIR"
+installer_repair_permissions "$HOME" "$DATA_DIR" "${INSTALL_DIR}/elastos" || exit 1
 
 # ── Fetch + verify release head ──────────────────────────────────────
 

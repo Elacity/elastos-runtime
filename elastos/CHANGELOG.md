@@ -8,6 +8,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Fixed
 
+- The installer repairs group-writable files in an older Home that you own and gives one ownership repair command for root-owned installation files (#516).
 - Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.
 
 ## [2.0.0] - 2026-11-02
