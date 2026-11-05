@@ -3217,14 +3217,6 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let seed_bytes = fs::metadata(&paths.rootfs_path)
-            .map_err(|error| format!("Browser VM rootfs seed: {error}"))?
-            .len();
-        if let Some(refusal) =
-            rootfs_overlay_space_refusal(seed_bytes, available_launch_bytes(&paths.session_dir)?)
-        {
-            return Err(refusal);
-        }
         if shared_writable_rootfs() {
             let lock = LifetimeFileLock::acquire_disk_sidecar(
                 &paths.rootfs_path,
@@ -3266,10 +3258,12 @@ const ROOTFS_OVERLAY_NAME: &str = "rootfs.qcow2";
 
 /// Free space a launch keeps beyond its overlay's worst case (every block of
 /// the seed rewritten): the room the Home keeps for update staging.
+#[cfg(any(target_os = "linux", test))]
 const ROOTFS_OVERLAY_FREE_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The refusal when this computer cannot hold a launch overlay's worst case
 /// plus the floor.
+#[cfg(any(target_os = "linux", test))]
 fn rootfs_overlay_space_refusal(seed_bytes: u64, available: u64) -> Option<String> {
     let required = seed_bytes.saturating_add(ROOTFS_OVERLAY_FREE_FLOOR);
     (available < required).then(|| {
@@ -3283,20 +3277,6 @@ fn rootfs_overlay_space_refusal(seed_bytes: u64, available: u64) -> Option<Strin
             },
         }).to_string()
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn available_launch_bytes(path: &Path) -> Result<u64, String> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path is NUL-terminated and statvfs initializes stats on success.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(format!("free space: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: statvfs succeeded.
-    let stats = unsafe { stats.assume_init() };
-    Ok(u64::from(stats.f_bavail).saturating_mul(stats.f_frsize))
 }
 
 /// Linux boots a per-launch qcow2 overlay whose backing file is the
