@@ -87,6 +87,7 @@ struct HomeLaunchTokenEnvelope {
 
 #[derive(Debug, Clone)]
 pub(in crate::api) struct RequiredHomeLaunchToken {
+    pub(in crate::api) expires_at: u64,
     pub(in crate::api) launch_id: String,
     pub(in crate::api) launch_context: HomeLaunchContext,
     pub(in crate::api) context: HomeLaunchTokenContext,
@@ -291,6 +292,26 @@ fn issue_home_launch_token_at(
     {
         anyhow::bail!("home launch token is missing authority context");
     }
+    let mut expires_at = issued_at.saturating_add(HOME_LAUNCH_TOKEN_TTL_SECS);
+    // Home can replace a frame only under its current parent authority.
+    if launch_context.authority_actor == HOME_CAPSULE_ID
+        && launch_context.selected_resource != HOME_CAPSULE_ID
+    {
+        if let Some(proof_binding_id) = context.proof_binding_id.as_deref() {
+            let grant = crate::auth::load_active_session_grant(
+                &home_launch_auth_data_dir(data_dir),
+                &context.session_id,
+                now_ts(),
+            )?;
+            if grant.principal_id != context.principal_id
+                || grant.proof_binding_id != proof_binding_id
+                || grant.grant_id != context.grant_id
+            {
+                anyhow::bail!("home launch token authority context mismatch");
+            }
+            expires_at = expires_at.min(grant.expires_at);
+        }
+    }
     let (signing_key, _did) = elastos_identity::load_or_create_did(data_dir)?;
     let envelope = HomeLaunchTokenEnvelope {
         payload: HomeLaunchTokenPayload {
@@ -298,7 +319,7 @@ fn issue_home_launch_token_at(
             launch_id: format!("launch:{}", uuid_like_token()),
             launch_context: launch_context.clone(),
             iat: issued_at,
-            exp: issued_at.saturating_add(HOME_LAUNCH_TOKEN_TTL_SECS),
+            exp: expires_at,
             principal_id: context.principal_id.clone(),
             session_id: context.session_id.clone(),
             proof_binding_id: context.proof_binding_id.clone(),
@@ -754,6 +775,7 @@ fn require_home_launch_token_value_from_expected_did(
         }
     }
     Ok(RequiredHomeLaunchToken {
+        expires_at: envelope.payload.exp,
         launch_id: envelope.payload.launch_id,
         launch_context: envelope.payload.launch_context,
         context: HomeLaunchTokenContext {
@@ -1202,6 +1224,65 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("not authorized"));
+    }
+
+    #[test]
+    fn frame_renewal_is_bounded_by_launch_ttl_and_current_parent_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ts();
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".into(),
+            session_id: "auth:alice".into(),
+            proof_binding_id: Some("proof:alice".into()),
+            grant_id: "grant:alice".into(),
+        };
+        let mut grant = elastos_runtime::auth::AuthSessionGrantV1 {
+            schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.into(),
+            principal_id: context.principal_id.clone(),
+            session_id: context.session_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            grant_id: context.grant_id.clone(),
+            issued_at: now,
+            expires_at: now + 60,
+            apps: vec![HOME_CAPSULE_ID.into()],
+        };
+        let renew = || {
+            issue_home_projection_launch_token_with_context(
+                dir.path(),
+                "chat-room",
+                "chat-room",
+                &context,
+            )
+        };
+        for lifetime in [60, HOME_LAUNCH_TOKEN_TTL_SECS * 2] {
+            grant.expires_at = now + lifetime;
+            crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
+            let token = renew().unwrap();
+            let payload = decode_launch_token(&token).payload;
+            assert_eq!(
+                payload.exp,
+                grant
+                    .expires_at
+                    .min(payload.iat + HOME_LAUNCH_TOKEN_TTL_SECS)
+            );
+            // An app launch cannot act as Home to obtain a replacement.
+            assert!(require_home_launch_token_context(
+                dir.path(),
+                &capsule_headers(&token),
+                HOME_CAPSULE_ID,
+            )
+            .is_err());
+        }
+        grant.expires_at = now;
+        crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
+        assert!(renew().is_err(), "expired parent");
+        grant.expires_at = now + 60;
+        crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
+        crate::auth::revoke_session_grant(dir.path(), &grant.session_id, now).unwrap();
+        assert!(renew().is_err(), "revoked parent");
+        grant.principal_id = "person:local:bob".into();
+        crate::auth::store_session_grant(dir.path(), grant).unwrap();
+        assert!(renew().is_err(), "another principal's parent");
     }
 
     #[test]
