@@ -577,7 +577,7 @@ pub(crate) async fn invoke(
             drop(admission);
             let result = page.wait_result().await?;
             ensure!(
-                result["status"] != "ok" || !page.closing.load(Ordering::Acquire),
+                result["status"] == "error" || !page.closing.load(Ordering::Acquire),
                 "Engine owner retired before launch publication"
             );
             Ok(result)

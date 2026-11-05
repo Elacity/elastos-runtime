@@ -14,6 +14,7 @@ pub(super) struct RemoteEngineFixture {
     calls: TokioMutex<Vec<Value>>,
     hold_launch: std::sync::atomic::AtomicBool,
     panic_launch: std::sync::atomic::AtomicBool,
+    missing_launch_status: std::sync::atomic::AtomicBool,
     hold_input: std::sync::atomic::AtomicBool,
     bad_close: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
@@ -131,6 +132,9 @@ impl Provider for RemoteEngineFixture {
                 response["data"]["effects"]["turn_process_absent"] = json!(false);
             }
         }
+        if request["op"] == "launch" && self.missing_launch_status.load(SeqCst) {
+            response.as_object_mut().unwrap().remove("status");
+        }
         Ok(response)
     }
 }
@@ -182,6 +186,30 @@ impl Provider for ConsumerExitFixture {
 
 #[tokio::test]
 async fn remote_engine_invoke_returns_fallback_when_launch_worker_panics() {
+    let result = remote_engine_launch_response(true, false).await.unwrap();
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["code"], "browser_engine_unavailable", "{result}");
+    assert_eq!(
+        result["message"],
+        "Remote Engine launch did not complete; retry cleanup"
+    );
+}
+
+#[tokio::test]
+async fn remote_engine_invoke_refuses_closing_launch_without_status() {
+    let error = remote_engine_launch_response(false, true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Engine owner retired before launch publication"
+    );
+}
+
+async fn remote_engine_launch_response(
+    panic_launch: bool,
+    missing_launch_status: bool,
+) -> anyhow::Result<Value> {
     use std::sync::atomic::Ordering::SeqCst;
     let root = tempfile::tempdir().unwrap();
     config(root.path());
@@ -237,19 +265,15 @@ async fn remote_engine_invoke_returns_fallback_when_launch_worker_panics() {
         }
     };
     assert_eq!(call(prepare).await.unwrap()["status"], "ok");
-    provider.panic_launch.store(true, SeqCst);
+    provider.panic_launch.store(panic_launch, SeqCst);
+    provider
+        .missing_launch_status
+        .store(missing_launch_status, SeqCst);
     let launch = json!({"op":"launch","principal_id":grant.requester_principal_id,
         "grant_id":grant.grant_id,"page_id":page_id,"lifecycle_generation":generation});
     let result = tokio::time::timeout(Duration::from_secs(2), call(launch))
         .await
-        .expect("invoke must wake after the detached launch worker panics")
-        .unwrap();
-    assert_eq!(result["status"], "error", "{result}");
-    assert_eq!(result["code"], "browser_engine_unavailable", "{result}");
-    assert_eq!(
-        result["message"],
-        "Remote Engine launch did not complete; retry cleanup"
-    );
+        .expect("invoke must wake after the detached launch worker completes");
     assert_eq!(
         provider
             .calls
@@ -261,6 +285,7 @@ async fn remote_engine_invoke_returns_fallback_when_launch_worker_panics() {
         1
     );
     endpoint.close().await;
+    result
 }
 
 #[tokio::test]

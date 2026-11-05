@@ -24,6 +24,7 @@ const IO_CHUNK_SIZE: usize = 64 * 1024;
 const STAGING_PREFIX: &str = ".browser-image-stage-";
 // Each image-set directory owns its admission budget across releases/platforms.
 const VERIFIED_SET_CACHE_LIMIT: usize = 8;
+const VERIFIED_SET_TOTAL_CACHE_LIMIT: usize = 32;
 // The unpacked set: the 4096 MiB root disk that
 // scripts/build/build-browser-vm-rootfs.sh builds, plus kernel, initrd and
 // receipts (about 120 MB). A test keeps it above the builder's root disk size.
@@ -241,6 +242,10 @@ fn verify_cached_payload_in_with_cancel(
                 key: key.clone(),
                 verification: verification.clone(),
             });
+            // Workers and their waiters retain their own result after eviction.
+            while cache.len() > VERIFIED_SET_TOTAL_CACHE_LIMIT {
+                cache.pop_front();
+            }
             (verification, true)
         }
     };
@@ -346,9 +351,12 @@ pub(crate) fn start_background_verification(
     platform: &str,
 ) -> Option<BackgroundVerification> {
     if !super::browser_config::local_vm_configured(data, platform).unwrap_or(false)
-        || !aliases(platform).first().is_some_and(|(alias, file)| {
-            data.join(INSTALL_PATH).join(file).is_file() || data.join(alias).is_file()
-        })
+        || !aliases(platform)
+            .iter()
+            .find(|(_, file)| *file == "rootfs.ext4")
+            .is_some_and(|(alias, file)| {
+                data.join(INSTALL_PATH).join(file).is_file() || data.join(alias).is_file()
+            })
     {
         return None;
     }
@@ -2411,13 +2419,50 @@ mod tests {
     }
 
     #[test]
+    fn browser_image_cache_has_total_limit_across_image_sets() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Mutex::new(VecDeque::new());
+        let mut sets = Vec::new();
+        for index in 0..33 {
+            let paths = cache_fixture(&temp.path().join(format!("home-{index}")));
+            verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
+                verify_payload_paths(&paths, "darwin-arm64")
+            })
+            .unwrap();
+            sets.push(paths);
+        }
+        assert_eq!(cache.lock().unwrap().len(), 32);
+        let cached = cache.lock().unwrap();
+        assert_eq!(cached.front().unwrap().key.paths, sets[1]);
+        assert_eq!(cached.back().unwrap().key.paths, sets[32]);
+        drop(cached);
+        verify_cached_payload_in(&cache, &sets[32], "darwin-arm64", "legacy", || {
+            panic!("the newest set must remain cached")
+        })
+        .unwrap();
+        let called = std::cell::Cell::new(false);
+        verify_cached_payload_in(&cache, &sets[0], "darwin-arm64", "legacy", || {
+            called.set(true);
+            verify_payload_paths(&sets[0], "darwin-arm64")
+        })
+        .unwrap();
+        assert!(
+            called.get(),
+            "the oldest set must require verification again"
+        );
+        assert_eq!(cache.lock().unwrap().len(), 32);
+    }
+
+    #[test]
     fn browser_image_successful_verification_cache_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let cache = Mutex::new(VecDeque::new());
         let mut first = None;
         for index in 0..VERIFIED_SET_CACHE_LIMIT + 1 {
             let paths = FILES.map(|name| temp.path().join(format!("{index}-{name}")));
-            for (path, (_, bytes)) in paths.iter().zip(fixture(b"working-image")) {
+            let files = fixture(b"working-image");
+            assert_eq!(FILES.len(), files.len(), "cache fixture file count changed");
+            for (path, (_, bytes)) in paths.iter().zip(files) {
                 fs::write(path, bytes).unwrap();
             }
             verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
