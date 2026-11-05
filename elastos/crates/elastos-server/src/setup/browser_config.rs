@@ -22,6 +22,11 @@ pub(super) async fn ensure_host_components(
     context: super::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
     ensure_viewer_ingress(data)?;
+    if matches!(context, super::FirstPartyCarrierContext::Runtime)
+        && linux_host_setup_message(data, platform).is_some()
+    {
+        return Ok(()); // The Browser viewer explains the explicit owner action.
+    }
     if !local_vm_selected(data, platform)? {
         return configure(data, platform, false);
     }
@@ -227,6 +232,36 @@ fn native_host_available(data: &Path) -> anyhow::Result<()> {
     probe_native_host(&program, data, std::time::Duration::from_secs(2))
 }
 
+pub(crate) fn linux_host_setup_message(data: &Path, platform: &str) -> Option<&'static str> {
+    linux_host_setup_message_with_kvm(
+        data,
+        platform,
+        super::browser_linux::kvm_present(Path::new("/dev/kvm")),
+    )
+}
+
+fn linux_host_setup_message_with_kvm(
+    data: &Path,
+    platform: &str,
+    kvm_present: bool,
+) -> Option<&'static str> {
+    if platform != "linux-arm64" || !local_vm_selected(data, platform).unwrap_or(false) {
+        return None;
+    }
+    if !kvm_present {
+        return Some(super::browser_linux::KVM_MESSAGE);
+    }
+    require_linux_host(data)
+        .is_err()
+        .then_some(super::browser_linux::SETUP_MESSAGE)
+}
+
+pub(super) fn require_linux_host(data: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    require_kvm(Path::new("/dev/kvm"))?;
+    native_host_available(data)
+}
+
 fn probe_native_host(
     program: &Path,
     data: &Path,
@@ -328,8 +363,15 @@ fn host_program(data: &Path, name: &str) -> Option<PathBuf> {
 fn require_kvm(path: &Path) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileTypeExt;
-    let file = fs::OpenOptions::new().read(true).write(true).open(path)
-        .map_err(|error| anyhow::anyhow!("Browser virtualization is unavailable to this Home user: {error}. Complete the installer host-access step, or choose another approved Engine"))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Browser virtualization needs host access: {error}. Run elastos setup --browser"
+            )
+        })?;
     anyhow::ensure!(
         file.metadata()?.file_type().is_char_device(),
         "Browser virtualization requires a KVM character device"
@@ -359,6 +401,9 @@ pub(super) async fn prepare_home(
     let result: anyhow::Result<()> = async {
         if !browser_available(platform) {
             return retire_host(data, manifest);
+        }
+        if platform.starts_with("linux-") {
+            return Ok(()); // Only `elastos setup --browser` prepares this host.
         }
         if browser_selected && manifest.profiles.contains_key("browser-host") {
             println!("Preparing Browser Engine helpers...");
@@ -411,7 +456,7 @@ pub(super) fn pending_download_bytes(
     platform: &str,
     browser_selected: bool,
 ) -> u64 {
-    if !browser_available(platform) || !browser_selected {
+    if platform.starts_with("linux-") || !browser_available(platform) || !browser_selected {
         return 0;
     }
     let Ok(Some(rows)) = host_rows(manifest, platform) else {
@@ -1070,6 +1115,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_setup_leaves_browser_helpers_and_image_for_explicit_setup() {
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        fs::create_dir_all(data.join("capsules/browser")).unwrap();
+        prepare_home(data, &manifest, "linux-arm64", true).await;
+        for path in ["scripts", "bin", "browser-vm", "config"] {
+            assert!(!data.join(path).exists(), "Linux setup prepared {path}");
+        }
+        assert_eq!(
+            pending_download_bytes(data, &manifest, "linux-arm64", true),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_browser_open_explains_setup_before_admitting_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        assert_eq!(
+            linux_host_setup_message_with_kvm(data, "linux-arm64", true),
+            Some("Browser is available on this computer. To turn it on, run: elastos setup --browser")
+        );
+        assert_eq!(
+            linux_host_setup_message_with_kvm(data, "linux-arm64", false),
+            Some(super::super::browser_linux::KVM_MESSAGE)
+        );
+        assert_eq!(linux_host_setup_message(data, "darwin-arm64"), None);
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        ensure_host_components(
+            data,
+            &manifest,
+            "linux-arm64",
+            super::super::FirstPartyCarrierContext::Runtime,
+        )
+        .await
+        .unwrap();
+        assert!(!data.join("bin").exists());
+        assert!(!data.join("browser-vm").exists());
+        fs::write(data.join("config/browser-engine-adapter.json"),
+            br#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/remote/bin/browser-vm-remote-vz-launcher"}}]}"#).unwrap();
+        assert_eq!(linux_host_setup_message(data, "linux-arm64"), None);
+    }
+
+    #[tokio::test]
     async fn linux_setup_installs_no_browser_host_helpers_or_image() {
         let manifest: super::super::ComponentsManifest =
             serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
@@ -1084,7 +1176,7 @@ mod tests {
         fs::create_dir_all(data.join("capsules/browser")).unwrap();
         prepare_home(data, &manifest, platform, true).await;
         assert!(!local_vm_selected(data, platform).unwrap());
-        // install.sh asks for sudo only when this helper exists.
+        // An unsupported host keeps its existing retirement behavior.
         assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
         assert!(!data.join("scripts").exists());
         assert!(!data.join("bin").exists());

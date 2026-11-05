@@ -87,7 +87,9 @@ stop after bootstrap.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
 Wallet, Documents, Library, Marketplace, and Inbox. On Apple Silicon
-Macs it also exposes Browser; Linux Homes do not show Browser in 2.0.0. People is installed as a
+Macs it also exposes Browser. On supported Linux ARM64 computers with KVM,
+Browser is optional; see [Jetson](#jetson) for `elastos setup --browser`.
+People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 
 Native Windows is not an accepted install target today. The current product
@@ -173,20 +175,24 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Home and chat use the ordinary user account. Browser runs on Apple Silicon Macs
-and uses the local Engine's virtual machine. When the signed release supplies
-Browser support, setup obtains its matching helpers and verified image before
-Home starts. The image streams to disk with progress; a transfer stops after 30
-seconds without data. Runtime keeps the committed Browser profile separate from
-the image during reopen and updates.
+Home and chat use the ordinary user account. Browser uses the local Engine's
+virtual machine on Apple Silicon Macs and supported Linux ARM64 hosts with KVM.
+On Linux, Marketplace lists Browser with its setup command. To turn it on, run
+`elastos setup --browser` in a terminal as the user who installed Home. The
+command installs the signed Browser helpers, shows the host access changes and
+asks for administrator approval. It then downloads and verifies the image with
+progress. Close Home and start it again with `elastos home --browser`.
 
-On other computers, including Linux ARM64 (Jetson) and Linux x86-64, Browser is
-hidden until the next release; setup prints "Browser is not available on this
-computer yet." Setup also clears the Browser Engine selection and removes the
-Browser host helpers and image an earlier release installed (Browser profiles
-stay). The installer runs its Linux host step only after setup and only if the
-helper is still present, so it asks for no administrator step. If an earlier
-release set up Browser host access on Linux, it can be removed with:
+The Linux installer and ordinary `elastos setup` leave this download to your
+choice. Opening Browser on an unprepared Linux host explains the command.
+After setup, a later open prepares a missing image on demand. Apple Silicon
+setup continues to prepare its helpers and image before Home starts. The image
+streams to disk with progress; a transfer stops after 30 seconds without data.
+Runtime keeps the committed Browser profile separate from the image during
+reopen and updates. Linux x86-64 keeps Browser hidden and retires helpers and
+images from unsupported releases while preserving Browser profiles.
+
+To remove Browser host access, close Browser and run this before uninstalling:
 
 ```sh
 sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
@@ -502,8 +508,8 @@ directory stays, including Browser profiles, so installing again continues with
 the same identity. Pass the same `--install-dir` you installed with. An install
 or update that is running or was interrupted stops the removal; finish it first.
 
-On Linux, the uninstall leaves any Browser host access an earlier release set
-up in place. Remove it with:
+On Linux, the administrator helper owns Browser host access. If you enabled it,
+close Browser and remove that access before uninstalling:
 
 ```sh
 sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"

@@ -8,6 +8,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Fixed
 
+- On Linux, Browser is turned on when you choose it, not during install.
 - Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
 - Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.
 

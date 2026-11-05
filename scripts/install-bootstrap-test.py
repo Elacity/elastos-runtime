@@ -1761,186 +1761,52 @@ class UninstallTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
-    def test_browser_setup_removes_only_retired_rootfs_pool(self):
+    def test_linux_summary_explains_missing_kvm(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            pool = root / 'browser-vm/rootfs-pool'
-            pool.mkdir(parents=True)
-            (pool / 'copy.raw').write_text('retired system copy')
-            image = root / 'browser-vm/rootfs.raw'
-            image.write_text('system image')
-            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
+            helpers = HELPERS.replace('/dev/kvm', str(root / 'missing-kvm'))
+            result = shell(helpers + '\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"', root)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(pool.exists())
-            self.assertEqual(image.read_text(), 'system image')
-            self.assertIn(f'Removed retired Browser rootfs pool: {pool}', result.stdout)
-            again = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
-            self.assertEqual(again.returncode, 0, again.stderr)
-            self.assertNotIn('Removed', again.stdout)
+            self.assertIn('Browser needs KVM', result.stdout)
+            self.assertIn('setup --browser', result.stdout)
+            self.assertNotIn('Browser is available', result.stdout)
 
-    def test_browser_pool_cleanup_preserves_link_targets(self):
-        with tempfile.TemporaryDirectory() as scratch:
-            root = Path(scratch)
-            data, outside = root / 'data', root / 'outside'
-            (data / 'browser-vm').mkdir(parents=True)
-            outside.mkdir()
-            (outside / 'keep').write_text('keep')
-            pool = data / 'browser-vm/rootfs-pool'
-            pool.symlink_to(outside)
-            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(pool.is_symlink())
-            self.assertEqual((outside / 'keep').read_text(), 'keep')
-            (data / 'browser-vm').rmdir()
-            (data / 'browser-vm').symlink_to(outside)
-            (outside / 'rootfs-pool').mkdir()
-            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertTrue((outside / 'rootfs-pool').is_dir())
-
-    def test_browser_pool_cleanup_requires_pool_and_parent_ownership(self):
-        cleanup = SOURCE.split("<<'PY_RETIRED_BROWSER_POOL'\n", 1)[1].split("\nPY_RETIRED_BROWSER_POOL", 1)[0]
-        real_lstat = os.lstat
-        for uid in (0, 1001):
-            for foreign in ('browser-vm', 'browser-vm/rootfs-pool'):
-                with self.subTest(uid=uid, foreign=foreign), tempfile.TemporaryDirectory() as scratch:
-                    root = Path(scratch)
-                    pool = root / 'browser-vm/rootfs-pool'
-                    pool.mkdir(parents=True)
-                    image = pool / 'copy.raw'
-                    image.write_text('keep foreign-owned pool')
-                    def metadata(path, *args, **kwargs):
-                        fields = list(real_lstat(path, *args, **kwargs))
-                        fields[4] = uid + 1 if Path(path) == root / foreign else uid
-                        return os.stat_result(fields)
-                    with mock.patch.object(os, 'lstat', side_effect=metadata), \
-                            mock.patch.object(os, 'geteuid', return_value=uid), \
-                            mock.patch.object(sys, 'argv', ['cleanup', str(root)]):
-                        with self.assertRaisesRegex(SystemExit, 'belongs to another user'):
-                            exec(compile(cleanup, str(INSTALLER) + ':pool-cleanup', 'exec'), {})
-                    self.assertEqual(image.read_text(), 'keep foreign-owned pool')
-
-    def test_browser_host_step_is_installer_only_and_handles_decline_or_unavailable_host(self):
-        function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
-        function = "prepare_browser_linux_host() {" + function
+    def test_linux_install_leaves_browser_setup_to_the_owner(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             (root / 'scripts').mkdir()
-            (root / 'scripts/browser-vm-linux-network.py').write_text('inert signed-helper fixture')
-            device, terminal = root / 'kvm', root / 'terminal'
-            function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
-            function = function.replace('/usr/bin/python3 -I "', 'fixture_python -I "')
-            script = function + '''
-DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
-uname() { printf '%s\\n' "$SYSTEM"; }
-fixture_python() {
-    [[ "$READY" != yes ]] || return 0
-    printf 'Browser network is unavailable (fixture).\\nAs root, run:\\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user %s --transport userspace-vsock --data-dir %s\\n' "$(id -un)" "$DATA_DIR"
-    return 1
-}
-sudo() { printf 'ROOT_STEP:%s\\n' "$*"; [[ "$ROOT_RESULT" != 0 ]] || READY=yes; return "$ROOT_RESULT"; }
-prepare_browser_linux_host
-'''
-            for case, system, ready, device_present, terminal_present, root_result in [
-                ('mac', 'Darwin', 'no', True, True, 0),
-                ('unavailable', 'Linux', 'no', False, True, 0),
-                ('ready', 'Linux', 'yes', True, True, 0),
-                ('headless', 'Linux', 'no', True, False, 0),
-                ('setup', 'Linux', 'no', True, True, 0),
-                ('declined', 'Linux', 'no', True, True, 1),
-            ]:
-                for path, present in [(device, device_present), (terminal, terminal_present)]:
-                    path.unlink(missing_ok=True)
-                    if present:
-                        path.touch()
-                result = shell(script, root, system, ready, root_result)
-                with self.subTest(case=case):
-                    self.assertEqual(result.returncode, root_result if case == 'declined' else 0, result.stderr)
-                    self.assertEqual('ROOT_STEP:' in result.stdout, case in ('setup', 'declined'))
-                    helper = root / 'scripts/browser-vm-linux-network.py'
-                    root_helper = '/usr/local/lib/elastos/browser-vm-linux-network.py'
-                    user = getpass.getuser()
-                    install = f'install -D -o root -g root -m 755 {helper} {root_helper}'
-                    run = f'fixture_python -I {root_helper} setup --user {user} --data-dir {root}'
-                    if case == 'setup':
-                        # sudo runs only the root-owned copy, never the user-writable helper.
-                        self.assertEqual(
-                            [line for line in result.stdout.splitlines() if line.startswith('ROOT_STEP:')],
-                            [f'ROOT_STEP:{install}', f'ROOT_STEP:{run}'],
-                        )
-                        self.assertIn(f'/usr/bin/python3 -I {root_helper} remove --user ', result.stdout)
-                    if case == 'headless':
-                        self.assertIn('Run from a terminal', result.stdout)
-                        self.assertIn(f'  sudo {install}\n', result.stdout)
-                        command = f'  sudo /usr/bin/python3 -I {root_helper} setup --user {user} --transport userspace-vsock --data-dir {root}\n'
-                        self.assertIn(command, result.stdout)
-                        self.assertLess(result.stdout.index('Browser network is unavailable'), result.stdout.index(command))
-                    if case == 'unavailable':
-                        self.assertIn('virtualization is unavailable', result.stdout)
-
-    def test_browser_setup_resumes_after_installer_host_access_and_home_survives_browser_failure(self):
-        with tempfile.TemporaryDirectory() as scratch:
-            root = Path(scratch)
+            (root / 'scripts/browser-vm-linux-network.py').write_text('fixture')
+            (root / 'kvm').symlink_to('/dev/null')
+            (root / 'terminal').touch()
             runtime = root / 'elastos'
-            runtime.write_text("#!/bin/bash\n" +
-                               'printf "SETUP:%s\\n" "$*" >> "$CALLS"\n' +
-                               '[[ -f "$HOST_READY" ]] || exit 0\n' +
-                               'exit "${BROWSER_SETUP_RESULT:-0}"\n')
+            runtime.write_text('#!/bin/bash\n'
+                               'printf "RUNTIME:%s\\n" "$*" >> "$CALLS"\n'
+                               'if [[ -f "$HOST_READY" || "$*" == *--browser* ]]; then '
+                               'printf "IMAGE_DOWNLOAD\\n" >> "$CALLS"; fi\n')
             runtime.chmod(0o755)
-            script = HELPERS + """
-INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data" ISOLATED="$3"
-export CALLS="$1/calls" HOST_READY="$1/host-ready" BROWSER_SETUP_RESULT="$2"
-prepare_browser_linux_host() { touch "$HOST_READY"; BROWSER_LINUX_HOST_READY=true; printf 'HOST_READY\\n' >> "$CALLS"; }
-show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
-finish_install
-"""
-            for isolated in ['false', 'true']:
-                for browser_result in [0, 7]:
-                    calls, ready = root / 'calls', root / 'host-ready'
-                    calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
-                    result = shell(script, root, browser_result, isolated)
-                    setup = 'SETUP:setup --isolated' if isolated == 'true' else 'SETUP:setup'
-                    with self.subTest(isolated=isolated, browser_result=browser_result):
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(calls.read_text().splitlines(), [setup, 'HOST_READY', setup, 'HOME_READY'])
-
-    def test_rerun_with_retained_linux_helper_never_asks_for_sudo_after_setup_retires_it(self):
-        # An earlier release left the helper and its check now fails. Setup runs
-        # first and, where Browser is unavailable, removes the helper, so the
-        # host step that follows finds nothing to set up.
-        function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
-        with tempfile.TemporaryDirectory() as scratch:
-            root = Path(scratch)
-            (root / 'data/scripts').mkdir(parents=True)
-            helper = root / 'data/scripts/browser-vm-linux-network.py'
-            device, terminal = root / 'kvm', root / 'terminal'
-            device.touch(); terminal.touch()
-            runtime = root / 'elastos'
-            runtime.write_text("#!/bin/bash\n" +
-                               'printf "SETUP:%s\\n" "$*" >> "$CALLS"\n' +
-                               '[[ "$1" != setup || "$RETIRES" != yes ]] || rm -f "$HELPER"\n')
-            runtime.chmod(0o755)
-            function = "prepare_browser_linux_host() {" + function
-            function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
-            function = function.replace('/usr/bin/python3', 'fixture_python')
-            script = function + """
-INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data"
-export CALLS="$1/calls" HELPER="$1/data/scripts/browser-vm-linux-network.py" RETIRES="$2"
-uname() { printf 'Linux\\n'; }
-fixture_python() { return 1; }
-sudo() { printf 'ROOT_STEP:%s\\n' "$*" >> "$CALLS"; return 1; }
-show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
+            helpers = HELPERS.replace('/dev/kvm', str(root / 'kvm'))
+            helpers = helpers.replace('/dev/tty', str(root / 'terminal'))
+            helpers = helpers.replace('/usr/bin/python3 -I ', 'fixture_python -I ')
+            script = helpers + r'''
+INSTALL_DIR="$1" DATA_DIR="$1" INSTALL_ONLY=false ISOLATED="$2" SYSTEM="$3"
+export CALLS="$1/calls" HOST_READY="$1/host-ready"
+uname() { case "$1" in -s) echo "$SYSTEM";; -m) echo aarch64;; esac; }
+fixture_python() { [[ -f "$HOST_READY" ]]; }
+sudo() { printf 'SUDO:%s\n' "$*" >> "$CALLS"; touch "$HOST_READY"; }
+retire_browser_rootfs_pool() { :; }
 finish_install </dev/null
-"""
-            for retires in ['yes', 'no']:
-                helper.write_text('retained helper from an earlier release')
+'''
+            for system, isolated in [('Linux', 'false'), ('Linux', 'true'), ('Darwin', 'false')]:
                 (root / 'calls').unlink(missing_ok=True)
-                result = shell(script, root, retires)
-                calls = (root / 'calls').read_text().splitlines()
-                with self.subTest(retires=retires):
-                    self.assertEqual(calls[0], 'SETUP:setup', result.stderr)
-                    # The control case shows the step would prompt if the helper stayed.
-                    self.assertEqual(any(c.startswith('ROOT_STEP:') for c in calls), retires == 'no')
+                (root / 'host-ready').unlink(missing_ok=True)
+                result = shell(script, root, isolated, system)
+                with self.subTest(system=system, isolated=isolated):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    setup = 'setup --isolated' if isolated == 'true' else 'setup'
+                    self.assertEqual((root / 'calls').read_text().splitlines(),
+                                     ['RUNTIME:' + setup])
+                    self.assertEqual('setup --browser' in result.stdout, system == 'Linux')
+                    self.assertEqual(result.stdout.count('To turn it on'), int(system == 'Linux'))
 
     def test_three_platform_release_keys(self):
         for system, machine, expected in [("Linux", "x86_64", "x86_64-linux"),

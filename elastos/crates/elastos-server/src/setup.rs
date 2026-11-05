@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod browser_config;
+pub(crate) use browser_config::linux_host_setup_message;
 pub use browser_config::{browser_available, home_browser_available};
+mod browser_linux;
 mod browser_vm_image;
 pub(crate) use browser_vm_image::start_background_verification as start_browser_image_verification;
 pub(crate) use browser_vm_image::verified_seed_identity as verified_browser_vm_seed_identity;
@@ -260,6 +262,11 @@ pub fn validate_provider_runtime<'a>(
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
+
+/// Explicit Linux Browser opt-in; normal setup keeps the image on demand.
+pub async fn enable_browser() -> anyhow::Result<()> {
+    browser_linux::enable(&data_dir()?, &detect_platform()).await
+}
 
 pub async fn run(
     profile: Option<String>,

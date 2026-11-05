@@ -481,22 +481,32 @@ guest and viewer allocations meet; loopback, private ranges and every other
 peer are denied, and TCP relays are off. coturn checks peer IPs only, so the
 relay output rule above confines relayed UDP to the TURN ports; host services
 on the slot IP stay unreachable. `check` refuses a receipt without that rule.
-`elastos setup` writes the Home's TURN credential to the
+`elastos setup --browser` writes the Linux Home's TURN credential to the
 owner-only `$DATA_DIR/runtime-turn/turn-credentials.env` and keeps an
 existing one.
 
-For removal, use the same root shell and helper:
+The Linux installer leaves Browser host access and its image to the Home owner.
+On a supported Linux ARM64 host with KVM, run `elastos setup --browser` from a
+terminal. This command admits the signed helpers, runs the one-time administrator
+setup above, checks host access, then downloads and verifies the image with
+progress. The administrator helper shows its changes and asks for confirmation.
+Ordinary `elastos setup` leaves the Linux Browser image untouched. Close Home
+and start it again after enabling Browser. Browser open explains this command
+on an unprepared host; after setup it prepares a missing image on demand.
+Apple Silicon setup keeps its existing Browser preparation behavior.
+
+For removal, close Browser and run this as the Home user before uninstalling:
 
 ```sh
-python3 /usr/local/lib/elastos/browser-vm-linux-network.py remove --user <home-user>
+sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
 ```
 
 After confirmation, removal deletes this account's TAPs, filter hooks/chains,
 boot service, udev rule, locks and receipts. It restores the prior named KVM
 ACL, or removes the grant created by setup. The shared root helper is removed
 when the last account's setup is removed. Other host firewall rules stay with
-their owner. `install.sh` integration is a separate change; the installer can
-call the exact setup command above as its approved root step.
+their owner. Runtime and the installer leave these administrator operations
+to the explicit Browser setup and removal commands.
 
 ### Linux operator proof
 
@@ -560,8 +570,9 @@ generator/stager for:
 - verified links to an existing rootfs, kernel, initrd and matching build manifest
 
 Linux uses the native supervisor and a disposable qcow2 overlay for each
-launch. The installer removes the retired `browser-vm/rootfs-pool` image copies
-as their ordinary owner and reports the removed path.
+launch. Linux Browser preparation belongs to `elastos setup --browser`.
+That command removes retired `browser-vm/rootfs-pool` image copies as their
+ordinary owner before preparing Browser.
 
 For already-provisioned targets, `scripts/browser-vm-target-refresh.sh` is the
 host-helper maintenance path. Guest drift requires a rebuilt image set. Runtime

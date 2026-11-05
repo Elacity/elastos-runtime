@@ -40,20 +40,24 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
             protected_content
                 || manifest.name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
         })
-        // Browser is absent, not merely unlaunchable, where it is unavailable.
-        .filter(|manifest| {
-            manifest.name != "browser" || crate::setup::home_browser_available(data_dir, platform)
-        })
+        // Supported Linux owners can find Browser before granting host access.
+        .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
         // Hidden Services and an unconfigured WalletConnect are absent here as
         // in the launcher and Wallet.
         .filter(|manifest| capsule_is_offered(data_dir, &manifest.name))
         .map(|manifest| {
-            catalog_capsule_summary(
+            let mut summary = catalog_capsule_summary(
                 manifest,
                 &launch_targets,
                 &components,
                 &accepted_content_by_viewer,
-            )
+            );
+            if summary.name == "browser" {
+                if let Some(message) = crate::setup::linux_host_setup_message(data_dir, platform) {
+                    summary.description = message.to_string();
+                }
+            }
+            summary
         })
         .collect::<Vec<_>>();
     // The browser terminal only starts in developer mode, so the Terminal
@@ -739,6 +743,28 @@ fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, Capsu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linux_marketplace_lists_browser_with_its_opt_in_command() {
+        let root = tempfile::tempdir().unwrap();
+        let capsule = root.path().join("capsules/browser");
+        std::fs::create_dir_all(&capsule).unwrap();
+        std::fs::write(
+            capsule.join("capsule.json"),
+            include_str!("../../../../../../capsules/browser/capsule.json"),
+        )
+        .unwrap();
+        let catalog = super::capsule_catalog_summary_for(root.path(), "linux-arm64");
+        let browser = catalog
+            .capsules
+            .iter()
+            .find(|row| row.name == "browser")
+            .unwrap();
+        assert!(!browser.launchable);
+        assert!(browser.description.contains("elastos setup --browser"));
+        let unsupported = super::capsule_catalog_summary_for(root.path(), "linux-amd64");
+        assert!(unsupported.capsules.iter().all(|row| row.name != "browser"));
+    }
+
     use super::*;
 
     #[test]

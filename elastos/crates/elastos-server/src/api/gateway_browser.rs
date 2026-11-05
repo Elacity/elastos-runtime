@@ -595,6 +595,24 @@ async fn execute_browser_open(
             err.to_string(),
         ));
     }
+    if adapter_id
+        .as_deref()
+        .is_none_or(|id| id == "browser-vm-product")
+    {
+        if let Some(message) = crate::setup::linux_host_setup_message(
+            &state.data_dir,
+            &crate::setup::detect_platform(),
+        ) {
+            return Err(BrowserOpenFailure::json(
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "code": "browser_host_setup_required",
+                    "stage": "engine_readiness",
+                    "message": message,
+                }),
+            ));
+        }
+    }
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
         None => {
