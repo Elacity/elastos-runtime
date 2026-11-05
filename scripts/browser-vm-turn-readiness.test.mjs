@@ -6,9 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 
-const preflight = fs.readFileSync(new URL("./browser-vm-artifact-preflight.sh", import.meta.url), "utf8");
-const hostReadiness = preflight.slice(preflight.indexOf('if mode == "--host-readiness":'),
-  preflight.indexOf("\nif launch_ready:"));
+import { fixture as imageFixture, probe as imageProbe } from "./lib/browser-vm-readiness-fixture.mjs";
+
 const control = fs.readFileSync(new URL("./browser-vm-control-service.mjs", import.meta.url), "utf8");
 const readiness = control.slice(control.indexOf("let readyHostReadiness ="),
   control.indexOf("const OPEN_REQUEST_ENV ="));
@@ -17,49 +16,24 @@ const unavailable = (reason = "preparation_required") => ({ ...ready, readiness:
 const turnKey = "ELASTOS_BROWSER_VM_TURN_PROGRAM";
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "browser-turn-readiness-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  for (const directory of ["bin", "browser-vm", "scripts"]) fs.mkdirSync(path.join(root, directory));
-  for (const file of ["bin/vmlinux", "bin/initrd", "browser-vm/initrd", "browser-vm/rootfs.ext4",
-    "browser-vm/browser-vm-rootfs-manifest.json", "scripts/browser-vm-artifact-preflight.sh", "bin/crosvm", "kvm"]) {
-    fs.writeFileSync(path.join(root, file), "disposable readiness identity fixture");
+  const f = imageFixture(t);
+  for (const file of ["scripts/browser-vm-artifact-preflight.sh", "kvm"]) {
+    fs.writeFileSync(path.join(f.root, file), "disposable readiness identity fixture");
   }
-  const launcher = path.join(root, "bin/browser-vz-engine-supervisor");
-  fs.writeFileSync(launcher, `#!/bin/sh\n[ "$1" = --host-capabilities ] || exit 99\nprintf '%s\\n' '{"schema":"elastos.browser.vm-host-capabilities/v1","available":true}'\n`, { mode: 0o755 });
-  const turn = path.join(root, "bin/turnserver");
-  // Readiness inspects this file; executing it would fail the test.
-  fs.writeFileSync(turn, "#!/bin/sh\nexit 99\n", { mode: 0o755 });
-  const env = { ELASTOS_BROWSER_VM_PLATFORM: "darwin-arm64", ELASTOS_BROWSER_VM_DATA_DIR: root,
-    ELASTOS_BROWSER_VM_VZ_SUPERVISOR: launcher, [turnKey]: turn };
-  return { root, launcher, turn, env };
+  const env = { ELASTOS_BROWSER_VM_PLATFORM: "darwin-arm64", ELASTOS_BROWSER_VM_DATA_DIR: f.root,
+    ELASTOS_BROWSER_VM_VZ_SUPERVISOR: f.launcher, [turnKey]: f.turn };
+  return { ...f, env };
 }
 
-function probe(env, imageReason = null, hostProbe = "ready") {
-  // Execute the actual host-readiness branch with real executable-file checks.
-  // Image hashing and the supervisor process are covered by the artifact smoke.
-  // Stub host eligibility so suite load cannot exhaust its two-second deadline.
-  const program = `import json, os, pathlib, platform as host_platform, subprocess, sys
-from types import SimpleNamespace
-host_platform.system = lambda: "Darwin"
-host_platform.machine = lambda: "arm64"
-platform = os.environ["ELASTOS_BROWSER_VM_PLATFORM"]
-mode = "--host-readiness"
-vz_supervisor = os.environ["ELASTOS_BROWSER_VM_VZ_SUPERVISOR"]
-def host_probe(command, **options):
-    assert command == [vz_supervisor, "--host-capabilities"]
-    assert options == dict(capture_output=True, text=True, timeout=2, check=True)
-    if sys.argv[2] == "timeout":
-        raise subprocess.TimeoutExpired(command, options["timeout"])
-    return SimpleNamespace(stdout=json.dumps({"schema": "elastos.browser.vm-host-capabilities/v1", "available": True}))
-subprocess.run = host_probe
-verify_image_set = lambda: json.loads(sys.argv[1])
-local_substrate_artifacts_ready = True
-${hostReadiness}`;
-  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason), hostProbe], {
-    env: { PATH: process.env.PATH, ...env }, encoding: "utf8", timeout: 5000,
+function probe(f, imageReason = null, hostProbe = "ready", env = f.env) {
+  return imageProbe(f, {
+    platform: env.ELASTOS_BROWSER_VM_PLATFORM, hostSystem: "Darwin", hostMachine: "arm64",
+    launcher: env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR, turn: env[turnKey] || "",
+    timeout: hostProbe === "timeout",
+    envOverrides: { ...env, ...(imageReason ? {
+      ELASTOS_BROWSER_VM_ROOTFS_MANIFEST: path.join(f.root, "missing-manifest"),
+    } : {}) },
   });
-  assert.equal(child.status, 0, child.stderr || String(child.error));
-  return JSON.parse(child.stdout);
 }
 
 for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "directory", "nonexecutable", "symlink", "dangling-symlink"]) {
@@ -75,22 +49,22 @@ for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "dir
       f.env[turnKey] = path.join(f.root, "turn-link");
       fs.symlinkSync(kind === "symlink" ? f.turn : path.join(f.root, "absent"), f.env[turnKey]);
     }
-    assert.deepEqual(probe(f.env), ["valid", "symlink"].includes(kind) ? ready : unavailable());
+    assert.deepEqual(probe(f), ["valid", "symlink"].includes(kind) ? ready : unavailable());
   });
 }
 
 test("a supervisor timeout keeps host readiness unavailable", t => {
   const f = fixture(t);
-  assert.deepEqual(probe(f.env, null, "timeout"), unavailable("readiness_unsupported"));
+  assert.deepEqual(probe(f, null, "timeout"), unavailable("readiness_unsupported"));
 });
 
 test("TURN readiness preserves image-shape and host compatibility checks", t => {
   const f = fixture(t);
-  assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
+  assert.deepEqual(probe(f, "artifact_invalid"), unavailable("artifact_invalid"));
   delete f.env[turnKey];
-  assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
+  assert.deepEqual(probe(f, "artifact_invalid"), unavailable("artifact_invalid"));
   f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
-  assert.deepEqual(probe(f.env), unavailable("host_unsupported"));
+  assert.deepEqual(probe(f), unavailable("host_unsupported"));
 });
 
 // The probe mock below reports ready unless the TURN or host checks refuse, so
@@ -123,7 +97,7 @@ function controller(t, { platform = "darwin-arm64", delayed = false } = {}) {
       assert.equal(args.join(), "--host-readiness");
       assert.equal(options.env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR, f.launcher);
       const turn = options.env[turnKey];
-      const result = linux ? (turn && fs.existsSync(turn) ? ready : unavailable()) : probe(options.env);
+      const result = linux ? (turn && fs.existsSync(turn) ? ready : unavailable()) : probe(f, null, "ready", options.env);
       const finish = () => done(null, JSON.stringify(result));
       probes.push({ finish, options });
       if (!delayed) finish();
@@ -140,7 +114,8 @@ test("unchanged TURN and image identities reuse successful readiness", async t =
   assert.deepEqual(await c.read(), ready);
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 1);
-  fs.writeFileSync(path.join(c.root, "bin/vmlinux"), "changed kernel identity");
+  const kernel = path.join(c.root, "bin/vmlinux");
+  fs.writeFileSync(kernel, Buffer.alloc(fs.statSync(kernel).size, 0x78));
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 2);
 });
