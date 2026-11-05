@@ -87,7 +87,7 @@ The owning issue keeps one record, edited in place, with these six items:
 
 ## Creating Work Branches
 
-Every task branch uses [develop](https://github.com/Elacity/elastos-runtime/tree/develop)
+Every task branch uses [develop](https://github.com/elastos/elastos-runtime/tree/develop)
 as its base and PR target unless the owning issue names another base. This is
 standing approval; do not ask for each task. Fetch the current base before
 branching. If the base moves, check compatibility before merging; history
@@ -107,7 +107,8 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
 - Milestones: `2.0.0` (the five first-release goals, phones, isolation S0-S2 and
   the release gates in #93) and `After 2.0.0`. There are no weekly milestones.
 - `main` changes only when a stable release is tagged: a release PR from the
-  accepted `develop` commit, then `vX.Y.Z` on the merge commit, then `main`
+  accepted `develop` commit, then `vX.Y.Z` on that accepted commit (release
+  publication refuses a tag that does not name the source commit), then `main`
   merges back into `develop`.
 - 2.0.0 ships when every result in the 2.0.0 milestone meets its Done means.
 
@@ -270,6 +271,23 @@ capsules, provider config, and `components.json`.
 
 ## Review And Commit Discipline
 
+- Before every non-trivial code change, put a short **Deepen notes** block at
+  the top of the PR description (`.github/pull_request_template.md` starts
+  every new PR with it). Answer these four questions before changing the code,
+  then adjust the plan to match:
+  1. **Expert view:** What would a top engineer in this area do here that the
+     task does not ask for?
+  2. **Raw material:** What is the rawest source to start from: code at a pinned
+     commit, the original issue, logs or primary data? Start there rather than
+     with summaries or another agent's notes, and cite `file:line`.
+  3. **Methods:** Which specific methods and tools would that expert use?
+  4. **Independent check:** What besides the author or requester proves the
+     result is right: a test that fails before and passes after, a measurement,
+     or an independent reviewer? Run the check or obtain the review before
+     calling the work done, and paste the evidence in the block.
+- When corrected, fix the cause as high up as possible: first in code, then
+  with an automatic check, then with a written rule. Rely on a human to catch
+  the same mistake again only as a last resort.
 - Keep review requests off draft PRs. When a PR leaves draft, request the
   required reviewers on GitHub yourself and name them in the report. Keep an
   existing request instead of sending a duplicate.

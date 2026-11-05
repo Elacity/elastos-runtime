@@ -32,7 +32,7 @@ named in the owning GitHub issue:
 
 ```bash
 mkdir -p "$HOME/Code"
-git clone --branch upstream/RELEASE-dev https://github.com/Elacity/elastos-runtime.git "$HOME/Code/elastos-runtime"
+git clone --branch upstream/RELEASE-dev https://github.com/elastos/elastos-runtime.git "$HOME/Code/elastos-runtime"
 cd "$HOME/Code/elastos-runtime"
 
 export MAC_TEST_HOME="$HOME/elastos-mac-test-home"

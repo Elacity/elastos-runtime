@@ -4,3 +4,6 @@ capsules/gba-emulator/browser/mgba.wasm -diff linguist-generated=true
 third-party/selkies/upstream/** -whitespace
 third-party/selkies/licenses/** -whitespace
 third-party/selkies/patches/*.patch -whitespace
+# Unified diff uses a single space for an unchanged blank context line.
+# Applied Rust is checked separately by formatting and target tests.
+scripts/build/crosvm-lifecycle-fds.patch whitespace=-blank-at-eol

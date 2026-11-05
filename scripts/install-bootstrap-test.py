@@ -40,6 +40,9 @@ exec(compile(PYTHON, str(INSTALLER) + ":embedded-verifier", "exec"), CRYPTO)
 PROCESS_SOURCE = SOURCE.split("<<'PY_RUNTIME_CONTROL'\n", 1)[1].split("\nPY_RUNTIME_CONTROL", 1)[0]
 PROCESSES = {"__name__": "installer_test"}
 exec(compile(PROCESS_SOURCE, str(INSTALLER) + ":runtime-control", "exec"), PROCESSES)
+PERMISSION_SOURCE = SOURCE.split("<<'PY_INSTALL_PERMISSIONS'\n", 1)[1].split("\nPY_INSTALL_PERMISSIONS", 1)[0]
+PERMISSIONS = {"__name__": "installer_test"}
+exec(compile(PERMISSION_SOURCE, str(INSTALLER) + ":permissions", "exec"), PERMISSIONS)
 UNINSTALL_SOURCE = SOURCE.split("<<'PY_UNINSTALL'\n", 1)[1].split("\nPY_UNINSTALL", 1)[0]
 # Published maintainer constant, checked by test_pinned_publisher_did_conversion.
 PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
@@ -866,8 +869,267 @@ validate_release_identity "$1" "$2"
         self.assertNotEqual(head["release_sha256"], hashlib.sha256(release + b"\n").hexdigest())
 
 
+class PermissionRepairTests(unittest.TestCase):
+    def setUp(self):
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="installer's permissions ", dir=SANDBOX_BASE)
+        self.addCleanup(self.scratch.cleanup)
+        self.home = Path(self.scratch.name)
+        self.data = self.home / "data"
+        self.data.mkdir()
+        self.binary = self.home / "bin/elastos"
+        self.binary.parent.mkdir()
+        self.binary.write_bytes(b"old runtime")
+        self.binary.chmod(0o775)
+        self.components = self.data / "components.json"
+        self.components.write_bytes(b"old manifest")
+        self.components.chmod(0o664)
+
+    def repair(self):
+        PERMISSIONS["repair_permissions"](str(self.home), str(self.data), str(self.binary))
+
+    def root_owned(self, path):
+        original = os.stat
+        def metadata(name, *args, **kwargs):
+            found = original(name, *args, **kwargs)
+            if str(name) == path.name and kwargs.get("dir_fd") is not None:
+                values = list(found)
+                values[4] = 0
+                return os.stat_result(values)
+            return found
+        return mock.patch.object(os, "stat", side_effect=metadata)
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_file_names_one_quoted_command_and_repairs_nothing(self):
+        with self.root_owned(self.components), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "Restore ownership") as raised:
+                self.repair()
+            changes.assert_not_called()
+        command = str(raised.exception).split(": ", 1)[1]
+        self.assertEqual(shlex.split(command), ["sudo", "chown", "-R", getpass.getuser() + ":", str(self.data)])
+        self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_data_root_names_its_command_before_opening_it(self):
+        with self.root_owned(self.data), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "sudo chown -R") as raised:
+                self.repair()
+            changes.assert_not_called()
+        self.assertEqual(shlex.split(str(raised.exception).split(": ", 1)[1])[-1], str(self.data))
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_root_owned_binary_and_metadata_share_one_repair_command(self):
+        with self.root_owned(self.components), self.root_owned(self.binary), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "sudo chown -R") as raised:
+                self.repair()
+            changes.assert_not_called()
+        command = str(raised.exception).split(": ", 1)[1]
+        self.assertEqual(command.count("sudo chown"), 1)
+        self.assertEqual(set(shlex.split(command)[4:]), {str(self.data), str(self.binary)})
+
+    @unittest.skipIf(os.geteuid() == 0, "ownership repair requires an ordinary user")
+    def test_foreign_owned_binary_outside_home_is_preserved_without_chown_advice(self):
+        with self.root_owned(self.binary), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaisesRegex(ValueError, "not owned by you") as raised:
+                PERMISSIONS["repair_permissions"](str(self.data), str(self.data), str(self.binary))
+            changes.assert_not_called()
+        self.assertNotIn("chown", str(raised.exception))
+
+    def test_symlink_and_hardlink_targets_preserve_both_files(self):
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                self.components.unlink()
+                if kind == "symlink":
+                    self.components.symlink_to(self.binary)
+                else:
+                    os.link(self.binary, self.components)
+                with mock.patch.object(os, "fchmod") as changes:
+                    with self.assertRaisesRegex(ValueError, "Unsafe installation"):
+                        self.repair()
+                    changes.assert_not_called()
+                self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    def test_changed_device_or_inode_stops_before_repair(self):
+        original = os.fstat
+        for index in (1, 2):  # inode, device
+            def changed(descriptor):
+                found = original(descriptor)
+                if found.st_ino == self.binary.stat().st_ino:
+                    values = list(found)
+                    values[index] += 1
+                    return os.stat_result(values)
+                return found
+            with self.subTest(field=index), mock.patch.object(os, "fstat", side_effect=changed), mock.patch.object(os, "fchmod") as changes:
+                with self.assertRaisesRegex(ValueError, "path changed"):
+                    self.repair()
+                changes.assert_not_called()
+
+    def test_symlink_replacement_during_open_preserves_target(self):
+        original = os.open
+        def swapped(name, flags, *args, **kwargs):
+            if name == self.components.name and kwargs.get("dir_fd") is not None:
+                self.components.unlink()
+                self.components.symlink_to(self.binary)
+            return original(name, flags, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=swapped), mock.patch.object(os, "fchmod") as changes:
+            with self.assertRaises(OSError):
+                self.repair()
+            changes.assert_not_called()
+        self.assertEqual(self.binary.stat().st_mode & 0o777, 0o775)
+
+    def test_private_release_and_coordinates_repairs_keep_bytes_and_identity(self):
+        directory = self.data / "installation"
+        directory.mkdir(mode=0o770)
+        directory.chmod(0o770)
+        private = [directory / "release-head.json", directory / "release.json", self.data / "runtime-coords.json"]
+        for path in private:
+            path.write_bytes(b"private bytes")
+            path.chmod(0o660)
+        before = {path: (path.stat().st_dev, path.stat().st_ino, path.read_bytes()) for path in private}
+        self.repair()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        for path in private:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino, path.read_bytes()), before[path])
+
+    def test_component_binaries_and_update_journal_keep_bytes_and_identity(self):
+        directory = self.data / "bin"
+        directory.mkdir()
+        directory.chmod(0o775)
+        paths = {directory / "localhost-provider": 0o755, directory / "shell": 0o755,
+                 self.binary.parent / ".elastos.update-journal.json": 0o600}
+        for path in paths:
+            path.write_bytes(b"retained component or journal")
+            path.chmod(0o775 if path.parent == directory else 0o660)
+        before = {path: (path.stat().st_dev, path.stat().st_ino, path.read_bytes()) for path in paths}
+        self.repair()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        for path, mode in paths.items():
+            self.assertEqual(path.stat().st_mode & 0o777, mode, path)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino, path.read_bytes()), before[path])
+
+    def test_linked_component_or_journal_preserves_outside_file_and_all_modes(self):
+        outside = self.home / "outside"
+        outside.write_bytes(b"outside file")
+        outside.chmod(0o664)
+        directory = self.data / "bin"
+        directory.mkdir()
+        directory.chmod(0o775)
+        for path in (directory / "localhost-provider", self.binary.parent / ".elastos.update-journal.json"):
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(path=path.name, kind=kind):
+                    if kind == "symlink":
+                        path.symlink_to(outside)
+                    else:
+                        os.link(outside, path)
+                    try:
+                        with mock.patch.object(os, "fchmod") as changes:
+                            with self.assertRaises(ValueError):
+                                self.repair()
+                            changes.assert_not_called()
+                        self.assertEqual((outside.read_bytes(), outside.stat().st_mode & 0o777),
+                                         (b"outside file", 0o664))
+                    finally:
+                        path.unlink()
+
+
 class InstallationTests(unittest.TestCase):
     """The complete installer against served artifact bytes inside one disposable sandbox."""
+
+    def test_older_group_writable_installation_is_repaired_before_writer(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            paths = [sandbox.binary, sandbox.data / "components.json", sandbox.data / "sources.json",
+                     sandbox.data / "ElastOS/SystemServices/Publisher/release-head.json"]
+            for path in paths:
+                path.chmod(0o775 if path == sandbox.binary else 0o664)
+            publisher = paths[-1].parent
+            publisher.chmod(0o775)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for path in [*paths, publisher]:
+                self.assertFalse(path.stat().st_mode & 0o022, path)
+                self.assertIn("Repaired permissions: " + shlex.quote(str(path)), result.stdout)
+
+    def test_symlinked_storage_ancestors_install_and_repair(self):
+        did, head, release = installable_fixture()
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), InstallerSandbox(head, release, did) as sandbox:
+                # Both roots can be relocated. The final managed elastos entries stay literal.
+                local = sandbox.home / ".local"
+                sandbox.data = local / "share/elastos"
+                if legacy:
+                    self.existing_installation(sandbox)
+                    sandbox.binary.chmod(0o775)
+                    (sandbox.data / "components.json").chmod(0o664)
+                else:
+                    local.mkdir()
+                storage = sandbox.root / "storage"
+                commands = sandbox.root / "commands"
+                for root, target in ((local / "share", storage), (local / "bin", commands)):
+                    if root.exists():
+                        root.rename(target)
+                    else:
+                        target.mkdir()
+                    root.symlink_to(target)
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only", env=("XDG_DATA_HOME=",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(requests, self.REQUESTS)
+                self.assertFalse(sandbox.binary.stat().st_mode & 0o022)
+                self.assertTrue(os.access(sandbox.binary, os.X_OK))
+                if legacy:
+                    self.assertEqual(sandbox.binary.stat().st_mode & 0o777, 0o755)
+                    self.assertIn("Repaired permissions:", result.stdout)
+                    self.assertEqual((sandbox.data / "components.json").stat().st_mode & 0o777, 0o644)
+                self.assertTrue((local / "share").is_symlink())
+                self.assertTrue((local / "bin").is_symlink())
+
+    def test_symlinks_inside_resolved_storage_refuse_before_repair(self):
+        did, head, release = installable_fixture()
+        for entry in ("", "components.json", "bin"):
+            with self.subTest(entry=entry), InstallerSandbox(head, release, did) as sandbox:
+                self.existing_installation(sandbox)
+                storage = sandbox.root / "storage"
+                sandbox.data.parent.rename(storage)
+                sandbox.data.parent.symlink_to(storage)
+                outside = sandbox.root / "outside"
+                if entry == "components.json":
+                    outside.write_bytes(b"outside file")
+                    outside.chmod(0o664)
+                    (sandbox.data / entry).unlink()
+                else:
+                    outside.mkdir()
+                    (outside / "probe").write_bytes(b"outside file")
+                    (outside / "probe").chmod(0o664)
+                    if entry == "":
+                        sandbox.data.rename(storage / "saved-home")
+                (sandbox.data / entry).symlink_to(outside)
+                probe = outside if outside.is_file() else outside / "probe"
+                sandbox.binary.chmod(0o775)
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Unsafe installation path", result.stderr)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+                self.assertEqual(sandbox.binary.stat().st_mode & 0o777, 0o775)
+                self.assertEqual((probe.read_bytes(), probe.stat().st_mode & 0o777), (b"outside file", 0o664))
+
+    def test_world_writable_installation_file_stops_before_any_repair(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            sandbox.binary.chmod(0o775)
+            (sandbox.data / "components.json").chmod(0o666)
+            before = sandbox.home_state()
+            result, requests = sandbox.run("--install-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("world-writable", result.stderr)
+            self.assertEqual(requests, [])
+            self.assertEqual(sandbox.home_state(), before)
+            self.assertEqual(sandbox.runtime_calls(), [])
 
     REQUESTS = ["https://test.invalid/release-head.json", "https://test.invalid/release.json",
                 "https://test.invalid/artifacts/elastos-x86_64-linux"]
@@ -1761,6 +2023,65 @@ class UninstallTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
+    def test_browser_setup_removes_only_retired_rootfs_pool(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            pool = root / 'browser-vm/rootfs-pool'
+            pool.mkdir(parents=True)
+            (pool / 'copy.raw').write_text('retired system copy')
+            image = root / 'browser-vm/rootfs.raw'
+            image.write_text('system image')
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(pool.exists())
+            self.assertEqual(image.read_text(), 'system image')
+            self.assertIn(f'Removed retired Browser rootfs pool: {pool}', result.stdout)
+            again = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', root)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertNotIn('Removed', again.stdout)
+
+    def test_browser_pool_cleanup_preserves_link_targets(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            data, outside = root / 'data', root / 'outside'
+            (data / 'browser-vm').mkdir(parents=True)
+            outside.mkdir()
+            (outside / 'keep').write_text('keep')
+            pool = data / 'browser-vm/rootfs-pool'
+            pool.symlink_to(outside)
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(pool.is_symlink())
+            self.assertEqual((outside / 'keep').read_text(), 'keep')
+            (data / 'browser-vm').rmdir()
+            (data / 'browser-vm').symlink_to(outside)
+            (outside / 'rootfs-pool').mkdir()
+            result = shell('DATA_DIR="$1"; retire_browser_rootfs_pool', data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((outside / 'rootfs-pool').is_dir())
+
+    def test_browser_pool_cleanup_requires_pool_and_parent_ownership(self):
+        cleanup = SOURCE.split("<<'PY_RETIRED_BROWSER_POOL'\n", 1)[1].split("\nPY_RETIRED_BROWSER_POOL", 1)[0]
+        real_lstat = os.lstat
+        for uid in (0, 1001):
+            for foreign in ('browser-vm', 'browser-vm/rootfs-pool'):
+                with self.subTest(uid=uid, foreign=foreign), tempfile.TemporaryDirectory() as scratch:
+                    root = Path(scratch)
+                    pool = root / 'browser-vm/rootfs-pool'
+                    pool.mkdir(parents=True)
+                    image = pool / 'copy.raw'
+                    image.write_text('keep foreign-owned pool')
+                    def metadata(path, *args, **kwargs):
+                        fields = list(real_lstat(path, *args, **kwargs))
+                        fields[4] = uid + 1 if Path(path) == root / foreign else uid
+                        return os.stat_result(fields)
+                    with mock.patch.object(os, 'lstat', side_effect=metadata), \
+                            mock.patch.object(os, 'geteuid', return_value=uid), \
+                            mock.patch.object(sys, 'argv', ['cleanup', str(root)]):
+                        with self.assertRaisesRegex(SystemExit, 'belongs to another user'):
+                            exec(compile(cleanup, str(INSTALLER) + ':pool-cleanup', 'exec'), {})
+                    self.assertEqual(image.read_text(), 'keep foreign-owned pool')
+
     def test_browser_host_step_is_installer_only_and_handles_decline_or_unavailable_host(self):
         function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
         function = "prepare_browser_linux_host() {" + function
@@ -1770,11 +2091,15 @@ class DataPathTests(unittest.TestCase):
             (root / 'scripts/browser-vm-linux-network.py').write_text('inert signed-helper fixture')
             device, terminal = root / 'kvm', root / 'terminal'
             function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
-            function = function.replace('/usr/bin/python3', 'fixture_python')
+            function = function.replace('/usr/bin/python3 -I "', 'fixture_python -I "')
             script = function + '''
 DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
 uname() { printf '%s\\n' "$SYSTEM"; }
-fixture_python() { [[ "$READY" == yes ]]; }
+fixture_python() {
+    [[ "$READY" != yes ]] || return 0
+    printf 'Browser network is unavailable (fixture).\\nAs root, run:\\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user %s --transport userspace-vsock --data-dir %s\\n' "$(id -un)" "$DATA_DIR"
+    return 1
+}
 sudo() { printf 'ROOT_STEP:%s\\n' "$*"; [[ "$ROOT_RESULT" != 0 ]] || READY=yes; return "$ROOT_RESULT"; }
 prepare_browser_linux_host
 '''
@@ -1798,17 +2123,20 @@ prepare_browser_linux_host
                     root_helper = '/usr/local/lib/elastos/browser-vm-linux-network.py'
                     user = getpass.getuser()
                     install = f'install -D -o root -g root -m 755 {helper} {root_helper}'
-                    run = f'fixture_python -I {root_helper} setup --user {user}'
+                    run = f'fixture_python -I {root_helper} setup --user {user} --data-dir {root}'
                     if case == 'setup':
                         # sudo runs only the root-owned copy, never the user-writable helper.
                         self.assertEqual(
                             [line for line in result.stdout.splitlines() if line.startswith('ROOT_STEP:')],
                             [f'ROOT_STEP:{install}', f'ROOT_STEP:{run}'],
                         )
-                        self.assertIn(f'fixture_python -I {root_helper} remove --user ', result.stdout)
+                        self.assertIn(f'/usr/bin/python3 -I {root_helper} remove --user ', result.stdout)
                     if case == 'headless':
                         self.assertIn('Run from a terminal', result.stdout)
-                        self.assertIn(f'  sudo {install}\n  sudo {run}\n', result.stdout)
+                        self.assertIn(f'  sudo {install}\n', result.stdout)
+                        command = f'  sudo /usr/bin/python3 -I {root_helper} setup --user {user} --transport userspace-vsock --data-dir {root}\n'
+                        self.assertIn(command, result.stdout)
+                        self.assertLess(result.stdout.index('Browser network is unavailable'), result.stdout.index(command))
                     if case == 'unavailable':
                         self.assertIn('virtualization is unavailable', result.stdout)
 
@@ -2190,6 +2518,59 @@ HOME_DIR="$2" DATA_DIR="$3" RUN_BIN="$4"
         self.assertEqual(self.coords.read_bytes(), original)
         self.assertEqual(self.coords.stat().st_mtime, 0)
 
+    def test_cleanup_accepts_german_and_spanish_ps_dates(self):
+        mocks = self.root / "mocks"
+        mocks.mkdir()
+        ps = mocks / "ps"
+        ps.write_text("#!" + sys.executable + "\n" + '''import os, subprocess, sys
+result = subprocess.run(["/bin/ps", *sys.argv[1:]], capture_output=True, text=True)
+output = result.stdout
+if "lstart=" in sys.argv:
+    fields = output.split(None, 6)
+    if len(fields) == 7:
+        fields[1:3] = ("Do", "Mär") if os.environ["FAKE_PS_LANGUAGE"] == "German" else ("jue", "nov")
+        output = " ".join(fields)
+sys.stdout.write(output)
+sys.exit(result.returncode)
+''')
+        ps.chmod(0o755)
+        for language in ("German", "Spanish"):
+            if self.child.poll() is not None:
+                self.child = subprocess.Popen([str(self.binary), "serve"], cwd=self.root,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.write_coords(self.coords, self.child.pid)
+            with self.subTest(language=language), mock.patch.dict(os.environ, {
+                "PATH": str(mocks) + os.pathsep + os.environ["PATH"], "FAKE_PS_LANGUAGE": language,
+                "LC_TIME": "de_DE.UTF-8" if language == "German" else "es_CO.UTF-8",
+            }):
+                PROCESSES["stop_installation"](str(self.data), str(self.binary), True)
+                self.child.wait(timeout=5)
+                self.assertFalse(self.coords.exists())
+
+    def test_numeric_process_age_formats_and_invalid_values(self):
+        for elapsed, age in (("00:09", 9), ("01:02:03", 3723), ("2-03:04:05", 183845)):
+            output = f"{os.geteuid()} Do Mär 05 10:00:00 2026 {elapsed} S {self.binary} serve"
+            with self.subTest(elapsed=elapsed), mock.patch.object(time, "time", return_value=1000000), mock.patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+            ):
+                snapshot = PROCESSES["process_snapshot"](self.child.pid, recorded_at=1000000 - age)
+                self.assertTrue(PROCESSES["matches_command"](snapshot, str(self.binary)))
+                with self.assertRaisesRegex(ValueError, "started after its ownership record"):
+                    PROCESSES["process_snapshot"](self.child.pid, recorded_at=1000000 - age - 1)
+        for elapsed in ("unknown", "1:60", "60:00", "1-24:00:00", "-01:00"):
+            output = f"{os.geteuid()} Do Mär 05 10:00:00 2026 {elapsed} S {self.binary} serve"
+            with self.subTest(elapsed=elapsed), mock.patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+            ), self.assertRaisesRegex(ValueError, "elapsed time is ambiguous"):
+                PROCESSES["process_snapshot"](self.child.pid, recorded_at=time.time())
+
+    def test_elapsed_second_rounding_accepts_record_created_before_clock_boundary(self):
+        output = f"{os.geteuid()} Thu Nov 05 10:00:00 2026 00:00 S {self.binary} serve"
+        with mock.patch.object(time, "time", return_value=1000000.1), mock.patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+        ):
+            self.assertIsNotNone(PROCESSES["process_snapshot"](self.child.pid, recorded_at=999999.9))
+
     def test_owned_process_escalation_finishes_cleanup(self):
         child = subprocess.Popen([str(self.binary), "serve"], cwd=self.root,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -2212,7 +2593,7 @@ HOME_DIR="$2" DATA_DIR="$3" RUN_BIN="$4"
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "incomplete", "")):
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 PROCESSES["process_snapshot"](self.child.pid)
-        foreign = f"{os.geteuid() + 1} Thu Sep 10 10:00:00 2026 S {self.binary} serve"
+        foreign = f"{os.geteuid() + 1} Thu Sep 10 10:00:00 2026 00:01 S {self.binary} serve"
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, foreign, "")):
             with self.assertRaisesRegex(ValueError, "another owner"):
                 PROCESSES["process_snapshot"](self.child.pid)

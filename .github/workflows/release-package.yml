@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REPOSITORY" == Elacity/elastos-runtime ]] \
+          [[ "$GITHUB_REPOSITORY" == elastos/elastos-runtime ]] \
             || { echo 'The canonical builder repository is required' >&2; exit 1; }
           [[ "$GITHUB_REF" == refs/heads/develop ]] \
             || { echo 'The develop builder ref is required' >&2; exit 1; }
@@ -442,9 +442,13 @@ jobs:
             [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
-            # Browser is Mac-only until #90: Linux builds take no image input.
+            # ARM64 Linux (Jetson) and the Mac ship the same admitted guest
+            # archive from this run's inputs; x86-64 Linux takes no image.
+            image=()
+            [[ "$name" != N || "$RELEASE_PLATFORM" != aarch64-linux ]] \
+              || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
-              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
             rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
           done

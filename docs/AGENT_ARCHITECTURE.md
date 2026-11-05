@@ -2,7 +2,7 @@
 
 This document defines how human and AI actors fit the same ElastOS authority
 model. It is an architecture contract, not a claim that the complete agent
-product is implemented. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own implementation status and proof.
+product is implemented. [GitHub issues](https://github.com/elastos/elastos-runtime/issues) own implementation status and proof.
 
 The governing rule is:
 

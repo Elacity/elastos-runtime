@@ -197,7 +197,7 @@ The approval has these fields:
 ```json
 {
   "schema": "elastos.release.approval/v1",
-  "repository": "Elacity/elastos-runtime",
+  "repository": "elastos/elastos-runtime",
   "source": {"commit": "APPROVED_SOURCE_COMMIT", "tree": "APPROVED_SOURCE_TREE"},
   "workflow": {
     "commit": "APPROVED_BUILDER_COMMIT",
@@ -300,8 +300,9 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    attested `components.json`. It shows source, builder, publisher tuple and approval digest
    before the operator types the DID. The source admission gate still applies.
    A network, outage or rate-limit failure refuses with a retry message,
-   distinct from a provenance refusal; the printed command passes the operator's
-   `gh auth token` to avoid anonymous rate limits.
+   distinct from a provenance refusal; the printed command gives the signer the
+   operator's `gh auth token` through a file descriptor, which avoids anonymous
+   rate limits and keeps the token out of every argv.
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every

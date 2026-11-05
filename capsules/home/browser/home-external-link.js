@@ -127,9 +127,9 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
       || typeof source !== "object" || Array.isArray(source)
       || !hasExactKeys(source, ["conversation_id", "message_id"])
       || ![source.conversation_id, source.message_id].every(value => typeof value === "string" && value.length > 0)))) return false;
-  const check = signal => fetchJson("/api/apps/home/shared-content/check", {
+  const check = (signal, homeToken = context.homeToken) => fetchJson("/api/apps/home/shared-content/check", {
     method: "POST", signal,
-    body: JSON.stringify({ schema: "elastos.home.shared-content.check/v1", app_token: context.homeToken, uri: data.uri,
+    body: JSON.stringify({ schema: "elastos.home.shared-content.check/v1", app_token: homeToken, uri: data.uri,
       ...(source === undefined ? {} : { source }) }),
   });
   const get = (check_id, signal) => fetchJson("/api/apps/home/shared-content/get", {
@@ -301,7 +301,7 @@ export function createHomeExternalLinkPrompt({
           return;
         }
       } else {
-        const result = validatedSharedResult(await request.check(request.controller.signal), request.uri);
+        const result = validatedSharedResult(await request.check(request.controller.signal, request.homeToken), request.uri);
         if (!current()) return;
         if (!result) throw new Error("Invalid file check");
         request.result = result;
@@ -505,7 +505,10 @@ export function createHomeExternalLinkPrompt({
         close();
       }
     },
-    // The sender's launch ended (closed, reloaded, reconnected): its request
+    transfer(oldToken, freshToken) {
+      if (active?.homeToken === oldToken) active.homeToken = freshToken;
+    },
+    // The sender's document ended (closed or reloaded): its request
     // closes without opening anything.
     retire(homeToken) {
       if (active?.homeToken === homeToken) {

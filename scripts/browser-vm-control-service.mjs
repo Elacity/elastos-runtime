@@ -100,6 +100,9 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
+// The structural host probe fits within Runtime's readiness budget. Runtime
+// admission owns the image hash; concurrent requests share this host probe.
+const HOST_READINESS_PROBE_TIMEOUT_MS = 10_000;
 // Probe inputs that are not files: where the preflight resolves its tools and
 // which platform it admits for. The Darwin TURN program is a stamped file.
 const READINESS_INPUT_ENV = [
@@ -111,7 +114,9 @@ const READINESS_INPUT_ENV = [
 
 // Key of the in-memory ready result: host platform/architecture/OS release,
 // the probe's environment, and each input file's dev/inode/mode/size/mtime/
-// ctime. A changed input, platform or architecture probes again.
+// ctime. A changed input, platform or architecture probes again. /dev/kvm is
+// keyed by device identity and owner/permissions only: its times change at
+// every VM exit, and live access is checked by the native owner on each call.
 function readinessInputStamps(dataDir, launcher) {
   const artifact = (key, fallback) => process.env[key] || path.join(dataDir, fallback);
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
@@ -120,13 +125,13 @@ function readinessInputStamps(dataDir, launcher) {
     artifact("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
     artifact("ELASTOS_BROWSER_VM_ROOTFS_MANIFEST", "browser-vm/browser-vm-rootfs-manifest.json"),
     artifact("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
-    linux ? artifact("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
-      : artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
+    artifact("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
     path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh"),
   ];
   if (linux) {
     files.push(artifact("ELASTOS_BROWSER_VM_CROSVM_BIN", "bin/crosvm"), "/dev/kvm");
-  } else if (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin") {
+  }
+  if (linux || (process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")) {
     const turnProgram = process.env.ELASTOS_BROWSER_VM_TURN_PROGRAM;
     if (!turnProgram || !path.isAbsolute(turnProgram)) return null;
     files.push(turnProgram);
@@ -135,11 +140,15 @@ function readinessInputStamps(dataDir, launcher) {
     const info = fs.statSync(file, { bigint: true });
     return [file, info.dev, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].map(String);
   };
+  const deviceStamp = (file) => {
+    const info = fs.statSync(file, { bigint: true });
+    return [file, info.dev, info.ino, info.mode, info.uid, info.gid, info.rdev].map(String);
+  };
   try {
     return JSON.stringify({
       host: [process.platform, process.arch, os.release()],
       env: READINESS_INPUT_ENV.map((key) => [key, process.env[key] ?? null]),
-      files: files.map(stamp),
+      files: files.map((file) => (file === "/dev/kvm" ? deviceStamp : stamp)(file)),
       // The preflight runs these through the same PATH; debugfs is optional.
       tools: [
         ["python", process.env.ELASTOS_BROWSER_VM_PYTHON || "python3"],
@@ -185,21 +194,28 @@ async function engineReadiness(config) {
   if (!dataDir || !path.isAbsolute(dataDir)) return unavailable("preparation_required");
   const linux = process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("linux-") ?? process.platform === "linux";
   if (linux) {
-    // Device access and the root-owned pool can change while images stay fixed.
-    // Check live state before returning a cached image-readiness result.
+    const platform = process.env.ELASTOS_BROWSER_VM_PLATFORM || `linux-${process.arch === "arm64" ? "arm64" : "amd64"}`;
+    if (platform !== "linux-arm64") return unavailable("host_unsupported");
+    if (config.launcher_program !== path.join(dataDir, "bin/browser-vz-engine-supervisor")) {
+      return unavailable("readiness_unsupported");
+    }
+    // The admitted native owner checks live KVM access and the selected transport
+    // before a structural host-readiness result can be reused.
     try {
-      execFileSync("python3", [path.join(dataDir, "scripts/browser-vm-linux-network.py"), "check"],
-        { timeout: 5000, stdio: ["ignore", "pipe", "pipe"] });
+      const result = JSON.parse(execFileSync(config.launcher_program, ["--host-capabilities"],
+        { timeout: 5000, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
+      if (result.schema !== "elastos.browser.vm-host-capabilities/v1" || result.available !== true) {
+        return unavailable("preparation_required");
+      }
     } catch (error) {
-      // Keep private host paths in the local operator log. Engine readiness
-      // has a strict state/reason contract.
-      process.stderr.write(`${error.stderr?.toString().trim() || "Linux Browser network check failed"}\n`);
+      process.stderr.write(`${error.stderr?.toString().trim() || "Linux Browser native host check failed"}\n`);
       return unavailable("preparation_required");
     }
   }
   const stamps = readinessInputStamps(dataDir, config.launcher_program);
   if (stamps && readyHostReadiness?.stamps === stamps) return readyHostReadiness.result;
-  // Service start and the first open share one probe.
+  // Service start and the first open share a structural host probe. Runtime
+  // admission owns image verification; this probe never hashes the image.
   hostReadinessProbe ??= probeHostReadiness(config, dataDir, stamps)
     .finally(() => { hostReadinessProbe = null; });
   return hostReadinessProbe;
@@ -223,11 +239,10 @@ function probeHostReadiness(config, dataDir, stamps) {
   const script = path.join(dataDir, "scripts/browser-vm-artifact-preflight.sh");
   return new Promise((resolve) => {
     execFile(script, ["--host-readiness"], {
-      timeout: 30000, maxBuffer: 64 * 1024,
+      timeout: HOST_READINESS_PROBE_TIMEOUT_MS, maxBuffer: 64 * 1024,
       env: {
         ...process.env, ELASTOS_BROWSER_VM_STAGED_ROOTFS: "",
-        ...((process.env.ELASTOS_BROWSER_VM_PLATFORM?.startsWith("darwin-") ?? process.platform === "darwin")
-          ? { ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program } : {}),
+        ELASTOS_BROWSER_VM_VZ_SUPERVISOR: config.launcher_program,
       },
     }, (error, stdout) => {
       if (error) return resolve(finish(unavailable("preparation_required")));
@@ -980,14 +995,6 @@ function tcpBindAbsent(host, port) {
   });
 }
 
-function bindTcpExclusive(host, port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", (error) => reject(error));
-    server.listen({ host, port, exclusive: true }, () => resolve(server));
-  });
-}
-
 function bindUdpExclusive(host, port) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket({
@@ -1003,24 +1010,18 @@ async function turnListenerPortAbsent(turn) {
   return tcpBindAbsent(turn.listen_host, turn.listen_port);
 }
 
+// TURN runs with no-tcp-relay, so its relays are UDP only. A TCP socket on a
+// relay port (for example a loopback connection's ephemeral port) is not a
+// relay and must not hold Close; the native owner checks the same way.
 async function turnRelayPortsAbsent(turn) {
   const held = [];
   try {
     for (let port = turn.relay_port_min; port <= turn.relay_port_max; port += 1) {
-      let tcp;
-      let udp;
       try {
-        tcp = await bindTcpExclusive(turn.relay_host, port);
+        held.push(await bindUdpExclusive(turn.relay_host, port));
       } catch {
         return false;
       }
-      held.push(tcp);
-      try {
-        udp = await bindUdpExclusive(turn.relay_host, port);
-      } catch {
-        return false;
-      }
-      held.push(udp);
     }
     return true;
   } finally {
@@ -1110,7 +1111,7 @@ async function exactTransportCleanupEffects(binding, termination) {
   // Supervisor connects to those paths and proves its own bridges by session
   // absence plus a graceful or already-terminal owned launcher exit.
   // Native browser-vz-engine-supervisor owns TURN child cleanup.
-  // Port binds prove only listen and declared TCP/UDP relay absence.
+  // Port binds prove only TCP listener and UDP relay absence (no-tcp-relay).
   const probeTurnPorts =
     binding.transport_receipt.effects.turn_launch_owned === true;
   const turnListenerAbsent = probeTurnPorts

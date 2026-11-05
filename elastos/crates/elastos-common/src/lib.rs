@@ -1,6 +1,8 @@
 //! Common types and utilities for ElastOS
 
 pub mod browser_protocol;
+#[cfg(unix)]
+pub mod browser_vm_seed;
 pub mod chat_protocol;
 pub mod collaboration_protocol;
 mod error;
@@ -8,6 +10,8 @@ mod free_space;
 pub mod host_memory;
 pub mod localhost;
 mod manifest;
+#[cfg(unix)]
+pub mod owned_removal;
 #[cfg(unix)]
 pub mod process_lifetime;
 pub mod protected_content;

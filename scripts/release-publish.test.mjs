@@ -11,7 +11,7 @@ const source = dirname(fileURLToPath(import.meta.url));
 const platforms = ['aarch64-darwin', 'x86_64-linux', 'aarch64-linux'];
 const commit = 'a'.repeat(40);
 const tree = 'b'.repeat(40);
-const ciRun = { id: 456, html_url: 'https://github.com/Elacity/elastos-runtime/actions/runs/456',
+const ciRun = { id: 456, html_url: 'https://github.com/elastos/elastos-runtime/actions/runs/456',
   head_sha: commit, head_branch: 'develop', event: 'push', path: '.github/workflows/ci.yml',
   status: 'completed', conclusion: 'success' };
 const queueRun = { ...ciRun, event: 'merge_group', head_branch: `gh-readonly-queue/develop/pr-1-${commit}` };
@@ -28,7 +28,7 @@ const delivery = { MAINTAINER_DID: did, SOURCE_CONNECT_TICKET: ticket, PUBLISHER
   PUBLISHER_NODE_ID: nodeId, IPNS_NAME: 'fixture-ipns' };
 const packageRun = { id: 123, run_attempt: 1, head_sha: workflowCommit, head_branch: 'develop', event: 'workflow_dispatch',
   path: '.github/workflows/release-package.yml', status: 'completed', conclusion: 'success',
-  head_repository: { id: 1234, full_name: 'Elacity/elastos-runtime' }, repository: { id: 1234, full_name: 'Elacity/elastos-runtime' } };
+  head_repository: { id: 1234, full_name: 'elastos/elastos-runtime' }, repository: { id: 1234, full_name: 'elastos/elastos-runtime' } };
 // The CIDv0 of the release-head.json bytes the fixture origin serves (curl stub below).
 const publicHead = 'QmZ9v8LQsW12TgsHKE9KtL5F1Vm3wtBe4BCNP9X6mEHWEh';
 const updatePin = { schema: 'elastos.update-hop.previous-release/v1', version: '1.2.2', release_cid: 'Qm' + 'R'.repeat(44),
@@ -166,13 +166,13 @@ fs.appendFileSync(path.join(c.root, 'calls.jsonl'), JSON.stringify({ command, ar
 if (command === 'gh') {
   if (args[0] === 'attestation') {
     if (c.failAttestation) process.exit(95);
-    const uri = 'https://github.com/Elacity/elastos-runtime/.github/workflows/release-package.yml@refs/heads/develop';
+    const uri = 'https://github.com/elastos/elastos-runtime/.github/workflows/release-package.yml@refs/heads/develop';
     const certificate = { issuer: 'https://token.actions.githubusercontent.com', subjectAlternativeName: uri,
       buildSignerURI: uri, buildSignerDigest: c.workflowCommit, runnerEnvironment: 'github-hosted',
-      sourceRepositoryURI: 'https://github.com/Elacity/elastos-runtime', sourceRepositoryDigest: c.workflowCommit,
+      sourceRepositoryURI: 'https://github.com/elastos/elastos-runtime', sourceRepositoryDigest: c.workflowCommit,
       sourceRepositoryIdentifier: '1234', sourceRepositoryRef: 'refs/heads/develop',
       buildConfigURI: uri, buildConfigDigest: c.workflowCommit, buildTrigger: 'workflow_dispatch',
-      runInvocationURI: 'https://github.com/Elacity/elastos-runtime/actions/runs/123/attempts/' + (c.proofAttempt || 1), ...c.certificate };
+      runInvocationURI: 'https://github.com/elastos/elastos-runtime/actions/runs/123/attempts/' + (c.proofAttempt || 1), ...c.certificate };
     console.log(JSON.stringify([{ verificationResult: { signature: { certificate }, verifiedTimestamps: [{ type: 'Tlog' }],
       statement: { predicateType: 'https://slsa.dev/provenance/v1', subject: [{ digest: { sha256: crypto.createHash('sha256').update(fs.readFileSync(args[2])).digest('hex') } }] } } }]));
     process.exit(0);
@@ -233,7 +233,7 @@ if (command === 'gh') {
 else process.exit(92);
 `;
   for (const name of ['gh', 'git', 'curl', 'scp']) writeFileSync(join(bin, name), stub, { mode: 0o755 });
-  const approval = { schema: 'elastos.release.approval/v1', repository: 'Elacity/elastos-runtime',
+  const approval = { schema: 'elastos.release.approval/v1', repository: 'elastos/elastos-runtime',
     source: { commit, tree }, workflow: { commit: workflowCommit, tree: workflowTree, ref: 'refs/heads/develop' }, delivery,
     gh: { path: join(bin, 'gh'), sha256: sha(readFileSync(join(bin, 'gh'))) }, ...changes.approval };
   const approvalPath = join(root, 'approval.json');
@@ -303,7 +303,7 @@ for (const selected of [[], ['aarch64-darwin', 'x86_64-linux'], ['aarch64-darwin
     assert.equal(readFileSync(f.env.VERIFY_LOG, 'utf8').trim().split('\n').length, expected.length);
     const record = JSON.parse(readFileSync(join(f.root, 'work/1.2.3-alpha.2/run.json')));
     assert.deepEqual(record.ci_run, { id: ciRun.id, url: ciRun.html_url });
-    assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
+    assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/elastos\/elastos-runtime\/actions\/runs\/456/);
   });
 }
 
@@ -366,8 +366,8 @@ for (const [label, changes, error] of [
   ['wrong workflow tree', { workflowTree: 'd'.repeat(40) }, /producer\/source tree/],
   ['missing attestation', { failAttestation: true }, /attestation verification failed/],
   ['self-hosted attestation', { certificate: { runnerEnvironment: 'self-hosted' } }, /certificate/],
-  ['wrong attested run', { certificate: { runInvocationURI: 'https://github.com/Elacity/elastos-runtime/actions/runs/999/attempts/1' } }, /certificate/],
-  ['wrong attested attempt', { certificate: { runInvocationURI: 'https://github.com/Elacity/elastos-runtime/actions/runs/123/attempts/2' } }, /certificate/],
+  ['wrong attested run', { certificate: { runInvocationURI: 'https://github.com/elastos/elastos-runtime/actions/runs/999/attempts/1' } }, /certificate/],
+  ['wrong attested attempt', { certificate: { runInvocationURI: 'https://github.com/elastos/elastos-runtime/actions/runs/123/attempts/2' } }, /certificate/],
   ['changed bootstrap node', { bootstrap: { node_id: '5'.repeat(64) } }, /delivery approval/],
   ['changed bootstrap ticket', { bootstrap: { ticket: 'unapproved' } }, /delivery approval/],
 ]) {
@@ -588,8 +588,8 @@ test('policy prints the prepared source, package run and develop CI run', t => {
   const result = policy(f, '1.2.3-alpha.1');
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`Source commit: ${commit}`));
-  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/123/);
-  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
+  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/elastos\/elastos-runtime\/actions\/runs\/123/);
+  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/elastos\/elastos-runtime\/actions\/runs\/456/);
   const pinned = JSON.parse(readFileSync(join(f.root, 'work/1.2.3-alpha.1/policy.json')));
   assert.deepEqual([pinned.channel, pinned.develop_oid, pinned.tag], ['canary', commit, undefined]);
 });
@@ -744,8 +744,8 @@ test('seed reconstructs all platform files and copies every other signed file fr
   writeState(f.env.RELEASE_SEED_DATA, {});
   const result = run('bash', [f.script, 'seed', '1.2.3-alpha.1', signed], { env: f.env });
   assert.match(result.stdout, new RegExp(`Source commit: ${commit}`));
-  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/123/);
-  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/Elacity\/elastos-runtime\/actions\/runs\/456/);
+  assert.match(result.stdout, /Package run: 123 https:\/\/github.com\/elastos\/elastos-runtime\/actions\/runs\/123/);
+  assert.match(result.stdout, /Develop CI run: 456 https:\/\/github.com\/elastos\/elastos-runtime\/actions\/runs\/456/);
   run('bash', ['-n'], { input: result.stdout });
   const stage = join(f.root, 'stage/1.2.3-alpha.1');
   mkdirSync(join(stage, 'signed'), { recursive: true });
@@ -993,4 +993,58 @@ test('prepare refuses a custodian directory that holds other files', t => {
   assert.match(result.stderr, /holding exactly collaboration-network-release-v1.json and collaboration-network-release-pin-v1.json/);
   assert.deepEqual(runtimeCalls(f), []);
   assertUnsignable(f);
+});
+
+// Any local account reads another process's command line, so the printed commands keep the
+// GitHub token in a pipe or a file descriptor and never in an argv (#528).
+test('the printed seed download and signing commands keep the GitHub token out of every argv', t => {
+  const f = fixture(t);
+  assert.equal(f.prepare().status, 0);
+  const token = 'gho_FIXTURE_TOKEN_0123456789';
+  const bin = join(f.root, 'argv-bin');
+  const argvLog = join(f.root, 'argv.log');
+  const stdinLog = join(f.root, 'curl-stdin.log');
+  const envLog = join(f.root, 'signer-env.log');
+  const realPython = run('which', ['python3']).stdout.trim();
+  mkdirSync(bin);
+  // Every fake records its own command line; the real tool then does the work.
+  const record = `{ printf '%s' "$0"; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; } >> '${argvLog}'`;
+  const fake = (name, body) => writeFileSync(join(bin, name), `#!/bin/sh\n${record}\n${body}\n`, { mode: 0o755 });
+  fake('curl', `cat >> '${stdinLog}'`);
+  fake('gh', `[ "$1 $2" = 'auth token' ] && { printf '%s\\n' '${token}'; exit 0; }\nexec '${join(f.root, 'bin/gh')}' "$@"`);
+  fake('env', 'exec /usr/bin/env "$@"');
+  fake('python3', `[ "$1" = -c ] && { printf '%s\\n' '${join(bin, 'python3')}'; exit 0; }\n`
+    + `case " $* " in *' --policy '*) /usr/bin/env >> '${envLog}' ;; esac\nexec '${realPython}' "$@"`);
+  const env = { ...f.env, PATH: `${bin}:${f.env.PATH}`, FIXTURE_CALLER_SECRET: 'caller environment' };
+
+  // The seed download: run the printed get() with a fake token and the recording curl.
+  writeState(f.env.RELEASE_SEED_DATA, {});
+  const printedSeed = run('bash', [f.script, 'seed', '1.2.3-alpha.1', signedSet(f, { signer_did: did })], { env: f.env }).stdout;
+  const lines = printedSeed.split('\n');
+  const start = lines.findIndex(line => line.startsWith('get() {'));
+  const end = lines.findIndex((line, index) => index >= start && line.trimEnd().endsWith('; }'));
+  assert.ok(start >= 0 && end >= start, printedSeed);
+  spawnSync('bash', ['-c', `${lines.slice(start, end + 1).join('\n')}\nget package 7 ${'0'.repeat(64)}`],
+    { encoding: 'utf8', cwd: f.root, input: '', env: { ...env, GH_TOKEN: token } });
+
+  // The signing launch: run the printed command with the recording env, gh and pinned Python.
+  const signer = join(f.root, 'fixture-signer.py');
+  const key = join(f.root, 'fixture-key');
+  writeFileSync(signer, '# fixture signer');
+  writeFileSync(key, 'fixture key');
+  const printedPolicy = run('bash', [f.script, 'policy', '1.2.3-alpha.1', signer, key, run('which', ['openssl']).stdout.trim()], { env }).stdout;
+  const launch = printedPolicy.trim().split('\n').at(-1);
+  const signed = spawnSync('bash', ['-c', launch], { encoding: 'utf8', cwd: f.root, env });
+  assert.equal(signed.status, 0, signed.stderr);
+
+  // Both tools ran, and neither they nor any process that started them carried the token.
+  const argv = readFileSync(argvLog, 'utf8');
+  assert.ok(argv.includes('/actions/artifacts/7/zip'), argv);
+  assert.ok(argv.includes(`-S ${signer} --policy`), argv);
+  assert.equal(argv.includes(token), false, argv);
+  // The token still reaches curl, and the signer's environment holds it and nothing else of the caller's.
+  assert.match(readFileSync(stdinLog, 'utf8'), new RegExp(`Authorization: Bearer ${token}`));
+  const signerEnv = readFileSync(envLog, 'utf8');
+  assert.match(signerEnv, new RegExp(`^GH_TOKEN=${token}$`, 'm'));
+  assert.equal(signerEnv.includes('FIXTURE_CALLER_SECRET'), false, signerEnv);
 });

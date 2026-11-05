@@ -177,7 +177,7 @@ propose an actuation; it cannot approve or authorize its own proposal.
 
 ## Current implementation boundary
 
-[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own implementation facts and proof.
+[GitHub issues](https://github.com/elastos/elastos-runtime/issues) own implementation facts and proof.
 This contract defines acceptance requirements; implementation and target evidence establish product support.
 
 Do not call the first physical provider ready until a stranger can verify all

@@ -5,7 +5,7 @@ import {
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
   renewHomeGuiBrowserWindowAuthority,
-  renewHomeGuiChatWindowAuthority,
+  renewHomeGuiFrameAuthority,
   restoreHomeGuiSession,
   setHomeGuiMenuManifest,
   handleHomeGuiHomeNavigation,
@@ -194,20 +194,20 @@ function handleGuiCommand(message) {
   if (command === "renew-browser-authority") {
     return handleBrowserAuthorityRenewalCommand(message);
   }
-  if (command === "renew-chat-authority") {
+  if (command === "renew-frame-authority") {
     if (!hasExactKeys(message, ["type", "command", "requestId", "homeToken", "launched", "expiresAt", "phase"])
       || !/^[A-Za-z0-9-]{1,64}$/.test(message.requestId)
       || !Number.isSafeInteger(message.expiresAt) || !["prepare", "commit"].includes(message.phase)) return false;
     const freshHomeToken = new URLSearchParams(new URL(message.launched?.route, homeOrigin).hash.slice(1)).get("home_token") || "";
     if (message.phase === "commit") {
-      const ok = renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin);
-      postToHome({ type: "home:chat-authority-committed", requestId: message.requestId,
+      const ok = renewHomeGuiFrameAuthority(message.homeToken, message.launched, homeOrigin);
+      postToHome({ type: "home:frame-authority-committed", requestId: message.requestId,
         oldHomeToken: message.homeToken, freshHomeToken, ok });
       return ok;
     }
     const ok = message.expiresAt > Date.now()
-      && renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin, false);
-    postToHome({ type: "home:chat-authority-renewed", requestId: message.requestId,
+      && renewHomeGuiFrameAuthority(message.homeToken, message.launched, homeOrigin, false);
+    postToHome({ type: "home:frame-authority-renewed", requestId: message.requestId,
       oldHomeToken: message.homeToken, freshHomeToken, ok });
     return ok;
   }

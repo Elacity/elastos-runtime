@@ -62,13 +62,18 @@ import {
     state.searchOpen = false;
     state.sidebarWidth = LIBRARY_SIDEBAR_WIDTH_DEFAULT;
     const homeOrigin = queryParams.get("home_origin") || "";
-    const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin,
+    const homeNavigation = createHomeNavigationClient({ homeToken: state.homeToken, homeOrigin, target: "library",
+      onHomeToken(token) {
+        homeClipboard.setHomeToken(token);
+        state.homeToken = token;
+      },
       enabled: state.mode === "browse" && !queryParams.get("returnTarget") });
-    const homeClipboard = createHomeClipboardClient({
+    const clipboardOptions = () => ({
       targetId: "library",
       homeOrigin,
       homeToken: state.homeToken,
     });
+    const homeClipboard = createHomeClipboardClient(clipboardOptions());
     homeClipboard.start();
     const {
       providerApi: runtimeProviderApi,

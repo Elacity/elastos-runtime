@@ -2,7 +2,7 @@
 
 ## Reporting
 
-If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
+If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/elastos/elastos-runtime/security/advisories/new). Do not open a public issue.
 
 Do not describe an unfixed issue in a public issue, pull request, commit message, or branch name.
 
@@ -19,7 +19,7 @@ system process as Runtime keys. Installed Homes admit only release-path
 capsules matched by signed CID receipts and capsules signed by the release
 publisher, so third-party executable capsules need key-free, confined
 worker processes before they are admitted
-([World Computer plan](https://github.com/Elacity/elastos-runtime/issues/285)).
+([World Computer plan](https://github.com/elastos/elastos-runtime/issues/285)).
 
 Providers run as native operating-system processes with the Runtime user's
 rights. Only the model provider is partly confined. The trusted shell helper
@@ -31,12 +31,12 @@ The seed operator can read hosted data, wallet keys and recovery material.
 Passkeys control sign-in; stored data and keys remain accessible to the Runtime
 account and root while Home is locked. Protection against hosted operators and
 root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+is the target of [hosted protection](https://github.com/elastos/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/elastos/elastos-runtime/issues/210).
 An unlocked self-hosted Home trusts its owner and their host software. Recovery
 from a stolen device or profile key requires a new identity.
 
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+The [isolation plan](https://github.com/elastos/elastos-runtime/issues/173)
 records the remaining gates. Source checks describe this source tree. Accepted
 installed proof binds the exact Runtime, components and app assets to the
 journeys tested on that device.
@@ -126,7 +126,7 @@ and slow-frame tests.
 ### Whole-object Carrier fetch replies are held in memory
 
 **Files:** `elastos/crates/elastos-server/src/carrier.rs`
-**Status:** Open ([#341](https://github.com/Elacity/elastos-runtime/issues/341))
+**Status:** Open ([#341](https://github.com/elastos/elastos-runtime/issues/341))
 
 A whole-object content fetch reply arrives as one line. It is refused while
 reading once it passes one 200 MiB file as base64 (about 268 MiB), the largest
@@ -137,7 +137,7 @@ peer.
 
 **Severity:** Low
 **Files:** `elastos/crates/elastos-server/src/collaboration_discovery_runtime.rs`, `elastos/crates/elastos-server/src/collaboration_contact_store.rs`
-**Status:** Open ([#86](https://github.com/Elacity/elastos-runtime/issues/86))
+**Status:** Open ([#86](https://github.com/elastos/elastos-runtime/issues/86))
 
 Anyone who has a Profile's DID can send it one contact request through the
 seed's Community node, whether or not that Profile is visible in Discovery.

@@ -41,7 +41,9 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
                 || manifest.name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
         })
         // Browser is absent, not merely unlaunchable, where it is unavailable.
-        .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
+        .filter(|manifest| {
+            manifest.name != "browser" || crate::setup::home_browser_available(data_dir, platform)
+        })
         // Hidden Services and an unconfigured WalletConnect are absent here as
         // in the launcher and Wallet.
         .filter(|manifest| capsule_is_offered(data_dir, &manifest.name))

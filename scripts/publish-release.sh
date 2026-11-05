@@ -617,10 +617,12 @@ create_capsule_tar() {
     local stage_root="$2"
     local capsule_name="$3"
     python3 - "$archive" "$stage_root" "$capsule_name" <<'PY'
-import gzip
+import io
 from pathlib import Path
+import struct
 import sys
 import tarfile
+import zlib
 
 archive, stage_root, capsule_name = sys.argv[1:]
 
@@ -639,12 +641,25 @@ def normalize(info):
     )
     return info
 
-# tarfile sorts recursive entries. The gzip header must also be independent
-# of the output filename and wall clock, on both macOS and Linux.
+# tarfile sorts recursive entries.
+tar = io.BytesIO()
+with tarfile.open(fileobj=tar, mode="w", format=tarfile.PAX_FORMAT) as package:
+    package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+data = tar.getvalue()
+
+# Universal assets must be byte-identical on every build worker. The host's
+# deflate (zlib on Linux, Apple's libz on macOS 15) emits different bytes for
+# the same input, so the gzip member is written here with stored (uncompressed)
+# deflate blocks: fixed header without name or time, blocks of at most 65535
+# bytes, then CRC-32 and length. Any gzip reader accepts it.
 with open(archive, "wb") as output:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            package.add(Path(stage_root) / capsule_name, arcname=capsule_name, filter=normalize)
+    output.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff")
+    chunks = [data[i:i + 65535] for i in range(0, len(data), 65535)] or [b""]
+    for index, chunk in enumerate(chunks):
+        last = index == len(chunks) - 1
+        output.write(bytes([1 if last else 0]) + struct.pack("<HH", len(chunk), len(chunk) ^ 0xFFFF))
+        output.write(chunk)
+    output.write(struct.pack("<II", zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF))
 PY
 }
 
@@ -848,15 +863,25 @@ build_supported_direct_assets() {
     cp "$archive" "$staged" || return
     updates_json=$(record_direct_asset "$updates_json" home-cli "$staged" "capsules/home-cli" "$release_path" home-cli) || return
 
-    if [[ "$setup_platform" == darwin-arm64 ]] && jq -e '.external["browser-vz-engine-supervisor"]' components.json >/dev/null; then
-        # The source Home and release use the same native supervisor and entitlement.
-        if [[ "$SKIP_BUILD" != true ]]; then
-            (cd elastos && cargo build --locked --release -p elastos-vz --bin browser-vz-engine-supervisor) >&2 || return
+    if jq -e --arg platform "$setup_platform" \
+        '.external["browser-vz-engine-supervisor"].platforms[$platform]' components.json >/dev/null; then
+        # Source Home and release share the native owner; Mac also needs its entitlement.
+        local supervisor_args=(build --locked --release -p elastos-vz --bin browser-vz-engine-supervisor)
+        local supervisor_output="${CARGO_TARGET_DIR:-elastos/target}"
+        if [[ -n "$target" ]]; then
+            supervisor_args+=(--target "$target")
+            supervisor_output="${supervisor_output}/${target}"
         fi
-        staged="$stage_dir/browser-vz-engine-supervisor-darwin-arm64"
-        cp "${CARGO_TARGET_DIR:-elastos/target}/release/browser-vz-engine-supervisor" "$staged" || return
-        scripts/dev/sign-elastos-vz/sign.sh "$staged" >&2 || return
-        updates_json=$(record_direct_asset "$updates_json" browser-vz-engine-supervisor "$staged" bin/browser-vz-engine-supervisor browser-vz-engine-supervisor-darwin-arm64) || return
+        if [[ "$SKIP_BUILD" != true ]]; then
+            (cd elastos && cargo "${supervisor_args[@]}") >&2 || return
+        fi
+        release_path="browser-vz-engine-supervisor-${setup_platform}"
+        staged="${stage_dir}/${release_path}"
+        cp "${supervisor_output}/release/browser-vz-engine-supervisor" "$staged" || return
+        if [[ "$setup_platform" == darwin-arm64 ]]; then
+            scripts/dev/sign-elastos-vz/sign.sh "$staged" >&2 || return
+        fi
+        updates_json=$(record_direct_asset "$updates_json" browser-vz-engine-supervisor "$staged" bin/browser-vz-engine-supervisor "$release_path") || return
     fi
 
     stamp_direct_assets "$setup_platform" "$updates_json"
@@ -1071,8 +1096,8 @@ runtime_tunnel_url() {
     token=$(jq -r '.shell_token // empty' "$coords_file" 2>/dev/null || true)
     [[ -n "$api" && -n "$token" ]] || return 1
 
-    response=$(curl -fsS --max-time 3 \
-        -H "Authorization: Bearer ${token}" \
+    # printf is a shell builtin and curl reads the header from stdin, so the token stays out of every argv.
+    response=$(printf 'header = "Authorization: Bearer %s"\n' "${token}" | curl -fsS --max-time 3 -K - \
         -H "Content-Type: application/json" \
         -X POST \
         -d '{}' \

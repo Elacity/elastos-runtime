@@ -2,7 +2,7 @@
 
 The [dated backlog snapshot](audits/2026-09-23-open-backlog-snapshot.md)
 preserves earlier open follow-up. It is a record for later triage, not a second
-execution queue. [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own the work queue and verified facts; an item
+execution queue. [GitHub issues](https://github.com/elastos/elastos-runtime/issues) own the work queue and verified facts; an item
 starts only when it has an issue with an owner, target and next proof.
 
 ## Retained source integration

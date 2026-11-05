@@ -1303,3 +1303,221 @@ async fn restarted_presence_get_keeps_legacy_core_bytes_until_lifecycle_repair()
         .records()
         .is_empty());
 }
+
+// Reproduction controls: real gateway, isolated state, expiry moved without waiting.
+#[tokio::test]
+async fn chat_online_expired_frame_is_refused_while_home_session_remains_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = configured_presence_state(dir.path());
+    let authority = passkey_authority_with_name(dir.path(), Some("Owner"));
+    install_signed_profile(dir.path(), &authority, "Owner");
+    let app = gateway_router(state);
+    let context = gateway_home_token::HomeLaunchTokenContext {
+        principal_id: authority.principal_id.clone(),
+        session_id: authority.session_id.clone(),
+        proof_binding_id: Some(authority.proof_binding_id.clone()),
+        grant_id: authority.grant_id.clone(),
+    };
+    let live = gateway_home_token::issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "chat-room",
+        "chat-room",
+        &context,
+    )
+    .unwrap();
+    gateway_home_token::require_home_launch_token_context(
+        dir.path(),
+        capsule_request("POST", "/api/apps/chat-room/poll", &live, "{}").headers(),
+        "chat-room",
+    )
+    .expect("the frame authority is valid before expiry");
+    // Age the same signed projection across its TTL using only fixture keys.
+    let codec = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&codec.decode(&live).unwrap()).unwrap();
+    envelope["payload"]["iat"] = json!(crate::auth::now_ts() - HOME_LAUNCH_TOKEN_TTL_SECS - 1);
+    envelope["payload"]["exp"] = json!(crate::auth::now_ts() - 1);
+    let (key, _) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let (signature, signer) = crate::crypto::domain_separated_sign(
+        &key,
+        HOME_LAUNCH_TOKEN_DOMAIN,
+        serde_json::to_string(&envelope["payload"])
+            .unwrap()
+            .as_bytes(),
+    );
+    envelope["signature"] = json!(signature);
+    envelope["signer_did"] = json!(signer);
+    let expired = codec.encode(serde_json::to_vec(&envelope).unwrap());
+    let refused = app
+        .clone()
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/poll",
+            &expired,
+            r#"{"since":41}"#,
+        ))
+        .await
+        .unwrap();
+    let status = refused.status();
+    let reason = response_text(refused).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{reason}");
+    eprintln!("expired frame response: {status}: {reason}");
+    assert!(gateway_home_token::require_home_launch_token_context(
+        dir.path(),
+        capsule_request("POST", "/api/apps/chat-room/poll", &expired, "{}").headers(),
+        "chat-room",
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("expired"));
+    crate::auth::load_active_session_grant(
+        dir.path(),
+        &authority.session_id,
+        crate::auth::now_ts(),
+    )
+    .expect("the person's session is still valid");
+    let refreshed = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/auth/sessions/refresh")
+                .header("x-elastos-home-token", &authority.home_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let fresh = gateway_home_token::issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "chat-room",
+        "chat-room",
+        &context,
+    )
+    .unwrap();
+    let start = app
+        .clone()
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/session/start",
+            &fresh,
+            "{}",
+        ))
+        .await
+        .unwrap();
+    let status = start.status();
+    assert_eq!(status, StatusCode::OK, "{}", response_text(start).await);
+    let resumed = app
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/poll",
+            &fresh,
+            r#"{"since":41}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::OK);
+    eprintln!("chat_online frame: expired token -> 403 ({reason}); Home refresh 200; fresh frame -> session/start -> poll 200");
+}
+
+#[tokio::test]
+async fn chat_online_configured_poll_does_not_renew_room_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = configured_presence_state(dir.path());
+    let authority = passkey_authority_with_name(dir.path(), Some("Owner"));
+    install_signed_profile(dir.path(), &authority, "Owner");
+    let app = gateway_router(state);
+    let context = gateway_home_token::HomeLaunchTokenContext {
+        principal_id: authority.principal_id.clone(),
+        session_id: authority.session_id.clone(),
+        proof_binding_id: Some(authority.proof_binding_id.clone()),
+        grant_id: authority.grant_id.clone(),
+    };
+    let token = gateway_home_token::issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "chat-room",
+        "chat-room",
+        &context,
+    )
+    .unwrap();
+    let started = app
+        .clone()
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/session/start",
+            &token,
+            "{}",
+        ))
+        .await
+        .unwrap();
+    let status = started.status();
+    assert_eq!(status, StatusCode::OK, "{}", response_text(started).await);
+    let path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        crate::room_service::room_root_uri(),
+    )
+    .unwrap()
+    .join("local/sessions.json");
+    let mut sessions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    let deadline = crate::auth::now_ts() + 60;
+    sessions[0]["expires_at"] = json!(deadline);
+    std::fs::write(&path, serde_json::to_vec(&sessions).unwrap()).unwrap();
+    for _ in 0..3 {
+        let poll = app
+            .clone()
+            .oneshot(capsule_request(
+                "POST",
+                "/api/apps/chat-room/poll",
+                &token,
+                r#"{"since":41}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+    }
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        after[0]["expires_at"], deadline,
+        "polls leave the deadline unchanged"
+    );
+    sessions[0]["expires_at"] = json!(crate::auth::now_ts().saturating_sub(1));
+    std::fs::write(&path, serde_json::to_vec(&sessions).unwrap()).unwrap();
+    let refused = app
+        .clone()
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/poll",
+            &token,
+            r#"{"since":41}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    let reason = response_text(refused).await;
+    assert!(reason.contains("invalid or expired session"), "{reason}");
+    let started = app
+        .clone()
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/session/start",
+            &token,
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let resumed = app
+        .oneshot(capsule_request(
+            "POST",
+            "/api/apps/chat-room/poll",
+            &token,
+            r#"{"since":41}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::OK);
+    eprintln!("chat_online room: 3 polls leave expiry unchanged; expired room -> 401 ({reason}); session/start -> poll 200");
+}

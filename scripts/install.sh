@@ -379,6 +379,134 @@ sha256_file() {
     fi
 }
 
+installer_physical_root() {
+    local root="$1" suffix=""
+    # A fresh install can have missing directories below a relocated ancestor.
+    while [[ ! -e "$root" && ! -L "$root" && "$root" != "/" ]]; do
+        suffix="/$(basename -- "$root")${suffix}"
+        root="$(dirname -- "$root")"
+    done
+    root="$(cd -P -- "$root" && pwd -P)" || return 1
+    printf '%s\n' "${root%/}${suffix:-/}"
+}
+
+installer_repair_existing_permissions() {
+    local home_root data_root bin_root
+    home_root="$(installer_physical_root "$HOME")" || return 1
+    data_root="$(installer_physical_root "$(dirname -- "$DATA_DIR")")" || return 1
+    bin_root="$(installer_physical_root "$INSTALL_DIR")" || return 1
+    # Resolve storage roots only. The managed elastos entries remain literal,
+    # so descriptor traversal still refuses links inside the installation.
+    installer_repair_permissions "$home_root" "${data_root%/}/elastos" "${bin_root%/}/elastos"
+}
+
+installer_repair_permissions() {
+    python3 - "$@" <<'PY_INSTALL_PERMISSIONS'
+import os
+import pwd
+import shlex
+import stat
+import sys
+
+
+def repair_permissions(home, data, binary):
+    home, data, binary = map(os.path.abspath, (home, data, binary))
+    targets = [(os.path.dirname(binary), True, 0), (data, True, 0),
+               (binary, False, 0o022),
+               (os.path.join(os.path.dirname(binary), ".elastos.install.lock"), False, 0o077),
+               (os.path.join(os.path.dirname(binary), ".elastos.update-journal.json"), False, 0o077)]
+    for name in ("components.json", "sources.json", "runtime-coords.json",
+                 "home-runtime-coords.json", "gateway-runtime-coords.json"):
+        targets.append((os.path.join(data, name), False, 0o077 if "coords" in name else 0o022))
+    for directory in ("bin", "installation", "ElastOS", "ElastOS/SystemServices", "ElastOS/SystemServices/Publisher"):
+        targets.append((os.path.join(data, directory), True, 0o077 if directory == "installation" else 0o022))
+    for directory in ("installation", "ElastOS/SystemServices/Publisher"):
+        for name in ("release-head.json", "release.json"):
+            targets.append((os.path.join(data, directory, name), False,
+                            0o077 if directory == "installation" else 0o022))
+    target_paths = {path for path, _, _ in targets}
+    descriptors, bindings, repairs, root_owned = {}, [], [], set()
+
+    def identity(metadata):
+        return (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode, metadata.st_nlink)
+
+    def open_path(path, directory):
+        if path in descriptors:
+            return descriptors[path]
+        parent, name = os.path.split(path)
+        parent_fd = open_path(parent, True)
+        if parent_fd is None:
+            return None
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        expected = stat.S_ISDIR if directory else stat.S_ISREG
+        if not expected(before.st_mode):
+            raise ValueError("Unsafe installation path: " + shlex.quote(path) + "; use a regular file or directory without symlinks")
+        if before.st_uid == 0 and os.geteuid() != 0 and os.path.commonpath((home, path)) == home:
+            root_owned.add(data if os.path.commonpath((data, path)) == data else path)
+            return None
+        if path in target_paths and before.st_uid != os.geteuid():
+            raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is not owned by you. Choose a location you own")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if directory else 0)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        descriptors[path] = descriptor
+        if identity(before) != identity(os.fstat(descriptor)):
+            raise ValueError("Installation path changed: " + shlex.quote(path))
+        bindings.append((parent_fd, name, before, path))
+        return descriptor
+
+    try:
+        descriptors["/"] = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        component_root = os.path.join(data, "bin")
+        component_fd = open_path(component_root, True)
+        if component_fd is not None:
+            for name in sorted(os.listdir(component_fd)):
+                path = os.path.join(component_root, name)
+                targets.append((path, False, 0o022))
+                target_paths.add(path)
+        for path, directory, refused in targets:
+            if not os.path.lexists(path):
+                continue
+            descriptor = open_path(path, directory)
+            if descriptor is None:
+                continue
+            metadata = os.fstat(descriptor)
+            if metadata.st_uid != os.geteuid():
+                raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is not owned by you. Choose a location you own")
+            if metadata.st_mode & 0o002:
+                raise ValueError("Unsafe installation path: " + shlex.quote(path) + " is world-writable; fix with: chmod o-w " + shlex.quote(path))
+            if not directory and (metadata.st_nlink != 1 or metadata.st_mode & 0o6000):
+                raise ValueError("Unsafe installation file: " + shlex.quote(path))
+            if metadata.st_mode & 0o020 and refused:
+                repairs.append((descriptor, stat.S_IMODE(metadata.st_mode) & ~refused, path))
+        if root_owned:
+            command = "sudo chown -R " + shlex.quote(pwd.getpwuid(os.geteuid()).pw_name + ":")
+            command += " " + " ".join(shlex.quote(path) for path in sorted(root_owned))
+            raise ValueError("Restore ownership of this Home, then run the installer again: " + command)
+        # Validate the complete set before the first change. Keep every parent
+        # open, compare device and inode, and apply modes through descriptors.
+        for parent, name, before, path in bindings:
+            if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity(before):
+                raise ValueError("Installation path changed: " + shlex.quote(path))
+        for descriptor, mode, path in repairs:
+            os.fchmod(descriptor, mode)
+            print("Repaired permissions: " + shlex.quote(path) + " (" + format(mode, "04o") + ")")
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+
+if __name__ == "__main__":
+    try:
+        repair_permissions(*sys.argv[1:])
+    except (ValueError, OSError) as error:
+        print("Error: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_INSTALL_PERMISSIONS
+}
+
 installer_runtime_control() {
     # All callers stop verified processes before changing the selected install.
     # Smoke cleanup can disable the binary scan when using a shared branch binary.
@@ -386,6 +514,7 @@ installer_runtime_control() {
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -395,7 +524,7 @@ import time
 PREFIXES = ("serve", "gateway", "room open", "home")
 
 
-def process_snapshot(pid):
+def process_snapshot(pid, recorded_at=None):
     if type(pid) is not int or not 1 < pid < 2**31:
         raise ValueError("Runtime PID must be a positive process ID greater than one")
     try:
@@ -404,8 +533,9 @@ def process_snapshot(pid):
         return None
     except PermissionError:
         raise ValueError("Runtime process belongs to another owner")
+    observed_at = time.time()
     result = subprocess.run(
-        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "stat=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "etime=", "-o", "stat=", "-o", "command="],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         env=dict(os.environ, LC_ALL="C"), text=True, check=False,
     )
@@ -415,14 +545,28 @@ def process_snapshot(pid):
         except ProcessLookupError:
             return None
         raise ValueError("Runtime process identity is unavailable")
-    parts = result.stdout.strip().split(None, 7)
-    if len(parts) != 8 or not parts[0].isdigit():
+    parts = result.stdout.strip().split(None, 8)
+    if len(parts) != 9 or not parts[0].isdigit():
         raise ValueError("Runtime process identity is ambiguous")
     if int(parts[0]) != os.geteuid():
         raise ValueError("Runtime process belongs to another owner")
-    if parts[6].startswith("Z"):
+    if parts[7].startswith("Z"):
         return None
-    return (" ".join(parts[1:6]), parts[7])
+    if recorded_at is not None:
+        # etime is numeric on Linux and macOS: [[days-]hours:]minutes:seconds.
+        # Sample the clock before ps; elapsed seconds are rounded down, so
+        # this lower bound rejects definite PID reuse without parsing dates.
+        elapsed = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", parts[6])
+        if elapsed is None:
+            raise ValueError("Runtime process elapsed time is ambiguous")
+        days, hours, minutes, seconds = (int(field or 0) for field in elapsed.groups())
+        if minutes >= 60 or seconds >= 60 or (days and hours >= 24):
+            raise ValueError("Runtime process elapsed time is ambiguous")
+        age = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+        if observed_at - age - 1 >= recorded_at:
+            raise ValueError("Runtime process started after its ownership record; preserved its process and state")
+    # Keep the raw birth string for identity checks, independent of elapsed age.
+    return (" ".join(parts[1:6]), parts[8])
 
 
 def matches_command(snapshot, binary, prefixes=PREFIXES):
@@ -591,16 +735,10 @@ def stop_installation(data_dir, binary, scan_binary):
             continue
         records.append((path, recorded))
         pid = recorded[0]
-        snapshot = process_snapshot(pid)
+        snapshot = process_snapshot(pid, recorded_at=recorded[4])
         if snapshot is not None:
             if not matches_command(snapshot, binary):
                 raise ValueError("Recorded Runtime is foreign or ambiguous; preserved its process and state")
-            # ps lstart and this Python process use the same local timezone.
-            # Its second precision rejects definite PID reuse; coordinates do
-            # not yet carry a process birth identity for finer comparisons.
-            started = time.mktime(time.strptime(snapshot[0], "%a %b %d %H:%M:%S %Y"))
-            if started > int(recorded[4]):
-                raise ValueError("Runtime process started after its ownership record; preserved its process and state")
             selected[pid] = snapshot
     if scan_binary:
         for pid, snapshot in selected_processes(binary).items():
@@ -1079,12 +1217,46 @@ show_remote_open_hint() {
     printf '  ssh -L 8090:localhost:8090 %s@%s\n' "$(id -un)" "$host"
 }
 
+# The native launcher creates per-launch overlays. Retire the old copies as
+# their ordinary owner, before requesting any privileged host setup.
+retire_browser_rootfs_pool() {
+    /usr/bin/python3 -I - "$DATA_DIR" <<'PY_RETIRED_BROWSER_POOL'
+import os
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1])
+parent = root / 'browser-vm'
+if root.is_symlink() or parent.is_symlink():
+    sys.exit('Browser pool cleanup requires plain data and browser-vm directories')
+pool = parent / 'rootfs-pool'
+for path in (parent, pool):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if metadata.st_uid != os.geteuid():
+        sys.exit(f'{path} belongs to another user')
+if pool.is_symlink():
+    pool.unlink()
+elif pool.is_dir():
+    # removal-ok: exact retired image-copy folder, as its ordinary owner;
+    # parent links are refused and rmtree leaves internal link targets intact.
+    shutil.rmtree(pool)
+else:
+    sys.exit(0)
+print(f'Removed retired Browser rootfs pool: {pool}')
+PY_RETIRED_BROWSER_POOL
+}
+
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
 prepare_browser_linux_host() {
     BROWSER_LINUX_HOST_READY=false
     [[ "$(uname -s)" == Linux ]] || return 0
-    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user
+    retire_browser_rootfs_pool || return $?
+    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user check_result line
     # sudo runs only a root-owned copy, never the user-writable helper.
     local root_helper=/usr/local/lib/elastos/browser-vm-linux-network.py
     [[ -f "$helper" ]] || return 0
@@ -1093,18 +1265,23 @@ prepare_browser_linux_host() {
         return 0
     fi
     user="$(id -un)"
-    if /usr/bin/python3 -I "$helper" check >/dev/null 2>&1; then
+    if check_result="$(/usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" 2>&1)"; then
         info "Browser KVM and network access are ready."
     elif ( : </dev/tty ) 2>/dev/null && command -v sudo >/dev/null 2>&1; then
         info "Browser needs one-time administrator setup for KVM access and its private network devices."
         info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
         sudo install -D -o root -g root -m 755 "$helper" "$root_helper" </dev/tty || return $?
-        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" </dev/tty || return $?
-        /usr/bin/python3 -I "$helper" check >/dev/null 2>&1 || return $?
+        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" --data-dir "$DATA_DIR" </dev/tty || return $?
+        /usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" >/dev/null 2>&1 || return $?
     else
         info "Browser needs one-time administrator setup. Run from a terminal:"
         printf '  sudo install -D -o root -g root -m 755 %q %q\n' "$helper" "$root_helper"
-        printf '  sudo /usr/bin/python3 -I %q setup --user %q\n' "$root_helper" "$user"
+        while IFS= read -r line; do
+            case "$line" in
+                '/usr/bin/python3 -I '*) printf '  sudo %s\n' "$line" ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done <<<"$check_result"
         return 0
     fi
     BROWSER_LINUX_HOST_READY=true
@@ -1415,8 +1592,11 @@ require_safe_existing_dir() {
     local dir="$1" real
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    if [[ ! -O "$dir" ]]; then
+        installer_repair_existing_permissions || exit 1
+        die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not owned by you. Choose a location you own"
+    fi
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you. Choose a location you own"
     if [[ -n "$(find "$real" -maxdepth 0 -perm -o+w)" ]]; then
         die_exact "Unsafe installation directory: $(printf '%q' "$real") is world-writable; fix with: chmod o-w $(printf '%q' "$real")"
     fi
@@ -1452,6 +1632,7 @@ require_safe_parent_chain() {
 require_safe_existing_dir "$INSTALL_DIR"
 require_safe_existing_dir "$DATA_DIR"
 require_safe_parent_chain "$DATA_DIR"
+installer_repair_existing_permissions || exit 1
 
 # ── Fetch + verify release head ──────────────────────────────────────
 

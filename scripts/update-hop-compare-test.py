@@ -2345,9 +2345,10 @@ class CliFixtureTests(unittest.TestCase):
             processes = SimpleNamespace(spawn=spawn, roots={})
             evidence = {}
 
-            def state_now(manifest_value, home_path):
-                # The same Home's state, read after prepare and Home close and before the update.
-                self.assertEqual((home_path, "prepare" in order, order[-1]), (home, True, "home-closed"))
+            def state_now(manifest_value, home_path, coordination=True):
+                # The same Home's state, read after prepare and Home close and before the update;
+                # the stopped gateway's lock is not an offline upgrade lock, so it is not admitted.
+                self.assertEqual((home_path, "prepare" in order, order[-1], coordination), (home, True, "home-closed", False))
                 return json.loads(json.dumps(state))
             with patch.object(observer, "cli_success", return_value=True), patch.object(observer, "cli_state", side_effect=state_now) as observed, \
                  patch.object(observer, "cli_private_json", return_value={"phase": "ready", "controller_pid": 4242}), \
@@ -2396,7 +2397,7 @@ class CliFixtureTests(unittest.TestCase):
                 version = "0.8.0-alpha.7" if label == "build-next" else "0.8.0-alpha.8"
                 self.assertEqual(env["ELASTOS_RELEASE_VERSION"], version)
                 self.assertEqual(env, {**os.environ, "ELASTOS_RELEASE_VERSION": version})
-                self.assertEqual(timeout, 900)
+                self.assertEqual(timeout, 1800)
                 runtime.write_bytes(header + (b"N+1" if label == "build-next" else b"N+2"))
             else:
                 stdout = b"elastos 0.8.0-alpha.7\n" if label == "new-version" else b"elastos 0.8.0-alpha.8\n"
@@ -2450,6 +2451,13 @@ class CliFixtureTests(unittest.TestCase):
                 self.assertFalse((self.root / "build-inputs").exists())
 
     def test_hop_builder_failed_compile_keeps_old_bytes_and_failed_cleanup_receipt(self):
+        self.assert_hop_builder_failed_compile(False)
+
+    def test_hop_builder_timed_out_compile_reports_limit_and_keeps_old_bytes(self):
+        self.assert_hop_builder_failed_compile(True)
+
+    def assert_hop_builder_failed_compile(self, timed_out):
+        run_command = observer.CliProcesses.command
         runtime = self.root / "built-runtime"
         original = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         runtime.write_bytes(original)
@@ -2458,14 +2466,34 @@ class CliFixtureTests(unittest.TestCase):
         def command(manager, argv, env, cwd, label, timeout):
             (destination / (label + ".stdout")).write_bytes(b"elastos 0.7.1\n" if label == "old-version" else b"")
             (destination / (label + ".stderr")).write_bytes(b"")
-            return {"exit": 0 if label == "old-version" else 124}
+            if label == "old-version":
+                return {"exit": 0}
+            self.assertEqual(timeout, 1800)
+            process = SimpleNamespace(pid=30000)
+            waits = []
+            def wait(timeout):
+                waits.append(timeout)
+                if timed_out and len(waits) == 1:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                return -observer.signal.SIGKILL if timed_out else 124
+            process.wait = wait
+            with patch.object(manager, "spawn", return_value=process), patch.object(observer.os, "killpg") as kill:
+                result = run_command(manager, argv, env, cwd, label, timeout)
+            self.assertEqual(result["exit"], 124)
+            self.assertEqual(result["timed_out"], timed_out)
+            self.assertEqual(waits, [1800, 5] if timed_out else [1800])
+            if timed_out:
+                kill.assert_called_once_with(process.pid, observer.signal.SIGKILL)
+            else:
+                kill.assert_not_called()
+            return result
         def git(argv, **kwargs):
             return "" if argv[1] == "status" else "a" * 40 + "\n"
         with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
              patch.object(observer.platform, "machine", return_value="arm64"), patch.object(observer.subprocess, "check_output", side_effect=git), \
              patch.object(observer.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3)), \
              patch.object(observer.CliProcesses, "command", command), patch.object(observer.CliProcesses, "cleanup", return_value={"errors": []}), \
-             self.assertRaisesRegex(ValueError, "new Runtime build failed"):
+             self.assertRaisesRegex(ValueError, "^new Runtime build timed out after 1800 s$" if timed_out else "^new Runtime build failed$"):
             observer.cli_build_hop(destination, runtime, previous)
         receipt = observer.cli_json(destination / "build.json")
         self.assertEqual(receipt["status"], "failed")

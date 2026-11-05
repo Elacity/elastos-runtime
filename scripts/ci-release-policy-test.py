@@ -823,7 +823,7 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_release_builds_are_hermetic_with_fresh_outputs(self):
         source = (WORKFLOW.parent / "release-package.yml").read_text()
         validate_release_builds_are_hermetic(source)
-        for job in ("mac", "linux"):
+        for job, platform in (("mac", "aarch64-darwin"), ("linux", "aarch64-linux"), ("linux", "x86_64-linux")):
             job_steps = steps(job, jobs(source))
             parity, = [step for step in job_steps if step.startswith("name: check native versions, source and support parity\n")]
             for token in ('cmp "$inputs/N1/support-input.json" "$inputs/N/platform-input.json"',
@@ -832,7 +832,7 @@ class ReleasePolicyTests(unittest.TestCase):
             build, = [step for step in job_steps if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
             script = textwrap.dedent(build.split("        run: |\n", 1)[1])
             for existing in (None, "target", "build", "target-link", "build-link"):
-                with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(job=job, platform=platform, existing=existing), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     (root / "scripts").mkdir()
                     (root / "shims").mkdir()
@@ -869,7 +869,7 @@ class ReleasePolicyTests(unittest.TestCase):
                            "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls),
                            "BROWSER_IMAGE_CID": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                            "BROWSER_IMAGE_SHA256": "ab" * 32, "BROWSER_IMAGE_SIZE": "1024",
-                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "aarch64-linux"}
+                           "RELEASE_PLATFORM": platform}
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
@@ -879,10 +879,11 @@ class ReleasePolicyTests(unittest.TestCase):
                     else:
                         built = [json.loads(line) for line in calls.read_text().splitlines()]
                         self.assertEqual(len(built), 2)
-                        # Browser image input is Mac-only until #90.
+                        # Both ARM64 hosts (Mac and Jetson) take the one admitted guest
+                        # archive from the workflow inputs; x86-64 Linux takes none.
                         image = (['--browser-vm-image-cid', env['BROWSER_IMAGE_CID'],
                                   '--browser-vm-image-sha256', env['BROWSER_IMAGE_SHA256'],
-                                  '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']] if job == "mac" else [])
+                                  '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']] if platform != "x86_64-linux" else [])
                         self.assertEqual({item['target'] for item in built}, {str(target)})
                         self.assertEqual({item['build'] for item in built}, {str(build_dir)})
                         self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N'), *image])
@@ -1383,6 +1384,7 @@ class ReleasePolicyTests(unittest.TestCase):
         # files they package; the step itself reaches the workflow and the shell script.
         for entry in ("scripts/release-upstream-input.py", "scripts/release-upstream-recipes.json",
                       "scripts/browser-upstream-build.py", "scripts/build/licenses/libcap-LICENSE.txt",
+                      "scripts/build/crosvm-lifecycle-fds.patch",
                       "scripts/release-host-prerequisites.sh", ".github/workflows/ci.yml"):
             with self.subTest(removed=entry):
                 self.assertIn(entry, upstream)
@@ -1701,7 +1703,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 shim.chmod(0o700)
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
                                     env={**os.environ, "PATH": f"{shims}{os.pathsep}{os.environ['PATH']}",
-                                         "GITHUB_REPOSITORY": "Elacity/elastos-runtime", "GITHUB_RUN_ID": "7",
+                                         "GITHUB_REPOSITORY": "elastos/elastos-runtime", "GITHUB_RUN_ID": "7",
                                          "GITHUB_RUN_ATTEMPT": "1", "POLL_DIR": str(queue),
                                          "CANCEL_LOG": str(root / "cancels")})
             cancels = (root / "cancels").read_text().splitlines() if (root / "cancels").exists() else []
@@ -1712,18 +1714,18 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@", watcher)
         self.assertEqual(watcher.split("    permissions:\n", 1)[1].split("    steps:\n", 1)[0], "      actions: write\n")
         for event, ref, ref_type, override, _ in CASES:
-            for head in ("Elacity/elastos-runtime", "someone/fork"):
-                context = {"github.event_name": event, "github.ref": ref, "github.repository": "Elacity/elastos-runtime",
+            for head in ("elastos/elastos-runtime", "someone/fork"):
+                context = {"github.event_name": event, "github.ref": ref, "github.repository": "elastos/elastos-runtime",
                            "github.event.pull_request.head.repo.full_name": head}
                 self.assertEqual(job_runs("cancel-on-failure", context),
-                                 event == "pull_request" and head == "Elacity/elastos-runtime", (event, head))
+                                 event == "pull_request" and head == "elastos/elastos-runtime", (event, head))
         watch = ("cancel-on-failure", "in_progress", None)
         gate = ("source-gate", "completed", "success")
         macos = ("source-home-macos", "in_progress", None)
         for conclusion in ("failure", "timed_out"):
             status, cancels, used = self.run_cancel_watcher(
                 [[watch, gate, macos], [watch, gate, ("lint", "completed", conclusion), macos]])
-            self.assertEqual((status, cancels, used), (0, ["repos/Elacity/elastos-runtime/actions/runs/7/cancel"], 2))
+            self.assertEqual((status, cancels, used), (0, ["repos/elastos/elastos-runtime/actions/runs/7/cancel"], 2))
         # A completed gate before dependent jobs appear is not the end of the run.
         done = [watch, gate, ("source-home-macos", "completed", "success"), ("lint", "completed", "cancelled")]
         status, cancels, used = self.run_cancel_watcher([[watch, gate], [watch, gate, macos], done, done])
@@ -2722,6 +2724,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
         owner.stop = mock.Mock()
         owner.stop.is_set.return_value = False
         owner.thread, owner.error, owner.failure, owner.launch_requested = None, None, None, True
+        owner.census_gap = None
         owner.baseline_events = {"oom": 0, "oom_kill": 0}
         owner.show = mock.Mock(return_value=dict(owner.binding))
         owner.command = mock.Mock()
@@ -2938,6 +2941,187 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 self.globals["pidfd_exited"] = lambda fd: fd == owner.fds[103]
                 self.assertNotIn(103, owner.observe_once())
                 self.assertEqual(opened.call_count, len(rows))
+
+    def test_finite_census_gap_names_child_without_changing_failure(self):
+        for observation in ("present", "gone", "reused", "denied"):
+            with self.subTest(observation=observation), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                with self.observations(owner, rows), mock.patch.object(os, "getuid", return_value=1001), \
+                        mock.patch.object(os, "pidfd_open", side_effect=lambda pid, flags: pid + 1000, create=True):
+                    owner.observe_once()
+                    rows.pop(103)
+                    reader = self.globals["bounded_text"]
+                    def read(path, limit):
+                        if Path(path).parent.name != "103":
+                            return reader(path, limit)
+                        if observation in ("gone", "denied"):
+                            raise (FileNotFoundError if observation == "gone" else PermissionError)("private detail")
+                        if Path(path).name == "stat":
+                            fields = ["Z", "102", "103"] + ["0"] * 17
+                            fields[19] = "999" if observation == "reused" else "803"
+                            return "103 (private name) " + " ".join(fields)
+                        if Path(path).name == "cmdline":
+                            return "/private/operator/llama-server\0--token\0bare-secret\0init\0"
+                        self.fail("unexpected diagnostic read")
+                    self.globals["bounded_text"] = read
+                    with self.assertRaisesRegex(RuntimeError, "live child left its unit census"):
+                        owner.observe_once()
+                    detail = owner.census_gap
+                    self.assertEqual(detail["retained"]["pid"], 103)
+                    self.assertEqual(detail["retained"]["ppid"], 102)
+                    self.assertEqual(detail["retained"]["start_ticks"], 803)
+                    self.assertEqual(detail["retained"]["role"], "llama_server")
+                    self.assertEqual(detail["retained"]["cgroup"], owner.binding["ControlGroup"])
+                    self.assertFalse(detail["pidfd_exited"])
+                    self.assertEqual(detail["expected_cgroup"], owner.binding["ControlGroup"])
+                    if observation in ("present", "reused"):
+                        self.assertEqual(detail["observed"]["ppid"], 102)
+                        self.assertEqual(detail["observed"]["state"], "Z")
+                        self.assertEqual(detail["same_start_ticks"], observation == "present")
+                        self.assertEqual(detail["observed"]["cmdline"],
+                                         ["llama-server", "<redacted>", "<redacted>", "init"])
+                    else:
+                        self.assertEqual(detail["observed"]["stat_error"],
+                                         "FileNotFoundError" if observation == "gone" else "PermissionError")
+                    encoded = json.dumps(detail)
+                    for secret in ("bare-secret", "--token", "/private/operator", "private name", "private detail"):
+                        self.assertNotIn(secret, encoded)
+                    private = owner.control / "census-gap.private.log"
+                    self.assertEqual(private.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(json.loads(private.read_text())["same_start_ticks"],
+                                     detail["same_start_ticks"])
+                    with mock.patch.dict(self.globals, {"private_json": mock.Mock()}) as globals_:
+                        owner.record_census_gap(103, 1103)
+                        globals_["private_json"].assert_not_called()
+                    self.assertIs(owner.census_gap, detail)
+                    owner.launch_requested = False
+                    with mock.patch.object(os, "close"):
+                        self.assertEqual(owner.finish()["census_gap"], detail)
+
+    def test_finite_census_diagnostics_keep_exit_and_capture_errors_separate(self):
+        for fault in ("exited", "pidfd", "private_write"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                with self.observations(owner, rows), mock.patch.object(os, "getuid", return_value=1001), \
+                        mock.patch.object(os, "pidfd_open", side_effect=lambda pid, flags: pid + 1000, create=True):
+                    owner.observe_once()
+                    rows.pop(103)
+                    polls = iter((False, True))
+                    def exited(fd):
+                        if fd != 1103:
+                            return False
+                        value = next(polls)
+                        if value and fault == "pidfd":
+                            raise RuntimeError("private pidfd detail")
+                        return value
+                    self.globals["pidfd_exited"] = exited
+                    self.globals["cgroup_membership"] = lambda pid: ("/foreign/operator/session.key" if pid == 103 else
+                        "/outside" if pid in owner.outside else owner.binding["ControlGroup"])
+                    # Force bounded stat/argv reads to fail; cgroup still reports
+                    # the foreign path independently of those observations.
+                    reader = self.globals["bounded_text"]
+                    self.globals["bounded_text"] = lambda path, limit: (
+                        "" if Path(path).parent.name == "103" else reader(path, limit))
+                    writer = self.globals["private_json"]
+                    if fault == "private_write":
+                        self.globals["private_json"] = mock.Mock(side_effect=PermissionError("private write detail"))
+                    with self.assertRaisesRegex(RuntimeError, "live child left its unit census"):
+                        owner.observe_once()
+                    detail = owner.census_gap
+                    self.assertNotIn("operator", json.dumps(detail))
+                    self.assertNotIn("private", json.dumps(detail).replace("private_capture", ""))
+                    self.assertEqual(detail["observed"]["cgroup"], "/<name>/<name>/<name>")
+                    self.assertEqual(len(detail["observed"]["cgroup_sha256"]), 64)
+                    self.assertEqual(detail["observed"]["cmdline"], [])
+                    self.assertEqual(detail.get("pidfd_error"), "RuntimeError" if fault == "pidfd" else None)
+                    self.assertEqual(detail.get("pidfd_exited"), None if fault == "pidfd" else True)
+                    self.assertEqual(detail["private_capture"], "PermissionError" if fault == "private_write" else "saved")
+                    self.globals["private_json"] = writer
+
+    def test_finite_census_gap_keeps_unit_names_in_public_receipt(self):
+        paths = {
+            "/init.scope": "/init.scope",
+            "/user.slice/user-1001.slice/user@1001.service/init.scope":
+                "/user.slice/user-1001.slice/user@1001.service/init.scope",
+            "/system.slice/cron.service": "/system.slice/cron.service",
+            "/private-operator/system.slice/cron.service": "/<name>/system.slice/cron.service",
+            "/a.mount/a.socket/" + "b" * 64 + ".scope/" + "c" * 65 + ".service":
+                "/a.mount/a.socket/" + "b" * 64 + ".scope/<name>",
+            "/bad!.service/cron.service.extra": "/<name>/<name>",
+        }
+        for path, public in paths.items():
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                with self.observations(owner, rows), mock.patch.object(os, "getuid", return_value=1001), \
+                        mock.patch.object(os, "pidfd_open", side_effect=lambda pid, flags: pid + 1000, create=True):
+                    owner.observe_once()
+                    rows.pop(103)
+                    membership = self.globals["cgroup_membership"]
+                    self.globals["cgroup_membership"] = lambda pid: path if pid in (102, 103) else membership(pid)
+                    owner.record_census_gap(103, 1103)
+                    # Use the same JSON serialization as the uploaded receipt.
+                    detail = json.loads(json.dumps(owner.census_gap))
+                    for sample in ("observed", "parent"):
+                        self.assertEqual(detail[sample]["cgroup"], public)
+                        self.assertEqual(detail[sample]["cgroup_sha256"], hashlib.sha256(path.encode()).hexdigest())
+                    self.assertNotIn("private-operator", json.dumps(detail))
+
+    def test_finite_census_gap_rereads_unit_and_parent_despite_missing_retained_keys(self):
+        for fault in ("none", "known", "sample", "parent_exited", "parent_gone", "parent_denied", "unit_gone"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                with self.observations(owner, rows), mock.patch.object(os, "getuid", return_value=1001), \
+                        mock.patch.object(os, "pidfd_open", side_effect=lambda pid, flags: pid + 1000, create=True):
+                    owner.observe_once()
+                    rows.pop(103)
+                    if fault == "known":
+                        del owner.known[103]
+                    elif fault == "sample":
+                        del owner.known[103]["census_sample"]
+                    reader = self.globals["bounded_text"]
+                    reads = []
+                    def read(path, limit):
+                        if Path(path).name == "cgroup.procs":
+                            reads.append(path)
+                            if fault == "unit_gone" and len(reads) == 2:
+                                raise FileNotFoundError("private unit detail")
+                            return "99 100 101 102" if len(reads) == 1 else "99 100 101 102 103"
+                        if Path(path) == Path("/proc/103/stat"):
+                            fields = ["S", "102", "103"] + ["0"] * 17
+                            fields[19] = "803"
+                            return "103 (private child) " + " ".join(fields)
+                        return reader(path, limit)
+                    def membership(pid):
+                        if pid == 102 and len(reads) == 2 and fault in ("parent_gone", "parent_denied"):
+                            raise (FileNotFoundError if fault == "parent_gone" else PermissionError)("private parent")
+                        return "/outside" if pid == 900 else owner.binding["ControlGroup"]
+                    def exited(fd):
+                        if len(reads) != 2:
+                            return False
+                        if fd == 1102 and fault in ("parent_gone", "parent_denied"):
+                            raise (ProcessLookupError if fault == "parent_gone" else PermissionError)("private parent")
+                        return fd == 1102 and fault == "parent_exited"
+                    self.globals.update(bounded_text=read, cgroup_membership=membership, pidfd_exited=exited)
+                    with self.assertRaisesRegex(RuntimeError, "live child left its unit census"):
+                        owner.observe_once()
+                    detail = owner.census_gap
+                    self.assertEqual(len(reads), 2)
+                    self.assertEqual(detail["parent"]["pid"], 102)
+                    if fault in ("parent_gone", "parent_denied"):
+                        self.assertIn("pidfd_error", detail["parent"])
+                        self.assertIn("cgroup_error", detail["parent"])
+                    else:
+                        self.assertEqual(detail["parent"]["pidfd_exited"], fault == "parent_exited")
+                        self.assertEqual(detail["parent"]["cgroup"], owner.binding["ControlGroup"])
+                    if fault == "unit_gone":
+                        self.assertEqual(detail["expected_cgroup_procs_error"], "FileNotFoundError")
+                    else:
+                        self.assertEqual(detail["expected_cgroup_procs"], [99, 100, 101, 102, 103])
+                    self.assertNotIn("private parent", json.dumps(detail))
 
     def test_finite_pidfd_binding_closes_on_identity_race_or_unreadable_child(self):
         for fault in ("reused", "disappeared", "denied"):

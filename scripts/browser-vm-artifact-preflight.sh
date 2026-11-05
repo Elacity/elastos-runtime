@@ -178,6 +178,8 @@ def path_stat(path, executable=False, socket=False):
         return {"ok": False, "path": ""}
     p = pathlib.Path(path)
     ok = p.exists()
+    if ok and not socket:
+        ok = p.is_file() and os.access(p, os.R_OK)
     if ok and executable:
         ok = os.access(p, os.X_OK)
     if ok and socket:
@@ -305,7 +307,7 @@ def inspect_ext4_sidecar_manifest(image):
     }
     image_path = pathlib.Path(image)
     manifest_path = pathlib.Path(rootfs_manifest)
-    if not image_path.is_file():
+    if not image_path.is_file() or not os.access(image_path, os.R_OK):
         result["errors"].append("rootfs image missing")
         return result
     if not manifest_path.is_file():
@@ -341,7 +343,7 @@ def inspect_ext4_sidecar_manifest(image):
     if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
             or any(char not in "0123456789abcdef" for char in expected_sha256)):
         result["errors"].append("rootfs manifest sidecar requires a lowercase SHA-256 digest")
-    else:
+    elif mode != "--host-readiness":
         try:
             actual_sha256 = sha256_file(image)
             result["image_identity"] = {"size": actual_size, "sha256": actual_sha256}
@@ -385,8 +387,8 @@ def inspect_ext4_sidecar_manifest(image):
         result["errors"].append("rootfs manifest target preflight reports script errors")
     validate_manifest(result["manifest"], result["errors"])
 
-    result["verified_sidecar"] = not result["errors"]
-    result["ok"] = result["verified_sidecar"]
+    result["ok"] = not result["errors"]
+    result["verified_sidecar"] = result["ok"] and mode != "--host-readiness"
     return result
 
 
@@ -395,7 +397,7 @@ def inspect_ext4_rootfs(image):
     # Availability of debugfs does not change the artifact identity requirement.
     result = inspect_ext4_sidecar_manifest(image)
     result["debugfs"] = path_stat(debugfs_bin, executable=True)
-    if not result["ok"] or not result["debugfs"]["ok"]:
+    if mode == "--host-readiness" or not result["ok"] or not result["debugfs"]["ok"]:
         return result
     result["source_kind"] = "ext4_image"
     result["inspectable"] = True
@@ -447,6 +449,8 @@ def inspect_ext4_rootfs(image):
 
 
 def inspect_rootfs():
+    if mode == "--host-readiness":
+        return inspect_ext4_rootfs(rootfs)
     if staged_rootfs and pathlib.Path(staged_rootfs).is_dir():
         return run_target_preflight(staged_rootfs)
     if pathlib.Path(rootfs).is_dir():
@@ -458,21 +462,26 @@ rootfs_contract = inspect_rootfs()
 
 
 def verify_image_set():
-    if not rootfs_contract.get("verified_sidecar") or not rootfs_contract.get("ok"):
+    if not rootfs_contract.get("ok") or (mode != "--host-readiness" and not rootfs_contract.get("verified_sidecar")):
         return "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
     receipt = rootfs_contract["build_receipt"]
     default_initrd = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
     initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
-    initrd = os.environ.get(initrd_key) or str(pathlib.Path(data_dir) / default_initrd)
+    # Native adapters share INITRAMFS; image projection also accepts Linux INITRD.
+    initrd = (os.environ.get("ELASTOS_BROWSER_VM_INITRAMFS") or os.environ.get(initrd_key)
+              or str(pathlib.Path(data_dir) / default_initrd))
     try:
         for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
             entry = receipt.get(name)
             actual = pathlib.Path(artifact)
-            if not actual.is_file():
+            if not actual.is_file() or not os.access(actual, os.R_OK):
                 return "preparation_required"
             if (not isinstance(entry, dict) or type(entry.get("size")) is not int
                     or entry["size"] != actual.stat().st_size
-                    or entry.get("sha256") != sha256_file(artifact)):
+                    or not isinstance(entry.get("sha256"), str)
+                    or len(entry["sha256"]) != 64
+                    or any(char not in "0123456789abcdef" for char in entry["sha256"])
+                    or (mode != "--host-readiness" and entry["sha256"] != sha256_file(artifact))):
                 return "artifact_invalid"
     except OSError:
         return "artifact_invalid"
@@ -495,7 +504,7 @@ control = {
 if platform.startswith("linux-"):
     substrate = {
         "kind": "crosvm",
-        "kvm": path_stat("/dev/kvm"),
+        "vz_supervisor": path_stat(vz_supervisor, executable=True),
         "crosvm": path_stat(crosvm, executable=True),
         "kernel": path_stat(kernel),
         "rootfs_contract": {"ok": rootfs_contract["ok"], "path": rootfs},
@@ -523,8 +532,8 @@ local_substrate_artifacts_ready = not missing_for_local_substrate and rootfs_con
 launch_ready = bool(control["control_socket"]["ok"])
 
 if mode == "--host-readiness":
-    # This operation is read-only. It admits the local host's immutable image
-    # set; control-socket presence is independent of artifact identity.
+    # Runtime owns content admission. This probe checks host capability and
+    # artifact presence, shape and permissions, without reading image bytes.
     reason = None
     message = None
     import platform as host_platform
@@ -536,14 +545,16 @@ if mode == "--host-readiness":
         message = "This computer uses an approved remote Browser Engine. The local guest requires ARM64 virtualization."
     elif platform != host_id:
         reason = "host_unsupported"
-    elif platform.startswith("linux-") and not os.path.exists("/dev/kvm"):
-        reason = "host_unsupported"
-        message = "Browser needs KVM virtualization. This host has no /dev/kvm device."
+    elif pathlib.Path(vz_supervisor).name.startswith(("browser-vm-local-crosvm-launcher", "browser-vm-remote-vz-launcher")):
+        reason = "readiness_unsupported"
     elif image_reason := verify_image_set():
         reason = image_reason
     elif not local_substrate_artifacts_ready:
         reason = "preparation_required"
-    elif platform == "darwin-arm64" and not (
+    elif not (os.path.isabs(vz_supervisor) and os.path.isfile(vz_supervisor)
+              and os.access(vz_supervisor, os.X_OK)):
+        reason = "preparation_required"
+    elif not (
         os.path.isabs(turn_program := os.environ.get("ELASTOS_BROWSER_VM_TURN_PROGRAM", ""))
         and os.path.isfile(turn_program)
         and os.access(turn_program, os.X_OK)
@@ -551,28 +562,15 @@ if mode == "--host-readiness":
         reason = "preparation_required"
     else:
         try:
-            if reason is None and platform == "darwin-arm64":
-                probe = subprocess.run([vz_supervisor, "--host-capabilities"],
-                                       capture_output=True, text=True, timeout=2, check=True)
-                host = json.loads(probe.stdout)
-                if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
-                    reason = "readiness_unsupported"
-                elif host.get("available") is not True:
-                    reason = ("preparation_required" if host.get("reason") == "preparation_required"
-                              else "host_unsupported")
-            elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
-                network = subprocess.run([sys.executable, str(pathlib.Path(data_dir) / "scripts/browser-vm-linux-network.py"), "check"],
-                                         capture_output=True, text=True, timeout=5)
-                if network.returncode:
-                    reason = "preparation_required"
-                    message = network.stderr.strip()
-                import fcntl
-                if reason is None:
-                    with open("/dev/kvm", "r+b", buffering=0) as kvm:
-                        if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
-                            reason = "host_unsupported"
-            elif reason is None:
-                reason = "host_unsupported"
+            # The native owner checks its platform and selected transport.
+            probe = subprocess.run([vz_supervisor, "--host-capabilities"],
+                                   capture_output=True, text=True, timeout=2, check=True)
+            host = json.loads(probe.stdout)
+            if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
+                reason = "readiness_unsupported"
+            elif host.get("available") is not True:
+                reason = ("preparation_required" if host.get("reason") == "preparation_required"
+                          else "host_unsupported")
         except (ValueError, subprocess.SubprocessError, AttributeError):
             reason = "readiness_unsupported"
         except OSError:

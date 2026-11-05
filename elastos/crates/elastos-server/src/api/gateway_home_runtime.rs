@@ -1,5 +1,16 @@
 use super::*;
 
+fn home_projection_token_error(err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    if err.to_string() == "home launch token auth session is not active" {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired session" })),
+        )
+    } else {
+        gateway_internal_error(err)
+    }
+}
+
 pub(super) async fn home_launch(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -111,15 +122,22 @@ pub(super) async fn home_launch(
         .viewer
         .as_deref()
         .unwrap_or(target_summary.target.as_str());
-    let route = append_home_launch_token(
+    let token = issue_home_projection_launch_token_with_context(
         &state.data_dir,
-        &target_summary.route,
         &target_summary.target,
         executable_actor,
-        &req.query,
         &context,
     )
-    .map_err(gateway_internal_error)?;
+    .map_err(home_projection_token_error)?;
+    let expires_at = gateway_home_token::require_carried_home_launch_token(
+        &state.data_dir,
+        &token,
+        &[executable_actor],
+    )
+    .map_err(gateway_internal_error)?
+    .expires_at;
+    let route = append_home_launch_token_to_route(&target_summary.route, &req.query, &token)
+        .map_err(gateway_internal_error)?;
     let route =
         crate::api::browser_capsules::canonical_browser_capsule_route(&route).map_err(|error| {
             (
@@ -129,6 +147,7 @@ pub(super) async fn home_launch(
         })?;
 
     Ok(Json(HomeLaunchResponse {
+        expires_at,
         target: target_summary.target,
         window_policy: target_summary.window_policy,
         title: target_summary.title,
@@ -1872,6 +1891,57 @@ async fn home_list_runtime_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_token_projection_lapsed_grant_returns_unauthorized() {
+        let data = tempfile::tempdir().unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:alice".into(),
+            session_id: "auth:alice".into(),
+            proof_binding_id: Some("proof:alice".into()),
+            grant_id: "grant:alice".into(),
+        };
+        let mut grant = elastos_runtime::auth::AuthSessionGrantV1 {
+            schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.into(),
+            principal_id: context.principal_id.clone(),
+            session_id: context.session_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone().unwrap(),
+            grant_id: context.grant_id.clone(),
+            issued_at: now_ts(),
+            expires_at: now_ts() + 300,
+            apps: vec![HOME_CAPSULE_ID.into()],
+        };
+        crate::auth::store_session_grant(data.path(), grant.clone()).unwrap();
+        let token =
+            issue_home_launch_token_with_context(data.path(), HOME_CAPSULE_ID, &context).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:61180".parse().unwrap());
+        headers.insert("origin", "http://localhost:61180".parse().unwrap());
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+        let validated =
+            require_home_launch_token_context(data.path(), &headers, HOME_CAPSULE_ID).unwrap();
+        // Expire the stored grant after frame validation, before projection minting.
+        grant.expires_at = now_ts();
+        crate::auth::store_session_grant(data.path(), grant).unwrap();
+        let (status, Json(body)) = issue_home_projection_launch_token_with_context(
+            data.path(),
+            CHAT_ROOM_CAPSULE_ID,
+            CHAT_ROOM_CAPSULE_ID,
+            &validated,
+        )
+        .map_err(home_projection_token_error)
+        .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid or expired session");
+    }
+
+    #[test]
+    fn home_token_projection_internal_error_keeps_server_status() {
+        let (status, Json(body)) =
+            home_projection_token_error(anyhow::anyhow!("failed to load signing key"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "failed to load signing key");
+    }
 
     #[tokio::test]
     async fn native_shell_metadata_refuses_generic_home_launch_before_runtime_start() {

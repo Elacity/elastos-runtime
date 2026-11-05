@@ -1,3 +1,4 @@
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
 import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 const lockedShell = document.getElementById("locked-shell");
@@ -30,7 +31,7 @@ const peopleCountNode = document.getElementById("people-count");
 const discoveryVisibleCountNode = document.getElementById("discovery-visible-count");
 const pageTitle = document.querySelector(".people-page-title");
 const launchParams = new URLSearchParams(window.location.search);
-const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
+let homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = launchParams.get("home_origin") || "";
 const DISCOVERY_SCHEMA = "elastos.people.discovery/v1";
 const SECTION_TITLES = {
@@ -39,10 +40,17 @@ const SECTION_TITLES = {
   discovery: "Public",
 };
 
-const homeClipboard = createHomeClipboardClient({
+const clipboardOptions = () => ({
   targetId: "people",
   homeOrigin: homeParentOrigin,
   homeToken,
+});
+const homeClipboard = createHomeClipboardClient(clipboardOptions());
+createHomeNavigationClient({ homeToken, homeOrigin: homeParentOrigin, target: "people",
+  onHomeToken(token) {
+    homeClipboard.setHomeToken(token);
+    homeToken = token;
+  },
 });
 let localProfileId = "";
 let sendingContact = false;
