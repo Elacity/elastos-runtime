@@ -59,6 +59,13 @@ struct EngineTaskCompletion<T> {
     changed: Arc<Notify>,
 }
 
+impl<T> EngineTaskCompletion<T> {
+    fn publish(mut self, result: T) {
+        let _ = self.result.set(result);
+        self.fallback = None;
+    }
+}
+
 impl<T> Drop for EngineTaskCompletion<T> {
     fn drop(&mut self) {
         if let Some(fallback) = self.fallback.take() {
@@ -454,8 +461,7 @@ pub(crate) async fn invoke(
             };
             tokio::spawn(async move {
                 let result = prepare(&task).await.map_err(|e| e.to_string());
-                task.prepared.set(result).ok();
-                drop(completion);
+                completion.publish(result);
                 supervise(task).await;
             });
             page
@@ -562,8 +568,7 @@ pub(crate) async fn invoke(
                     if result["status"] != "ok" {
                         task.closing.store(true, Ordering::Release);
                     }
-                    task.result.set(result).ok();
-                    drop(completion);
+                    completion.publish(result);
                     if task.closing.load(Ordering::Acquire) {
                         let _ = close(&task).await;
                     }
@@ -572,7 +577,7 @@ pub(crate) async fn invoke(
             drop(admission);
             let result = page.wait_result().await?;
             ensure!(
-                !page.closing.load(Ordering::Acquire),
+                result["status"] != "ok" || !page.closing.load(Ordering::Acquire),
                 "Engine owner retired before launch publication"
             );
             Ok(result)

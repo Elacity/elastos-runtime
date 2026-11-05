@@ -22,6 +22,7 @@ const FILES: [&str; 4] = [RECEIPT, "rootfs.ext4", "vmlinux", "initrd"];
 const MAX_ARCHIVE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
 const STAGING_PREFIX: &str = ".browser-image-stage-";
+// Each image-set directory owns its admission budget across releases/platforms.
 const VERIFIED_SET_CACHE_LIMIT: usize = 8;
 // The unpacked set: the 4096 MiB root disk that
 // scripts/build/build-browser-vm-rootfs.sh builds, plus kernel, initrd and
@@ -74,6 +75,7 @@ impl ImageVerification {
 
 struct VerificationOwner<'a> {
     cache: &'a Mutex<VecDeque<VerifiedSet>>,
+    image_set: &'a Path,
     verification: Arc<ImageVerification>,
 }
 
@@ -91,13 +93,19 @@ impl VerificationOwner<'_> {
         cache.retain(|entry| !entry.verification.result.get().is_some_and(Result::is_err));
         while cache
             .iter()
-            .filter(|entry| entry.verification.result.get().is_some())
+            .filter(|entry| {
+                entry.key.paths[0].parent() == Some(self.image_set)
+                    && entry.verification.result.get().is_some()
+            })
             .count()
             > VERIFIED_SET_CACHE_LIMIT
         {
             let oldest = cache
                 .iter()
-                .position(|entry| entry.verification.result.get().is_some())
+                .position(|entry| {
+                    entry.key.paths[0].parent() == Some(self.image_set)
+                        && entry.verification.result.get().is_some()
+                })
                 .unwrap();
             cache.remove(oldest);
         }
@@ -209,6 +217,9 @@ fn verify_cached_payload_in_with_cancel(
     verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
 ) -> anyhow::Result<[String; 3]> {
     check_cancelled(cancelled)?;
+    let image_set = paths[0]
+        .parent()
+        .context("Browser image set directory required")?;
     let key = VerifiedSetKey {
         paths: paths.clone(),
         platform: platform.to_owned(),
@@ -243,6 +254,7 @@ fn verify_cached_payload_in_with_cancel(
     }
     let owner = VerificationOwner {
         cache,
+        image_set,
         verification,
     };
     let checked = (|| -> anyhow::Result<[String; 3]> {
@@ -334,8 +346,9 @@ pub(crate) fn start_background_verification(
     platform: &str,
 ) -> Option<BackgroundVerification> {
     if !super::browser_config::local_vm_configured(data, platform).unwrap_or(false)
-        || !(data.join(INSTALL_PATH).join("rootfs.ext4").is_file()
-            || data.join("browser-vm/rootfs.ext4").is_file())
+        || !aliases(platform).first().is_some_and(|(alias, file)| {
+            data.join(INSTALL_PATH).join(file).is_file() || data.join(alias).is_file()
+        })
     {
         return None;
     }
@@ -2375,12 +2388,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_image_cache_keeps_other_home_admission_after_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = cache_fixture(&temp.path().join("first-home"));
+        verify_cached_payload(&first, "darwin-arm64", "legacy", None, || {
+            verify_payload_paths(&first, "darwin-arm64")
+        })
+        .unwrap();
+        for index in 0..VERIFIED_SET_CACHE_LIMIT + 1 {
+            let paths = cache_fixture(&temp.path().join(format!("other-home-{index}")));
+            verify_cached_payload(&paths, "darwin-arm64", "legacy", None, || {
+                verify_payload_paths(&paths, "darwin-arm64")
+            })
+            .unwrap();
+            verified_seed_identity(&paths[1], "darwin-arm64").unwrap();
+        }
+        verified_seed_identity(&first[1], "darwin-arm64").unwrap();
+        verify_cached_payload(&first, "darwin-arm64", "legacy", None, || {
+            panic!("other Homes must retain this Home's verification")
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn browser_image_successful_verification_cache_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let cache = Mutex::new(VecDeque::new());
         let mut first = None;
         for index in 0..VERIFIED_SET_CACHE_LIMIT + 1 {
-            let paths = cache_fixture(&temp.path().join(index.to_string()));
+            let paths = FILES.map(|name| temp.path().join(format!("{index}-{name}")));
+            for (path, (_, bytes)) in paths.iter().zip(fixture(b"working-image")) {
+                fs::write(path, bytes).unwrap();
+            }
             verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
                 verify_payload_paths(&paths, "darwin-arm64")
             })
