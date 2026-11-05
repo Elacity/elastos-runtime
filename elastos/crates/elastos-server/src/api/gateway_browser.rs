@@ -186,16 +186,21 @@ impl BrowserOpenFailure {
 
     fn provider(scheme: &str, err: anyhow::Error) -> Self {
         let (status, message) = gateway_provider_error_tuple(scheme, err);
-        Self::text(status, message)
+        if scheme == "browser-engine" {
+            Self::json(
+                status,
+                serde_json::json!({
+                    "code": "provider_error",
+                    "message": "Browser Engine failed to start cleanly.",
+                }),
+            )
+        } else {
+            Self::text(status, message)
+        }
     }
 
     fn engine_provider(message: impl Into<String>) -> Self {
-        let (status, _) =
-            gateway_provider_error_tuple("browser-engine", anyhow::anyhow!(message.into()));
-        Self::text(
-            status,
-            "Browser Engine failed to start cleanly.".to_string(),
-        )
+        Self::provider("browser-engine", anyhow::anyhow!(message.into()))
     }
 
     fn into_response(self) -> Response {
@@ -4662,6 +4667,33 @@ fn browser_display_error_response(error: BrowserDisplayError) -> Response {
 #[cfg(test)]
 mod browser_open_outcome_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn engine_provider_constructor_keeps_all_diagnostics_out_of_response_bodies() {
+        for message in [
+            "browser-engine provider unavailable: /private/engine/rootfs.img",
+            "private host blocked: /private/engine/rootfs.img",
+            "invalid engine reply: /private/engine/rootfs.img",
+            "page not found: /private/engine/rootfs.img",
+            "engine failed: /private/engine/rootfs.img",
+        ] {
+            let expected_status =
+                gateway_provider_error_tuple("browser-engine", anyhow::anyhow!(message)).0;
+            let response = BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .into_response();
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("/private/engine/rootfs.img"));
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                payload["message"],
+                "Browser Engine failed to start cleanly."
+            );
+            assert_eq!(payload["code"], "provider_error");
+        }
+    }
 
     #[test]
     fn engine_error_keeps_status_while_projection_keeps_diagnostics_private() {

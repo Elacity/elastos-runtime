@@ -3445,6 +3445,12 @@ async fn test_browser_malformed_success_reconciles_instead_of_releasing_ownershi
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("/private/engine/rootfs.img"));
+    assert_eq!(
+        payload["message"],
+        "Browser Engine failed to start cleanly."
+    );
+    assert_eq!(payload["code"], "provider_error");
     assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(close_calls.snapshot().await.len(), 1);
     assert_eq!(reconciliation_calls.count(), 1);

@@ -4007,6 +4007,12 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                             "provider": "browser-engine-adapter",
                             "protocol_version": "2.1",
                             "page_id": "unsafe page id",
+                            "direct_network": false,
+                            "wallet_injection": false,
+                            "display_session": {
+                                "schema": "elastos.browser.display-session/v1",
+                                "mode": "/private/engine/rootfs.img",
+                            },
                         }
                     })),
                     MockDispatchedBrowserLaunchFailure::PendingThenTerminal
