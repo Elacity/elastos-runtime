@@ -2054,13 +2054,15 @@ class DataPathTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual('setup --browser' in result.stdout, hinted)
 
-    def test_linux_update_omits_browser_hint(self):
+    def test_linux_existing_install_omits_browser_hint(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             helpers = HELPERS.replace('/dev/kvm', '/dev/null')
-            result = shell(helpers + '\nPREVIOUS_VERSION=0.8.0\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"', root)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn('setup --browser', result.stdout)
+            for previous_version in ['0.8.0', '']:
+                with self.subTest(previous_version=previous_version):
+                    result = shell(helpers + '\nEXISTING_INSTALL=true\nPREVIOUS_VERSION="$2"\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"', root, previous_version)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('setup --browser', result.stdout)
 
     def test_linux_install_leaves_browser_setup_to_the_owner(self):
         with tempfile.TemporaryDirectory() as scratch:

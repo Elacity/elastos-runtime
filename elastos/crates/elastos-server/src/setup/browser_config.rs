@@ -188,45 +188,6 @@ pub fn browser_available(platform: &str) -> bool {
     matches!(platform, "darwin-arm64" | "linux-arm64")
 }
 
-pub fn home_browser_available(data: &Path, platform: &str) -> bool {
-    home_browser_available_with_probe(
-        data,
-        platform,
-        std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
-            .ok()
-            .as_deref(),
-        || native_host_available(data).is_ok(),
-    )
-}
-
-fn home_browser_available_with_probe(
-    data: &Path,
-    platform: &str,
-    inline: Option<&str>,
-    native_available: impl FnOnce() -> bool,
-) -> bool {
-    // Apple Silicon retains its existing local and approved remote Engines.
-    if platform == "darwin-arm64" {
-        return true;
-    }
-    if platform != "linux-arm64" {
-        return false;
-    }
-    let Ok(Some(config)) = read_engine_selection(data, inline) else {
-        return false;
-    };
-    let native = data.join("bin/browser-vz-engine-supervisor");
-    config["adapters"].as_array().is_some_and(|adapters| {
-        adapters.iter().any(|adapter| {
-            let supervisor = &adapter["supervisor"];
-            let launcher = supervisor["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
-                .as_str()
-                .or_else(|| supervisor["program"].as_str());
-            adapter["kind"] == "chromium_microvm" && launcher == native.to_str()
-        })
-    }) && native_available()
-}
-
 fn native_host_available(data: &Path) -> anyhow::Result<()> {
     let program = data.join("bin/browser-vz-engine-supervisor");
     super::verify_installed_component_binary(data, "browser-vz-engine-supervisor", &program)?;
@@ -729,67 +690,6 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use sha2::Digest;
-
-    #[test]
-    fn arm_browser_requires_its_selected_managed_native_host() {
-        let data = Path::new("/fixture/elastos");
-        let selected = |program: &str| {
-            serde_json::json!({"adapters":[{
-                "kind":"chromium_microvm", "supervisor":{"env":{
-                    "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER": program
-                }}
-            }]})
-            .to_string()
-        };
-        let native = selected("/fixture/elastos/bin/browser-vz-engine-supervisor");
-        assert!(home_browser_available_with_probe(
-            data,
-            "linux-arm64",
-            Some(&native),
-            || true
-        ));
-        assert!(!home_browser_available_with_probe(
-            data,
-            "linux-arm64",
-            Some(&native),
-            || false
-        ));
-        for platform in ["linux-amd64", "darwin-amd64", "linux-riscv64"] {
-            assert!(!home_browser_available_with_probe(
-                data,
-                platform,
-                Some(&native),
-                || true
-            ));
-        }
-        for program in [
-            "/other/browser-vz-engine-supervisor",
-            "/fixture/elastos/bin/browser-vm-local-crosvm-launcher",
-            "/fixture/elastos/bin/browser-vm-remote-vz-launcher",
-        ] {
-            assert!(!home_browser_available_with_probe(
-                data,
-                "linux-arm64",
-                Some(&selected(program)),
-                || true
-            ));
-        }
-        for raw in ["invalid", r#"{"adapters":[]}"#] {
-            assert!(!home_browser_available_with_probe(
-                data,
-                "linux-arm64",
-                Some(raw),
-                || true
-            ));
-        }
-        let remote = selected("/fixture/elastos/bin/browser-vm-remote-vz-launcher");
-        assert!(home_browser_available_with_probe(
-            data,
-            "darwin-arm64",
-            Some(&remote),
-            || false
-        ));
-    }
 
     #[test]
     fn native_host_probe_requires_its_contract_and_has_a_deadline() {

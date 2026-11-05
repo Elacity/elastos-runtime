@@ -1209,7 +1209,7 @@ show_ready() {
     echo -e "  ${GREEN}${BOLD}ElastOS ${RELEASE_VERSION:-} is ready${NC} ${DIM}(took ${elapsed})${NC}"
     printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
     printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
-    if [[ -z "${PREVIOUS_VERSION:-}" && "$(uname -s)" == Linux && "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && browser_kvm_access_available; then
+    if [[ "${EXISTING_INSTALL:-false}" == false && "$(uname -s)" == Linux && "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && browser_kvm_access_available; then
         printf '    Browser is available on this computer. To turn it on, run: %s setup --browser\n' "$command"
     fi
     if [[ "$command" != elastos ]]; then

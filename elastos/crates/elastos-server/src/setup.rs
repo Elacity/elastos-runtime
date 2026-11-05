@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod browser_config;
+pub use browser_config::browser_available;
 pub(crate) use browser_config::linux_host_setup_message;
-pub use browser_config::{browser_available, home_browser_available};
 mod browser_linux;
 mod browser_vm_image;
 pub(crate) use browser_vm_image::start_background_verification as start_browser_image_verification;
