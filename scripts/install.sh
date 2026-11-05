@@ -485,6 +485,7 @@ installer_runtime_control() {
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -494,7 +495,7 @@ import time
 PREFIXES = ("serve", "gateway", "room open", "home")
 
 
-def process_snapshot(pid):
+def process_snapshot(pid, recorded_at=None):
     if type(pid) is not int or not 1 < pid < 2**31:
         raise ValueError("Runtime PID must be a positive process ID greater than one")
     try:
@@ -503,8 +504,9 @@ def process_snapshot(pid):
         return None
     except PermissionError:
         raise ValueError("Runtime process belongs to another owner")
+    observed_at = time.time()
     result = subprocess.run(
-        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "stat=", "-o", "command="],
+        ["ps", "-ww", "-p", str(pid), "-o", "uid=", "-o", "lstart=", "-o", "etime=", "-o", "stat=", "-o", "command="],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         env=dict(os.environ, LC_ALL="C"), text=True, check=False,
     )
@@ -514,14 +516,28 @@ def process_snapshot(pid):
         except ProcessLookupError:
             return None
         raise ValueError("Runtime process identity is unavailable")
-    parts = result.stdout.strip().split(None, 7)
-    if len(parts) != 8 or not parts[0].isdigit():
+    parts = result.stdout.strip().split(None, 8)
+    if len(parts) != 9 or not parts[0].isdigit():
         raise ValueError("Runtime process identity is ambiguous")
     if int(parts[0]) != os.geteuid():
         raise ValueError("Runtime process belongs to another owner")
-    if parts[6].startswith("Z"):
+    if parts[7].startswith("Z"):
         return None
-    return (" ".join(parts[1:6]), parts[7])
+    if recorded_at is not None:
+        # etime is numeric on Linux and macOS: [[days-]hours:]minutes:seconds.
+        # Sample the clock before ps; elapsed seconds are rounded down, so
+        # this lower bound rejects definite PID reuse without parsing dates.
+        elapsed = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", parts[6])
+        if elapsed is None:
+            raise ValueError("Runtime process elapsed time is ambiguous")
+        days, hours, minutes, seconds = (int(field or 0) for field in elapsed.groups())
+        if minutes >= 60 or seconds >= 60 or (days and hours >= 24):
+            raise ValueError("Runtime process elapsed time is ambiguous")
+        age = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+        if observed_at - age - 1 >= recorded_at:
+            raise ValueError("Runtime process started after its ownership record; preserved its process and state")
+    # Keep the raw birth string for identity checks, independent of elapsed age.
+    return (" ".join(parts[1:6]), parts[8])
 
 
 def matches_command(snapshot, binary, prefixes=PREFIXES):
@@ -690,16 +706,10 @@ def stop_installation(data_dir, binary, scan_binary):
             continue
         records.append((path, recorded))
         pid = recorded[0]
-        snapshot = process_snapshot(pid)
+        snapshot = process_snapshot(pid, recorded_at=recorded[4])
         if snapshot is not None:
             if not matches_command(snapshot, binary):
                 raise ValueError("Recorded Runtime is foreign or ambiguous; preserved its process and state")
-            # ps lstart and this Python process use the same local timezone.
-            # Its second precision rejects definite PID reuse; coordinates do
-            # not yet carry a process birth identity for finer comparisons.
-            started = time.mktime(time.strptime(snapshot[0], "%a %b %d %H:%M:%S %Y"))
-            if started > int(recorded[4]):
-                raise ValueError("Runtime process started after its ownership record; preserved its process and state")
             selected[pid] = snapshot
     if scan_binary:
         for pid, snapshot in selected_processes(binary).items():

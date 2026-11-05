@@ -2347,6 +2347,59 @@ HOME_DIR="$2" DATA_DIR="$3" RUN_BIN="$4"
         self.assertEqual(self.coords.read_bytes(), original)
         self.assertEqual(self.coords.stat().st_mtime, 0)
 
+    def test_cleanup_accepts_german_and_spanish_ps_dates(self):
+        mocks = self.root / "mocks"
+        mocks.mkdir()
+        ps = mocks / "ps"
+        ps.write_text("#!" + sys.executable + "\n" + '''import os, subprocess, sys
+result = subprocess.run(["/bin/ps", *sys.argv[1:]], capture_output=True, text=True)
+output = result.stdout
+if "lstart=" in sys.argv:
+    fields = output.split(None, 6)
+    if len(fields) == 7:
+        fields[1:3] = ("Do", "Mär") if os.environ["FAKE_PS_LANGUAGE"] == "German" else ("jue", "nov")
+        output = " ".join(fields)
+sys.stdout.write(output)
+sys.exit(result.returncode)
+''')
+        ps.chmod(0o755)
+        for language in ("German", "Spanish"):
+            if self.child.poll() is not None:
+                self.child = subprocess.Popen([str(self.binary), "serve"], cwd=self.root,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.write_coords(self.coords, self.child.pid)
+            with self.subTest(language=language), mock.patch.dict(os.environ, {
+                "PATH": str(mocks) + os.pathsep + os.environ["PATH"], "FAKE_PS_LANGUAGE": language,
+                "LC_TIME": "de_DE.UTF-8" if language == "German" else "es_CO.UTF-8",
+            }):
+                PROCESSES["stop_installation"](str(self.data), str(self.binary), True)
+                self.child.wait(timeout=5)
+                self.assertFalse(self.coords.exists())
+
+    def test_numeric_process_age_formats_and_invalid_values(self):
+        for elapsed, age in (("00:09", 9), ("01:02:03", 3723), ("2-03:04:05", 183845)):
+            output = f"{os.geteuid()} Do Mär 05 10:00:00 2026 {elapsed} S {self.binary} serve"
+            with self.subTest(elapsed=elapsed), mock.patch.object(time, "time", return_value=1000000), mock.patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+            ):
+                snapshot = PROCESSES["process_snapshot"](self.child.pid, recorded_at=1000000 - age)
+                self.assertTrue(PROCESSES["matches_command"](snapshot, str(self.binary)))
+                with self.assertRaisesRegex(ValueError, "started after its ownership record"):
+                    PROCESSES["process_snapshot"](self.child.pid, recorded_at=1000000 - age - 1)
+        for elapsed in ("unknown", "1:60", "60:00", "1-24:00:00", "-01:00"):
+            output = f"{os.geteuid()} Do Mär 05 10:00:00 2026 {elapsed} S {self.binary} serve"
+            with self.subTest(elapsed=elapsed), mock.patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+            ), self.assertRaisesRegex(ValueError, "elapsed time is ambiguous"):
+                PROCESSES["process_snapshot"](self.child.pid, recorded_at=time.time())
+
+    def test_elapsed_second_rounding_accepts_record_created_before_clock_boundary(self):
+        output = f"{os.geteuid()} Thu Nov 05 10:00:00 2026 00:00 S {self.binary} serve"
+        with mock.patch.object(time, "time", return_value=1000000.1), mock.patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")
+        ):
+            self.assertIsNotNone(PROCESSES["process_snapshot"](self.child.pid, recorded_at=999999.9))
+
     def test_owned_process_escalation_finishes_cleanup(self):
         child = subprocess.Popen([str(self.binary), "serve"], cwd=self.root,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -2369,7 +2422,7 @@ HOME_DIR="$2" DATA_DIR="$3" RUN_BIN="$4"
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "incomplete", "")):
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 PROCESSES["process_snapshot"](self.child.pid)
-        foreign = f"{os.geteuid() + 1} Thu Sep 10 10:00:00 2026 S {self.binary} serve"
+        foreign = f"{os.geteuid() + 1} Thu Sep 10 10:00:00 2026 00:01 S {self.binary} serve"
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, foreign, "")):
             with self.assertRaisesRegex(ValueError, "another owner"):
                 PROCESSES["process_snapshot"](self.child.pid)
