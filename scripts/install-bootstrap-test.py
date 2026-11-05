@@ -871,7 +871,8 @@ validate_release_identity "$1" "$2"
 
 class PermissionRepairTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(prefix="installer's permissions ", dir=Path(__file__).resolve().parent.parent)
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(prefix="installer's permissions ", dir=SANDBOX_BASE)
         self.addCleanup(self.scratch.cleanup)
         self.home = Path(self.scratch.name)
         self.data = self.home / "data"
@@ -991,8 +992,50 @@ class PermissionRepairTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual((path.stat().st_dev, path.stat().st_ino, path.read_bytes()), before[path])
 
+    def test_component_binaries_and_update_journal_keep_bytes_and_identity(self):
+        directory = self.data / "bin"
+        directory.mkdir()
+        directory.chmod(0o775)
+        paths = {directory / "localhost-provider": 0o755, directory / "shell": 0o755,
+                 self.binary.parent / ".elastos.update-journal.json": 0o600}
+        for path in paths:
+            path.write_bytes(b"retained component or journal")
+            path.chmod(0o775 if path.parent == directory else 0o660)
+        before = {path: (path.stat().st_dev, path.stat().st_ino, path.read_bytes()) for path in paths}
+        self.repair()
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        for path, mode in paths.items():
+            self.assertEqual(path.stat().st_mode & 0o777, mode, path)
+            self.assertEqual((path.stat().st_dev, path.stat().st_ino, path.read_bytes()), before[path])
+
+    def test_linked_component_or_journal_preserves_outside_file_and_all_modes(self):
+        outside = self.home / "outside"
+        outside.write_bytes(b"outside file")
+        outside.chmod(0o664)
+        directory = self.data / "bin"
+        directory.mkdir()
+        directory.chmod(0o775)
+        for path in (directory / "localhost-provider", self.binary.parent / ".elastos.update-journal.json"):
+            for kind in ("symlink", "hardlink"):
+                with self.subTest(path=path.name, kind=kind):
+                    if kind == "symlink":
+                        path.symlink_to(outside)
+                    else:
+                        os.link(outside, path)
+                    try:
+                        with mock.patch.object(os, "fchmod") as changes:
+                            with self.assertRaises(ValueError):
+                                self.repair()
+                            changes.assert_not_called()
+                        self.assertEqual((outside.read_bytes(), outside.stat().st_mode & 0o777),
+                                         (b"outside file", 0o664))
+                    finally:
+                        path.unlink()
+
 
 class InstallationTests(unittest.TestCase):
+    """The complete installer against served artifact bytes inside one disposable sandbox."""
+
     def test_older_group_writable_installation_is_repaired_before_writer(self):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
@@ -1010,6 +1053,70 @@ class InstallationTests(unittest.TestCase):
                 self.assertFalse(path.stat().st_mode & 0o022, path)
                 self.assertIn("Repaired permissions: " + shlex.quote(str(path)), result.stdout)
 
+    def test_symlinked_storage_ancestors_install_and_repair(self):
+        did, head, release = installable_fixture()
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), InstallerSandbox(head, release, did) as sandbox:
+                # Both roots can be relocated. The final managed elastos entries stay literal.
+                local = sandbox.home / ".local"
+                sandbox.data = local / "share/elastos"
+                if legacy:
+                    self.existing_installation(sandbox)
+                    sandbox.binary.chmod(0o775)
+                    (sandbox.data / "components.json").chmod(0o664)
+                else:
+                    local.mkdir()
+                storage = sandbox.root / "storage"
+                commands = sandbox.root / "commands"
+                for root, target in ((local / "share", storage), (local / "bin", commands)):
+                    if root.exists():
+                        root.rename(target)
+                    else:
+                        target.mkdir()
+                    root.symlink_to(target)
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only", env=("XDG_DATA_HOME=",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(requests, self.REQUESTS)
+                self.assertFalse(sandbox.binary.stat().st_mode & 0o022)
+                self.assertTrue(os.access(sandbox.binary, os.X_OK))
+                if legacy:
+                    self.assertEqual(sandbox.binary.stat().st_mode & 0o777, 0o755)
+                    self.assertIn("Repaired permissions:", result.stdout)
+                    self.assertEqual((sandbox.data / "components.json").stat().st_mode & 0o777, 0o644)
+                self.assertTrue((local / "share").is_symlink())
+                self.assertTrue((local / "bin").is_symlink())
+
+    def test_symlinks_inside_resolved_storage_refuse_before_repair(self):
+        did, head, release = installable_fixture()
+        for entry in ("", "components.json", "bin"):
+            with self.subTest(entry=entry), InstallerSandbox(head, release, did) as sandbox:
+                self.existing_installation(sandbox)
+                storage = sandbox.root / "storage"
+                sandbox.data.parent.rename(storage)
+                sandbox.data.parent.symlink_to(storage)
+                outside = sandbox.root / "outside"
+                if entry == "components.json":
+                    outside.write_bytes(b"outside file")
+                    outside.chmod(0o664)
+                    (sandbox.data / entry).unlink()
+                else:
+                    outside.mkdir()
+                    (outside / "probe").write_bytes(b"outside file")
+                    (outside / "probe").chmod(0o664)
+                    if entry == "":
+                        sandbox.data.rename(storage / "saved-home")
+                (sandbox.data / entry).symlink_to(outside)
+                probe = outside if outside.is_file() else outside / "probe"
+                sandbox.binary.chmod(0o775)
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Unsafe installation path", result.stderr)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+                self.assertEqual(sandbox.binary.stat().st_mode & 0o777, 0o775)
+                self.assertEqual((probe.read_bytes(), probe.stat().st_mode & 0o777), (b"outside file", 0o664))
+
     def test_world_writable_installation_file_stops_before_any_repair(self):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
@@ -1023,8 +1130,6 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(requests, [])
             self.assertEqual(sandbox.home_state(), before)
             self.assertEqual(sandbox.runtime_calls(), [])
-
-    """The complete installer against served artifact bytes inside one disposable sandbox."""
 
     REQUESTS = ["https://test.invalid/release-head.json", "https://test.invalid/release.json",
                 "https://test.invalid/artifacts/elastos-x86_64-linux"]

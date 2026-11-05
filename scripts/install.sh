@@ -379,6 +379,27 @@ sha256_file() {
     fi
 }
 
+installer_physical_root() {
+    local root="$1" suffix=""
+    # A fresh install can have missing directories below a relocated ancestor.
+    while [[ ! -e "$root" && ! -L "$root" && "$root" != "/" ]]; do
+        suffix="/$(basename -- "$root")${suffix}"
+        root="$(dirname -- "$root")"
+    done
+    root="$(cd -P -- "$root" && pwd -P)" || return 1
+    printf '%s\n' "${root%/}${suffix:-/}"
+}
+
+installer_repair_existing_permissions() {
+    local home_root data_root bin_root
+    home_root="$(installer_physical_root "$HOME")" || return 1
+    data_root="$(installer_physical_root "$(dirname -- "$DATA_DIR")")" || return 1
+    bin_root="$(installer_physical_root "$INSTALL_DIR")" || return 1
+    # Resolve storage roots only. The managed elastos entries remain literal,
+    # so descriptor traversal still refuses links inside the installation.
+    installer_repair_permissions "$home_root" "${data_root%/}/elastos" "${bin_root%/}/elastos"
+}
+
 installer_repair_permissions() {
     python3 - "$@" <<'PY_INSTALL_PERMISSIONS'
 import os
@@ -392,11 +413,12 @@ def repair_permissions(home, data, binary):
     home, data, binary = map(os.path.abspath, (home, data, binary))
     targets = [(os.path.dirname(binary), True, 0), (data, True, 0),
                (binary, False, 0o022),
-               (os.path.join(os.path.dirname(binary), ".elastos.install.lock"), False, 0o077)]
+               (os.path.join(os.path.dirname(binary), ".elastos.install.lock"), False, 0o077),
+               (os.path.join(os.path.dirname(binary), ".elastos.update-journal.json"), False, 0o077)]
     for name in ("components.json", "sources.json", "runtime-coords.json",
                  "home-runtime-coords.json", "gateway-runtime-coords.json"):
         targets.append((os.path.join(data, name), False, 0o077 if "coords" in name else 0o022))
-    for directory in ("installation", "ElastOS", "ElastOS/SystemServices", "ElastOS/SystemServices/Publisher"):
+    for directory in ("bin", "installation", "ElastOS", "ElastOS/SystemServices", "ElastOS/SystemServices/Publisher"):
         targets.append((os.path.join(data, directory), True, 0o077 if directory == "installation" else 0o022))
     for directory in ("installation", "ElastOS/SystemServices/Publisher"):
         for name in ("release-head.json", "release.json"):
@@ -437,6 +459,13 @@ def repair_permissions(home, data, binary):
 
     try:
         descriptors["/"] = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        component_root = os.path.join(data, "bin")
+        component_fd = open_path(component_root, True)
+        if component_fd is not None:
+            for name in sorted(os.listdir(component_fd)):
+                path = os.path.join(component_root, name)
+                targets.append((path, False, 0o022))
+                target_paths.add(path)
         for path, directory, refused in targets:
             if not os.path.lexists(path):
                 continue
@@ -1525,7 +1554,7 @@ require_safe_existing_dir() {
     [[ -e "$dir" || -L "$dir" ]] || return 0
     [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
     if [[ ! -O "$dir" ]]; then
-        installer_repair_permissions "$HOME" "$DATA_DIR" "${INSTALL_DIR}/elastos" || exit 1
+        installer_repair_existing_permissions || exit 1
         die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not owned by you. Choose a location you own"
     fi
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
@@ -1564,7 +1593,7 @@ require_safe_parent_chain() {
 require_safe_existing_dir "$INSTALL_DIR"
 require_safe_existing_dir "$DATA_DIR"
 require_safe_parent_chain "$DATA_DIR"
-installer_repair_permissions "$HOME" "$DATA_DIR" "${INSTALL_DIR}/elastos" || exit 1
+installer_repair_existing_permissions || exit 1
 
 # ── Fetch + verify release head ──────────────────────────────────────
 
