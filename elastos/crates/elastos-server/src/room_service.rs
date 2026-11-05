@@ -2606,12 +2606,6 @@ fn create_session_record_with_actor(
     }
 }
 
-fn ensure_session_actor_id(session: &mut SessionRecord) {
-    if session.actor_id.trim().is_empty() {
-        session.actor_id = random_hex(16);
-    }
-}
-
 fn current_session_identity(session: &SessionRecord) -> CurrentSessionIdentity {
     CurrentSessionIdentity {
         actor_id: session.actor_id.clone(),
@@ -3810,7 +3804,7 @@ pub fn read_attachment(
 }
 
 fn validate_session_authority(data_dir: &Path, session: &SessionRecord) -> anyhow::Result<()> {
-    if session.expires_at <= now_ts() {
+    if session.expires_at <= now_ts() || session.actor_id.trim().is_empty() {
         anyhow::bail!("invalid or expired session");
     }
     match session.authorization.as_ref() {
@@ -3834,7 +3828,6 @@ fn validate_session<'a>(
         .iter_mut()
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
-    ensure_session_actor_id(session);
     validate_session_authority(data_dir, session)?;
     if !session
         .capabilities
@@ -5887,6 +5880,57 @@ mod tests {
         )
         .unwrap();
         authorization
+    }
+
+    #[test]
+    fn room_session_bound_refuses_stored_legacy_authority_and_allows_restart() {
+        for missing in [
+            vec!["actor_id"],
+            vec!["authorization"],
+            vec!["actor_id", "authorization"],
+        ] {
+            let data = tempfile::tempdir().unwrap();
+            let authorization = grant_room_authorization(data.path());
+            let start = || {
+                start_local_principal_runtime_session(
+                    data.path(),
+                    "did:key:z6room",
+                    &authorization.principal_id,
+                    "Room person",
+                    "Browser",
+                    &authorization,
+                )
+                .unwrap()
+            };
+            let session = start();
+            let path = storage_paths(data.path()).unwrap().sessions_path;
+            let mut records: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            for field in &missing {
+                records[0].as_object_mut().unwrap().remove(*field);
+            }
+            fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+            let before = room_state_snapshot(data.path());
+            // Exercise both the read-only and mutable validators after deserialization.
+            for result in [
+                collaboration_room_poll(data.path(), &session.token, "network", "room", 0)
+                    .map(|_| ()),
+                room_poll(data.path(), &session.token, 0).map(|_| ()),
+                append_object(data.path(), &session.token, "legacy message").map(|_| ()),
+            ] {
+                assert!(
+                    result.is_err_and(|error| error
+                        .to_string()
+                        .contains("invalid or expired session")),
+                    "legacy session accepted with missing {missing:?}"
+                );
+            }
+            assert_eq!(room_state_snapshot(data.path()), before);
+            let replacement = start();
+            assert_ne!(replacement.token, session.token);
+            assert!(room_poll(data.path(), &replacement.token, 0).is_ok());
+            assert!(append_object(data.path(), &replacement.token, "new message").is_ok());
+        }
     }
 
     #[test]
