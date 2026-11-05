@@ -17,6 +17,7 @@ use std::process::Command;
 mod browser_config;
 pub use browser_config::{browser_available, home_browser_available};
 mod browser_vm_image;
+pub(crate) use browser_vm_image::start_background_verification as start_browser_image_verification;
 #[cfg(unix)]
 mod local_model_engine_receipt;
 mod progress;

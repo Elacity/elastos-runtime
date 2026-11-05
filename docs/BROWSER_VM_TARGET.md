@@ -105,6 +105,15 @@ SHA-256, plus successful evidence for each guest and audio dependency. When
 Staged directories use the build-time target check; installed ext4 images need
 the image receipt. Publisher authorization, host eligibility, control-service
 readiness and product media remain separate admission and qualification gates.
+Runtime hashes the installed image set in a background thread at Home start
+on local Browser hosts. Linux uses idle I/O priority and nice 19; macOS uses a
+plain background thread. Browser open shares that verification and waits for
+its remaining work. Runtime keeps the computed digests in process memory,
+bound to device, inode, size, mode, nanosecond modification and change times,
+plus the receipt and selected release. A changed identity requires a new hash.
+The shell preflight hashes its own inputs on each invocation. Adjacent files
+provide no verification authority.
+
 An image refresh must retain its source provenance and produce a matching
 receipt for the changed bytes before the image passes this check.
 

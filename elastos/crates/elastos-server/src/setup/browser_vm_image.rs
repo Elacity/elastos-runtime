@@ -50,8 +50,14 @@ struct VerifiedSetKey {
     identities: Vec<(FileIdentity, FileIdentity)>,
 }
 
-fn verified_sets() -> &'static Mutex<VecDeque<VerifiedSetKey>> {
-    static CACHE: OnceLock<Mutex<VecDeque<VerifiedSetKey>>> = OnceLock::new();
+struct VerifiedSet {
+    key: VerifiedSetKey,
+    // These digests come only from bytes hashed by this Runtime process.
+    digests: [String; 3],
+}
+
+fn verified_sets() -> &'static Mutex<VecDeque<VerifiedSet>> {
+    static CACHE: OnceLock<Mutex<VecDeque<VerifiedSet>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
@@ -93,20 +99,20 @@ fn verify_cached_payload(
     paths: &[PathBuf; 4],
     platform: &str,
     release: &str,
-    verify: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
+) -> anyhow::Result<[String; 3]> {
     verify_cached_payload_in(verified_sets(), paths, platform, release, verify)
 }
 
 fn verify_cached_payload_in(
-    cache: &Mutex<VecDeque<VerifiedSetKey>>,
+    cache: &Mutex<VecDeque<VerifiedSet>>,
     paths: &[PathBuf; 4],
     platform: &str,
     release: &str,
-    verify: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    // Callers run on the blocking pool. Serialize verification with this small
-    // cache so concurrent opens share one hash pass, including a cold miss.
+    verify: impl FnOnce() -> anyhow::Result<[String; 3]>,
+) -> anyhow::Result<[String; 3]> {
+    // Background startup and blocking open callers share this lock. A cold
+    // open waits for the in-progress hash and then rechecks the file identities.
     let mut cache = cache.lock().unwrap_or_else(|err| err.into_inner());
     let key = VerifiedSetKey {
         paths: paths.clone(),
@@ -114,25 +120,122 @@ fn verify_cached_payload_in(
         release: release.to_owned(),
         identities: image_identities(paths)?,
     };
-    let checked = (|| -> anyhow::Result<()> {
-        if !cache.iter().any(|entry| entry == &key) {
-            verify()?;
-        }
+    let checked = (|| -> anyhow::Result<[String; 3]> {
+        let digests = match cache.iter().find(|entry| entry.key == key) {
+            Some(entry) => entry.digests.clone(),
+            None => verify()?,
+        };
         // Replacement during verification fails this admission and invalidates
         // any earlier successful entry before another caller can use it.
         ensure!(
             image_identities(paths)? == key.identities,
             "Browser image set changed during verification; retry preparation"
         );
-        Ok(())
+        Ok(digests)
     })();
-    cache.retain(|entry| entry.paths != key.paths);
-    checked?;
-    cache.push_back(key);
+    cache.retain(|entry| entry.key.paths != key.paths);
+    let digests = checked?;
+    cache.push_back(VerifiedSet {
+        key,
+        digests: digests.clone(),
+    });
     while cache.len() > VERIFIED_SET_CACHE_LIMIT {
         cache.pop_front();
     }
+    Ok(digests)
+}
+
+/// A Home owns this read-only warmup until gateway shutdown. It uses a dedicated
+/// thread so Linux per-thread scheduling changes stay off Tokio's blocking pool.
+pub(crate) struct BackgroundVerification {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundVerification {
+    fn spawn(
+        platform: String,
+        verify: impl FnOnce(&AtomicBool) -> anyhow::Result<()> + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let worker = std::thread::Builder::new()
+            .name("browser-image-verification".into())
+            .spawn(move || {
+                let result = lower_background_priority(&platform).and_then(|()| verify(&flag));
+                if let Err(error) = result {
+                    if !flag.load(Ordering::Acquire) {
+                        tracing::warn!(%error, "Browser startup image verification failed; open will verify or prepare the image");
+                    }
+                }
+            })?;
+        Ok(Self {
+            cancelled,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
+    }
+}
+
+impl Drop for BackgroundVerification {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn lower_background_priority(platform: &str) -> anyhow::Result<()> {
+    if platform.starts_with("linux-") {
+        #[cfg(target_os = "linux")]
+        {
+            // Linux pid 0 here names the calling thread. Idle I/O and nice 19
+            // let foreground Home work run first, without requiring privilege.
+            let io = unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13) };
+            let cpu = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) };
+            ensure!(
+                io == 0 && cpu == 0,
+                "Browser background priority could not be set: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
     Ok(())
+}
+
+/// Hash existing local Engine artifacts at Home start. Acquisition stays with
+/// an explicit Browser open; source Homes and released Homes share this cache.
+pub(crate) fn start_background_verification(
+    data: &Path,
+    platform: &str,
+) -> Option<BackgroundVerification> {
+    if !super::browser_config::local_vm_selected(data, platform).unwrap_or(false) {
+        return None;
+    }
+    let data = data.to_path_buf();
+    let platform = platform.to_owned();
+    let result = BackgroundVerification::spawn(platform.clone(), move |cancelled| {
+        let manifest_path = data.join("components.json");
+        if manifest_path.exists() {
+            let manifest = super::load_manifest_from_path(&manifest_path)?;
+            if manifest.external.contains_key(NAME) {
+                let info = component_info(&manifest, &platform)?;
+                return verify_installed_with_cancel(&data, info, &platform, Some(cancelled));
+            }
+        }
+        verify_legacy_with_cancel(&data, &platform, Some(cancelled))
+    });
+    match result {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::warn!(%error, "Browser startup image verification could not start");
+            None
+        }
+    }
 }
 
 fn guest_platform(platform: &str) -> anyhow::Result<&str> {
@@ -273,15 +376,11 @@ pub(super) fn validate_request(
     check_aliases(data, platform, false)
 }
 
-fn verify_payload(bundle: &Path, platform: &str) -> anyhow::Result<()> {
-    verify_payload_with_cancel(bundle, platform, None)
-}
-
 fn verify_payload_with_cancel(
     bundle: &Path,
     platform: &str,
     cancelled: Option<&AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<[String; 3]> {
     for name in FILES {
         ensure!(
             fs::symlink_metadata(bundle.join(name))?
@@ -294,6 +393,14 @@ fn verify_payload_with_cancel(
 }
 
 pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> anyhow::Result<()> {
+    verify_legacy_with_cancel(data, platform, None)
+}
+
+fn verify_legacy_with_cancel(
+    data: &Path,
+    platform: &str,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<()> {
     guest_platform(platform)?;
     // Existing source-home installations own these paths. Verify their bytes and
     // receipt in place; setup acquisition neither copies nor rewrites them.
@@ -313,11 +420,13 @@ pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> a
         kernel,
         data.join(image_aliases[3].0),
     ];
-    verify_cached_payload(&paths, platform, "legacy", || verify_payload_paths(&paths, platform))
+    verify_cached_payload(&paths, platform, "legacy", || verify_payload_paths_with_cancel(&paths, platform, cancelled))
+        .map(|_| ())
         .map_err(|err| anyhow::anyhow!("Browser image release package metadata is unavailable and the installed image set requires preparation ({err}); install a release with browser-vm-image metadata or select an approved remote Engine"))
 }
 
-fn verify_payload_paths(paths: &[PathBuf; 4], platform: &str) -> anyhow::Result<()> {
+#[cfg(test)]
+fn verify_payload_paths(paths: &[PathBuf; 4], platform: &str) -> anyhow::Result<[String; 3]> {
     verify_payload_paths_with_cancel(paths, platform, None)
 }
 
@@ -325,7 +434,9 @@ fn verify_payload_paths_with_cancel(
     paths: &[PathBuf; 4],
     platform: &str,
     cancelled: Option<&AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<[String; 3]> {
+    check_cancelled(cancelled)?;
+    let identities = image_identities(paths)?;
     let target = guest_platform(platform)?;
     let receipt_path = &paths[0];
     ensure!(
@@ -342,7 +453,7 @@ fn verify_payload_paths_with_cancel(
         receipt["target_platform"] == target,
         "Browser image architecture does not match {platform}"
     );
-    let mut verified = Vec::with_capacity(3);
+    let mut digests = Vec::with_capacity(3);
     for (path, name, entry) in [
         (&paths[1], "rootfs.ext4", &receipt),
         (&paths[2], "vmlinux", &receipt["kernel"]),
@@ -357,21 +468,16 @@ fn verify_payload_paths_with_cancel(
                 && entry["size"].as_u64() == Some(meta.len()),
             "Browser image {name} size or file type is invalid"
         );
-        // The identity is taken before the bytes are read, so a write during
-        // hashing cannot bind its new identity to the old digest.
-        let identity = VerifiedArtifact::observe(path);
+        let digest = hash_reader(&mut fs::File::open(path)?, cancelled)?;
         ensure!(
             hash.len() == 64
                 && hash
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                && (identity
-                    .as_ref()
-                    .is_some_and(|artifact| artifact.recorded_digest().as_deref() == Some(hash))
-                    || hash_reader(&mut fs::File::open(path)?, cancelled)? == hash),
+                && digest == hash,
             "Browser image {name} checksum mismatch"
         );
-        verified.push((path, hash, identity));
+        digests.push(digest);
     }
     let preflight = &receipt["preflight"];
     ensure!(
@@ -410,14 +516,27 @@ fn verify_payload_paths_with_cancel(
         ),
         "Browser image transport contract is incompatible"
     );
-    record_verified_identities(&verified);
-    Ok(())
+    ensure!(
+        image_identities(paths)? == identities,
+        "Browser image set changed during verification; retry preparation"
+    );
+    check_cancelled(cancelled)?;
+    Ok(digests.try_into().unwrap())
 }
 
 pub(super) fn verify_installed(
     data: &Path,
     info: &PlatformInfo,
     platform: &str,
+) -> anyhow::Result<()> {
+    verify_installed_with_cancel(data, info, platform, None)
+}
+
+fn verify_installed_with_cancel(
+    data: &Path,
+    info: &PlatformInfo,
+    platform: &str,
+    cancelled: Option<&AtomicBool>,
 ) -> anyhow::Result<()> {
     let dest = data.join(INSTALL_PATH);
     validate_request(data, info, &dest, platform)?;
@@ -433,108 +552,9 @@ pub(super) fn verify_installed(
     );
     let paths = FILES.map(|name| dest.join(name));
     verify_cached_payload(&paths, platform, &serde_json::to_string(info)?, || {
-        verify_payload(&dest, platform)
+        verify_payload_with_cancel(&dest, platform, cancelled)
     })
-}
-
-/// Image artifacts whose bytes matched the receipt, by file identity, kept in
-/// the image set. A later verifier (the Runtime at a Browser open, the
-/// Engine's host readiness) then trusts them without hashing the 4 GiB root
-/// disk again: 45-80 s on an SD card (#90). Any write or replacement changes
-/// the inode or the change time, which an unprivileged process cannot set back.
-const VERIFIED_IDENTITY: &str = ".elastos-verified-identity.json";
-const VERIFIED_IDENTITY_SCHEMA: &str = "elastos.browser.vm-image-verified-identity/v1";
-const VERIFIED_IDENTITY_MAX_BYTES: u64 = 64 * 1024;
-
-/// One artifact's record location and identity, observed before its bytes
-/// are read.
-#[derive(PartialEq, Eq)]
-struct VerifiedArtifact {
-    record: PathBuf,
-    name: String,
-    identity: Value,
-}
-
-impl VerifiedArtifact {
-    #[cfg(unix)]
-    fn observe(path: &Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let real = fs::canonicalize(path).ok()?;
-        let meta = fs::metadata(&real).ok()?;
-        let nanos = |secs: i64, nsec: i64| secs.checked_mul(1_000_000_000)?.checked_add(nsec);
-        Some(Self {
-            record: real.parent()?.join(VERIFIED_IDENTITY),
-            name: real.file_name()?.to_str()?.to_owned(),
-            identity: json!({
-                "dev": meta.dev(),
-                "ino": meta.ino(),
-                "size": meta.len(),
-                "mtime_ns": nanos(meta.mtime(), meta.mtime_nsec())?,
-                "ctime_ns": nanos(meta.ctime(), meta.ctime_nsec())?,
-            }),
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn observe(_path: &Path) -> Option<Self> {
-        None
-    }
-
-    fn recorded_digest(&self) -> Option<String> {
-        let entry = &read_verified_record(&self.record)?["files"][&self.name];
-        (entry["identity"] == self.identity)
-            .then(|| entry["sha256"].as_str().map(str::to_owned))
-            .flatten()
-    }
-}
-
-fn read_verified_record(record: &Path) -> Option<Value> {
-    let meta = fs::symlink_metadata(record).ok()?;
-    if !meta.file_type().is_file() || meta.len() > VERIFIED_IDENTITY_MAX_BYTES {
-        return None;
-    }
-    let value: Value = serde_json::from_slice(&fs::read(record).ok()?).ok()?;
-    (value["schema"] == VERIFIED_IDENTITY_SCHEMA).then_some(value)
-}
-
-/// Records the verified artifacts when they share one image-set directory and
-/// none changed since its identity was observed. Best effort: without a
-/// record the next verifier hashes again.
-fn record_verified_identities(verified: &[(&PathBuf, &str, Option<VerifiedArtifact>)]) {
-    let mut record = None;
-    let mut files = serde_json::Map::new();
-    for (path, sha256, observed) in verified {
-        let Some(observed) = observed else { return };
-        if VerifiedArtifact::observe(path).as_ref() != Some(observed)
-            || record.get_or_insert_with(|| observed.record.clone()) != &observed.record
-        {
-            return;
-        }
-        files.insert(
-            observed.name.clone(),
-            json!({"identity": observed.identity, "sha256": sha256}),
-        );
-    }
-    let Some(record) = record else { return };
-    let value = json!({"schema": VERIFIED_IDENTITY_SCHEMA, "files": files});
-    if read_verified_record(&record).as_ref() == Some(&value) {
-        return;
-    }
-    let partial = record.with_file_name(format!("{VERIFIED_IDENTITY}.{}", std::process::id()));
-    let _ = fs::remove_file(&partial);
-    let written = (|| -> std::io::Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&partial)?;
-        std::io::Write::write_all(&mut file, &serde_json::to_vec(&value)?)?;
-        file.sync_all()?;
-        fs::rename(&partial, &record)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&partial);
-    }
+    .map(|_| ())
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> anyhow::Result<()> {
@@ -1015,47 +1035,42 @@ mod tests {
     }
 
     #[test]
-    fn browser_image_verified_identity_record_skips_the_hash_until_a_write() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path();
-        let (bytes, info) = archive(&fixture(b"recorded-image"));
-        install_archive(data, &bytes, &info, "darwin-arm64").unwrap();
-        let dest = data.join(INSTALL_PATH);
-        let mut record: Value =
-            serde_json::from_slice(&fs::read(dest.join(VERIFIED_IDENTITY)).unwrap()).unwrap();
-        assert_eq!(record["files"].as_object().unwrap().len(), 3);
-        assert_eq!(
-            record["files"]["rootfs.ext4"]["sha256"],
-            sha(b"recorded-image")
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dest.join(VERIFIED_IDENTITY))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
+    fn browser_image_refuses_forged_current_identity_record_on_each_host() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let mut files = fixture(b"original-image");
+            let mut receipt: Value = serde_json::from_slice(&files[0].1).unwrap();
+            receipt["target_platform"] = json!(guest_platform(platform).unwrap());
+            files[0].1 = serde_json::to_vec(&receipt).unwrap();
+            let (bytes, info) = archive(&files);
+            install_archive(data, &bytes, &info, platform).unwrap();
+            verify_installed(data, &info, platform).unwrap();
+            let dest = data.join(INSTALL_PATH);
+            let image = dest.join("rootfs.ext4");
+            fs::write(&image, b"modified-image").unwrap();
+            let meta = fs::metadata(&image).unwrap();
+            let record = dest.join(".elastos-verified-identity.json");
+            fs::write(
+                &record,
+                serde_json::to_vec(&json!({
+                    "schema": "elastos.browser.vm-image-verified-identity/v1",
+                    "files": {"rootfs.ext4": {"sha256": sha(b"original-image"), "identity": {
+                        "dev": meta.dev(), "ino": meta.ino(), "size": meta.len(),
+                        "mtime_ns": meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                        "ctime_ns": meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
+                    }}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                verify_installed(data, &info, platform).is_err(),
+                "{platform} must hash changed bytes despite the forged record"
+            );
         }
-
-        // A digest recorded for this exact identity admits the file without
-        // reading it: the receipt now names a digest the bytes do not have.
-        let paths = FILES.map(|name| dest.join(name));
-        let claimed = "0".repeat(64);
-        let mut receipt: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
-        receipt["sha256"] = json!(claimed);
-        fs::write(&paths[0], serde_json::to_vec(&receipt).unwrap()).unwrap();
-        record["files"]["rootfs.ext4"]["sha256"] = json!(claimed);
-        fs::write(
-            dest.join(VERIFIED_IDENTITY),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
-        verify_payload_paths(&paths, "darwin-arm64").unwrap();
-
-        // Any write changes the identity, so the bytes are hashed and refused.
-        fs::write(&paths[1], b"recorded-image").unwrap();
-        assert!(verify_payload_paths(&paths, "darwin-arm64").is_err());
     }
 
     #[test]
@@ -1701,6 +1716,175 @@ mod tests {
         FILES.map(|name| path.join(name))
     }
 
+    #[tokio::test]
+    async fn browser_image_background_verification_and_open_share_one_hash_on_each_host() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+        use std::time::Duration;
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = cache_fixture(temp.path());
+            let cache = Arc::new(Mutex::new(VecDeque::new()));
+            let count = Arc::new(AtomicUsize::new(0));
+            let (entered, started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let (background_cache, background_paths, background_count) =
+                (cache.clone(), paths.clone(), count.clone());
+            let worker = BackgroundVerification::spawn(platform.into(), move |cancelled| {
+                verify_cached_payload_in(
+                    &background_cache,
+                    &background_paths,
+                    platform,
+                    "legacy",
+                    || {
+                        background_count.fetch_add(1, Ordering::SeqCst);
+                        entered.send(()).unwrap();
+                        released.recv_timeout(Duration::from_secs(5)).unwrap();
+                        verify_payload_paths_with_cancel(
+                            &background_paths,
+                            platform,
+                            Some(cancelled),
+                        )
+                    },
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (opening, opened) = mpsc::channel();
+            let (done, finished) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let open = scope.spawn(|| {
+                    opening.send(()).unwrap();
+                    let digests =
+                        verify_cached_payload_in(&cache, &paths, platform, "legacy", || {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            verify_payload_paths(&paths, platform)
+                        })
+                        .unwrap();
+                    done.send(()).unwrap();
+                    digests
+                });
+                opened.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(
+                    cache.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                assert!(
+                    matches!(finished.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                    "open must wait for background verification"
+                );
+                release.send(()).unwrap();
+                assert_eq!(open.join().unwrap()[0], sha(b"working-image"));
+            });
+            worker.shutdown().await;
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{platform}");
+            let digests = verify_cached_payload_in(&cache, &paths, platform, "legacy", || {
+                panic!("unchanged identity must reuse process-owned digests")
+            })
+            .unwrap();
+            assert_eq!(digests[0], sha(b"working-image"));
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_image_home_start_warms_released_and_legacy_sets_on_each_host() {
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            for released in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let data = temp.path();
+                let (bytes, info) = archive(&fixture(b"startup-image"));
+                install_archive(data, &bytes, &info, platform).unwrap();
+                if released {
+                    let manifest = json!({"external": {NAME: {"install_path": INSTALL_PATH,
+                        "platforms": {platform: info}}}, "profiles": {}});
+                    fs::write(
+                        data.join("components.json"),
+                        serde_json::to_vec(&manifest).unwrap(),
+                    )
+                    .unwrap();
+                }
+                let mut worker = start_background_verification(data, platform).unwrap();
+                worker.worker.take().unwrap().join().unwrap();
+                let paths = if released {
+                    FILES.map(|name| data.join(INSTALL_PATH).join(name))
+                } else {
+                    let names = aliases(platform);
+                    [
+                        data.join(names[1].0),
+                        data.join(names[0].0),
+                        data.join(names[2].0),
+                        data.join(names[3].0),
+                    ]
+                };
+                let release = if released {
+                    serde_json::to_string(&info).unwrap()
+                } else {
+                    "legacy".into()
+                };
+                let digests = verify_cached_payload(&paths, platform, &release, || {
+                    panic!("Home startup must fill the same cache used by Browser open")
+                })
+                .unwrap();
+                assert_eq!(digests[0], sha(b"startup-image"));
+                assert!(!data
+                    .join(INSTALL_PATH)
+                    .join(".elastos-verified-identity.json")
+                    .exists());
+                worker.shutdown().await;
+            }
+        }
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(start_background_verification(fresh.path(), "linux-amd64").is_none());
+        assert!(start_background_verification(fresh.path(), "windows-amd64").is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_image_background_shutdown_cancels_and_joins_verification() {
+        use std::sync::mpsc;
+        let (entered, started) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let worker = BackgroundVerification::spawn("darwin-arm64".into(), move |cancelled| {
+            entered.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            assert!(hash_reader(&mut std::io::Cursor::new(b"image"), Some(cancelled)).is_err());
+            done.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        worker.shutdown().await;
+        finished.try_recv().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_image_background_linux_priority_is_thread_local_and_idle() {
+        let foreground_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let foreground_io = unsafe { libc::syscall(libc::SYS_ioprio_get, 1, 0) };
+        let thread = std::thread::spawn(|| {
+            lower_background_priority("linux-arm64").unwrap();
+            assert_eq!(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }, 19);
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_ioprio_get, 1, 0) } >> 13,
+                3
+            );
+        });
+        thread.join().unwrap();
+        assert_eq!(
+            unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) },
+            foreground_nice
+        );
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_ioprio_get, 1, 0) },
+            foreground_io
+        );
+    }
+
     #[test]
     fn browser_image_concurrent_opens_share_one_verification() {
         use std::sync::{
@@ -1748,81 +1932,85 @@ mod tests {
 
     #[test]
     fn browser_image_cache_reuses_unchanged_set_and_invalidates_release_receipt_and_replacement() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = cache_fixture(temp.path());
-        let cache = Mutex::new(VecDeque::new());
-        let count = std::cell::Cell::new(0);
-        let check = |release| {
-            verify_cached_payload_in(&cache, &paths, "darwin-arm64", release, || {
-                count.set(count.get() + 1);
-                verify_payload_paths(&paths, "darwin-arm64")
-            })
-        };
-        check("release-one").unwrap();
-        check("release-one").unwrap();
-        assert_eq!(
-            count.get(),
-            1,
-            "unchanged set must reuse its verified result"
-        );
-        check("release-two").unwrap();
-        assert_eq!(
-            count.get(),
-            2,
-            "selected release changes require a fresh verification"
-        );
-        let replacement = temp.path().join("replacement");
-        fs::write(&replacement, fs::read(&paths[1]).unwrap()).unwrap();
-        fs::rename(&replacement, &paths[1]).unwrap();
-        check("release-two").unwrap();
-        assert_eq!(
-            count.get(),
-            3,
-            "same-byte replacement must invalidate the cache"
-        );
-        let old_receipt = fs::read(&paths[0]).unwrap();
-        let mut receipt: Value = serde_json::from_slice(&old_receipt).unwrap();
-        receipt["target_platform"] = json!("linux-amd64");
-        fs::write(&paths[0], serde_json::to_vec(&receipt).unwrap()).unwrap();
-        assert!(check("release-two").is_err());
-        assert!(cache.lock().unwrap().is_empty());
-        fs::write(&paths[0], old_receipt).unwrap();
-        check("release-two").unwrap();
-        assert_eq!(count.get(), 5);
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = cache_fixture(temp.path());
+            let cache = Mutex::new(VecDeque::new());
+            let count = std::cell::Cell::new(0);
+            let check = |release| {
+                verify_cached_payload_in(&cache, &paths, platform, release, || {
+                    count.set(count.get() + 1);
+                    verify_payload_paths(&paths, platform)
+                })
+            };
+            check("release-one").unwrap();
+            check("release-one").unwrap();
+            assert_eq!(
+                count.get(),
+                1,
+                "unchanged set must reuse its verified result"
+            );
+            check("release-two").unwrap();
+            assert_eq!(
+                count.get(),
+                2,
+                "selected release changes require a fresh verification"
+            );
+            let replacement = temp.path().join("replacement");
+            fs::write(&replacement, fs::read(&paths[1]).unwrap()).unwrap();
+            fs::rename(&replacement, &paths[1]).unwrap();
+            check("release-two").unwrap();
+            assert_eq!(
+                count.get(),
+                3,
+                "same-byte replacement must invalidate the cache"
+            );
+            let old_receipt = fs::read(&paths[0]).unwrap();
+            let mut receipt: Value = serde_json::from_slice(&old_receipt).unwrap();
+            receipt["target_platform"] = json!("linux-amd64");
+            fs::write(&paths[0], serde_json::to_vec(&receipt).unwrap()).unwrap();
+            assert!(check("release-two").is_err());
+            assert!(cache.lock().unwrap().is_empty());
+            fs::write(&paths[0], old_receipt).unwrap();
+            check("release-two").unwrap();
+            assert_eq!(count.get(), 5);
+        }
     }
 
     #[test]
     fn browser_image_cache_rejects_same_size_mutation_with_restored_mtime_and_keeps_failures_uncached(
     ) {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = cache_fixture(temp.path());
-        let cache = Mutex::new(VecDeque::new());
-        let count = std::cell::Cell::new(0);
-        let check = || {
-            verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
-                count.set(count.get() + 1);
-                verify_payload_paths(&paths, "darwin-arm64")
-            })
-        };
-        check().unwrap();
-        let before = fs::metadata(&paths[1]).unwrap();
-        fs::write(&paths[1], b"changed-image").unwrap();
-        fs::File::open(&paths[1])
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
-            .unwrap();
-        assert_eq!(before.len(), fs::metadata(&paths[1]).unwrap().len());
-        assert_eq!(
-            before.modified().unwrap(),
-            fs::metadata(&paths[1]).unwrap().modified().unwrap()
-        );
-        assert!(
-            check().is_err(),
-            "same-size mutation must fail before admission"
-        );
-        assert!(check().is_err(), "a failed verification must run again");
-        assert_eq!(count.get(), 3);
-        assert!(cache.lock().unwrap().is_empty());
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = cache_fixture(temp.path());
+            let cache = Mutex::new(VecDeque::new());
+            let count = std::cell::Cell::new(0);
+            let check = || {
+                verify_cached_payload_in(&cache, &paths, platform, "legacy", || {
+                    count.set(count.get() + 1);
+                    verify_payload_paths(&paths, platform)
+                })
+            };
+            check().unwrap();
+            let before = fs::metadata(&paths[1]).unwrap();
+            fs::write(&paths[1], b"changed-image").unwrap();
+            fs::File::open(&paths[1])
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+            assert_eq!(before.len(), fs::metadata(&paths[1]).unwrap().len());
+            assert_eq!(
+                before.modified().unwrap(),
+                fs::metadata(&paths[1]).unwrap().modified().unwrap()
+            );
+            assert!(
+                check().is_err(),
+                "same-size mutation must fail before admission"
+            );
+            assert!(check().is_err(), "a failed verification must run again");
+            assert_eq!(count.get(), 3);
+            assert!(cache.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -1831,9 +2019,9 @@ mod tests {
         let paths = cache_fixture(temp.path());
         let cache = Mutex::new(VecDeque::new());
         let result = verify_cached_payload_in(&cache, &paths, "darwin-arm64", "legacy", || {
-            verify_payload_paths(&paths, "darwin-arm64")?;
+            let digests = verify_payload_paths(&paths, "darwin-arm64")?;
             fs::write(&paths[1], b"changed-image")?;
-            Ok(())
+            Ok(digests)
         });
         assert!(result
             .unwrap_err()

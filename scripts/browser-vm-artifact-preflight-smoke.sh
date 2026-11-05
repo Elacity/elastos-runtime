@@ -299,6 +299,22 @@ if debugfs and mke2fs:
                 env["ELASTOS_BROWSER_VM_TURN_PROGRAM"] = program
             host_check(f"host rejects {name} TURN program", {"state":"unavailable","reason":"preparation_required"})
         env["ELASTOS_BROWSER_VM_TURN_PROGRAM"] = str(turn_program)
+        # Keep the admitted rootfs digest fixed while forging current stat evidence.
+        original_image = image.read_bytes()
+        with image.open("r+b") as handle:
+            handle.seek(-1, 2)
+            handle.write(bytes([original_image[-1] ^ 1]))
+        info = image.stat()
+        forged_image_record = image.parent / ".elastos-verified-identity.json"
+        forged_image_record.write_text(json.dumps({"schema": "elastos.browser.vm-image-verified-identity/v1",
+            "files": {image.name: {"sha256": valid["sha256"], "identity": {
+                "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}}}}))
+        forged_image_record.chmod(0o600)
+        host_check("host rejects modified rootfs with forged current identity", {"state":"unavailable","reason":"artifact_invalid"})
+        image.write_bytes(original_image)
+        host_check("host hashes restored rootfs despite stale forged identity", {"state":"ready"})
+        forged_image_record.unlink()
         original_kernel = (data / "bin/vmlinux").read_bytes()
         (data / "bin/vmlinux").write_bytes(b"changed kernel")
         host_check("host rejects changed kernel", {"state":"unavailable","reason":"artifact_invalid"})
@@ -309,8 +325,8 @@ if debugfs and mke2fs:
         host_helper.write_text(host_helper.read_text().replace("true", "false"))
         host_check("host rejects unavailable virtualization", {"state":"unavailable","reason":"host_unsupported"})
         host_helper.write_text(host_helper.read_text().replace("false", "true"))
-        # A digest recorded for the kernel's exact identity is trusted without
-        # hashing; any later write changes that identity and is hashed again.
+        # A same-user writer can forge a current identity with the admitted digest.
+        # Readiness must still hash the bytes and refuse the changed artifact.
         kernel = data / "bin/vmlinux"
         kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
         info = kernel.stat()
@@ -319,7 +335,7 @@ if debugfs and mke2fs:
             "files": {"vmlinux": {"sha256": valid["kernel"]["sha256"], "identity": {
                 "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
                 "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}}}}))
-        host_check("host readiness trusts the recorded kernel identity", {"state":"ready"})
+        host_check("host rejects forged current kernel identity", {"state":"unavailable","reason":"artifact_invalid"})
         kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
         host_check("a write voids the recorded identity", {"state":"unavailable","reason":"artifact_invalid"})
         kernel.write_bytes(original_kernel)
@@ -398,7 +414,7 @@ if debugfs and mke2fs:
     # A valid identity still needs intact guest files when direct inspection is available.
     subprocess.run([debugfs, "-w", "-R", "rm /opt/elastos/bin/chromium", str(image)],
                    check=True, capture_output=True, text=True, timeout=10)
-    contract = check("verified identity with missing guest file", receipt(), False, debugfs)
+    contract = check("matching receipt with missing guest file", receipt(), False, debugfs)
     assert "chromium" in contract["missing"] and contract["verified_sidecar"] is True
 
 print(json.dumps({"schema": "elastos.browser.vm-artifact-preflight-smoke/v1", "ok": True,

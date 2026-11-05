@@ -144,6 +144,8 @@ async fn start_gateway_server_with_shutdown(
             crate::update_controller::finalize_principal_root_backups_after_start(data_dir.clone()),
         )
     });
+    let image_verification =
+        crate::setup::start_browser_image_verification(&data_dir, &crate::setup::detect_platform());
     let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
@@ -181,6 +183,9 @@ async fn start_gateway_server_with_shutdown(
     };
     if let Some(task) = backup_cleanup {
         task.abort();
+    }
+    if let Some(verification) = image_verification {
+        verification.shutdown().await;
     }
     connections.shutdown();
     // The server's deadline signals connection tasks. Wait for their request

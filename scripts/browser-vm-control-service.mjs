@@ -100,9 +100,8 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
-// A probe without the image set's verified-identity record hashes the 4 GiB
-// root disk once: 82 s cold on a Jetson SD card (#90). Runtime does not wait
-// for this at Home start; concurrent requests share the one probe.
+// The shell probe hashes the image bytes: up to 82 s cold on a Jetson
+// SD card (#90). Concurrent requests share this process-owned probe.
 const HOST_READINESS_PROBE_TIMEOUT_MS = 240_000;
 // Probe inputs that are not files: where the preflight resolves its tools and
 // which platform it admits for. The Darwin TURN program is a stamped file.
