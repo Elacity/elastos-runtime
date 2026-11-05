@@ -2073,13 +2073,17 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     lastScrollTop = scroller.scrollTop;
     lastMaxTop = scroller.scrollHeight - scroller.clientHeight;
   };
+  /* Layout can clamp a saved pin when the scroll range shrinks. A reader
+     above that reachable position has moved up; a clamp alone keeps follow. */
+  const stayedAtPin = (top) =>
+    scroller.scrollTop >= Math.min(top, scroller.scrollHeight - scroller.clientHeight) - 1;
   /* Land on the end now and once more after layout settles, unless the reader
      moved up in between or another turn took the transcript. */
   const pinToEnd = () => {
     scroller.scrollTop = scroller.scrollHeight;
     const top = scroller.scrollTop;
     window.requestAnimationFrame(() => {
-      if (generation === ctx.streamGeneration && scroller.scrollTop >= top - 1) {
+      if (generation === ctx.streamGeneration && stayedAtPin(top)) {
         scroller.scrollTop = scroller.scrollHeight;
         if (endScrollTop === top) {
           endScrollTop = scroller.scrollTop;
@@ -2928,7 +2932,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       /* The last flush and the rich render below make the reply taller; keep
          a reader who was following at the end. One who scrolled up since the
          stream ended (its listeners are gone) stays where they are. */
-      const pinned = endScrollTop !== null && !!scroller && scroller.scrollTop >= endScrollTop - 1;
+      const pinned = endScrollTop !== null && !!scroller && stayedAtPin(endScrollTop);
       /* Streaming painted plain text (live tokens never run Markdown, see
          adaptQuality). The finished reply, stopped early or not, now gets the
          render a reopened chat gives it: the whole text through the history
