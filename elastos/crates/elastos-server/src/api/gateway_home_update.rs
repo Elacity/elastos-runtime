@@ -372,6 +372,12 @@ where
             None if checking => "Checking for updates.",
             Some(check) if check.update_available && refused => crate::update_controller::REFUSED_MESSAGE,
             Some(check) if check.update_available => "An update is available.",
+            Some(check) if check.version_status == crate::operator_control::UpdateVersionStatus::InstalledNewer
+                && check.channel == "stable"
+                && semver::Version::parse(&check.current_version).is_ok_and(|version| !version.pre.is_empty())
+                => "Home has a newer test version than the latest stable release. The next newer stable release will be offered.",
+            Some(check) if check.version_status == crate::operator_control::UpdateVersionStatus::InstalledNewer
+                => "Home has a newer version than the latest release on this channel. The next newer release will be offered.",
             Some(_) => "Home is up to date.",
             None => "Could not check for updates. Check again when Carrier is connected.",
         },

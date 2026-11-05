@@ -3694,7 +3694,7 @@ function setRuntimeState(runtime) {
 }
 
 const TEST_CHANNEL_LABEL = "Test versions";
-const SOURCE_CHANNEL_NAMES = { canary: TEST_CHANNEL_LABEL, stable: "Stable" };
+const SOURCE_CHANNEL_NAMES = { canary: TEST_CHANNEL_LABEL, stable: "Stable", "jetson-test": "Retired test channel" };
 const SOURCE_SIGNED_TEXT = "Home installs only updates signed by its configured publisher.";
 
 function setSourceState(source) {
@@ -3719,7 +3719,7 @@ function setSourceState(source) {
   if (sourceChannelChoice) {
     sourceChannelChoice.querySelector('[value="canary"]').textContent = TEST_CHANNEL_LABEL;
     sourceChannelChoice.hidden = !configured || !hasShellAccess() || currentAccess.role !== "admin";
-    sourceChannelChoice.disabled = sourceChannelBusy || sourceChannelChoice.hidden || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
+    refreshSourceChannelChoiceDisabled();
     if (!sourceChannelBusy) sourceChannelChoice.value = channelId;
     setHiddenFields("source-status", !sourceChannelChoice.hidden && ["stable", "canary"].includes(channelId));
     if (channelId === "jetson-test" && !sourceChannelChoice.hidden && !sourceChannelBusy && !sourceChannelStatus.textContent) {
@@ -3730,7 +3730,7 @@ function setSourceState(source) {
 
 async function onSourceChannelChange() {
   const channel = sourceChannelChoice.value;
-  if (sourceChannelBusy || runtimeUpdateBusy || runtimeUpdatePending || currentAccess.role !== "admin"
+  if (sourceChannelBusy || runtimeUpdateBusy || runtimeUpdatePending || runtimeUpdateControllerBusy() || currentAccess.role !== "admin"
     || !hasShellAccess() || !currentSource.configured || !["stable", "canary"].includes(channel)
     || channel === currentSource.channel) {
     sourceChannelChoice.value = currentSource.channel;
@@ -3814,6 +3814,18 @@ function updateNoteItems(notes) {
   }).filter((item) => item.text);
 }
 
+function refreshSourceChannelChoiceDisabled() {
+  if (sourceChannelChoice) {
+    sourceChannelChoice.disabled = sourceChannelBusy || sourceChannelChoice.hidden || runtimeUpdateBusy
+      || Boolean(runtimeUpdatePending) || runtimeUpdateControllerBusy();
+  }
+}
+
+function runtimeUpdateControllerBusy() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  return Boolean(phase) && !["ready", "updated", "restored", "failed"].includes(phase);
+}
+
 function renderRuntimeUpdate(update) {
   runtimeUpdate = update && typeof update === "object" ? update : null;
   if (!runtimeUpdateNode || !runtimeUpdateButton) return;
@@ -3830,6 +3842,7 @@ function renderRuntimeUpdate(update) {
     runtimeUpdatePending = null;
     runtimeUpdateReconnects = 0;
   }
+  refreshSourceChannelChoiceDisabled();
   if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
     // An update running now (from any page) replaces this page's older result.
     runtimeUpdateFeedback = "";

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chromium, brave, jsonResponse, makeAppearanceRecord, makeSystemSummary, startSystemFixtureServer } from "./system-uiux-fixture.mjs";
 
 test("System channel choice confirms the exact owner intent, refreshes offers and keeps a test install", async () => {
-  let channel = "canary", role = "admin", reads = 0, refuse = false;
+  let channel = "canary", role = "admin", reads = 0, refuse = false, phase = "ready";
   const writes = [];
   const server = await startSystemFixtureServer({
     title: "System update channel",
@@ -21,7 +21,7 @@ test("System channel choice confirms the exact owner intent, refreshes offers an
         summary.runtime.version = "2.1.0-rc.1";
         summary.access.role = role;
         summary.source = { configured:true, name:"default", channel, mode:"release", installed_version:"2.1.0-rc.1", update_checks_allowed:true };
-        summary.runtime_update = { configured:true, available:false, message:`Checked ${channel} updates.`, controller:{phase:"ready"} };
+        summary.runtime_update = { configured:true, available:false, message:`Checked ${channel} updates.`, controller:{phase} };
         jsonResponse(response, summary);
         return true;
       }
@@ -42,11 +42,12 @@ test("System channel choice confirms the exact owner intent, refreshes offers an
   const browser = await chromium.launch({ executablePath:brave, headless:true });
   try {
     const page = await browser.newPage({viewport:{width:390,height:844}});
-    async function open() {
+    async function open(busy = false) {
       await page.goto(`${server.baseUrl}/fixture?settings=about`);
       const frame = await page.waitForSelector("#system-frame").then(handle => handle.contentFrame());
       await frame.waitForSelector("#source-channel-choice", {timeout:3000});
-      await frame.waitForFunction(() => !document.querySelector("#source-channel-choice").disabled);
+      await frame.waitForFunction(() => document.querySelector('[data-field="source-installed-version"]').textContent === "2.1.0-rc.1");
+      if (!busy) await frame.waitForFunction(() => !document.querySelector("#source-channel-choice").disabled);
       return frame;
     }
     let frame = await open();
@@ -79,10 +80,23 @@ test("System channel choice confirms the exact owner intent, refreshes offers an
     assert.equal(await select.inputValue(), "stable", "failed change keeps saved channel");
     assert.match(await frame.locator("#source-channel-status").textContent(), /could not be confirmed/i);
     refuse = false;
+    for (phase of ["staging", "downloading", "verifying", "restarting"]) {
+      frame = await open(true);
+      assert.equal(await frame.locator("#source-channel-choice").isDisabled(), true, phase);
+      const before = writes.length;
+      await frame.locator("#source-channel-choice").evaluate(node => {
+        node.value = "canary";
+        node.dispatchEvent(new Event("change", {bubbles:true}));
+      });
+      assert.equal(writes.length, before, "busy controller keeps the channel");
+      assert.equal(await frame.locator("#source-channel-choice").inputValue(), "stable");
+    }
+    phase = "ready";
     channel = "jetson-test";
     frame = await open();
     assert.equal(await frame.locator("#source-channel-choice").inputValue(), "");
     assert.match(await frame.locator("#source-channel-status").textContent(), /This channel has ended/);
+    assert.equal(await frame.locator('[data-field="source-channel"]').textContent(), "Retired test channel");
     await frame.selectOption("#source-channel-choice", "canary");
     await frame.waitForFunction(() => document.querySelector("#runtime-update-status").textContent === "Checked canary updates.");
     assert.equal(channel, "canary", "retired channel can leave");

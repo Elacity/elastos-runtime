@@ -398,7 +398,7 @@ fn admit_pair(
         .context("Installed release CID is missing")?;
     crate::update::verify_release_metadata_cid(release_cid, release_bytes)?;
     crate::update::verify_release_binding(&head, release_bytes, &release)?;
-    crate::update::verify_source_channel(
+    crate::update::verify_installed_channel(
         source,
         head["payload"]["channel"].as_str().unwrap_or(""),
     )?;

@@ -185,6 +185,19 @@ pub fn verify_source_channel(source: &TrustedSource, signed_channel: &str) -> an
     Ok(())
 }
 
+/// Installed files keep their signed channel when the subscription changes.
+/// Callers separately verify their exact version, head CID and publisher pins.
+/// The retired board channel remains valid for its already installed release.
+pub fn verify_installed_channel(
+    source: &TrustedSource,
+    signed_channel: &str,
+) -> anyhow::Result<()> {
+    if matches!(signed_channel, "stable" | "canary" | "jetson-test") {
+        return Ok(());
+    }
+    verify_source_channel(source, signed_channel)
+}
+
 /// install.sh is the explicit way off a non-public channel such as the retired
 /// `jetson-test`, so such a Home may install a stable or canary release. Stable
 /// and canary Homes keep the update rule: the installer never moves stable to canary.
@@ -2387,6 +2400,26 @@ mod tests {
         .unwrap();
         verify_source_channel(&jetson, "jetson-test").unwrap();
         assert!(verify_source_channel(&jetson, "stable").is_err());
+    }
+
+    #[test]
+    fn installed_channels_follow_pins_while_offers_follow_subscription() {
+        for subscription in ["stable", "canary", "jetson-test"] {
+            let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                "name":"fixture", "publisher_dids":["did:key:fixture"], "channel":subscription
+            }))
+            .unwrap();
+            for installed_channel in ["stable", "canary", "jetson-test"] {
+                verify_installed_channel(&source, installed_channel).unwrap();
+                assert_eq!(
+                    verify_source_channel(&source, installed_channel).is_ok(),
+                    subscription == installed_channel
+                        || (subscription == "canary" && installed_channel == "stable")
+                );
+            }
+            assert!(verify_installed_channel(&source, "").is_err());
+            assert!(verify_installed_channel(&source, "unknown").is_err());
+        }
     }
 
     #[test]
