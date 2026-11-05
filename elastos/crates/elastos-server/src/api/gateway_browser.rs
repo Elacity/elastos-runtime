@@ -889,7 +889,6 @@ async fn execute_browser_open(
     )
     .await;
     let mut engine_launch_request = serde_json::json!({
-        "verified_rootfs": verified_rootfs,
         "url": url.clone(),
         "stream_session": engine_stream_session,
         "lifecycle_generation": launch_reservation.generation(),
@@ -902,6 +901,9 @@ async fn execute_browser_open(
         "guarantee_level": guarantee_level,
         "adapter_id": adapter_id,
     });
+    if let Some(seed) = verified_rootfs {
+        engine_launch_request["verified_rootfs"] = serde_json::json!(seed);
+    }
     if let Some(transport) = vz_transport_launch.as_ref() {
         engine_launch_request["page_id"] = serde_json::json!(launch_reservation.page_id());
         engine_launch_request["vm_id"] = serde_json::json!(launch_reservation.vm_id());

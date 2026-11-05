@@ -37,16 +37,37 @@ struct ServedPage {
     gateway: GatewayState,
     network: crate::collaboration_network::VerifiedCollaborationNetworkProfile,
     slots: tokio::sync::Semaphore,
-    prepared: OnceLock<std::result::Result<Prepared, String>>,
+    prepared: Arc<OnceLock<std::result::Result<Prepared, String>>>,
     reservation: OnceLock<BrowserLaunchReservation>,
     dispatched: AtomicBool,
     expires_at: u64,
     launched: AtomicBool,
     closing: Arc<AtomicBool>,
-    result: OnceLock<Value>,
+    result: Arc<OnceLock<Value>>,
     terminal: Mutex<Option<Value>>,
-    changed: Notify,
+    changed: Arc<Notify>,
     last_seen: Mutex<tokio::time::Instant>,
+}
+
+// Capture this guard before spawning: even cancellation before the first poll
+// publishes a terminal result and wakes every waiter. Native effects retain
+// their durable owner for cleanup when a worker stops unexpectedly.
+struct EngineTaskCompletion<T> {
+    result: Arc<OnceLock<T>>,
+    fallback: Option<T>,
+    closing: Arc<AtomicBool>,
+    changed: Arc<Notify>,
+}
+
+impl<T> Drop for EngineTaskCompletion<T> {
+    fn drop(&mut self) {
+        if let Some(fallback) = self.fallback.take() {
+            if self.result.set(fallback).is_ok() {
+                self.closing.store(true, Ordering::Release);
+            }
+        }
+        self.changed.notify_waiters();
+    }
 }
 
 type ServedPages = BTreeMap<(PathBuf, String), Arc<ServedPage>>;
@@ -410,23 +431,31 @@ pub(crate) async fn invoke(
                 gateway: runtime_state(data_dir, registry, endpoint),
                 network,
                 slots: tokio::sync::Semaphore::new(32),
-                prepared: OnceLock::new(),
+                prepared: Arc::new(OnceLock::new()),
                 reservation: OnceLock::new(),
                 dispatched: AtomicBool::new(false),
                 expires_at: grant.expires_at,
                 launched: AtomicBool::new(false),
                 closing: Arc::new(AtomicBool::new(false)),
-                result: OnceLock::new(),
+                result: Arc::new(OnceLock::new()),
                 terminal: Mutex::new(None),
-                changed: Notify::new(),
+                changed: Arc::new(Notify::new()),
                 last_seen: Mutex::new(tokio::time::Instant::now()),
             });
             pages.insert(key, page.clone());
             let task = page.clone();
+            let completion = EngineTaskCompletion {
+                result: task.prepared.clone(),
+                fallback: Some(Err(
+                    "Engine preparation did not complete; retry cleanup".into()
+                )),
+                closing: task.closing.clone(),
+                changed: task.changed.clone(),
+            };
             tokio::spawn(async move {
                 let result = prepare(&task).await.map_err(|e| e.to_string());
                 task.prepared.set(result).ok();
-                task.changed.notify_waiters();
+                drop(completion);
                 supervise(task).await;
             });
             page
@@ -516,6 +545,13 @@ pub(crate) async fn invoke(
             );
             if !page.launched.swap(true, Ordering::AcqRel) {
                 let task = page.clone();
+                let completion = EngineTaskCompletion {
+                    result: task.result.clone(),
+                    fallback: Some(json!({"status":"error","code":"browser_engine_unavailable",
+                        "message":"Remote Engine launch did not complete; retry cleanup"})),
+                    closing: task.closing.clone(),
+                    changed: task.changed.clone(),
+                };
                 tokio::spawn(async move {
                     let result = launch(&task).await.unwrap_or_else(|error| {
                         task.closing.store(true, Ordering::Release);
@@ -527,7 +563,7 @@ pub(crate) async fn invoke(
                         task.closing.store(true, Ordering::Release);
                     }
                     task.result.set(result).ok();
-                    task.changed.notify_waiters();
+                    drop(completion);
                     if task.closing.load(Ordering::Acquire) {
                         let _ = close(&task).await;
                     }
@@ -829,12 +865,15 @@ async fn prepare(page: &ServedPage) -> Result<Prepared> {
                 == owner.page_id,
             "Engine Wallet launch request escaped its page"
         );
-        let request = json!({"op":"launch","verified_rootfs":verified_rootfs,"url":url,"stream_session":browser_engine_stream_session(&stream),
+        let mut request = json!({"op":"launch","url":url,"stream_session":browser_engine_stream_session(&stream),
             "lifecycle_generation":owner.generation,"principal_id":principal,"profile":profile,
             "wallet":wallet,
             "viewport":intent["viewport"],"display_mode":mode,"guarantee_level":guarantee,
             "adapter_id":owner.adapter_id,"page_id":owner.page_id,"vm_id":owner.vm_id,
             "transport_authority":transport.authority,"transport_secret":transport.secret});
+        if let Some(seed) = verified_rootfs {
+            request["verified_rootfs"] = json!(seed);
+        }
         Ok::<_, anyhow::Error>(Prepared {reservation:reservation.clone(),owner_launch_id,
             principal_id:principal,request,stream,authority:transport.authority,viewer})
     }.await;
@@ -2085,6 +2124,45 @@ pub(in crate::api::gateway) async fn retry_consumer_preparations(gateway: &Gatew
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_engine_worker_abort_and_panic_publish_failure_and_wake_waiters() {
+        for stage in ["prepare", "launch"] {
+            for stop in ["before_poll", "during_wait", "panic"] {
+                let result = Arc::new(OnceLock::new());
+                let closing = Arc::new(AtomicBool::new(false));
+                let changed = Arc::new(Notify::new());
+                let wake = changed.notified();
+                let fallback = format!("{stage} did not complete; retry cleanup");
+                let completion = EngineTaskCompletion {
+                    result: result.clone(),
+                    fallback: Some(fallback.clone()),
+                    closing: closing.clone(),
+                    changed: changed.clone(),
+                };
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let worker = tokio::spawn(async move {
+                    let _completion = completion;
+                    entered.send(()).unwrap();
+                    assert_ne!(stop, "panic", "fixture Engine worker panic");
+                    std::future::pending::<()>().await;
+                });
+                if stop != "before_poll" {
+                    started.await.unwrap();
+                }
+                if stop != "panic" {
+                    worker.abort();
+                }
+                assert!(worker.await.is_err());
+                tokio::time::timeout(Duration::from_secs(1), wake)
+                    .await
+                    .unwrap();
+                assert_eq!(result.get(), Some(&fallback));
+                assert!(closing.load(Ordering::Acquire));
+            }
+        }
+    }
+
     fn pending_binding(serial: usize, principal: &str) -> ConsumerBinding {
         ConsumerBinding {
             grant: json!({"peer_did":"runtime-b"}),
