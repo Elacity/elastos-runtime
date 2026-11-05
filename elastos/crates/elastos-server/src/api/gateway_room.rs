@@ -764,11 +764,15 @@ pub(super) async fn chat_room_session_start(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
-            Ok(context) => context,
-            Err(err) => return room_service_error_response(err),
-        };
+    let launch = match gateway_home_token::require_home_launch_grant(
+        &state.data_dir,
+        &headers,
+        CHAT_ROOM_CAPSULE_ID,
+    ) {
+        Ok(context) => context,
+        Err(err) => return room_service_error_response(err),
+    };
+    let context = launch.context.clone();
     // Chat asks once, on Community open; a refusal or an open card is kept.
     let _ = gateway_collaboration_presence::request_community_presence(&state, &context, false);
     let community_presence =
@@ -784,9 +788,9 @@ pub(super) async fn chat_room_session_start(
     };
     match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let output = if port.is_some() {
-            start_configured_chat_room_session(&data_dir, &context)?
+            start_configured_chat_room_session(&data_dir, &launch)?
         } else {
-            start_chat_room_session(&data_dir, &context)?
+            start_chat_room_session(&data_dir, &launch)?
         };
         let configured = port.is_some();
         let mut poll = match port {
@@ -1287,8 +1291,9 @@ struct ChatRoomSessionGrant {
 
 fn start_chat_room_session(
     data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
+    launch: &RequiredHomeLaunchToken,
 ) -> anyhow::Result<ChatRoomSessionGrant> {
+    let context = &launch.context;
     let (did, handle) = trusted_local_chat_room_principal(data_dir, context)?;
     let session = crate::room_service::start_local_principal_runtime_session(
         data_dir,
@@ -1296,14 +1301,16 @@ fn start_chat_room_session(
         &context.principal_id,
         &handle,
         "ElastOS shell",
+        &room_session_authorization(launch),
     )?;
     Ok(chat_room_session_grant(session))
 }
 
 fn start_configured_chat_room_session(
     data_dir: &std::path::Path,
-    context: &HomeLaunchTokenContext,
+    launch: &RequiredHomeLaunchToken,
 ) -> anyhow::Result<ChatRoomSessionGrant> {
+    let context = &launch.context;
     let (did, handle) = trusted_configured_chat_profile(data_dir, context)?;
     let session = crate::room_service::start_configured_collaboration_principal_session(
         data_dir,
@@ -1311,8 +1318,22 @@ fn start_configured_chat_room_session(
         &context.principal_id,
         &handle,
         "ElastOS shell",
+        &room_session_authorization(launch),
     )?;
     Ok(chat_room_session_grant(session))
+}
+
+fn room_session_authorization(
+    launch: &RequiredHomeLaunchToken,
+) -> crate::room_service::RoomSessionAuthorization {
+    crate::room_service::RoomSessionAuthorization {
+        principal_id: launch.context.principal_id.clone(),
+        session_id: launch.context.session_id.clone(),
+        proof_binding_id: launch.context.proof_binding_id.clone(),
+        grant_id: launch.context.grant_id.clone(),
+        authority_actor: launch.launch_context.authority_actor.clone(),
+        expires_at: launch.expires_at,
+    }
 }
 
 fn trusted_local_chat_room_principal(
@@ -1874,11 +1895,16 @@ pub(super) async fn room_service_session_leave(
     let secure = request_uses_tls(&headers);
     let data_dir = state.data_dir.clone();
     if state.collaboration_chat_product_port.is_some() {
-        let context =
-            match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
-                Ok(context) => context,
-                Err(err) => return room_service_error_response(err),
-            };
+        let launch = match gateway_home_token::require_home_launch_grant(
+            &data_dir,
+            &headers,
+            CHAT_ROOM_CAPSULE_ID,
+        ) {
+            Ok(context) => context,
+            Err(err) => return room_service_error_response(err),
+        };
+        let context = launch.context.clone();
+        let authorization = room_session_authorization(&launch);
         let (did, _) = match trusted_configured_chat_profile(&data_dir, &context) {
             Ok(principal) => principal,
             Err(err) => return room_service_error_response(err),
@@ -1889,6 +1915,7 @@ pub(super) async fn room_service_session_leave(
                 &data_dir,
                 &did,
                 &principal_id,
+                &authorization,
             )
         })
         .await;
@@ -1959,7 +1986,7 @@ pub(super) async fn room_service_poll(
     let mut reader_profile = None;
     let token = match port.as_ref() {
         Some(_) => {
-            let context = match require_home_launch_token_context(
+            let launch = match gateway_home_token::require_home_launch_grant(
                 &data_dir,
                 &headers,
                 CHAT_ROOM_CAPSULE_ID,
@@ -1967,6 +1994,7 @@ pub(super) async fn room_service_poll(
                 Ok(context) => context,
                 Err(err) => return room_service_error_response(err),
             };
+            let context = launch.context.clone();
             launch_context = Some(context.clone());
             let profile = match trusted_chat_room_profile_authority(&data_dir, &context) {
                 Ok(profile) => profile,
@@ -1979,6 +2007,7 @@ pub(super) async fn room_service_poll(
                     &data_dir,
                     &did,
                     &context.principal_id,
+                    &room_session_authorization(&launch),
                 ) {
                     Ok(session) => session,
                     Err(err) => return room_service_error_response(err),
@@ -2088,15 +2117,20 @@ pub(super) async fn room_service_objects_send(
     }
     let data_dir = state.data_dir.clone();
     let port = state.collaboration_chat_product_port.clone();
-    let context = match port.as_ref() {
+    let launch = match port.as_ref() {
         Some(_) => {
-            match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+            match gateway_home_token::require_home_launch_grant(
+                &data_dir,
+                &headers,
+                CHAT_ROOM_CAPSULE_ID,
+            ) {
                 Ok(context) => Some(context),
                 Err(err) => return room_service_error_response(err),
             }
         }
         None => None,
     };
+    let context = launch.as_ref().map(|launch| launch.context.clone());
     let profile = match context.as_ref() {
         Some(context) => {
             match gateway_home_system::load_profile_authority_for_context(&data_dir, context) {
@@ -2111,8 +2145,8 @@ pub(super) async fn room_service_objects_send(
         }
         None => None,
     };
-    let token = match context.as_ref() {
-        Some(context) => match start_configured_chat_room_session(&data_dir, context) {
+    let token = match launch.as_ref() {
+        Some(launch) => match start_configured_chat_room_session(&data_dir, launch) {
             Ok(session) => session.token,
             Err(err) => return room_service_error_response(err),
         },
@@ -2312,11 +2346,15 @@ pub(super) async fn chat_room_attach_library(
             attach_library_error_body("unsupported", "Files can be posted only in Community."),
         );
     };
-    let context = match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
-    {
+    let launch = match gateway_home_token::require_home_launch_grant(
+        &data_dir,
+        &headers,
+        CHAT_ROOM_CAPSULE_ID,
+    ) {
         Ok(context) => context,
         Err(err) => return attach_library_chat_error(err),
     };
+    let context = launch.context.clone();
     let profile = match gateway_home_system::load_profile_authority_for_context(&data_dir, &context)
     {
         Ok(Some(profile)) => profile,
@@ -2325,7 +2363,7 @@ pub(super) async fn chat_room_attach_library(
         }
         Err(err) => return attach_library_chat_error(err),
     };
-    let token = match start_configured_chat_room_session(&data_dir, &context) {
+    let token = match start_configured_chat_room_session(&data_dir, &launch) {
         Ok(session) => session.token,
         Err(err) => return attach_library_chat_error(err),
     };
@@ -2584,8 +2622,9 @@ fn chat_room_access_token_from_headers(
     headers: &HeaderMap,
 ) -> anyhow::Result<String> {
     if headers.contains_key("x-elastos-home-token") {
-        let context = require_home_launch_token_context(data_dir, headers, CHAT_ROOM_CAPSULE_ID)?;
-        return Ok(start_chat_room_session(data_dir, &context)?.token);
+        let launch =
+            gateway_home_token::require_home_launch_grant(data_dir, headers, CHAT_ROOM_CAPSULE_ID)?;
+        return Ok(start_chat_room_session(data_dir, &launch)?.token);
     }
     room_session_token_from_headers(headers)
 }

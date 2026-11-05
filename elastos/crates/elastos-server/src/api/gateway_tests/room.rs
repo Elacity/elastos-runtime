@@ -1,5 +1,161 @@
 use super::*;
 
+#[tokio::test]
+async fn room_session_bound_to_frame_expiry() {
+    room_session_bound_fixture(300, "active", false).await;
+}
+
+#[tokio::test]
+async fn room_session_bound_preserves_twelve_hours() {
+    room_session_bound_fixture(12 * 60 * 60, "active", false).await;
+}
+
+#[tokio::test]
+async fn room_session_bound_rejects_revoked_grant_on_poll() {
+    room_session_bound_fixture(300, "revoked", false).await;
+}
+
+#[tokio::test]
+async fn room_session_bound_rejects_sign_out_on_poll() {
+    room_session_bound_fixture(300, "signed-out", false).await;
+}
+
+#[tokio::test]
+async fn room_session_bound_rejects_expired_grant_on_poll() {
+    room_session_bound_fixture(300, "expired", false).await;
+}
+
+#[tokio::test]
+async fn room_session_bound_configured_community() {
+    for outcome in ["active", "revoked", "signed-out", "expired"] {
+        room_session_bound_fixture(300, outcome, true).await;
+    }
+    room_session_bound_fixture(12 * 60 * 60, "active", true).await;
+}
+
+async fn room_session_bound_fixture(frame_lifetime: u64, outcome: &str, configured: bool) {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let context = HomeLaunchTokenContext {
+        principal_id: authority.principal_id.clone(),
+        session_id: authority.session_id.clone(),
+        proof_binding_id: Some(authority.proof_binding_id.clone()),
+        grant_id: authority.grant_id.clone(),
+    };
+    let mut grant = crate::auth::load_active_session_grant(
+        dir.path(),
+        &authority.session_id,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    grant.expires_at = crate::auth::now_ts() + 24 * 60 * 60;
+    crate::auth::renew_session_grant(dir.path(), grant).unwrap();
+    let token = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        CHAT_ROOM_CAPSULE_ID,
+        CHAT_ROOM_CAPSULE_ID,
+        &context,
+    )
+    .unwrap();
+    let codec = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&codec.decode(token).unwrap()).unwrap();
+    let now = crate::auth::now_ts();
+    let frame_expiry = envelope["payload"]["iat"].as_u64().unwrap() + frame_lifetime;
+    envelope["payload"]["exp"] = frame_expiry.into();
+    let (key, _) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        &key,
+        HOME_LAUNCH_TOKEN_DOMAIN,
+        serde_json::to_string(&envelope["payload"])
+            .unwrap()
+            .as_bytes(),
+    );
+    envelope["signature"] = signature.into();
+    envelope["signer_did"] = signer_did.into();
+    let token = codec.encode(serde_json::to_vec(&envelope).unwrap());
+    let mut state = test_state(dir.path());
+    if configured {
+        state.collaboration_chat_product_port =
+            Some(crate::collaboration_product::test_chat_product_port(
+                dir.path(),
+                "room-bound-network",
+                "room-bound-community",
+            ));
+    }
+    let app = gateway_router(state.clone());
+    let start = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/session/start")
+                .header("x-elastos-home-token", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let cookie = room_cookie_header(&start);
+    let body = axum::body::to_bytes(start.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    if outcome == "active" {
+        assert!(payload["expires_at"].as_u64().unwrap() <= frame_expiry);
+        assert!(payload["expires_at"].as_u64().unwrap() >= frame_expiry - 1);
+    } else if outcome == "signed-out" {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "http://localhost:61180")
+                    .method("POST")
+                    .uri("/api/auth/sessions/sign-out")
+                    .header("x-elastos-home-token", &authority.home_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    } else if outcome == "revoked" {
+        crate::auth::revoke_session_grant(dir.path(), &authority.session_id, now).unwrap();
+    } else {
+        let mut grant =
+            crate::auth::load_active_session_grant(dir.path(), &authority.session_id, now).unwrap();
+        grant.expires_at = now;
+        crate::auth::store_session_grant(dir.path(), grant).unwrap();
+    }
+    // Use only the room cookie: frame validation cannot mask a room-session gap.
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, cookie.parse().unwrap());
+    if configured {
+        headers.insert(HOST, "localhost:61180".parse().unwrap());
+        headers.insert("origin", "null".parse().unwrap());
+        headers.insert("x-elastos-home-token", token.parse().unwrap());
+    }
+    let poll = room_service_poll(
+        State(state),
+        headers,
+        Json(serde_json::from_value(json!({"since": 0})).unwrap()),
+    )
+    .await;
+    if outcome == "active" {
+        assert_eq!(poll.status(), StatusCode::OK);
+    } else {
+        assert!(
+            matches!(
+                poll.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{}",
+            poll.status()
+        );
+    }
+}
+
 mod contact_request;
 mod direct;
 
