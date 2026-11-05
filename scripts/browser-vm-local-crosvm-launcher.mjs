@@ -127,8 +127,16 @@ function defaultRootfsPoolDir(dataDir) {
   return path.join(dataDir, "browser-vm/rootfs-pool");
 }
 
-function defaultVmVcpus() {
-  return os.arch() === "arm64" ? "4" : "2";
+export function browserVmVcpus(platform, hostCpus, value) {
+  if (value !== undefined) {
+    if (!/^\+?\d+$/.test(value) || Number(value) < 1 || Number(value) > 255) {
+      throw new Error("ELASTOS_BROWSER_VM_VCPUS must be an integer in 1..255");
+    }
+    return String(Number(value));
+  }
+  return platform === "linux"
+    ? String(Math.min(hostCpus, Math.max(2, Math.min(4, hostCpus - 2))))
+    : "2";
 }
 
 function isIpv4(value) {
@@ -869,7 +877,7 @@ function prepareLaunchRootfs({ rootfs, launchRootfs, dataDir, sessionDir, script
   };
 }
 
-function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, launch, profile, iceConfig }) {
+function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, launch, profile, iceConfig, vcpus }) {
   const serialLog = path.join(sessionDir, "serial.log");
   const crosvmLog = path.join(sessionDir, "crosvm.log");
   const crosvmFd = fs.openSync(crosvmLog, "a");
@@ -904,7 +912,7 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "--mem",
     process.env.ELASTOS_BROWSER_VM_MEMORY_MIB || (os.arch() === "arm64" ? "2048" : "3072"),
     "--cpus",
-    process.env.ELASTOS_BROWSER_VM_VCPUS || defaultVmVcpus(),
+    vcpus,
     "--serial",
     `type=file,path=${serialLog},hardware=serial,num=1`,
     "--block",
@@ -1284,10 +1292,11 @@ async function main() {
   }
 
   const memoryMiB = process.env.ELASTOS_BROWSER_VM_MEMORY_MIB || (os.arch() === "arm64" ? "2048" : "3072");
-  const vcpus = process.env.ELASTOS_BROWSER_VM_VCPUS || defaultVmVcpus();
+  const vcpus = browserVmVcpus(process.platform, os.availableParallelism(), process.env.ELASTOS_BROWSER_VM_VCPUS);
   logPhase(`starting crosvm with ${memoryMiB}MiB and ${vcpus} vCPUs`);
   const vm = startCrosvm({
     crosvm,
+    vcpus,
     kernel,
     initrd,
     rootfs: launchRootfs,
@@ -1343,13 +1352,15 @@ async function main() {
   }
 }
 
-process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
-process.on("SIGINT", () => cleanupAndExit("SIGINT"));
-process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
+  process.on("SIGINT", () => cleanupAndExit("SIGINT"));
+  process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
 
-main()
-  .then(() => cleanupAndExit(null))
-  .catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    cleanupAndExit(null);
-  });
+  main()
+    .then(() => cleanupAndExit(null))
+    .catch((error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      cleanupAndExit(null);
+    });
+}
