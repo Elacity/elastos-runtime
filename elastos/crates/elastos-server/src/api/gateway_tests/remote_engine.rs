@@ -13,6 +13,8 @@ use elastos_runtime::signature::generate_keypair;
 pub(super) struct RemoteEngineFixture {
     calls: TokioMutex<Vec<Value>>,
     hold_launch: std::sync::atomic::AtomicBool,
+    panic_launch: std::sync::atomic::AtomicBool,
+    missing_launch_status: std::sync::atomic::AtomicBool,
     hold_input: std::sync::atomic::AtomicBool,
     bad_close: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
@@ -34,6 +36,12 @@ impl Provider for RemoteEngineFixture {
         use std::sync::atomic::Ordering::SeqCst;
         self.calls.lock().await.push(request.clone());
         self.entered.notify_one();
+        if request["op"] == "launch" {
+            assert!(
+                !self.panic_launch.load(SeqCst),
+                "fixture Engine launch panic"
+            );
+        }
         if request["op"] == "launch" && self.hold_launch.load(SeqCst)
             || request["op"] == "input" && self.hold_input.load(SeqCst)
         {
@@ -124,6 +132,9 @@ impl Provider for RemoteEngineFixture {
                 response["data"]["effects"]["turn_process_absent"] = json!(false);
             }
         }
+        if request["op"] == "launch" && self.missing_launch_status.load(SeqCst) {
+            response.as_object_mut().unwrap().remove("status");
+        }
         Ok(response)
     }
 }
@@ -171,6 +182,110 @@ impl Provider for ConsumerExitFixture {
         }
         Ok(response)
     }
+}
+
+#[tokio::test]
+async fn remote_engine_invoke_returns_fallback_when_launch_worker_panics() {
+    let result = remote_engine_launch_response(true, false).await.unwrap();
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["code"], "browser_engine_unavailable", "{result}");
+    assert_eq!(
+        result["message"],
+        "Remote Engine launch did not complete; retry cleanup"
+    );
+}
+
+#[tokio::test]
+async fn remote_engine_invoke_refuses_closing_launch_without_status() {
+    let error = remote_engine_launch_response(false, true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Engine owner retired before launch publication"
+    );
+}
+
+async fn remote_engine_launch_response(
+    panic_launch: bool,
+    missing_launch_status: bool,
+) -> anyhow::Result<Value> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let root = tempfile::tempdir().unwrap();
+    config(root.path());
+    let provider = Arc::new(RemoteEngineFixture::default());
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("browser-engine", provider.clone())
+        .await
+        .unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await
+        .unwrap();
+    let (trusted, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted, "remote-engine-binding");
+    let grant = crate::carrier::BrowserEngineGrant {
+        provider_principal_id: "provider".into(),
+        requester_principal_id: "consumer".into(),
+        requester_endpoint: iroh::SecretKey::from_bytes(&[45; 32]).public(),
+        grant_id: "grant:remote-engine".into(),
+        revision: now_ts(),
+        expires_at: now_ts() + 3600,
+        execution_allowed: true,
+    };
+    let generation = format!("sha256:{}", "c".repeat(64));
+    let page_id = format!(
+        "page:vz-{}",
+        hex::encode(Sha256::digest(format!("{generation}\npage")))
+    );
+    let prepare = json!({"op":"prepare_launch","principal_id":grant.requester_principal_id,"grant_id":grant.grant_id,
+        "lifecycle_generation":generation,"page_id":page_id,
+        "vm_id":format!("browser-vm-{}",hex::encode(Sha256::digest(format!("{generation}\nvm")))),
+        "profile_key":elastos_common::browser_profile_key_from_value(&grant.requester_principal_id),"adapter_id":"mock-browser-engine",
+        "stream_id":"stream:remote-engine-test","target":"tls://example.com:443","url":"https://example.com/",
+        "viewport":{"width":1280,"height":720},"display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"});
+    let call = |request: Value| {
+        let root = root.path().to_owned();
+        let registry = registry.clone();
+        let endpoint = endpoint.clone();
+        let network = network.clone();
+        let grant = grant.clone();
+        async move {
+            gateway_browser_remote::invoke(
+                &root,
+                registry,
+                endpoint,
+                grant.requester_endpoint,
+                network,
+                Some(grant),
+                &request,
+            )
+            .await
+        }
+    };
+    assert_eq!(call(prepare).await.unwrap()["status"], "ok");
+    provider.panic_launch.store(panic_launch, SeqCst);
+    provider
+        .missing_launch_status
+        .store(missing_launch_status, SeqCst);
+    let launch = json!({"op":"launch","principal_id":grant.requester_principal_id,
+        "grant_id":grant.grant_id,"page_id":page_id,"lifecycle_generation":generation});
+    let result = tokio::time::timeout(Duration::from_secs(2), call(launch))
+        .await
+        .expect("invoke must wake after the detached launch worker completes");
+    assert_eq!(
+        provider
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r["op"] == "launch")
+            .count(),
+        1
+    );
+    endpoint.close().await;
+    result
 }
 
 #[tokio::test]

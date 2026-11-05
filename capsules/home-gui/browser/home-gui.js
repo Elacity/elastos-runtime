@@ -663,16 +663,16 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
   return true;
 }
 
-export function renewHomeGuiChatWindowAuthority(homeToken, launched, homeOrigin, apply = true) {
+export function renewHomeGuiFrameAuthority(homeToken, launched, homeOrigin, apply = true) {
   const entry = homeGuiWindowEntryForToken(homeToken);
   const frame = entry?.node?.querySelector(".window-frame");
   const freshToken = homeLaunchTokenFromRoute(launched?.route || "");
   let route;
   try { route = new URL(launched?.route, homeOrigin); } catch { return false; }
-  if (!entry || entry.targetId !== "chat-room" || !frame?.contentWindow
-    || launched?.target !== "chat-room" || launched.attach_kind !== "iframe"
+  if (!entry || entry.targetId !== launched?.target || !frame?.contentWindow
+    || !["chat-room", "people", "documents", "assistant", "library"].includes(launched?.target) || launched.attach_kind !== "iframe"
     || (launched.launch_status && launched.launch_status !== "launched")
-    || route.origin !== homeOrigin || route.pathname !== "/apps/chat-room/"
+    || route.origin !== homeOrigin || route.pathname !== `/apps/${entry.targetId}/`
     || route.username || route.password
     || !freshToken || freshToken === homeToken) return false;
   if (!apply) return true;

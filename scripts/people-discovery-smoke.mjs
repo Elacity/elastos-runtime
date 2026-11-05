@@ -164,6 +164,7 @@ function setupEnvironment(name, replies) {
     },
   };
   globalThis.window = {
+    crypto: globalThis.crypto,
     location: {
       search: "?home_origin=http%3A%2F%2Flocalhost%3A61180",
       hash: "#home_token=people-test-token",
@@ -214,6 +215,7 @@ function setupEnvironment(name, replies) {
 
 async function loadPeople() {
   const source = readFileSync(new URL("../capsules/people/browser/people.js", import.meta.url), "utf8")
+    .replace('"/apps/home/home-navigation-client.js"', JSON.stringify(new URL("../capsules/home/browser/home-navigation-client.js", import.meta.url).href))
     .replace(/import \{ createHomeClipboardClient \} from [^;]+;/,
       "const createHomeClipboardClient = globalThis.createClipboardFixture;");
   await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);

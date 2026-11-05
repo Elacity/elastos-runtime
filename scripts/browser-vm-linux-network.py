@@ -23,6 +23,19 @@ IPV6 = Path('/proc/sys/net/ipv6/conf')
 SLOTS = 4
 RELAY_PORTS = '49152:49215'
 FIREWALL_SERVICES = 'nftables.service firewalld.service ufw.service netfilter-persistent.service'
+TRANSPORTS = ('kernel-vsock', 'userspace-vsock')
+
+
+def transport_devices(transport):
+    if transport not in TRANSPORTS:
+        raise RuntimeError('Browser host transport is invalid')
+    return ['/dev/kvm', '/dev/net/tun'] + (['/dev/vhost-vsock'] if transport == 'kernel-vsock' else [])
+
+
+def saved_transport(saved):
+    transport = saved.get('transport', 'kernel-vsock')
+    transport_devices(transport)
+    return transport
 
 
 class SlotsBusy(RuntimeError):
@@ -132,7 +145,7 @@ def check(uid):
     if not isinstance(receipt, dict) or receipt.get('uid') != uid or receipt.get('boot_id') != boot_id() or receipt.get('networks') != pool or receipt.get('policy') != policy(pool):
         raise RuntimeError('setup receipt does not match this user, boot or network policy')
     run('systemctl', 'is-active', '--quiet', f'elastos-browser-network-{uid}.service')
-    for device in ['/dev/kvm', '/dev/net/tun']:
+    for device in transport_devices(saved_transport(receipt)):
         if not stat.S_ISCHR(os.stat(device).st_mode) or not os.access(device, os.R_OK | os.W_OK):
             raise RuntimeError(f'{device} requires read/write access')
     if not isinstance(receipt.get('ifindices'), list) or len(receipt['ifindices']) != SLOTS:
@@ -201,7 +214,33 @@ def write_json(file, value):
     temporary.replace(file)
 
 
+def verify_owned_taps(uid, pool):
+    # Check the complete set before any link or firewall mutation.
+    for n in pool:
+        device = SYSFS / n['tapName']
+        if not device.exists():
+            continue
+        if (not (device / 'owner').exists() or not (device / 'tun_flags').exists()
+                or int((device / 'owner').read_text()) != uid
+                or int((device / 'tun_flags').read_text().strip(), 16) & 2 != 2):
+            raise RuntimeError(f"Browser TAP is not owned by this user: {n['tapName']}")
+
+
+def prepare_locks(user, pool):
+    RUN.mkdir(mode=0o755, exist_ok=True)
+    trusted_path(RUN)
+    for n in pool:
+        file = RUN / f"{n['tapName']}.lock"
+        if not file.exists():
+            file.touch(mode=0o600)
+        if not stat.S_ISREG(file.lstat().st_mode):
+            raise RuntimeError('Browser lease path must be a regular file')
+        file.chmod(0o600)
+        os.chown(file, user.pw_uid, user.pw_gid)
+
+
 def invalidate(user):
+    verify_owned_taps(user.pw_uid, networks(user.pw_uid))
     if RUN.exists():
         trusted_path(RUN)
         (RUN / f'{user.pw_uid}.json').unlink(missing_ok=True)
@@ -211,26 +250,85 @@ def invalidate(user):
             run('ip', 'link', 'set', n['tapName'], 'down')
 
 
+def prepare_vsock_device():
+    # The root-owned boot service repeats module preparation after each reboot.
+    if not Path('/dev/vhost-vsock').exists():
+        if not shutil.which('modprobe'):
+            raise RuntimeError('Install modprobe before Browser vsock setup')
+        run('modprobe', 'vhost_vsock')
+    if not stat.S_ISCHR(os.stat('/dev/vhost-vsock', follow_symlinks=False).st_mode):
+        raise RuntimeError('/dev/vhost-vsock must be a character device')
+
+
+def prepare_transport(transport):
+    # Resolve the chosen host capability before creating setup state or ACLs.
+    for device in transport_devices(transport):
+        if device == '/dev/vhost-vsock':
+            prepare_vsock_device()
+        elif not stat.S_ISCHR(os.stat(device, follow_symlinks=False).st_mode):
+            raise RuntimeError(f'{device} must be a character device')
+    if transport == 'userspace-vsock':
+        sandbox = Path('/usr/bin/bwrap')
+        trusted_path(sandbox)
+        if not stat.S_ISREG(sandbox.lstat().st_mode) or not os.access(sandbox, os.X_OK):
+            raise RuntimeError('Install the root-owned /usr/bin/bwrap before Browser setup')
+
+
+def setup_data_dir(user, data_dir=None):
+    if data_dir is None:
+        state = STATE / f'{user.pw_uid}.json'
+        if state.exists():
+            data_dir = trusted_json(state).get('data_dir')
+    directory = Path(data_dir) if data_dir else Path(user.pw_dir) / '.local/share/elastos'
+    if not directory.is_absolute():
+        raise RuntimeError('Browser data directory must be absolute')
+    return directory
+
+
+def require_userspace_backend(user, data_dir=None):
+    # Runtime admits and executes this binary as the Home user. Root only checks
+    # its presence; it never executes code from the Home's data directory.
+    binary = setup_data_dir(user, data_dir) / 'bin/vhost-device-vsock'
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError(f'Install the admitted executable {binary} before Browser setup')
+
+
+def select_transport(user, transport=None, data_dir=None):
+    if transport is not None:
+        return transport
+    state = STATE / f'{user.pw_uid}.json'
+    if state.exists():
+        return saved_transport(trusted_json(state))
+    try:
+        prepare_vsock_device()
+        return 'kernel-vsock'
+    except (OSError, RuntimeError) as kernel_error:
+        missing = []
+        try:
+            prepare_transport('userspace-vsock')
+        except (OSError, RuntimeError) as error:
+            missing.append(str(error))
+        try:
+            require_userspace_backend(user, data_dir)
+        except (OSError, RuntimeError) as error:
+            missing.append(str(error))
+        if missing:
+            raise RuntimeError(f'Browser transport unavailable: kernel vhost-vsock ({kernel_error}); '
+                               f'userspace-vsock requires: {"; ".join(missing)}') from kernel_error
+        return 'userspace-vsock'
+
+
 def restore(user):
     uid, pool = user.pw_uid, networks(user.pw_uid)
-    RUN.mkdir(mode=0o755, exist_ok=True)
-    trusted_path(RUN)
+    transport = saved_transport(trusted_json(STATE / f'{uid}.json'))
+    prepare_transport(transport)
+    verify_owned_taps(uid, pool)
+    prepare_locks(user, pool)
     receipt = RUN / f'{uid}.json'
     receipt.unlink(missing_ok=True)
-    for n in pool:
-        file = RUN / f"{n['tapName']}.lock"
-        if not file.exists():
-            file.touch(mode=0o600)
-        if not stat.S_ISREG(file.lstat().st_mode):
-            raise RuntimeError('Browser lease path must be a regular file')
-        file.chmod(0o600)
-        os.chown(file, uid, user.pw_gid)
     with locks(uid, pool):
         # Refuse unrelated devices and connected routes before any host changes.
         for n in pool:
-            device = SYSFS / n['tapName']
-            if device.exists() and (not (device / 'owner').exists() or int((device / 'owner').read_text()) != uid):
-                raise RuntimeError(f"device name is already owned: {n['tapName']}")
             route = json.loads(run('ip', '-j', 'route', 'show', 'table', 'all').stdout)
             import ipaddress
             subnet = ipaddress.ip_network(f"{n['hostIp']}/30", strict=False)
@@ -250,26 +348,41 @@ def restore(user):
             run('ip', 'addr', 'flush', 'dev', tap)
             run('ip', 'addr', 'add', f"{n['hostIp']}/30", 'dev', tap)
             run('ip', 'link', 'set', tap, 'up')
-        run('setfacl', '-m', f'u:{uid}:rw', '/dev/kvm')
+        for device in transport_devices(transport):
+            if device == '/dev/net/tun':
+                continue
+            run('setfacl', '-m', f'u:{uid}:rw', device)
         write_json(receipt, dict(uid=uid, boot_id=boot_id(), networks=pool, policy=policy(pool),
+                                transport=transport,
                                 ifindices=[int((SYSFS / n['tapName'] / 'ifindex').read_text()) for n in pool]))
 
 
-def configure(user, remove=False):
+def configure(user, remove=False, transport=None, data_dir=None):
     uid = user.pw_uid
     unit = f'elastos-browser-network-{uid}.service'
     unit_path = Path('/etc/systemd/system') / unit
-    udev = Path(f'/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules')
+    # Seat access rules clear named-user ACLs. Apply this Home's grant afterwards.
+    udev = Path(f'/etc/udev/rules.d/99-elastos-browser-kvm-{uid}.rules')
+    legacy_udev = Path(f'/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules')
     state = STATE / f'{uid}.json'
     trusted_path(unit_path.parent)
     trusted_path(udev.parent)
-    for file in [unit_path, udev]:
+    for file in [unit_path, udev, legacy_udev]:
         if file.exists() or file.is_symlink():
             trusted_path(file)
     if remove:
         if not state.exists():
             raise RuntimeError('Browser network setup state is absent; removal requires its KVM ACL receipt')
-        previous = trusted_json(state)['previous_kvm_acl']
+        saved = trusted_json(state)
+        previous = saved['previous_kvm_acl']
+        vsock_present = 'previous_vsock_acl' in saved and Path('/dev/vhost-vsock').exists()
+        if vsock_present and not stat.S_ISCHR(os.stat('/dev/vhost-vsock', follow_symlinks=False).st_mode):
+            raise RuntimeError('/dev/vhost-vsock must be a character device')
+        trusted_path(HELPER.parent)
+        if HELPER.exists() or HELPER.is_symlink():
+            trusted_path(HELPER)
+        verify_owned_taps(uid, networks(uid))
+        prepare_locks(user, networks(uid))
         # Refuse removal while any slot has an active owner.
         with locks(uid, networks(uid)):
             (RUN / f'{uid}.json').unlink(missing_ok=True)
@@ -284,9 +397,16 @@ def configure(user, remove=False):
                 run('setfacl', '-x', f'u:{uid}', '/dev/kvm')
             else:
                 run('setfacl', '-m', previous, '/dev/kvm')
+            if vsock_present:
+                if saved['previous_vsock_acl'] is None:
+                    run('setfacl', '-x', f'u:{uid}', '/dev/vhost-vsock')
+                else:
+                    run('setfacl', '-m', saved['previous_vsock_acl'], '/dev/vhost-vsock')
             run('systemctl', 'disable', '--now', unit, optional=True)
             unit_path.unlink(missing_ok=True)
             udev.unlink(missing_ok=True)
+            # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
+            legacy_udev.unlink(missing_ok=True)
             state.unlink()
         for n in networks(uid):
             (RUN / f"{n['tapName']}.lock").unlink(missing_ok=True)
@@ -296,12 +416,28 @@ def configure(user, remove=False):
         for command in ['ip', 'iptables', 'ip6tables', 'setfacl', 'getfacl', 'systemctl', 'udevadm']:
             if not shutil.which(command):
                 raise RuntimeError(f'Install {command} before Browser network setup')
+        transport = select_transport(user, transport, data_dir)
+        if state.exists() and saved_transport(trusted_json(state)) != transport:
+            raise RuntimeError('Remove the previous Browser host setup before changing transport')
+        prepare_transport(transport)
+        data_dir = setup_data_dir(user, data_dir)
+        if transport == 'userspace-vsock':
+            require_userspace_backend(user, data_dir)
         STATE.mkdir(mode=0o755, exist_ok=True)
         trusted_path(STATE)
         if not state.exists():
             acl = run('getfacl', '-cpn', '/dev/kvm').stdout.splitlines()
             previous = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
-            write_json(state, dict(previous_kvm_acl=previous))
+            write_json(state, dict(previous_kvm_acl=previous, transport=transport))
+        # vhost-vsock belongs to the installer step. Runtime only opens the
+        # admitted device as the Home user, and removal restores this UID's ACL.
+        saved = trusted_json(state)
+        saved['transport'] = transport
+        saved['data_dir'] = str(data_dir)
+        if transport == 'kernel-vsock' and 'previous_vsock_acl' not in saved:
+            acl = run('getfacl', '-cpn', '/dev/vhost-vsock').stdout.splitlines()
+            saved['previous_vsock_acl'] = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
+        write_json(state, saved)
         HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         trusted_path(HELPER.parent)
         if HELPER.exists() or HELPER.is_symlink():
@@ -309,7 +445,10 @@ def configure(user, remove=False):
         if Path(__file__).resolve() != HELPER:
             shutil.copyfile(__file__, HELPER)
         HELPER.chmod(0o755)
-        udev.write_text(f'KERNEL=="kvm", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/kvm"\n')
+        devices = ['kvm'] + (['vhost-vsock'] if transport == 'kernel-vsock' else [])
+        udev.write_text(''.join(f'KERNEL=="{device}", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/{device}"\n' for device in devices))
+        # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
+        legacy_udev.unlink(missing_ok=True)
         command = f'{sys.executable} {HELPER}'
         unit_path.write_text(f'[Unit]\nDescription=ElastOS Browser network for UID {uid}\nAfter=network.target {FIREWALL_SERVICES}\nPartOf={FIREWALL_SERVICES}\nReloadPropagatedFrom={FIREWALL_SERVICES}\n\n[Service]\nType=oneshot\nExecStart={command} restore --user {user.pw_name}\nExecReload={command} restore --user {user.pw_name}\nExecStop={command} invalidate --user {user.pw_name}\nExecStopPost={command} invalidate --user {user.pw_name}\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n')
         run('systemctl', 'daemon-reload')
@@ -320,21 +459,38 @@ def configure(user, remove=False):
         run('systemctl', 'restart', unit)
 
 
-def repair_command(user):
-    prerequisite = ''
-    try:
-        trusted_path(HELPER)
-        if not stat.S_ISREG(HELPER.lstat().st_mode):
-            raise RuntimeError('helper is not a regular file')
-    except (OSError, RuntimeError):
-        prerequisite = f'Install the reviewed root-owned helper at {HELPER} first. '
-    return f'{prerequisite}As root, run: python3 {shlex.quote(str(HELPER))} setup --user {shlex.quote(user.pw_name)}'
+def repair_command(user, data_dir=None):
+    options = ''
+    remove_first = False
+    state = STATE / f'{user.pw_uid}.json'
+    if state.exists():
+        saved = trusted_json(state)
+        transport = saved_transport(saved)
+        if transport == 'kernel-vsock':
+            try:
+                remove_first = not (stat.S_ISCHR(os.stat('/dev/vhost-vsock').st_mode)
+                                    and os.access('/dev/vhost-vsock', os.R_OK | os.W_OK))
+            except OSError:
+                remove_first = True
+        if not remove_first:
+            options += f' --transport {transport}'
+        data_dir = saved.get('data_dir', data_dir)
+    data_option = f' --data-dir {shlex.quote(str(data_dir))}' if data_dir is not None else ''
+    interpreter = f'/usr/bin/python3 -I {shlex.quote(str(HELPER))}'
+    user_option = f' --user {shlex.quote(user.pw_name)}'
+    setup = f'{interpreter} setup{user_option}{options}{data_option}'
+    if remove_first:
+        return f'{interpreter} remove{user_option}{data_option}\n{setup}'
+    return setup
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['setup', 'remove', 'restore', 'invalidate', 'check', 'lease'])
     parser.add_argument('--user')
+    parser.add_argument('--transport', choices=TRANSPORTS,
+                        help='setup only: override automatic kernel or confined userspace selection')
+    parser.add_argument('--data-dir', help='Home data directory (default: saved setup or the user data directory)')
     args = parser.parse_args()
     user = pwd.getpwnam(args.user) if args.user else pwd.getpwuid(os.getuid())
     if args.action in ['check', 'lease']:
@@ -348,7 +504,15 @@ def main():
         except SlotsBusy:
             raise
         except (OSError, ValueError, KeyError, IndexError, TypeError, RuntimeError) as error:
-            raise RuntimeError(f'Browser network is unavailable ({error}). {repair_command(user)}') from error
+            prerequisite = ''
+            try:
+                trusted_path(HELPER)
+                if not stat.S_ISREG(HELPER.lstat().st_mode):
+                    raise RuntimeError('helper is not a regular file')
+            except (OSError, RuntimeError):
+                prerequisite = f' Install the reviewed root-owned helper at {HELPER} first.'
+            raise RuntimeError(f'Browser network is unavailable ({error}).{prerequisite}\n'
+                               f'As root, run:\n{repair_command(user, args.data_dir)}') from error
         return
     if os.getuid() != 0 or not args.user or user.pw_uid == 0:
         raise RuntimeError('Run setup/removal as root with --user naming the ordinary Home account')
@@ -356,12 +520,14 @@ def main():
         raise RuntimeError('Browser network setup requires a Linux host')
     if args.action in ['setup', 'remove']:
         verb = 'Remove' if args.action == 'remove' else 'Create/repair'
-        print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, KVM user ACL, a KVM udev rule and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
+        transport = saved_transport(trusted_json(STATE / f'{user.pw_uid}.json')) if args.action == 'remove' else select_transport(user, args.transport, args.data_dir)
+        devices = 'KVM and vhost-vsock' if transport == 'kernel-vsock' else 'KVM'
+        print(f'Browser transport: {transport}.\n{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, {devices} user ACLs, device udev rules and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
         for n in networks(user.pw_uid):
             print(f"  {n['tapName']}: host {n['hostIp']}/30, guest {n['guestIp']}; relay TCP 19091, TURN TCP/UDP 41000 and {RELAY_PORTS}; relayed UDP reaches only those TURN ports")
         if input('Continue? [y/N] ').lower() != 'y':
             return
-        configure(user, remove=args.action == 'remove')
+        configure(user, remove=args.action == 'remove', transport=transport, data_dir=args.data_dir)
     else:
         invalidate(user)
         if args.action == 'restore':

@@ -1,3 +1,5 @@
+import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
+import { onHomeTokenChanged, setHomeGuiLaunchToken } from "./harness-host.js";
 import { selectLiveOffer } from "./agent-live.js";
 import { selectSession, renderSessions } from "./agent-sessions.js";
 import { validModelCid } from "./model-selection.js";
@@ -201,12 +203,17 @@ document.addEventListener(
   true,
 );
 
-const homeClipboard = createHomeClipboardClient({
+const clipboardOptions = () => ({
   targetId: "assistant",
   homeOrigin: homeOrigin(),
   homeToken: getHomeGuiLaunchToken(),
 });
+const homeClipboard = createHomeClipboardClient(clipboardOptions());
 homeClipboard.start();
+onHomeTokenChanged(token => homeClipboard.setHomeToken(token));
+createHomeNavigationClient({ homeToken: getHomeGuiLaunchToken(), homeOrigin: homeOrigin(),
+  target: "assistant", onHomeToken: setHomeGuiLaunchToken });
+
 
 /* A copy Home would refuse for its size is refused here, by name, before Home
    is asked to confirm it. */

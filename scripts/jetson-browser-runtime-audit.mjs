@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const schema = "elastos.jetson-browser-runtime-audit/v1";
 
@@ -42,7 +43,7 @@ function usage() {
   process.stdout.write(`Usage:
   scripts/jetson-browser-runtime-audit.mjs [options]
 
-Read-only Jetson Browser VM runtime audit for the 0.5.0 closeout.
+Read-only Jetson native Browser VM runtime audit.
 
 Options:
   --host HOST             Jetson SSH host. Required unless ELASTOS_050_JETSON_HOST is set.
@@ -61,7 +62,7 @@ Options:
   --help, -h              Show this help.
 
 This audit does not mutate the Jetson. It checks the installed Browser adapter
-contract, VM preflight state, rootfs pool, active crosvm launch shape, and recent
+contract, admitted native components, VM readiness, active crosvm launch shape, and recent
 guest-control logs.
 `);
 }
@@ -138,6 +139,7 @@ function run(command, args, options = {}) {
     encoding: "utf8",
     timeout: options.timeoutMs ?? 20_000,
     maxBuffer: options.maxBuffer ?? 2 * 1024 * 1024,
+    env: options.env,
   });
   return {
     ok: result.status === 0,
@@ -186,7 +188,39 @@ function localSha256(paths) {
   return hashes;
 }
 
-function remoteAuditScript(dataDir, sourceDir, minActiveCrosvmSeconds) {
+export function verifyNativeComponents(dataDir, sourceDir, transport) {
+  if (!["kernel-vsock", "userspace-vsock"].includes(transport)) {
+    return { ok: false, components: [], error: "Browser host setup requires an explicit transport" };
+  }
+  const components = ["browser-vz-engine-supervisor", "crosvm"];
+  if (transport === "userspace-vsock") components.push("vhost-device-vsock");
+  try {
+    const manifest = JSON.parse(fs.readFileSync(dataDir + "/components.json", "utf8"));
+    for (const name of components) {
+      const component = manifest.external?.[name];
+      const entry = component?.platforms?.["linux-arm64"] || component?.platforms?.["aarch64-linux"];
+      // A direct binary is installed at bin/<name>; an archive package's
+      // executable is reached through the bin/<name> link setup makes.
+      const selected = entry && (entry.install_path || component.install_path);
+      const bound = selected && (entry.extract_path
+        ? fs.realpathSync(dataDir + "/bin/" + name) === fs.realpathSync(dataDir + "/" + selected + "/" + (entry.binary_path || component.binary_path || ""))
+        : selected === "bin/" + name);
+      if (!bound) {
+        throw new Error("Native component receipt must bind its selected path: " + name);
+      }
+    }
+  } catch (error) {
+    return { ok: false, components, error: error.message };
+  }
+  const result = run("bash", [sourceDir + "/scripts/installed-provider-verify.sh", "--require-verified", ...components], {
+    timeout: 20000, timeoutMs: 20000,
+    env: { ...process.env, ELASTOS_DATA_DIR: dataDir, ELASTOS_COMPONENTS_JSON: dataDir + "/components.json",
+      ELASTOS_SETUP_PLATFORM: "linux-arm64" },
+  });
+  return { ...result, components };
+}
+
+export function remoteAuditScript(dataDir, sourceDir, minActiveCrosvmSeconds) {
   return `
 const fs = require("node:fs");
 const crypto = require("node:crypto");
@@ -195,6 +229,7 @@ const os = require("node:os");
 const dataDir = ${JSON.stringify(dataDir)};
 const sourceDir = ${JSON.stringify(sourceDir)};
 const minActiveCrosvmSeconds = ${JSON.stringify(minActiveCrosvmSeconds)};
+${verifyNativeComponents.toString()}
 
 function parentDir(path) {
   const parts = path.replace(/\\/+$/, "").split("/");
@@ -404,26 +439,34 @@ const adapterPath = dataDir + "/config/browser-engine-adapter.json";
 const adapterConfig = readJson(adapterPath);
 const adapter = adapterConfig.adapters?.[0] || {};
 const env = adapter.supervisor?.env || {};
-const preflight = JSON.parse(run("bash", [
-  sourceDir + "/scripts/browser-vm-engine-preflight.sh",
+const runtimeEnv = { ...process.env, ...env };
+const nativeOwnerSelected = env.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER === dataDir + "/bin/browser-vz-engine-supervisor";
+const nativeProgramPaths = [
+  ["ELASTOS_BROWSER_VM_CROSVM_BIN", "crosvm"],
+  ["ELASTOS_BROWSER_VM_VHOST_DEVICE_VSOCK_BIN", "vhost-device-vsock"],
+].every(([key, name]) => !runtimeEnv[key] || runtimeEnv[key] === dataDir + "/bin/" + name);
+let transport = null;
+try {
+  const receipt = readJson("/run/elastos-browser/" + process.getuid() + ".json");
+  if (receipt.uid === process.getuid() && receipt.boot_id === fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()) {
+    transport = receipt.transport;
+  }
+} catch {}
+const nativeComponents = verifyNativeComponents(dataDir, sourceDir, transport);
+const preflightResult = nativeComponents.ok && nativeOwnerSelected && nativeProgramPaths ? run("bash", [
+  sourceDir + "/scripts/browser-vm-artifact-preflight.sh", "--host-readiness",
 ], {
+  timeout: 30000,
   env: {
-    ...process.env,
+    ...runtimeEnv,
     ELASTOS_BROWSER_VM_DATA_DIR: dataDir,
     ELASTOS_BROWSER_VM_PLATFORM: "linux-arm64",
-    ELASTOS_BROWSER_VM_CONTROL_SOCKET: env.ELASTOS_BROWSER_VM_CONTROL_SOCKET || "",
+    ELASTOS_BROWSER_VM_VZ_SUPERVISOR: dataDir + "/bin/browser-vz-engine-supervisor",
   },
-}).stdout || "{}");
-const poolDir = dataDir + "/browser-vm/rootfs-pool";
-let poolFiles = [];
+}) : { ok: false, stdout: "" };
+let preflight = { schema: "elastos.browser.engine-readiness/v1", readiness: { state: "unavailable", reason: "preparation_required" } };
 try {
-  poolFiles = fs.readdirSync(poolDir)
-    .filter((name) => name.endsWith(".ext4"))
-    .map((name) => {
-      const path = poolDir + "/" + name;
-      const st = fs.statSync(path);
-      return { name, size: st.size };
-    });
+  if (preflightResult.ok) preflight = JSON.parse(preflightResult.stdout);
 } catch {}
 const crosvmInfos = crosvmProcessInfos();
 const crosvmLines = crosvmInfos.map((info) => info.command);
@@ -434,24 +477,23 @@ const sessionId = bvmMatch?.[1] || null;
 const sessionDir = sessionId ? dataDir + "/bvm/" + sessionId : null;
 const serialTail = sessionDir ? tail(sessionDir + "/serial.log", 140) : "";
 const crosvmTail = sessionDir ? tail(sessionDir + "/crosvm.log", 80) : "";
-const activeInitrdPath = extractFlagPath(activeCrosvm, "--initrd") || dataDir + "/browser-vm/initrd";
-const baseRootfsPath = dataDir + "/browser-vm/rootfs.ext4";
+const activeInitrdPath = extractFlagPath(activeCrosvm, "--initrd") || env.ELASTOS_BROWSER_VM_INITRAMFS || dataDir + "/browser-vm/initrd";
+const baseRootfsPath = env.ELASTOS_BROWSER_VM_ROOTFS || dataDir + "/browser-vm/rootfs.ext4";
 const activeRootfsPath =
+  extractFlagPath(activeCrosvm, "--block")?.split(",").find((field) => field.startsWith("path="))?.slice(5) ||
   extractFlagPath(activeCrosvm, "--rwdisk") ||
   extractFlagPath(activeCrosvm, "--rw-root") ||
   null;
 const helperNames = [
-  "browser-vm-local-crosvm-launcher.mjs",
+  "browser-vm-engine-supervisor.mjs",
   "browser-vm-control-service.mjs",
   "browser-source-home-config.mjs",
-  "browser-vm-prepare-rootfs-pool.mjs",
   "browser-selkies-control-service.mjs",
 ];
 const installedHelperPaths = {
-  "browser-vm-local-crosvm-launcher.mjs": dataDir + "/bin/browser-vm-local-crosvm-launcher.mjs",
+  "browser-vm-engine-supervisor.mjs": dataDir + "/bin/browser-vm-engine-supervisor.mjs",
   "browser-vm-control-service.mjs": dataDir + "/bin/browser-vm-control-service.mjs",
   "browser-source-home-config.mjs": dataDir + "/scripts/browser-source-home-config.mjs",
-  "browser-vm-prepare-rootfs-pool.mjs": dataDir + "/scripts/browser-vm-prepare-rootfs-pool.mjs",
   "browser-selkies-control-service.mjs": dataDir + "/scripts/browser-selkies-control-service.mjs",
 };
 const helperHashes = {};
@@ -493,9 +535,11 @@ const checks = {
   adapter_runtime_net_only: adapter.network_mode === "runtime_net_only" && adapter.direct_network !== true && adapter.wallet_injection !== true,
   control_socket_configured: Boolean(env.ELASTOS_BROWSER_VM_CONTROL_SOCKET),
   control_socket_exists: exists(controlSocket),
-  rootfs_pool_required: env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE === "pool-required",
-  local_substrate_ready: preflight.local_substrate_ready === true,
-  launch_ready: preflight.launch_ready === true,
+  native_owner_selected: nativeOwnerSelected,
+  native_program_paths: nativeProgramPaths,
+  native_components_verified: nativeComponents.ok === true,
+  local_substrate_ready: preflight.schema === "elastos.browser.engine-readiness/v1" && preflight.readiness?.state === "ready",
+  launch_ready: controlStatus.ok === true,
   crosvm_running: crosvmLines.length > 0,
   crosvm_min_uptime: minActiveCrosvmSeconds === 0 ||
     Number(activeCrosvmInfo?.uptime_seconds || 0) >= minActiveCrosvmSeconds,
@@ -518,13 +562,11 @@ console.log(JSON.stringify({
     network_mode: adapter.network_mode,
     control_socket: env.ELASTOS_BROWSER_VM_CONTROL_SOCKET || null,
     launcher: env.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER || null,
-    rootfs_pool_dir: env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR || null,
-    rootfs_copy_mode: env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE || null,
   },
   preflight,
   control_status: controlStatus,
   active_page_status: activePageStatus,
-  rootfs_pool: poolFiles,
+  native_components: { ...nativeComponents, transport, manifest_sha256: sha(dataDir + "/components.json") },
   active_crosvm: activeCrosvm,
   active_crosvm_process: activeCrosvmInfo ? {
     pid: activeCrosvmInfo.pid,
@@ -564,10 +606,9 @@ function main() {
   }
 
   const localHashes = localSha256([
-    "scripts/browser-vm-local-crosvm-launcher.mjs",
+    "scripts/browser-vm-engine-supervisor.mjs",
     "scripts/browser-vm-control-service.mjs",
     "scripts/browser-source-home-config.mjs",
-    "scripts/browser-vm-prepare-rootfs-pool.mjs",
     "scripts/browser-selkies-control-service.mjs",
   ]);
   const result = sshNode(
@@ -616,7 +657,9 @@ function main() {
     "adapter_runtime_net_only",
     "control_socket_configured",
     "control_socket_exists",
-    "rootfs_pool_required",
+    "native_owner_selected",
+    "native_program_paths",
+    "native_components_verified",
     "local_substrate_ready",
     "launch_ready",
     "crosvm_running",
@@ -710,4 +753,4 @@ function main() {
   process.exit(report.ok ? 0 : 1);
 }
 
-main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

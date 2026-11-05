@@ -85,6 +85,7 @@ pub(super) fn run_supervisor_launch(
 ) -> Result<SupervisorLaunchResult, SupervisorLaunchError> {
     let mut request = json!({
         "schema": "elastos.browser.engine.launch-request/v1",
+        "verified_rootfs": context.verified_rootfs,
         "adapter": &adapter.id,
         "engine": adapter.kind,
         "url": context.url,

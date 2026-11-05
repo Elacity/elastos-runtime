@@ -1912,6 +1912,13 @@ function homeBrowserNavigateUrl(event) {
 }
 
 window.addEventListener("message", (event) => {
+  if (event.source === window.top && event.origin === homeParentOrigin &&
+      event.data?.type === "elastos.home.authority.request/v1" && event.data.homeToken === launchToken &&
+      Object.keys(event.data).sort().join(",") === "homeToken,type") {
+    requestHomeRelaunch("Renewing Browser session");
+    return;
+  }
+
   if (isHomeBrowserWindowCloseRequest(event)) {
     void handleHomeBrowserWindowCloseRequest(event);
     return;

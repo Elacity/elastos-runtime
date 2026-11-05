@@ -155,6 +155,10 @@ struct AppState {
     /// offered whatever other message is showing.
     reconnect_needed: bool,
     reconnecting: bool,
+    room_expires_at: u64,
+    recovery_attempts: u32,
+    recovery_after_ms: f64,
+    recovery_terminal: bool,
     pending_direct_launch: Option<String>,
     /// Unsent text of the conversations the composer does not show, with the
     /// revision it had when it left the composer.
@@ -319,6 +323,8 @@ struct BrowserSessionStatusOutput {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ShellSessionStartOutput {
+    #[serde(default)]
+    expires_at: u64,
     poll: RoomPollView,
 }
 
@@ -1208,9 +1214,65 @@ impl App {
         .await;
     }
 
-    async fn poll_and_render_once(&self) {
-        if self.state.borrow().reconnect_needed {
+    fn recovery_failed(&self) {
+        if !self.is_shell_mode() {
             return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+        state.recovery_after_ms = js_sys::Date::now()
+            + recovery_delay_ms(state.recovery_attempts, js_sys::Math::random()) as f64;
+        state.status_badge = "Reconnecting".into();
+    }
+
+    fn recovery_succeeded(&self) {
+        let mut state = self.state.borrow_mut();
+        state.recovery_attempts = 0;
+        state.recovery_after_ms = 0.0;
+        if state.status_badge == "Reconnecting" {
+            state.status_badge = state.community_state.label().to_string();
+        }
+    }
+
+    async fn poll_and_render_once(&self) {
+        if self.is_shell_mode() {
+            {
+                let state = self.state.borrow();
+                if state.recovery_terminal
+                    || state.close_leave_sent
+                    || state.reconnecting
+                    || js_sys::Date::now() < state.recovery_after_ms
+                {
+                    return;
+                }
+            }
+            if self.state.borrow().reconnect_needed {
+                if let Err(error) = self.reconnect_from_home().await {
+                    self.state.borrow_mut().recovery_terminal = error.contains("Sign in to Home");
+                    apply_reconnect_failure(&mut self.state.borrow_mut(), error);
+                    self.recovery_failed();
+                }
+                let _ = self.render();
+                return;
+            }
+            let renew_room = {
+                let state = self.state.borrow();
+                state.session_active
+                    && state.room_expires_at > 0
+                    && state.room_expires_at <= (js_sys::Date::now() / 1000.0) as u64 + 30
+            };
+            if renew_room {
+                let guard = current_selection_guard(&self.state.borrow());
+                if let Err(error) = self.ensure_shell_session_for_guard(&guard).await {
+                    if error == ShellSessionBootstrapFailure::Unauthorized {
+                        self.handle_session_loss(self.session_loss_detail());
+                    }
+                    self.set_transient_error(Some(error.detail().to_string()));
+                    self.recovery_failed();
+                    let _ = self.render();
+                    return;
+                }
+            }
         }
         if self.is_direct_mode() {
             let (selection_guard, polled_transient_error) = {
@@ -1231,6 +1293,7 @@ impl App {
             }
             match result {
                 Ok(changed) => {
+                    self.recovery_succeeded();
                     let cleared_transient_error = {
                         let mut state = self.state.borrow_mut();
                         if should_clear_polled_transient_error(
@@ -1255,6 +1318,7 @@ impl App {
                     let _ = self.render();
                 }
                 Err(_) => {
+                    self.recovery_failed();
                     self.set_transient_error(Some(
                         "Direct messages are temporarily unavailable.".to_string(),
                     ));
@@ -1285,6 +1349,7 @@ impl App {
                 {
                     return;
                 }
+                self.recovery_succeeded();
                 // Show current Shared messages before waiting for auxiliary metadata.
                 let poll_rendered = changed && self.render().is_ok();
                 let mut shell_summary_changed = false;
@@ -1354,6 +1419,7 @@ impl App {
                 }
             }
             Err(err) => {
+                self.recovery_failed();
                 self.set_transient_error(Some(err));
                 let _ = self.render();
             }
@@ -1692,8 +1758,34 @@ impl App {
             reset_click.forget();
         }
 
+        for event_name in ["online", "pageshow", "elastos-chat-authority-renewed"] {
+            let app = Rc::clone(self);
+            let wake = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+                app.state.borrow_mut().recovery_after_ms = 0.0;
+                if let Some(window) = window() {
+                    if let Ok(getter) =
+                        Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatHomeToken"))
+                            .and_then(|value| value.dyn_into::<Function>())
+                    {
+                        if let Ok(value) = getter.call0(&JsValue::NULL) {
+                            if let Some(token) = value.as_string() {
+                                *app.current_home_token.borrow_mut() = Some(token);
+                            }
+                        }
+                    }
+                }
+            }));
+            if let Some(window) = window() {
+                window
+                    .add_event_listener_with_callback(event_name, wake.as_ref().unchecked_ref())?;
+            }
+            wake.forget();
+        }
+
         let reconnect_app = Rc::clone(self);
         let reconnect_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            reconnect_app.state.borrow_mut().recovery_terminal = false;
+            reconnect_app.state.borrow_mut().recovery_after_ms = 0.0;
             reconnect_app.reconnect_shell_session();
         }));
         self.reconnect_button
@@ -2641,7 +2733,12 @@ impl App {
                 reconnect.call0(&JsValue::NULL).map_err(js_error)?,
             ))
             .await
-            .map_err(js_error)?
+            .map_err(|error| {
+                Reflect::get(&error, &JsValue::from_str("message"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_else(|| js_error(error))
+            })?
             .as_string()
             .filter(|token| !token.is_empty())
             .ok_or_else(|| "Home could not reopen Chat. Try again.".to_string())?;
@@ -2671,7 +2768,9 @@ impl App {
                 }
             }
             let guard = current_selection_guard(&self.state.borrow());
-            self.ensure_shell_session_for_guard(&guard).await?;
+            self.ensure_shell_session_for_guard(&guard)
+                .await
+                .map_err(|error| error.detail().to_string())?;
             if self.selection_guard_is_current(&guard)
                 && self.state.borrow().session_active
                 && guard.selected_conversation_id.is_some()
@@ -2699,6 +2798,7 @@ impl App {
     fn handle_session_loss(&self, detail: &str) {
         self.clear_browser_session_request_storage();
         apply_session_loss(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
+        self.recovery_failed();
         // Loss invalidates the request's selection guard. Render it here,
         // before that stale caller returns without updating the screen.
         let _ = self.render();
@@ -2829,7 +2929,7 @@ impl App {
                     .map(|_| ());
                 if let Err(err) = bootstrap {
                     if app.selection_guard_is_current(&shared_guard) {
-                        app.set_error(Some(err));
+                        app.set_error(Some(err.detail().to_string()));
                     }
                 } else if app.selection_guard_is_current(&shared_guard)
                     && app.state.borrow().session_active
@@ -2924,8 +3024,17 @@ impl App {
         Ok(())
     }
 
-    async fn ensure_shell_session_for_guard(&self, guard: &SelectionGuard) -> Result<bool, String> {
-        if !self.is_shell_mode() || self.state.borrow().session_active {
+    async fn ensure_shell_session_for_guard(
+        &self,
+        guard: &SelectionGuard,
+    ) -> Result<bool, ShellSessionBootstrapFailure> {
+        let room_current = {
+            let state = self.state.borrow();
+            state.session_active
+                && (state.room_expires_at == 0
+                    || state.room_expires_at > (js_sys::Date::now() / 1000.0) as u64 + 30)
+        };
+        if !self.is_shell_mode() || room_current {
             return Ok(false);
         }
         if self.state.borrow().reconnect_needed && !self.state.borrow().reconnecting {
@@ -2936,7 +3045,8 @@ impl App {
             &self.room_api_url("/summary"),
             &self.home_token_headers(),
         )
-        .await?;
+        .await
+        .map_err(|error| ShellSessionBootstrapFailure::from_request_error(&error))?;
         if !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
@@ -2965,16 +3075,14 @@ impl App {
         }
 
         let poll_guard = begin_poll_request(&mut self.state.borrow_mut());
-        let start: ShellSessionStartOutput = api_post_empty_json_with_headers(
+        let start: ShellSessionStartOutput = api_post_json_with_headers(
             &self.room_api_url("/session/start"),
+            &serde_json::json!({}),
             &self.home_token_headers(),
+            Some(REQUEST_DEADLINE_MS),
         )
         .await
-        .map_err(|error| {
-            ShellSessionBootstrapFailure::from_request_error(&error)
-                .detail()
-                .to_string()
-        })?;
+        .map_err(|error| ShellSessionBootstrapFailure::from_request_error(&error))?;
         if !self.selection_guard_is_current(guard) {
             return Ok(false);
         }
@@ -2983,6 +3091,7 @@ impl App {
         // the poll loop from starting.
         let changed = {
             let mut state = self.state.borrow_mut();
+            state.room_expires_at = start.expires_at;
             let Some(changed) = apply_active_poll_if_current(&mut state, &poll_guard, start.poll)
             else {
                 return Ok(false);
@@ -3856,7 +3965,7 @@ impl App {
             if choice == "shared" {
                 if let Err(error) = app.ensure_shell_session_for_guard(&selection_guard).await {
                     if app.selection_guard_is_current(&selection_guard) {
-                        app.set_error(Some(error));
+                        app.set_error(Some(error.detail().to_string()));
                     }
                 }
             } else if let Err(status) = app
@@ -6304,6 +6413,13 @@ fn element_with_attribute(root: &Element, attribute: &str, value: &str) -> Optio
 
 /// The Reconnect action shows only inside Home, while a lost session has not
 /// come back. It does not depend on which message is showing.
+fn recovery_delay_ms(attempt: u32, jitter: f64) -> u32 {
+    let ceiling = 1000u32
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(5))
+        .min(30_000);
+    (ceiling as f64 * (0.5 + 0.5 * jitter.clamp(0.0, 1.0))) as u32
+}
+
 fn shows_reconnect(shell_mode: bool, session_active: bool, reconnect_needed: bool) -> bool {
     shell_mode && !session_active && reconnect_needed
 }
@@ -6338,14 +6454,16 @@ fn apply_session_loss(state: &mut AppState, shell_mode: bool, detail: &str) {
     state.show_participants = false;
     state.show_access_controls = false;
     state.force_message_follow = true;
-    state.latest_seq = 0;
-    state.history = None;
-    state.objects.clear();
-    state.participants.clear();
-    state.active_sessions.clear();
-    state.attachment_urls.clear();
-    state.attachment_retry.clear();
-    state.status_badge = if shell_mode { "Reconnect" } else { "Join" }.to_string();
+    if !shell_mode {
+        state.latest_seq = 0;
+        state.history = None;
+        state.objects.clear();
+        state.participants.clear();
+        state.active_sessions.clear();
+        state.attachment_urls.clear();
+        state.attachment_retry.clear();
+    }
+    state.status_badge = if shell_mode { "Reconnecting" } else { "Join" }.to_string();
     state.status_detail = detail.to_string();
     state.error_text = shell_mode.then(|| detail.to_string());
     state.error_transient = false;
@@ -6774,6 +6892,10 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_conversation: None,
         reconnect_needed: false,
         reconnecting: false,
+        room_expires_at: 0,
+        recovery_attempts: 0,
+        recovery_after_ms: 0.0,
+        recovery_terminal: false,
         pending_direct_launch: None,
         drafts: BTreeMap::new(),
         composer_revision: 0,
@@ -6953,6 +7075,43 @@ mod tests {
         )
         .is_none());
         assert!(state.direct.selected_conversation_id.is_none());
+    }
+
+    #[test]
+    fn recovery_delay_has_jitter_and_never_exceeds_thirty_seconds() {
+        for attempt in 1..100 {
+            let low = super::recovery_delay_ms(attempt, 0.0);
+            let high = super::recovery_delay_ms(attempt, 1.0);
+            assert!(low > 0 && low < high);
+            assert!(high <= 30_000);
+        }
+        assert_eq!(super::recovery_delay_ms(1, 1.0), 1000);
+        assert_eq!(super::recovery_delay_ms(20, 1.0), 30_000);
+    }
+
+    #[test]
+    fn automatic_session_recovery_keeps_cursor_and_saved_drafts() {
+        let mut state = AppState {
+            latest_seq: 41,
+            session_active: true,
+            ..AppState::default()
+        };
+        state.drafts.insert(None, ("Keep this draft".into(), 7));
+        apply_session_loss(&mut state, true, super::SHELL_SESSION_LOST_DETAIL);
+        assert_eq!(state.latest_seq, 41);
+        assert_eq!(
+            state.drafts.get(&None),
+            Some(&("Keep this draft".into(), 7))
+        );
+        assert_eq!(state.status_badge, "Reconnecting");
+        assert!(state.reconnect_needed);
+        assert!(!state.session_active);
+        assert!(!super::is_session_error(
+            "request failed: 403 conversation access denied"
+        ));
+        assert!(super::is_session_error(
+            "request failed: 403 Gateway request requires an admitted host and caller"
+        ));
     }
 
     #[test]
@@ -9877,7 +10036,11 @@ fn room_send_error_text(err: String) -> String {
 }
 
 fn is_session_error(err: &str) -> bool {
-    err.contains("invalid or expired session") || err.contains("request failed: 401")
+    err.contains("invalid or expired session")
+        || err.contains("request failed: 401")
+        || (err.contains("request failed: 403")
+            && (err.contains("Gateway request requires an admitted host and caller")
+                || err.contains("home launch token expired")))
 }
 
 fn shell_summary_allows_session(summary: &SummaryView) -> bool {
@@ -10362,7 +10525,15 @@ async fn direct_get_json<T: DeserializeOwned>(
     }
     let response = request.send().await.map_err(|_| 0u16)?;
     if response.status() != 200 {
-        return Err(response.status());
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(
+            if is_session_error(&format!("request failed: {status} {body}")) {
+                401
+            } else {
+                status
+            },
+        );
     }
     response.json::<T>().await.map_err(|_| 500)
 }
