@@ -790,6 +790,54 @@ struct SessionRecord {
     approved_at: u64,
     expires_at: u64,
     last_seen_at: u64,
+    #[serde(default)]
+    authorization: Option<RoomSessionAuthorization>,
+}
+
+/// Runtime authority retained for every use of a person's room session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomSessionAuthorization {
+    pub principal_id: String,
+    pub session_id: String,
+    pub proof_binding_id: Option<String>,
+    pub grant_id: String,
+    pub authority_actor: String,
+    pub expires_at: u64,
+}
+
+impl RoomSessionAuthorization {
+    fn same_grant(&self, other: &Self) -> bool {
+        self.principal_id == other.principal_id
+            && self.session_id == other.session_id
+            && self.proof_binding_id == other.proof_binding_id
+            && self.grant_id == other.grant_id
+            && self.authority_actor == other.authority_actor
+    }
+
+    fn validate(&self, data_dir: &Path, actor_id: &str) -> anyhow::Result<u64> {
+        let now = now_ts();
+        if self.expires_at <= now || local_principal_room_actor_id(&self.principal_id)? != actor_id
+        {
+            anyhow::bail!("invalid or expired session authority");
+        }
+        if let Some(proof) = self.proof_binding_id.as_deref() {
+            let grant = crate::auth::load_active_session_grant(
+                &crate::api::gateway::home_launch_auth_data_dir(data_dir),
+                &self.session_id,
+                now,
+            )
+            .map_err(|_| anyhow::anyhow!("invalid or expired session authority"))?;
+            if grant.principal_id != self.principal_id
+                || grant.proof_binding_id != proof
+                || grant.grant_id != self.grant_id
+                || !grant.apps.iter().any(|app| app == &self.authority_actor)
+            {
+                anyhow::bail!("invalid or expired session authority");
+            }
+            return Ok(self.expires_at.min(grant.expires_at));
+        }
+        Ok(self.expires_at)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2049,7 +2097,14 @@ pub fn start_local_runtime_session_with_transport(
     display_name: &str,
     device_label: &str,
 ) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
-    start_local_runtime_session_for_actor(data_dir, member_did, None, display_name, device_label)
+    start_local_runtime_session_for_actor(
+        data_dir,
+        member_did,
+        None,
+        display_name,
+        device_label,
+        None,
+    )
 }
 
 pub fn start_local_principal_runtime_session(
@@ -2058,14 +2113,17 @@ pub fn start_local_principal_runtime_session(
     principal_id: &str,
     display_name: &str,
     device_label: &str,
+    authorization: &RoomSessionAuthorization,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
     let actor_id = local_principal_room_actor_id(principal_id)?;
+    authorization.validate(data_dir, &actor_id)?;
     Ok(start_local_runtime_session_for_actor(
         data_dir,
         member_did,
         Some(actor_id),
         display_name,
         device_label,
+        Some(authorization),
     )?
     .session)
 }
@@ -2076,9 +2134,11 @@ pub(crate) fn start_configured_collaboration_principal_session(
     principal_id: &str,
     display_name: &str,
     device_label: &str,
+    authorization: &RoomSessionAuthorization,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
     let member_did = normalize_member_did(member_did)?;
     let actor_id = local_principal_room_actor_id(principal_id)?;
+    let expires_at = authorization.validate(data_dir, &actor_id)?;
     let display_name = normalize_display_name(display_name)?;
     let device_label = normalize_device_label(device_label);
 
@@ -2086,22 +2146,32 @@ pub(crate) fn start_configured_collaboration_principal_session(
         let now = now_ts();
         state.sessions.retain(|session| {
             session.actor_id != actor_id
-                || session.member_did.as_deref() == Some(member_did.as_str())
+                || (session.authorization.is_some()
+                    && session.member_did.as_deref() == Some(member_did.as_str()))
         });
         let canonical_token = state
             .sessions
             .iter()
             .filter(|session| {
                 session.actor_id == actor_id
+                    && session
+                        .authorization
+                        .as_ref()
+                        .is_some_and(|saved| saved.same_grant(authorization))
                     && session.member_did.as_deref() == Some(member_did.as_str())
             })
             .max_by_key(|session| (session.last_seen_at, session.expires_at))
             .map(|session| session.token.clone());
 
         if let Some(token) = canonical_token {
-            state
-                .sessions
-                .retain(|session| session.actor_id != actor_id || session.token == token);
+            state.sessions.retain(|session| {
+                session.actor_id != actor_id
+                    || !session
+                        .authorization
+                        .as_ref()
+                        .is_some_and(|saved| saved.same_grant(authorization))
+                    || session.token == token
+            });
             let session = state
                 .sessions
                 .iter_mut()
@@ -2112,7 +2182,8 @@ pub(crate) fn start_configured_collaboration_principal_session(
             session.member_did = Some(member_did);
             session.capabilities = room_access_capabilities();
             session.last_seen_at = now;
-            session.expires_at = now + SESSION_TTL_SECS;
+            session.expires_at = now.saturating_add(SESSION_TTL_SECS).min(expires_at);
+            session.authorization = Some(authorization.clone());
             return Ok(LocalRuntimeSessionOutput {
                 token: session.token.clone(),
                 display_name: session.display_name.clone(),
@@ -2122,7 +2193,7 @@ pub(crate) fn start_configured_collaboration_principal_session(
         }
 
         let capabilities = room_access_capabilities();
-        let session = create_session_record_with_actor(
+        let mut session = create_session_record_with_actor(
             &display_name,
             &device_label,
             Some(member_did),
@@ -2130,6 +2201,8 @@ pub(crate) fn start_configured_collaboration_principal_session(
             capabilities.clone(),
             now,
         );
+        session.expires_at = session.expires_at.min(expires_at);
+        session.authorization = Some(authorization.clone());
         let output = LocalRuntimeSessionOutput {
             token: session.token.clone(),
             display_name: session.display_name.clone(),
@@ -2145,12 +2218,18 @@ pub(crate) fn resolve_configured_collaboration_principal_session(
     data_dir: &Path,
     member_did: &str,
     principal_id: &str,
+    authorization: &RoomSessionAuthorization,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
     let member_did = normalize_member_did(member_did)?;
     let actor_id = local_principal_room_actor_id(principal_id)?;
+    authorization.validate(data_dir, &actor_id)?;
     with_read_state(data_dir, |state| {
         let mut matches = state.sessions.iter().filter(|session| {
             session.actor_id == actor_id
+                && session
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_grant(authorization))
                 && session.member_did.as_deref() == Some(member_did.as_str())
         });
         let session = matches
@@ -2159,6 +2238,7 @@ pub(crate) fn resolve_configured_collaboration_principal_session(
         if matches.next().is_some() {
             anyhow::bail!("configured Chat session is ambiguous");
         }
+        validate_session_authority(data_dir, session)?;
         if session.expires_at <= now_ts()
             || session.capabilities != room_access_capabilities()
             || session.token.len() != 64
@@ -2182,13 +2262,19 @@ pub(crate) fn leave_configured_collaboration_principal_session(
     data_dir: &Path,
     member_did: &str,
     principal_id: &str,
+    authorization: &RoomSessionAuthorization,
 ) -> anyhow::Result<Option<LocalRuntimeSessionOutput>> {
     let member_did = normalize_member_did(member_did)?;
     let actor_id = local_principal_room_actor_id(principal_id)?;
+    authorization.validate(data_dir, &actor_id)?;
     with_locked_state(data_dir, |_, state| {
         let mut removed = None;
         state.sessions.retain(|session| {
             let matches = session.actor_id == actor_id
+                && session
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_grant(authorization))
                 && session.member_did.as_deref() == Some(member_did.as_str());
             if matches && removed.is_none() {
                 removed = Some(LocalRuntimeSessionOutput {
@@ -2210,14 +2296,17 @@ pub fn start_local_principal_runtime_session_with_transport(
     principal_id: &str,
     display_name: &str,
     device_label: &str,
+    authorization: &RoomSessionAuthorization,
 ) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
     let actor_id = local_principal_room_actor_id(principal_id)?;
+    authorization.validate(data_dir, &actor_id)?;
     start_local_runtime_session_for_actor(
         data_dir,
         member_did,
         Some(actor_id),
         display_name,
         device_label,
+        Some(authorization),
     )
 }
 
@@ -2227,7 +2316,14 @@ fn start_local_runtime_session_for_actor(
     actor_id: Option<String>,
     display_name: &str,
     device_label: &str,
+    authorization: Option<&RoomSessionAuthorization>,
 ) -> anyhow::Result<LocalRuntimeSessionWithTransportOutput> {
+    let expires_at = match authorization {
+        Some(authorization) => {
+            authorization.validate(data_dir, actor_id.as_deref().unwrap_or_default())?
+        }
+        None => u64::MAX,
+    };
     let member_did = normalize_member_did(member_did)?;
     let display_name = normalize_display_name(display_name)?;
     let device_label = normalize_device_label(device_label);
@@ -2268,7 +2364,14 @@ fn start_local_runtime_session_for_actor(
             .sessions
             .iter()
             .filter(|session| match actor_id.as_deref() {
-                Some(actor_id) => session.actor_id == actor_id,
+                Some(actor_id) => {
+                    session.actor_id == actor_id
+                        && session
+                            .authorization
+                            .as_ref()
+                            .zip(authorization)
+                            .is_some_and(|(saved, current)| saved.same_grant(current))
+                }
                 None => {
                     session.member_did.as_deref() == Some(member_did.as_str())
                         || (session.member_did.is_none() && session.device_label == device_label)
@@ -2285,7 +2388,15 @@ fn start_local_runtime_session_for_actor(
 
         if let Some(token) = canonical_local_token {
             state.sessions.retain(|session| match actor_id.as_deref() {
-                Some(actor_id) => session.actor_id != actor_id || session.token == token,
+                Some(actor_id) => {
+                    session.actor_id != actor_id
+                        || !session
+                            .authorization
+                            .as_ref()
+                            .zip(authorization)
+                            .is_some_and(|(saved, current)| saved.same_grant(current))
+                        || session.token == token
+                }
                 None => {
                     !(session.member_did.as_deref() == Some(member_did.as_str())
                         || (session.member_did.is_none() && session.device_label == device_label))
@@ -2305,7 +2416,8 @@ fn start_local_runtime_session_for_actor(
             existing.member_did = session_member_did.clone();
             existing.capabilities = capabilities.clone();
             existing.last_seen_at = now;
-            existing.expires_at = now + SESSION_TTL_SECS;
+            existing.expires_at = now.saturating_add(SESSION_TTL_SECS).min(expires_at);
+            existing.authorization = authorization.cloned();
             return Ok(LocalRuntimeSessionWithTransportOutput {
                 session: LocalRuntimeSessionOutput {
                     token: existing.token.clone(),
@@ -2325,7 +2437,7 @@ fn start_local_runtime_session_for_actor(
             (None, Some(did)) => active_local_session_count(state, did) > 0,
             _ => false,
         };
-        let session = create_session_record_with_actor(
+        let mut session = create_session_record_with_actor(
             &display_name,
             &device_label,
             session_member_did.clone(),
@@ -2333,6 +2445,8 @@ fn start_local_runtime_session_for_actor(
             capabilities.clone(),
             now,
         );
+        session.expires_at = session.expires_at.min(expires_at);
+        session.authorization = authorization.cloned();
         let output = LocalRuntimeSessionOutput {
             token: session.token.clone(),
             display_name: session.display_name.clone(),
@@ -2488,6 +2602,7 @@ fn create_session_record_with_actor(
         approved_at: now,
         expires_at: now + SESSION_TTL_SECS,
         last_seen_at: now,
+        authorization: None,
     }
 }
 
@@ -2713,7 +2828,7 @@ pub fn session_view(data_dir: &Path, token: &str) -> anyhow::Result<SessionView>
     with_locked_state(data_dir, |_, state| {
         let room_slug = state.room_slug.clone();
         let (display_name, expires_at, capabilities, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             (
                 session.display_name.clone(),
                 session.expires_at,
@@ -2748,6 +2863,7 @@ pub fn leave_session_with_transport(
     token: &str,
 ) -> anyhow::Result<AppendedConversationObject> {
     with_locked_state(data_dir, |paths, state| {
+        validate_session(data_dir, state, token)?;
         let now = now_ts();
         let session_index = state
             .sessions
@@ -2796,7 +2912,7 @@ pub fn conversation_feed(
 ) -> anyhow::Result<ConversationFeed> {
     with_locked_state(data_dir, |_, state| {
         let current_session = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             current_session_identity(session)
         };
         let objects = state
@@ -2818,7 +2934,7 @@ pub fn room_poll(data_dir: &Path, token: &str, since: u64) -> anyhow::Result<Roo
     with_locked_state(data_dir, |_, state| {
         let room_slug = state.room_slug.clone();
         let (display_name, expires_at, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             session.last_seen_at = now_ts();
             (
                 session.display_name.clone(),
@@ -2863,7 +2979,7 @@ pub fn append_object_with_transport(
     let draft = classify_object_body(body)?;
     with_locked_state(data_dir, |paths, state| {
         let (sender, sender_member_did, sender_actor_id, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             session.last_seen_at = now_ts();
             (
                 session.display_name.clone(),
@@ -2936,7 +3052,7 @@ pub(crate) fn project_collaboration_text(
     let object = with_locked_state(data_dir, |_, state| {
         let current_session = match local_session_token {
             Some(token) => {
-                let session = validate_session(state, token)?;
+                let session = validate_session(data_dir, state, token)?;
                 if session.member_did.as_deref() != Some(sender_member_did.as_str()) {
                     anyhow::bail!(
                         "room session does not match the collaboration sender Profile DID"
@@ -3165,7 +3281,7 @@ pub(crate) fn collaboration_room_poll(
 ) -> anyhow::Result<RoomPollView> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
     with_expired_read_state(data_dir, |state| {
-        collaboration_poll_from_state(state, token, &scope, since)
+        collaboration_poll_from_state(data_dir, state, token, &scope, since)
     })
 }
 
@@ -3250,7 +3366,7 @@ pub(crate) fn collaboration_room_poll_with_delivery(
     let result = (|| {
         let mut state = load_state(&paths)?;
         let _ = expire_state_in_place(&mut state);
-        let session = validate_session_for_read(&state, token)?;
+        let session = validate_session_for_read(data_dir, &state, token)?;
         if session.member_did.as_deref() != Some(reader.as_str()) {
             anyhow::bail!("Chat delivery reader does not match the room Profile");
         }
@@ -3305,19 +3421,20 @@ pub(crate) fn collaboration_room_poll_with_delivery(
         if changed {
             write_json_atomic(&paths.objects_path, &state.objects)?;
         }
-        collaboration_poll_from_state(&state, token, &scope, since)
+        collaboration_poll_from_state(data_dir, &state, token, &scope, since)
     })();
     unlock_state_file(lock)?;
     result
 }
 
 fn collaboration_poll_from_state(
+    data_dir: &Path,
     state: &RoomState,
     token: &str,
     scope: &CollaborationObjectScope,
     since: u64,
 ) -> anyhow::Result<RoomPollView> {
-    let session = validate_session_for_read(state, token)?;
+    let session = validate_session_for_read(data_dir, state, token)?;
     let current_session = current_session_identity(session);
     let participants = participant_views_from_state(state, Some(&current_session), Some(scope));
     let scoped = state.objects.iter().filter(|item| {
@@ -3477,7 +3594,7 @@ pub fn append_attachment_object_with_transport(
 
     with_locked_state(data_dir, |paths, state| {
         let (sender, sender_member_did, sender_actor_id, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             session.last_seen_at = now_ts();
             (
                 session.display_name.clone(),
@@ -3526,10 +3643,11 @@ pub fn start_attachment_upload(
     }
 
     with_locked_state(data_dir, |paths, state| {
-        let session = validate_session(state, token)?;
+        let session = validate_session(data_dir, state, token)?;
         session.last_seen_at = now_ts();
 
         let now = now_ts();
+        let expires_at = now.saturating_add(UPLOAD_TTL_SECS).min(session.expires_at);
         let upload_id = random_hex(16);
         fs::create_dir_all(&paths.uploads_dir)?;
         fs::write(upload_staging_path(paths, &upload_id), [])?;
@@ -3541,13 +3659,13 @@ pub fn start_attachment_upload(
             size_bytes,
             received_bytes: 0,
             created_at: now,
-            expires_at: now + UPLOAD_TTL_SECS,
+            expires_at,
         });
         Ok(AttachmentUploadStartOutput {
             upload_id,
             chunk_size_bytes: ATTACHMENT_UPLOAD_CHUNK_BYTES,
             received_bytes: 0,
-            expires_at: now + UPLOAD_TTL_SECS,
+            expires_at,
         })
     })
 }
@@ -3570,7 +3688,7 @@ pub fn append_attachment_upload_chunk(
     }
 
     with_locked_state(data_dir, |paths, state| {
-        let session = validate_session(state, token)?;
+        let session = validate_session(data_dir, state, token)?;
         session.last_seen_at = now_ts();
 
         let upload = find_upload_mut(state, token, upload_id)?;
@@ -3616,7 +3734,7 @@ pub fn finish_attachment_upload(
 ) -> anyhow::Result<AppendedConversationObject> {
     let (output, staged_path) = with_locked_state(data_dir, |paths, state| {
         let (sender, sender_member_did, sender_actor_id, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session(data_dir, state, token)?;
             session.last_seen_at = now_ts();
             (
                 session.display_name.clone(),
@@ -3676,7 +3794,7 @@ pub fn read_attachment(
     attachment_id: &str,
 ) -> anyhow::Result<(AttachmentView, Vec<u8>)> {
     let attachment = with_locked_state(data_dir, |_, state| {
-        let session = validate_session(state, token)?;
+        let session = validate_session(data_dir, state, token)?;
         session.last_seen_at = now_ts();
         state
             .objects
@@ -3691,7 +3809,23 @@ pub fn read_attachment(
     Ok((attachment, bytes))
 }
 
+fn validate_session_authority(data_dir: &Path, session: &SessionRecord) -> anyhow::Result<()> {
+    if session.expires_at <= now_ts() {
+        anyhow::bail!("invalid or expired session");
+    }
+    match session.authorization.as_ref() {
+        Some(authorization) => authorization
+            .validate(data_dir, &session.actor_id)
+            .map(|_| ()),
+        None if session.actor_id.starts_with("principal:") => {
+            anyhow::bail!("invalid or expired session authority")
+        }
+        None => Ok(()),
+    }
+}
+
 fn validate_session<'a>(
+    data_dir: &Path,
     state: &'a mut RoomState,
     token: &str,
 ) -> anyhow::Result<&'a mut SessionRecord> {
@@ -3701,6 +3835,7 @@ fn validate_session<'a>(
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     ensure_session_actor_id(session);
+    validate_session_authority(data_dir, session)?;
     if !session
         .capabilities
         .iter()
@@ -3712,6 +3847,7 @@ fn validate_session<'a>(
 }
 
 fn validate_session_for_read<'a>(
+    data_dir: &Path,
     state: &'a RoomState,
     token: &str,
 ) -> anyhow::Result<&'a SessionRecord> {
@@ -3720,6 +3856,7 @@ fn validate_session_for_read<'a>(
         .iter()
         .find(|item| item.token == token && item.expires_at > now_ts())
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
+    validate_session_authority(data_dir, session)?;
     if !session
         .capabilities
         .iter()
@@ -5715,6 +5852,233 @@ fn unlock_state_file(lock: FileLock) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_room_authorization(principal: &str) -> RoomSessionAuthorization {
+        RoomSessionAuthorization {
+            principal_id: principal.into(),
+            session_id: "local:fixture".into(),
+            proof_binding_id: None,
+            grant_id: "grant:local:fixture".into(),
+            authority_actor: "chat-room".into(),
+            expires_at: now_ts() + 24 * 60 * 60,
+        }
+    }
+
+    fn grant_room_authorization(data: &Path) -> RoomSessionAuthorization {
+        let authorization = RoomSessionAuthorization {
+            principal_id: "person:local:room".into(),
+            session_id: "auth:room".into(),
+            proof_binding_id: Some("proof:room".into()),
+            grant_id: "grant:room".into(),
+            authority_actor: "home".into(),
+            expires_at: now_ts() + 300,
+        };
+        crate::auth::store_session_grant(
+            data,
+            elastos_runtime::auth::AuthSessionGrantV1 {
+                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.into(),
+                principal_id: authorization.principal_id.clone(),
+                session_id: authorization.session_id.clone(),
+                proof_binding_id: authorization.proof_binding_id.clone().unwrap(),
+                grant_id: authorization.grant_id.clone(),
+                issued_at: now_ts(),
+                expires_at: authorization.expires_at,
+                apps: vec!["home".into()],
+            },
+        )
+        .unwrap();
+        authorization
+    }
+
+    #[test]
+    fn room_session_bound_checks_all_use_paths() {
+        for configured in [false, true] {
+            for refusal in ["revoked", "expired", "replaced", "legacy"] {
+                let data = tempfile::tempdir().unwrap();
+                let authorization = grant_room_authorization(data.path());
+                let start = if configured {
+                    start_configured_collaboration_principal_session
+                } else {
+                    start_local_principal_runtime_session
+                };
+                let session = start(
+                    data.path(),
+                    "did:key:z6room",
+                    &authorization.principal_id,
+                    "Room person",
+                    "Browser",
+                    &authorization,
+                )
+                .unwrap();
+                let token = &session.token;
+                let upload =
+                    start_attachment_upload(data.path(), token, "test.txt", "text/plain", 1)
+                        .unwrap();
+                assert!(upload.expires_at <= session.expires_at);
+                let attachment =
+                    append_attachment_object(data.path(), token, "test.txt", "text/plain", b"x")
+                        .unwrap();
+                let attachment_id = attachment.attachment.unwrap().attachment_id;
+                assert!(collaboration_room_poll(data.path(), token, "network", "room", 0).is_ok());
+                match refusal {
+                    "revoked" => crate::auth::revoke_session_grant(
+                        data.path(),
+                        &authorization.session_id,
+                        now_ts(),
+                    )
+                    .unwrap(),
+                    "legacy" => with_locked_state(data.path(), |_, state| {
+                        state
+                            .sessions
+                            .iter_mut()
+                            .find(|s| s.token == *token)
+                            .unwrap()
+                            .authorization = None;
+                        Ok(())
+                    })
+                    .unwrap(),
+                    _ => {
+                        let mut grant = crate::auth::load_active_session_grant(
+                            data.path(),
+                            &authorization.session_id,
+                            now_ts(),
+                        )
+                        .unwrap();
+                        if refusal == "expired" {
+                            grant.expires_at = now_ts();
+                        } else {
+                            grant.grant_id = "grant:replacement".into();
+                        }
+                        crate::auth::store_session_grant(data.path(), grant).unwrap();
+                    }
+                }
+                let before = room_state_snapshot(data.path());
+                for result in [
+                    session_view(data.path(), token).map(|_| ()),
+                    room_poll(data.path(), token, 0).map(|_| ()),
+                    conversation_feed(data.path(), token, 0).map(|_| ()),
+                    collaboration_room_poll(data.path(), token, "network", "room", 0).map(|_| ()),
+                    append_object(data.path(), token, "message").map(|_| ()),
+                    append_attachment_object(data.path(), token, "file.txt", "text/plain", b"x")
+                        .map(|_| ()),
+                    start_attachment_upload(data.path(), token, "file.txt", "text/plain", 1)
+                        .map(|_| ()),
+                    append_attachment_upload_chunk(data.path(), token, &upload.upload_id, 0, b"x")
+                        .map(|_| ()),
+                    finish_attachment_upload(data.path(), token, &upload.upload_id).map(|_| ()),
+                    read_attachment(data.path(), token, &attachment_id).map(|_| ()),
+                    leave_session(data.path(), token).map(|_| ()),
+                ] {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("invalid or expired session"),
+                        "{configured} {refusal}"
+                    );
+                }
+                assert_eq!(room_state_snapshot(data.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn room_session_bound_renewal_and_distinct_grants() {
+        for configured in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let mut authorization = grant_room_authorization(data.path());
+            let start = if configured {
+                start_configured_collaboration_principal_session
+            } else {
+                start_local_principal_runtime_session
+            };
+            let first = start(
+                data.path(),
+                "did:key:z6room",
+                &authorization.principal_id,
+                "Room person",
+                "Browser",
+                &authorization,
+            )
+            .unwrap();
+            let mut grant = crate::auth::load_active_session_grant(
+                data.path(),
+                &authorization.session_id,
+                now_ts(),
+            )
+            .unwrap();
+            grant.expires_at += 300;
+            crate::auth::renew_session_grant(data.path(), grant.clone()).unwrap();
+            authorization.expires_at = grant.expires_at;
+            let renewed = start(
+                data.path(),
+                "did:key:z6room",
+                &authorization.principal_id,
+                "Room person",
+                "Browser",
+                &authorization,
+            )
+            .unwrap();
+            assert_eq!(renewed.token, first.token);
+            assert_eq!(renewed.expires_at, authorization.expires_at);
+            let old = authorization.clone();
+            grant.session_id = "auth:second".into();
+            grant.grant_id = "grant:second".into();
+            crate::auth::store_session_grant(data.path(), grant.clone()).unwrap();
+            authorization.session_id = grant.session_id;
+            authorization.grant_id = grant.grant_id;
+            // Even a frame with a later deadline stays within its stored grant.
+            authorization.expires_at += 300;
+            let second = start(
+                data.path(),
+                "did:key:z6room",
+                &authorization.principal_id,
+                "Room person",
+                "Browser",
+                &authorization,
+            )
+            .unwrap();
+            assert_ne!(second.token, first.token);
+            assert_eq!(second.expires_at, grant.expires_at);
+            let mut long_grant = crate::auth::load_active_session_grant(
+                data.path(),
+                &authorization.session_id,
+                now_ts(),
+            )
+            .unwrap();
+            long_grant.expires_at = now_ts() + 24 * 60 * 60;
+            crate::auth::renew_session_grant(data.path(), long_grant.clone()).unwrap();
+            authorization.expires_at = long_grant.expires_at;
+            let before = now_ts();
+            let full = start(
+                data.path(),
+                "did:key:z6room",
+                &authorization.principal_id,
+                "Room person",
+                "Browser",
+                &authorization,
+            )
+            .unwrap();
+            assert!(full.expires_at >= before + SESSION_TTL_SECS);
+            assert!(full.expires_at <= now_ts() + SESSION_TTL_SECS);
+            if configured {
+                assert_eq!(
+                    resolve_configured_collaboration_principal_session(
+                        data.path(),
+                        "did:key:z6room",
+                        &authorization.principal_id,
+                        &authorization
+                    )
+                    .unwrap()
+                    .token,
+                    second.token
+                );
+            }
+            crate::auth::revoke_session_grant(data.path(), &old.session_id, now_ts()).unwrap();
+            assert!(room_poll(data.path(), &first.token, 0).is_err());
+            assert!(room_poll(data.path(), &second.token, 0).is_ok());
+        }
+    }
+
     struct RoomTestActor {
         profile_did: String,
         profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
@@ -6858,6 +7222,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         let replay = start_configured_collaboration_principal_session(
@@ -6866,6 +7231,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         assert_eq!(replay.token, first.token);
@@ -6881,6 +7247,8 @@ mod tests {
                 room_access_capabilities(),
                 now,
             ));
+            state.sessions.last_mut().unwrap().authorization =
+                Some(test_room_authorization("principal-one"));
             state.sessions.push(create_session_record_with_actor(
                 "Alice stale device",
                 "ElastOS shell",
@@ -6889,6 +7257,8 @@ mod tests {
                 room_access_capabilities(),
                 now,
             ));
+            state.sessions.last_mut().unwrap().authorization =
+                Some(test_room_authorization("principal-one"));
             Ok(())
         })
         .unwrap();
@@ -6899,6 +7269,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         assert_ne!(rotated.token, first.token);
@@ -6920,6 +7291,8 @@ mod tests {
                 room_access_capabilities(),
                 now,
             ));
+            state.sessions.last_mut().unwrap().authorization =
+                Some(test_room_authorization("principal-one"));
             Ok(())
         })
         .unwrap();
@@ -6928,6 +7301,7 @@ mod tests {
             tmp.path(),
             "did:key:z6device-two",
             "principal-one",
+            &test_room_authorization("principal-one"),
         )
         .unwrap()
         .is_some());
@@ -6952,6 +7326,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         let paths = storage_paths(tmp.path()).unwrap();
@@ -6961,6 +7336,7 @@ mod tests {
             tmp.path(),
             "did:key:z6device-one",
             "principal-one",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         assert_eq!(resolved.token, session.token);
@@ -6969,12 +7345,14 @@ mod tests {
             tmp.path(),
             "did:key:z6device-other",
             "principal-one",
+            &test_room_authorization("principal-one"),
         )
         .is_err());
         assert!(resolve_configured_collaboration_principal_session(
             tmp.path(),
             "did:key:z6device-one",
             "principal-other",
+            &test_room_authorization("principal-other"),
         )
         .is_err());
 
@@ -6994,6 +7372,7 @@ mod tests {
             tmp.path(),
             "did:key:z6device-one",
             "principal-one",
+            &test_room_authorization("principal-one"),
         )
         .unwrap_err()
         .to_string()
@@ -7020,6 +7399,7 @@ mod tests {
             tmp.path(),
             "did:key:z6device-one",
             "principal-one",
+            &test_room_authorization("principal-one"),
         )
         .is_err());
     }
@@ -7199,6 +7579,7 @@ mod tests {
             "person:local:admin",
             "Admin",
             "ElastOS shell",
+            &test_room_authorization("person:local:admin"),
         )
         .unwrap();
         let guest = start_local_principal_runtime_session(
@@ -7207,6 +7588,7 @@ mod tests {
             "person:local:guest",
             "Guest",
             "ElastOS shell",
+            &test_room_authorization("person:local:guest"),
         )
         .unwrap();
 
@@ -7317,6 +7699,7 @@ mod tests {
             "person:local:admin",
             "Admin",
             "ElastOS shell",
+            &test_room_authorization("person:local:admin"),
         )
         .unwrap();
         let guest = start_local_principal_runtime_session(
@@ -7325,6 +7708,7 @@ mod tests {
             "person:local:guest",
             "Guest",
             "ElastOS shell",
+            &test_room_authorization("person:local:guest"),
         )
         .unwrap();
 
@@ -8267,6 +8651,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         let profile = RoomProfileCardView {
@@ -8331,6 +8716,7 @@ mod tests {
             "principal-one",
             "Alice",
             "ElastOS shell",
+            &test_room_authorization("principal-one"),
         )
         .unwrap();
         let profile = RoomProfileCardView {
@@ -8394,6 +8780,7 @@ mod tests {
                 "principal-one",
                 "Alice",
                 "ElastOS shell",
+                &test_room_authorization("principal-one"),
             )
             .unwrap();
             assert!(collaboration_room_poll(
@@ -8409,6 +8796,7 @@ mod tests {
                     tmp.path(),
                     "did:key:z6configured",
                     "principal-one",
+                    &test_room_authorization("principal-one"),
                 )
                 .unwrap();
             } else {

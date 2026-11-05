@@ -438,6 +438,15 @@ pub(super) async fn home_shared_content_check(
         return reply("not_contact", extra);
     };
     let now = now_ts();
+    let expires_at = match gateway_home_token::grant_bound_token_expiry(
+        &state.data_dir,
+        &home,
+        now,
+        SHARED_CONTENT_CHECK_TTL_SECS,
+    ) {
+        Ok(expires_at) => expires_at,
+        Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
+    };
     let online = match state.collaboration_presence_product_port.as_ref() {
         Some(port) => port
             .authorized_snapshot(now)
@@ -456,7 +465,7 @@ pub(super) async fn home_shared_content_check(
             cid: cid.clone(),
             peer_did,
             message: source,
-            expires_at: now + SHARED_CONTENT_CHECK_TTL_SECS,
+            expires_at,
         },
         now,
     ));
