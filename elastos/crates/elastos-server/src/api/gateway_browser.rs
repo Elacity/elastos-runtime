@@ -189,6 +189,15 @@ impl BrowserOpenFailure {
         Self::text(status, message)
     }
 
+    fn engine_provider(message: impl Into<String>) -> Self {
+        let (status, _) =
+            gateway_provider_error_tuple("browser-engine", anyhow::anyhow!(message.into()));
+        Self::text(
+            status,
+            "Browser Engine failed to start cleanly.".to_string(),
+        )
+    }
+
     fn into_response(self) -> Response {
         let status = self.status;
         (status, Json(self.status_value())).into_response()
@@ -1042,10 +1051,9 @@ async fn execute_browser_open(
                     .await
                 }
             };
-            return Err(BrowserOpenFailure::provider(
-                "browser-engine",
-                anyhow::anyhow!("Browser Engine is unavailable."),
-            )
+            return Err(BrowserOpenFailure::engine_provider(format!(
+                "browser-engine provider unavailable: {message}",
+            ))
             .with_outcome(outcome));
         }
         if matches!(
@@ -1093,11 +1101,7 @@ async fn execute_browser_open(
                 .await
             }
         };
-        return Err(BrowserOpenFailure::provider(
-            "browser-engine",
-            anyhow::anyhow!("Browser Engine failed to start cleanly."),
-        )
-        .with_outcome(outcome));
+        return Err(BrowserOpenFailure::engine_provider(message).with_outcome(outcome));
     }
     if let Some(message) = provider_response_error_message(&engine_response) {
         let outcome = reconcile_dispatched_browser_launch_failure(
@@ -1110,11 +1114,7 @@ async fn execute_browser_open(
             &message,
         )
         .await;
-        return Err(BrowserOpenFailure::provider(
-            "browser-engine",
-            anyhow::anyhow!("Browser Engine failed to start cleanly."),
-        )
-        .with_outcome(outcome));
+        return Err(BrowserOpenFailure::engine_provider(message).with_outcome(outcome));
     }
     let raw_engine_page = match provider_response_data(&engine_response) {
         Some(data) => data,
@@ -4662,6 +4662,33 @@ fn browser_display_error_response(error: BrowserDisplayError) -> Response {
 #[cfg(test)]
 mod browser_open_outcome_tests {
     use super::*;
+
+    #[test]
+    fn engine_error_keeps_status_while_projection_keeps_diagnostics_private() {
+        for (message, status) in [
+            (
+                "browser-engine provider unavailable: private diagnostic",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "private host blocked: private diagnostic",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "invalid engine reply: private diagnostic",
+                StatusCode::BAD_REQUEST,
+            ),
+            ("page not found: private diagnostic", StatusCode::NOT_FOUND),
+            ("private diagnostic", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let failure = BrowserOpenFailure::engine_provider(message);
+            assert_eq!(failure.status, status);
+            assert_eq!(
+                failure.status_value()["message"],
+                "Browser Engine failed to start cleanly."
+            );
+        }
+    }
 
     #[test]
     fn failed_open_serializes_cleanup_pending_separately_from_pre_effect_failure() {

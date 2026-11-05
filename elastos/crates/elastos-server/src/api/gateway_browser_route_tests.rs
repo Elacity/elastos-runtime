@@ -3214,7 +3214,14 @@ async fn test_browser_space_refusal_preserves_counts_and_cleanup_ownership() {
                     "display_mode": "webrtc_remote_display", "guarantee_level": "mechanism_microvm",
                 }).to_string())).unwrap(),
         ).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.status(),
+            if valid {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
