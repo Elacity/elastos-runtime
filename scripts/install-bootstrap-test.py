@@ -1761,15 +1761,44 @@ class UninstallTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
-    def test_linux_summary_explains_missing_kvm(self):
+    def test_linux_summary_omits_browser_hint_without_kvm(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             helpers = HELPERS.replace('/dev/kvm', str(root / 'missing-kvm'))
             result = shell(helpers + '\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"', root)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Browser needs KVM', result.stdout)
-            self.assertIn('setup --browser', result.stdout)
-            self.assertNotIn('Browser is available', result.stdout)
+            self.assertNotIn('setup --browser', result.stdout)
+
+    def test_linux_summary_distinguishes_acl_setup_from_host_open_failure(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            device = root / 'kvm'
+            device.symlink_to('/dev/null')
+            # Drive the real helper with an injected device-open error. EACCES
+            # is repairable by setup's per-user ACL; EPERM/ENODEV are host gaps.
+            (root / 'sitecustomize.py').write_text(
+                'import errno, os\n'
+                'original_open = os.open\n'
+                'def fixture_open(path, *args, **kwargs):\n'
+                '    if path == os.environ.get("KVM_DEVICE"):\n'
+                '        raise OSError(int(os.environ["KVM_ERRNO"]), "fixture")\n'
+                '    return original_open(path, *args, **kwargs)\n'
+                'os.open = fixture_open\n')
+            helpers = HELPERS.replace('/dev/kvm', str(device))
+            for error, hinted in [(13, True), (1, False), (6, False), (19, False)]:
+                script = helpers + '\nexport PYTHONPATH="$1" KVM_DEVICE="$1/kvm" KVM_ERRNO="$2"\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"'
+                result = shell(script, root, error)
+                with self.subTest(errno=error):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual('setup --browser' in result.stdout, hinted)
+
+    def test_linux_update_omits_browser_hint(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            helpers = HELPERS.replace('/dev/kvm', '/dev/null')
+            result = shell(helpers + '\nPREVIOUS_VERSION=0.8.0\nuname() { case "$1" in -s) echo Linux;; -m) echo aarch64;; esac; }\nshow_ready "$1/elastos"', root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('setup --browser', result.stdout)
 
     def test_linux_install_leaves_browser_setup_to_the_owner(self):
         with tempfile.TemporaryDirectory() as scratch:

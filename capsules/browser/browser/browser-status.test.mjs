@@ -265,7 +265,7 @@ test("Linux host setup guidance names the opt-in command", () => {
   Object.assign(error.payload, {
     stage: "engine_readiness",
     code: "browser_host_setup_required",
-    message: "Browser is available on this computer. To turn it on, run: elastos setup --browser",
+    message: "Browser is available on this computer. To turn it on, run: elastos setup --browser. Then close Home and start it again with elastos home --browser.",
   });
   assert.equal(friendlyOpenError(error), error.payload.message);
   error.payload.message = "Browser needs KVM on this computer. After KVM is available, run: elastos setup --browser";

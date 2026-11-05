@@ -183,10 +183,13 @@ command installs the signed Browser helpers, shows the host access changes and
 asks for administrator approval. It then downloads and verifies the image with
 progress. Close Home and start it again with `elastos home --browser`.
 
-The Linux installer and ordinary `elastos setup` leave this download to your
-choice. Opening Browser on an unprepared Linux host explains the command.
-After setup, a later open prepares a missing image on demand. Apple Silicon
-setup continues to prepare its helpers and image before Home starts. The image
+The Linux installer and ordinary `elastos setup` leave Browser preparation to
+your choice until you enable it. Home lists Browser on supported Linux ARM64
+computers; opening it before setup explains the command and restart. After you
+enable Browser, ordinary setup refreshes its signed helpers and image during
+updates. A later open repairs missing or changed helpers and prepares a missing
+image on demand. Apple Silicon setup continues to prepare its helpers and image
+before Home starts. The image
 streams to disk with progress; a transfer stops after 30 seconds without data.
 Runtime keeps the committed Browser profile separate from the image during
 reopen and updates. Linux x86-64 keeps Browser hidden and retires helpers and

@@ -561,6 +561,26 @@ fn browser_open_status_value(open_id: &str, snapshot: BrowserOpenJobSnapshot) ->
     }
 }
 
+fn browser_host_setup_failure(
+    data: &std::path::Path,
+    platform: &str,
+    adapter_id: Option<&str>,
+) -> Option<BrowserOpenFailure> {
+    if adapter_id.is_some_and(|id| id != "browser-vm-product") {
+        return None;
+    }
+    crate::setup::linux_host_setup_message(data, platform).map(|message| {
+        BrowserOpenFailure::json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "code": "browser_host_setup_required",
+                "stage": "engine_readiness",
+                "message": message,
+            }),
+        )
+    })
+}
+
 async fn execute_browser_open(
     state: &GatewayState,
     context: HomeLaunchTokenContext,
@@ -595,23 +615,12 @@ async fn execute_browser_open(
             err.to_string(),
         ));
     }
-    if adapter_id
-        .as_deref()
-        .is_none_or(|id| id == "browser-vm-product")
-    {
-        if let Some(message) = crate::setup::linux_host_setup_message(
-            &state.data_dir,
-            &crate::setup::detect_platform(),
-        ) {
-            return Err(BrowserOpenFailure::json(
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "code": "browser_host_setup_required",
-                    "stage": "engine_readiness",
-                    "message": message,
-                }),
-            ));
-        }
+    if let Some(failure) = browser_host_setup_failure(
+        &state.data_dir,
+        &crate::setup::detect_platform(),
+        adapter_id.as_deref(),
+    ) {
+        return Err(failure);
     }
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
@@ -4644,6 +4653,27 @@ fn browser_display_error_response(error: BrowserDisplayError) -> Response {
 #[cfg(test)]
 mod browser_open_outcome_tests {
     use super::*;
+
+    #[test]
+    fn unprepared_linux_browser_open_explains_setup_and_restart_before_acquiring_effects() {
+        let data = tempfile::tempdir().unwrap();
+        for adapter in [None, Some("browser-vm-product")] {
+            let failure = browser_host_setup_failure(data.path(), "linux-arm64", adapter).unwrap();
+            assert_eq!(failure.status, StatusCode::CONFLICT);
+            let body = failure.status_value();
+            assert_eq!(body["code"], "browser_host_setup_required");
+            assert_eq!(body["stage"], "engine_readiness");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("elastos setup --browser"));
+            assert!(message.contains("close Home and start it again with elastos home --browser"));
+            assert_eq!(body["outcome"]["effects"]["vm_acquired"], false);
+        }
+        assert!(
+            browser_host_setup_failure(data.path(), "linux-arm64", Some("remote-engine")).is_none()
+        );
+        assert!(browser_host_setup_failure(data.path(), "darwin-arm64", None).is_none());
+        assert!(std::fs::read_dir(data.path()).unwrap().next().is_none());
+    }
 
     #[test]
     fn failed_open_serializes_cleanup_pending_separately_from_pre_effect_failure() {

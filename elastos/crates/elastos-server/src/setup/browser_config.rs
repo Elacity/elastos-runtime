@@ -23,7 +23,8 @@ pub(super) async fn ensure_host_components(
 ) -> anyhow::Result<()> {
     ensure_viewer_ingress(data)?;
     if matches!(context, super::FirstPartyCarrierContext::Runtime)
-        && linux_host_setup_message(data, platform).is_some()
+        && platform == "linux-arm64"
+        && !local_vm_configured(data, platform)?
     {
         return Ok(()); // The Browser viewer explains the explicit owner action.
     }
@@ -402,8 +403,8 @@ pub(super) async fn prepare_home(
         if !browser_available(platform) {
             return retire_host(data, manifest);
         }
-        if platform.starts_with("linux-") {
-            return Ok(()); // Only `elastos setup --browser` prepares this host.
+        if platform.starts_with("linux-") && !local_vm_configured(data, platform)? {
+            return Ok(()); // The owner enables Browser with `elastos setup --browser`.
         }
         if browser_selected && manifest.profiles.contains_key("browser-host") {
             println!("Preparing Browser Engine helpers...");
@@ -456,7 +457,10 @@ pub(super) fn pending_download_bytes(
     platform: &str,
     browser_selected: bool,
 ) -> u64 {
-    if platform.starts_with("linux-") || !browser_available(platform) || !browser_selected {
+    if !browser_available(platform)
+        || !browser_selected
+        || (platform.starts_with("linux-") && !local_vm_configured(data, platform).unwrap_or(false))
+    {
         return 0;
     }
     let Ok(Some(rows)) = host_rows(manifest, platform) else {
@@ -1115,6 +1119,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabled_linux_home_refreshes_changed_helpers_on_setup() {
+        check_enabled_linux_helper_refresh(super::super::FirstPartyCarrierContext::Setup).await;
+    }
+
+    #[tokio::test]
+    async fn enabled_linux_home_refreshes_changed_helpers_on_open() {
+        check_enabled_linux_helper_refresh(super::super::FirstPartyCarrierContext::Runtime).await;
+    }
+
+    async fn check_enabled_linux_helper_refresh(context: super::super::FirstPartyCarrierContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(data.join("config")).unwrap();
+        fs::write(
+            data.join("config/browser-engine-adapter.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"adapters":[{"kind":"chromium_microvm","supervisor":{
+                    "program":data.join("bin/browser-vz-engine-supervisor")
+                }}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manifest: super::super::ComponentsManifest = serde_json::from_value(
+            serde_json::json!({"schema":"elastos.components/v1", "capsules":{},
+                "profiles":{"browser-host":{"components":[
+                    "browser-vz-engine-supervisor", "browser-vm-linux-network"
+                ]}}, "external":{}}),
+        )
+        .unwrap();
+        let mut artifacts = std::collections::HashMap::new();
+        let helpers = [
+            (
+                "browser-vz-engine-supervisor",
+                "bin/browser-vz-engine-supervisor",
+            ),
+            (
+                "browser-vm-linux-network",
+                "scripts/browser-vm-linux-network.py",
+            ),
+        ];
+        for (name, relative) in helpers {
+            let bytes = format!("{name} current release").into_bytes();
+            let digest = sha2::Sha256::digest(&bytes);
+            let cid = cid::Cid::new_v1(
+                0x55,
+                cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
+            )
+            .to_string();
+            manifest.external.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({
+                    "install_path":relative, "platforms":{"*":{
+                        "release_path":name, "checksum":format!("sha256:{digest:x}"),
+                        "size":bytes.len(), "cid":cid
+                    }}
+                }))
+                .unwrap(),
+            );
+            // Same-size stale bytes exercise checksum validation.
+            let old_bytes = vec![b'x'; bytes.len()];
+            artifacts.insert(cid, bytes);
+            let path = data.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, old_bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            data.join("components.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        for (name, relative) in helpers {
+            let info = &manifest.external[name].platforms["*"];
+            assert!(super::super::verify_checksum(
+                name,
+                &fs::read(data.join(relative)).unwrap(),
+                info
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Checksum mismatch"));
+        }
+        let source = serde_json::from_value(serde_json::json!({
+            "name":"fixture", "publisher_dids":[elastos_identity::derive_did(&[217;32]).1],
+            "connect_ticket":"", "publisher_node_id":""
+        }))
+        .unwrap();
+        let (_, server, serving) =
+            crate::setup::tests::carrier_cid_source(&data, &source, artifacts).await;
+        let pending = pending_download_bytes(&data, &manifest, "linux-arm64", true);
+        if matches!(context, super::super::FirstPartyCarrierContext::Setup) {
+            prepare_home(&data, &manifest, "linux-arm64", true).await;
+        } else {
+            ensure_host_components(&data, &manifest, "linux-arm64", context)
+                .await
+                .unwrap();
+        }
+        for (name, relative) in helpers {
+            assert_eq!(
+                fs::read(data.join(relative)).unwrap(),
+                format!("{name} current release").as_bytes(),
+                "{name}"
+            );
+            super::super::verify_installed_component_binary(&data, name, &data.join(relative))
+                .unwrap();
+        }
+        assert!(pending > 0);
+        assert_eq!(
+            pending_download_bytes(&data, &manifest, "linux-arm64", true),
+            0
+        );
+        server.close().await;
+        assert_eq!(serving.await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn installed_browser_network_helper_requires_its_exact_path_and_manifest_checksum() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let name = "browser-vm-linux-network";
+        let helper = data.join("scripts/browser-vm-linux-network.py");
+        let bytes = b"signed network fixture";
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(&helper, bytes).unwrap();
+        let manifest: super::super::ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "schema":"elastos.components/v1", "profiles":{}, "capsules":{},
+            "external":{name:{"install_path":"scripts/browser-vm-linux-network.py",
+                "platforms":{"*":{"checksum":format!("sha256:{:x}", sha2::Sha256::digest(bytes))}}}}
+        })).unwrap();
+        fs::write(
+            data.join("components.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        super::super::verify_installed_component_binary(data, name, &helper).unwrap();
+        let other = data.join("scripts/other.py");
+        fs::write(&other, bytes).unwrap();
+        assert!(super::super::verify_installed_component_binary(data, name, &other).is_err());
+        fs::write(&helper, b"changed network bytes").unwrap();
+        assert!(
+            super::super::verify_installed_component_binary(data, name, &helper)
+                .unwrap_err()
+                .to_string()
+                .contains("failed checksum verification")
+        );
+    }
+
+    #[tokio::test]
     async fn linux_setup_leaves_browser_helpers_and_image_for_explicit_setup() {
         let manifest: super::super::ComponentsManifest =
             serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
@@ -1137,7 +1291,7 @@ mod tests {
         let data = temp.path();
         assert_eq!(
             linux_host_setup_message_with_kvm(data, "linux-arm64", true),
-            Some("Browser is available on this computer. To turn it on, run: elastos setup --browser")
+            Some(super::super::browser_linux::SETUP_MESSAGE)
         );
         assert_eq!(
             linux_host_setup_message_with_kvm(data, "linux-arm64", false),

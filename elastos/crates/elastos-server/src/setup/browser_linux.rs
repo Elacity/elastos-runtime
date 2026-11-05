@@ -4,9 +4,9 @@ use std::process::{Command, Stdio};
 
 pub(super) const ENABLE_COMMAND: &str = "elastos setup --browser";
 pub(crate) const SETUP_MESSAGE: &str =
-    "Browser is available on this computer. To turn it on, run: elastos setup --browser";
+    "Browser is available on this computer. To turn it on, run: elastos setup --browser. Then close Home and start it again with elastos home --browser.";
 pub(crate) const KVM_MESSAGE: &str =
-    "Browser needs KVM on this computer. After KVM is available, run: elastos setup --browser";
+    "Browser needs KVM on this computer. After KVM is available, run: elastos setup --browser. Then close Home and start it again with elastos home --browser.";
 const ROOT_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
 
 /// Keep ordinary Home setup and Browser open free of administrator operations.
@@ -61,12 +61,12 @@ pub(super) async fn enable(data: &Path, platform: &str) -> anyhow::Result<()> {
         },
     )
     .await?;
-    println!("Browser is ready. Close Home, then start it with elastos home --browser.");
     println!("To remove Browser host access after closing Browser:");
     println!(
         "  sudo /usr/bin/python3 -I {ROOT_HELPER} remove --user {}",
         user.trim()
     );
+    println!("Browser is ready. Close Home, then start it again with elastos home --browser.");
     Ok(())
 }
 

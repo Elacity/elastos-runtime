@@ -1048,6 +1048,21 @@ show_login_profile_lines() {
     done
 }
 
+# Browser's one-time setup grants a per-user device ACL. Other open failures
+# (for example a host/container restriction) need host support, not that ACL.
+browser_kvm_access_available() {
+    [[ -c /dev/kvm ]] || return 1
+    python3 - <<'PY_BROWSER_KVM'
+import errno, os
+try:
+    device = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
+except OSError as error:
+    raise SystemExit(0 if error.errno == errno.EACCES else 1)
+else:
+    os.close(device)
+PY_BROWSER_KVM
+}
+
 show_ready() {
     local runtime_bin="$1" command elapsed
     command="$(runtime_command "$runtime_bin")"
@@ -1056,12 +1071,8 @@ show_ready() {
     echo -e "  ${GREEN}${BOLD}ElastOS ${RELEASE_VERSION:-} is ready${NC} ${DIM}(took ${elapsed})${NC}"
     printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
     printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
-    if [[ "$(uname -s)" == Linux && "$(uname -m)" =~ ^(aarch64|arm64)$ ]]; then
-        if [[ -c /dev/kvm ]]; then
-            printf '    Browser is available on this computer. To turn it on, run: %s setup --browser\n' "$command"
-        else
-            printf '    Browser needs KVM on this computer. After KVM is available, run: %s setup --browser\n' "$command"
-        fi
+    if [[ -z "${PREVIOUS_VERSION:-}" && "$(uname -s)" == Linux && "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && browser_kvm_access_available; then
+        printf '    Browser is available on this computer. To turn it on, run: %s setup --browser\n' "$command"
     fi
     if [[ "$command" != elastos ]]; then
         local label="Add to PATH"

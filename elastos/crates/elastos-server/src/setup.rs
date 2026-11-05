@@ -1097,7 +1097,7 @@ fn installed_component_entry(
     })
 }
 
-/// Verify an installed binary whose bytes carry the signed checksum. A binary
+/// Verify an installed program whose bytes carry the signed checksum. A program
 /// extracted from a signed archive is refused: its checksum names the archive.
 pub fn verify_installed_component_binary(
     data_dir: &Path,
@@ -1235,6 +1235,13 @@ fn write_archive_executable_receipt(
 }
 
 fn installed_component_root_for_path(data_dir: &Path, name: &str, path: &Path) -> Option<PathBuf> {
+    // Browser host setup executes this exact release-owned script through Python.
+    if name == "browser-vm-linux-network"
+        && path == data_dir.join("scripts/browser-vm-linux-network.py")
+    {
+        return Some(data_dir.to_path_buf());
+    }
+
     let installed_bin = data_dir.join("bin").join(name);
     if path == installed_bin {
         return Some(data_dir.to_path_buf());
