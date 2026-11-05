@@ -32,15 +32,7 @@ const UNPACK_ESTIMATE: u64 = if cfg!(test) { 0 } else { UNPACKED_SET_BYTES };
 
 // Like AuthState's verified-file cache, use inode plus nanosecond change time:
 // a same-size rewrite with restored mtime still requires verification.
-#[derive(Clone, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mode: u32,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
+use elastos_common::browser_vm_seed::{BrowserVmSeedIdentity, FileIdentity};
 
 #[derive(Clone, PartialEq, Eq)]
 struct VerifiedSetKey {
@@ -61,21 +53,32 @@ fn verified_sets() -> &'static Mutex<VecDeque<VerifiedSet>> {
     CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn file_identity(metadata: &fs::Metadata) -> anyhow::Result<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(FileIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            mode: metadata.mode(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        })
-    }
-    #[cfg(not(unix))]
-    bail!("Browser image verification cache requires Unix file identity")
+/// Capture only identities whose bytes this process admitted. Alias links may
+/// select the verified target; changed target bytes require another admission.
+pub(crate) fn verified_seed_identity(
+    rootfs: &Path,
+    platform: &str,
+) -> anyhow::Result<BrowserVmSeedIdentity> {
+    verified_seed_identity_in(verified_sets(), rootfs, platform)
+}
+
+fn verified_seed_identity_in(
+    cache: &Mutex<VecDeque<VerifiedSet>>,
+    rootfs: &Path,
+    platform: &str,
+) -> anyhow::Result<BrowserVmSeedIdentity> {
+    let cache = cache.lock().unwrap_or_else(|err| err.into_inner());
+    let identity = BrowserVmSeedIdentity::read(rootfs)?;
+    ensure!(
+        cache.iter().any(|entry| {
+            entry.key.platform == platform
+                && entry.key.identities[1].1 == identity.target
+                && image_identities(&entry.key.paths)
+                    .is_ok_and(|current| current == entry.key.identities)
+        }),
+        "Browser rootfs seed has no current Runtime admission; retry Browser open"
+    );
+    Ok(identity)
 }
 
 fn image_identities(paths: &[PathBuf; 4]) -> anyhow::Result<Vec<(FileIdentity, FileIdentity)>> {
@@ -88,8 +91,8 @@ fn image_identities(paths: &[PathBuf; 4]) -> anyhow::Result<Vec<(FileIdentity, F
                 "Browser image artifact must be a regular file"
             );
             Ok((
-                file_identity(&fs::symlink_metadata(path)?)?,
-                file_identity(&target)?,
+                FileIdentity::from_metadata(&fs::symlink_metadata(path)?),
+                FileIdentity::from_metadata(&target),
             ))
         })
         .collect()
@@ -2028,6 +2031,43 @@ mod tests {
             .to_string()
             .contains("changed during verification"));
         assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn browser_image_launch_identity_requires_process_admission_and_binds_link_and_target() {
+        use std::os::unix::fs::symlink;
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = cache_fixture(temp.path());
+            let cache = Mutex::new(VecDeque::new());
+            let alias = temp.path().join("seed-link");
+            symlink(&paths[1], &alias).unwrap();
+            assert!(verified_seed_identity_in(&cache, &alias, platform).is_err());
+            verify_cached_payload_in(&cache, &paths, platform, "legacy", || {
+                verify_payload_paths(&paths, platform)
+            })
+            .unwrap();
+            let identity = verified_seed_identity_in(&cache, &alias, platform).unwrap();
+            identity.check(&alias).unwrap();
+            fs::remove_file(&alias).unwrap();
+            symlink(&paths[1], &alias).unwrap();
+            assert!(identity
+                .check(&alias)
+                .unwrap_err()
+                .contains("changed after Runtime admission"));
+            // The unchanged target can be admitted through the new link.
+            let identity = verified_seed_identity_in(&cache, &alias, platform).unwrap();
+            fs::write(&paths[1], b"changed-image").unwrap();
+            assert!(identity.check(&alias).is_err());
+            assert!(verified_seed_identity_in(&cache, &alias, platform).is_err());
+            assert!(
+                verify_cached_payload_in(&cache, &paths, platform, "legacy", || {
+                    verify_payload_paths(&paths, platform)
+                })
+                .is_err(),
+                "a modified rootfs must still fail Runtime launch admission"
+            );
+        }
     }
 
     #[test]

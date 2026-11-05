@@ -84,7 +84,7 @@ test("a supervisor timeout keeps host readiness unavailable", t => {
   assert.deepEqual(probe(f.env, null, "timeout"), unavailable("readiness_unsupported"));
 });
 
-test("TURN readiness does not replace image integrity or host compatibility checks", t => {
+test("TURN readiness preserves image-shape and host compatibility checks", t => {
   const f = fixture(t);
   assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
   delete f.env[turnKey];
@@ -352,11 +352,10 @@ test("ARM Linux readiness survives a VM exit's /dev/kvm time change but not a de
   assert.equal(c.probes.length, 2, "changed device permissions probe again");
 });
 
-test("a readiness probe has room for a first-time image hash on slow storage", async t => {
+test("the structural host probe fits inside Runtime's twelve-second readiness budget", async t => {
   const c = controller(t, { platform: "linux-arm64" });
   assert.deepEqual(await c.read(), ready);
-  // 82 s measured cold on a Jetson SD card; the old 30 s limit refused it.
-  assert.equal(c.probes[0].options.timeout, 240_000);
+  assert.equal(c.probes[0].options.timeout, 10_000);
 });
 
 for (const capabilities of ["failure", "{", '{"available":true}',

@@ -758,7 +758,7 @@ async fn prepare(page: &ServedPage) -> Result<Prepared> {
         serde_json::from_value(intent["guarantee_level"].clone())?;
     validate_browser_launch_contract(mode, guarantee)?;
     let principal = owner.storage_principal();
-    let adapter = resolve_browser_engine_adapter(
+    let (adapter, verified_rootfs) = resolve_browser_engine_adapter(
         registry,
         &gateway.data_dir,
         &principal,
@@ -829,7 +829,7 @@ async fn prepare(page: &ServedPage) -> Result<Prepared> {
                 == owner.page_id,
             "Engine Wallet launch request escaped its page"
         );
-        let request = json!({"op":"launch","url":url,"stream_session":browser_engine_stream_session(&stream),
+        let request = json!({"op":"launch","verified_rootfs":verified_rootfs,"url":url,"stream_session":browser_engine_stream_session(&stream),
             "lifecycle_generation":owner.generation,"principal_id":principal,"profile":profile,
             "wallet":wallet,
             "viewport":intent["viewport"],"display_mode":mode,"guarantee_level":guarantee,

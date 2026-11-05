@@ -663,7 +663,7 @@ async fn execute_browser_open(
         }
     };
     let resolved_adapter = if let Some(choice) = &remote_choice {
-        Ok(choice.1.clone())
+        Ok((choice.1.clone(), None))
     } else {
         resolve_browser_engine_adapter(
             registry.as_ref(),
@@ -675,7 +675,7 @@ async fn execute_browser_open(
         )
         .await
     };
-    let adapter_id = match resolved_adapter {
+    let (adapter_id, verified_rootfs) = match resolved_adapter {
         Ok(adapter_id) => adapter_id,
         Err(error) => {
             let mut body =
@@ -889,6 +889,7 @@ async fn execute_browser_open(
     )
     .await;
     let mut engine_launch_request = serde_json::json!({
+        "verified_rootfs": verified_rootfs,
         "url": url.clone(),
         "stream_session": engine_stream_session,
         "lifecycle_generation": launch_reservation.generation(),

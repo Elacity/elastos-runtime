@@ -13,18 +13,40 @@ pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
     requested_adapter: Option<&str>,
     display_mode: BrowserDisplayMode,
     guarantee_level: BrowserGuaranteeLevel,
-) -> Result<String, BrowserCompatibilityError> {
-    resolve_browser_engine_adapter_with_preparation(
+) -> Result<
+    (
+        String,
+        Option<elastos_common::browser_vm_seed::BrowserVmSeedIdentity>,
+    ),
+    BrowserCompatibilityError,
+> {
+    let platform = crate::setup::detect_platform();
+    let adapter_id = resolve_browser_engine_adapter_with_preparation(
         registry,
         data_dir,
-        &crate::setup::detect_platform(),
+        &platform,
         principal_id,
         requested_adapter,
         display_mode,
         guarantee_level,
         || crate::setup::ensure_browser_vm_image_for_local_engine(data_dir),
     )
-    .await
+    .await?;
+    let seed =
+        match browser_engine_runtime_image_path(registry, data_dir, &adapter_id, &platform).await {
+            Some(path) => Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::setup::verified_browser_vm_seed_identity(&path, &platform)
+                })
+                .await
+                .map_err(|_| BrowserCompatibilityError::EngineUnavailable)?
+                .map_err(|_| BrowserCompatibilityError::EngineNotReady {
+                    reason: BrowserEngineReadinessReason::PreparationRequired,
+                })?,
+            ),
+            None => None,
+        };
+    Ok((adapter_id, seed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,7 +95,12 @@ where
     let mut readiness_budget = std::time::Duration::from_secs(12);
     let mut unavailable_reason = BrowserEngineReadinessReason::ReadinessUnsupported;
     for adapter in candidates {
-        if browser_engine_requires_runtime_image(registry, data_dir, adapter, platform).await {
+        if adapter.engine == "chromium_microvm"
+            && adapter.backing_substrate == "local_microvm"
+            && browser_engine_runtime_image_path(registry, data_dir, &adapter.id, platform)
+                .await
+                .is_some()
+        {
             if let Err(error) = prepare_image().await {
                 tracing::warn!(adapter_id = %adapter.id, error = %error,
                     "Browser local Engine image preparation failed");
@@ -84,7 +111,8 @@ where
         let request = serde_json::json!({
             "op": "readiness", "principal_id": principal_id, "adapter_id": adapter.id,
         });
-        // Acquisition can exceed the host probe budget. Start this probe after
+        // Runtime admission waits for startup verification or acquisition before
+        // the host probe budget starts. Start this probe after
         // preparation, preserving the total twelve seconds across candidates.
         let probe_started = tokio::time::Instant::now();
         let deadline = probe_started + readiness_budget;
@@ -124,15 +152,12 @@ where
     })
 }
 
-async fn browser_engine_requires_runtime_image(
+async fn browser_engine_runtime_image_path(
     registry: &ProviderRegistry,
     data_dir: &FsPath,
-    adapter: &elastos_common::browser_protocol::BrowserEngineAdapterCapabilities,
+    adapter_id: &str,
     platform: &str,
-) -> bool {
-    if adapter.engine != "chromium_microvm" || adapter.backing_substrate != "local_microvm" {
-        return false;
-    }
+) -> Option<std::path::PathBuf> {
     // Inventory capability strings alone do not bind a provider to Runtime's
     // image layout. Match the configured first-party host launcher as well.
     if registry
@@ -140,7 +165,7 @@ async fn browser_engine_requires_runtime_image(
         .await
         .is_none_or(|registration| registration.provider != "capsule-provider")
     {
-        return false;
+        return None;
     }
     let raw = match std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG") {
         Ok(raw) => raw,
@@ -149,12 +174,12 @@ async fn browser_engine_requires_runtime_image(
                 .await
             {
                 Ok(raw) => raw,
-                Err(_) => return false,
+                Err(_) => return None,
             }
         }
     };
     let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
+        return None;
     };
     // Supervisor commands inherit Runtime's environment. Explicit configuration
     // wins, just as it does when the provider starts the launcher.
@@ -177,7 +202,19 @@ async fn browser_engine_requires_runtime_image(
             }
         }
     }
-    browser_engine_config_uses_runtime_image(&config, data_dir, &adapter.id, platform)
+    if !browser_engine_config_uses_runtime_image(&config, data_dir, adapter_id, platform) {
+        return None;
+    }
+    let adapter = config["adapters"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["id"] == adapter_id)?;
+    Some(
+        adapter["supervisor"]["env"]["ELASTOS_BROWSER_VM_ROOTFS"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("browser-vm/rootfs.ext4")),
+    )
 }
 
 fn browser_engine_config_uses_runtime_image(
@@ -910,6 +947,56 @@ mod tests {
                 *calls.lock().unwrap(),
                 ["status", "prepare", "verified", "readiness"]
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_during_startup_verification_waits_outside_readiness_budget() {
+        for platform in ["darwin-arm64", "linux-arm64"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_image_config(dir.path());
+            let (registry, calls) = image_registry(
+                "capsule-provider",
+                vec![image_adapter("local", "local_microvm", true)],
+                std::time::Duration::from_secs(11),
+            )
+            .await;
+            let (finished, verification) = tokio::sync::watch::channel(false);
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let background_count = count.clone();
+            let worker = tokio::spawn(async move {
+                background_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                finished.send(true).unwrap();
+            });
+            tokio::task::yield_now().await;
+            assert!(!*verification.borrow(), "open starts during verification");
+            let started = tokio::time::Instant::now();
+            let resolved = resolve_browser_engine_adapter_with_preparation(
+                &registry,
+                dir.path(),
+                platform,
+                "person:test",
+                None,
+                BrowserDisplayMode::WebrtcRemoteDisplay,
+                BrowserGuaranteeLevel::MechanismMicrovm,
+                || {
+                    let mut verification = verification.clone();
+                    async move {
+                        while !*verification.borrow_and_update() {
+                            verification.changed().await?;
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            worker.await.unwrap();
+            assert_eq!(resolved, "local");
+            assert!(started.elapsed() >= std::time::Duration::from_secs(101));
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(*calls.lock().unwrap(), ["status", "readiness"]);
         }
     }
 

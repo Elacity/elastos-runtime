@@ -68,6 +68,8 @@ enum Request {
         transport_authority: Option<Value>,
     },
     Launch {
+        #[serde(default)]
+        verified_rootfs: Option<Value>,
         url: String,
         stream_session: Box<StreamSessionReceipt>,
         lifecycle_generation: String,
@@ -690,6 +692,7 @@ fn engine_terminal_cleanup_result(
 }
 
 struct LaunchContext<'a> {
+    verified_rootfs: Option<Value>,
     url: &'a str,
     stream_session: &'a StreamSessionReceipt,
     profile: BrowserProfileDescriptor,
@@ -762,6 +765,7 @@ impl BrowserEngineAdapter {
                 transport_authority,
             ),
             Request::Launch {
+                verified_rootfs,
                 url,
                 stream_session,
                 lifecycle_generation,
@@ -789,6 +793,7 @@ impl BrowserEngineAdapter {
                 };
                 self.launch_with_generation(
                     LaunchContext {
+                        verified_rootfs,
                         url: &url,
                         stream_session: &stream_session,
                         profile,
@@ -1467,6 +1472,7 @@ impl BrowserEngineAdapter {
         wallet: Value,
     ) -> Response {
         self.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url,
             stream_session,
             profile: BrowserProfileDescriptor {

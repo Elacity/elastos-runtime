@@ -111,8 +111,12 @@ plain background thread. Browser open shares that verification and waits for
 its remaining work. Runtime keeps the computed digests in process memory,
 bound to device, inode, size, mode, nanosecond modification and change times,
 plus the receipt and selected release. A changed identity requires a new hash.
-The shell preflight hashes its own inputs on each invocation. Adjacent files
-provide no verification authority.
+The artifact and `--verify-image-set` shell checks hash their inputs.
+`--host-readiness` checks presence, shape, permissions and host capability;
+it leaves image verification to Runtime and makes no verification claim.
+Runtime carries the verified seed identity in the launch request. The
+supervisor checks link and target identity again immediately before the Mac
+copy or Linux overlay creation. Adjacent cache files provide no authority.
 
 An image refresh must retain its source provenance and produce a matching
 receipt for the changed bytes before the image passes this check.

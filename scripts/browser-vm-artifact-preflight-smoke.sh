@@ -311,9 +311,9 @@ if debugfs and mke2fs:
                 "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
                 "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}}}}))
         forged_image_record.chmod(0o600)
-        host_check("host rejects modified rootfs with forged current identity", {"state":"unavailable","reason":"artifact_invalid"})
+        host_check("host leaves modified rootfs content admission to Runtime", {"state":"ready"})
         image.write_bytes(original_image)
-        host_check("host hashes restored rootfs despite stale forged identity", {"state":"ready"})
+        host_check("host checks restored rootfs shape despite stale forged identity", {"state":"ready"})
         forged_image_record.unlink()
         original_kernel = (data / "bin/vmlinux").read_bytes()
         (data / "bin/vmlinux").write_bytes(b"changed kernel")
@@ -326,7 +326,7 @@ if debugfs and mke2fs:
         host_check("host rejects unavailable virtualization", {"state":"unavailable","reason":"host_unsupported"})
         host_helper.write_text(host_helper.read_text().replace("false", "true"))
         # A same-user writer can forge a current identity with the admitted digest.
-        # Readiness must still hash the bytes and refuse the changed artifact.
+        # Host readiness checks shape; Runtime admission checks the changed bytes.
         kernel = data / "bin/vmlinux"
         kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
         info = kernel.stat()
@@ -335,9 +335,9 @@ if debugfs and mke2fs:
             "files": {"vmlinux": {"sha256": valid["kernel"]["sha256"], "identity": {
                 "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
                 "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}}}}))
-        host_check("host rejects forged current kernel identity", {"state":"unavailable","reason":"artifact_invalid"})
+        host_check("host leaves kernel content admission to Runtime", {"state":"ready"})
         kernel.write_bytes(bytes(byte ^ 1 for byte in original_kernel))
-        host_check("a write voids the recorded identity", {"state":"unavailable","reason":"artifact_invalid"})
+        host_check("host leaves same-size kernel writes to Runtime admission", {"state":"ready"})
         kernel.write_bytes(original_kernel)
         record.unlink()
 
@@ -379,7 +379,7 @@ if debugfs and mke2fs:
             checks.append("control service reports host readiness")
             assert get("/readiness")["readiness"] == {"state":"ready"}
             assert probe_count.read_text() == "x"
-            checks.append("unchanged admitted artifacts reuse verified readiness")
+            checks.append("unchanged artifact shapes reuse host readiness")
             (data / "bin/vmlinux").write_bytes(b"changed kernel")
             assert get("/readiness")["readiness"] == {"state":"unavailable","reason":"artifact_invalid"}
             checks.append("control service notices artifact change")

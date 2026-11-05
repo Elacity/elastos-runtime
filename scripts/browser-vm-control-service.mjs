@@ -100,9 +100,9 @@ export function watchParentPipe(handleSignal, _timeoutMs) {
 const CONFIG_ENV = "ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG";
 let readyHostReadiness = null;
 let hostReadinessProbe = null;
-// The shell probe hashes the image bytes: up to 82 s cold on a Jetson
-// SD card (#90). Concurrent requests share this process-owned probe.
-const HOST_READINESS_PROBE_TIMEOUT_MS = 240_000;
+// The structural host probe fits within Runtime's readiness budget. Runtime
+// admission owns the image hash; concurrent requests share this host probe.
+const HOST_READINESS_PROBE_TIMEOUT_MS = 10_000;
 // Probe inputs that are not files: where the preflight resolves its tools and
 // which platform it admits for. The Darwin TURN program is a stamped file.
 const READINESS_INPUT_ENV = [
@@ -200,7 +200,7 @@ async function engineReadiness(config) {
       return unavailable("readiness_unsupported");
     }
     // The admitted native owner checks live KVM access and the selected transport
-    // before an image-readiness result can be reused.
+    // before a structural host-readiness result can be reused.
     try {
       const result = JSON.parse(execFileSync(config.launcher_program, ["--host-capabilities"],
         { timeout: 5000, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "pipe"] }));
@@ -214,7 +214,8 @@ async function engineReadiness(config) {
   }
   const stamps = readinessInputStamps(dataDir, config.launcher_program);
   if (stamps && readyHostReadiness?.stamps === stamps) return readyHostReadiness.result;
-  // Service start and the first open share one probe.
+  // Service start and the first open share a structural host probe. Runtime
+  // admission owns image verification; this probe never hashes the image.
   hostReadinessProbe ??= probeHostReadiness(config, dataDir, stamps)
     .finally(() => { hostReadinessProbe = null; });
   return hostReadinessProbe;

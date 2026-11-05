@@ -1938,6 +1938,7 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 struct LaunchPaths {
+    verified_rootfs: Option<elastos_common::browser_vm_seed::BrowserVmSeedIdentity>,
     kernel_path: PathBuf,
     rootfs_path: PathBuf,
     initramfs_path: Option<PathBuf>,
@@ -2380,6 +2381,17 @@ impl LaunchPaths {
             }
         }
         Ok(Self {
+            verified_rootfs: Some(
+                serde_json::from_value(
+                    launch
+                        .get("verified_rootfs")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+                .map_err(|_| {
+                    "Browser launch requires Runtime verified_rootfs identity".to_string()
+                })?,
+            ),
             kernel_path,
             rootfs_path,
             initramfs_path,
@@ -3189,6 +3201,14 @@ fn shared_writable_rootfs() -> bool {
         .unwrap_or(false)
 }
 
+fn recheck_verified_rootfs(paths: &LaunchPaths) -> Result<(), String> {
+    paths
+        .verified_rootfs
+        .as_ref()
+        .ok_or_else(|| "Browser launch requires Runtime verified_rootfs identity".to_string())?
+        .check(&paths.rootfs_path)
+}
+
 fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
     // Every Linux launch boots an overlay, so no guest can write the seed.
     #[cfg(target_os = "linux")]
@@ -3198,16 +3218,19 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     #[cfg(not(target_os = "linux"))]
     {
         if shared_writable_rootfs() {
+            let lock = LifetimeFileLock::acquire_disk_sidecar(
+                &paths.rootfs_path,
+                "shared writable Browser VZ rootfs",
+            )?;
+            recheck_verified_rootfs(paths)?;
             return Ok(PreparedLaunchRootfs {
                 path: paths.rootfs_path.clone(),
-                _lock: Some(LifetimeFileLock::acquire_disk_sidecar(
-                    &paths.rootfs_path,
-                    "shared writable Browser VZ rootfs",
-                )?),
+                _lock: Some(lock),
                 overlay: false,
             });
         }
         let launch_rootfs = paths.session_dir.join("rootfs.ext4");
+        recheck_verified_rootfs(paths)?;
         clone_or_copy_writable_rootfs(&paths.rootfs_path, &launch_rootfs).map_err(|err| {
             format!(
                 "failed to prepare per-launch Browser VM rootfs {} from {}: {}",
@@ -3286,6 +3309,7 @@ fn prepare_launch_rootfs_overlay(paths: &LaunchPaths) -> Result<PreparedLaunchRo
         _lock: Some(lock),
         overlay: true,
     };
+    recheck_verified_rootfs(paths)?;
     linux::create_rootfs_overlay(&linux::crosvm_binary(), &paths.rootfs_path, &prepared.path)
         .map_err(|error| format!("failed to prepare the Browser VM rootfs overlay: {error}"))?;
     Ok(prepared)
@@ -5718,6 +5742,10 @@ mod tests {
         std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES", "4");
         let root = tempfile::tempdir().unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("missing-rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("missing-kernel"),
             rootfs_path: root.path().join("missing-rootfs"),
             initramfs_path: None,
@@ -5776,6 +5804,10 @@ mod tests {
         let launch = launch_for_transport(&transport);
         let root = tempfile::tempdir().unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
@@ -5825,6 +5857,10 @@ mod tests {
         let launch = launch_for_transport(&transport);
         let root = tempfile::tempdir().unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
@@ -5872,6 +5908,10 @@ mod tests {
         let launch = launch_for_transport(&transport);
         let root = tempfile::tempdir().unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
@@ -5952,6 +5992,10 @@ mod tests {
         let transport = transport_fixture('k');
         let launch = launch_for_transport(&transport);
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.join("kernel"),
             rootfs_path: root.join("rootfs"),
             initramfs_path: None,
@@ -6456,6 +6500,10 @@ mod tests {
     fn exact_vm_state_is_retired_only_after_vm_absence() {
         let root = tempfile::tempdir().unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
@@ -6784,6 +6832,10 @@ mod tests {
         let session_dir = root.path().join("session");
         fs::create_dir_all(&session_dir).unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &root.path().join("rootfs"),
+            )
+            .ok(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
@@ -7953,6 +8005,52 @@ mod tests {
     }
 
     #[test]
+    fn launch_refuses_seed_changed_after_runtime_admission() {
+        for setting in ["0", "1"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            let _per_launch = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
+            let _crosvm = EnvVarRestore::capture("ELASTOS_BROWSER_VM_CROSVM_BIN");
+            std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", setting);
+            let crosvm = tmp.path().join("crosvm");
+            fs::write(
+                &crosvm,
+                "#!/bin/sh\nprintf 'QFI\\373\\000\\000\\000\\003' > \"$4\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&crosvm, fs::Permissions::from_mode(0o700)).unwrap();
+            std::env::set_var("ELASTOS_BROWSER_VM_CROSVM_BIN", &crosvm);
+            let seed = tmp.path().join("rootfs.ext4");
+            fs::write(&seed, vec![0x5a; 64 * 1024]).unwrap();
+            let paths = LaunchPaths {
+                verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                    &seed,
+                )
+                .ok(),
+                kernel_path: tmp.path().join("kernel"),
+                rootfs_path: seed.clone(),
+                initramfs_path: None,
+                state_dir: tmp.path().join("state"),
+                rootfs_cache_dir: tmp.path().join("rootfs-cache"),
+                session_dir: tmp.path().join("bvm/vz-launch"),
+                socket_dir: tmp.path().join("socket"),
+                control_socket_path: tmp.path().join("socket/c.sock"),
+                runtime_stream_path: tmp.path().join("runtime.sock"),
+                control_port: DEFAULT_CONTROL_PORT,
+                memory_mib: 2048,
+                vcpu_count: 2,
+            };
+            fs::create_dir_all(&paths.session_dir).unwrap();
+
+            fs::write(&seed, vec![0x78; 64 * 1024]).unwrap();
+            let error = prepare_launch_rootfs(&paths).unwrap_err();
+            assert!(error.contains("changed after Runtime admission"), "{error}");
+            assert!(!paths.session_dir.join("rootfs.ext4").exists());
+            assert!(!paths.session_dir.join("rootfs.qcow2").exists());
+        }
+    }
+
+    #[test]
     fn the_shared_seed_setting_never_hands_a_linux_guest_the_seed() {
         // ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH=0 selects the shared writable
         // seed on macOS only; a Linux launch still boots its own overlay.
@@ -7972,6 +8070,8 @@ mod tests {
         let seed = tmp.path().join("rootfs.ext4");
         fs::write(&seed, vec![0x5a; 64 * 1024]).unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(&seed)
+                .ok(),
             kernel_path: tmp.path().join("kernel"),
             rootfs_path: seed.clone(),
             initramfs_path: None,
@@ -8037,6 +8137,8 @@ mod tests {
         };
         let before = seed_identity(fs::metadata(&seed).unwrap());
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(&seed)
+                .ok(),
             kernel_path: tmp.path().join("kernel"),
             rootfs_path: seed.clone(),
             initramfs_path: None,
@@ -8143,6 +8245,10 @@ mod tests {
         let rootfs_path = tmp.path().join("rootfs.ext4");
         fs::write(&rootfs_path, b"rootfs").unwrap();
         let paths = LaunchPaths {
+            verified_rootfs: elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(
+                &rootfs_path,
+            )
+            .ok(),
             kernel_path: tmp.path().join("kernel"),
             rootfs_path,
             initramfs_path: None,

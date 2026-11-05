@@ -70,7 +70,11 @@ exit "$FIXTURE_PROBE_STATUS"
   // The shell invokes this interpreter with its complete production heredoc.
   // Only host identity changes; parsing, admission, I/O and subprocesses stay real.
   const bootstrap = path.join(root, "fixture-python.py");
-  fs.writeFileSync(bootstrap, `import os, platform, sys
+  fs.writeFileSync(bootstrap, `import os, platform, sys, hashlib
+if os.environ.get("FIXTURE_FORBID_HASH") == "1":
+    def forbidden_hash(*args, **kwargs):
+        raise AssertionError("host readiness attempted to hash image bytes")
+    hashlib.sha256 = forbidden_hash
 platform.system = lambda: os.environ["FIXTURE_HOST_SYSTEM"]
 platform.machine = lambda: os.environ["FIXTURE_HOST_MACHINE"]
 sys.argv = sys.argv[1:]
@@ -197,20 +201,47 @@ for (const kind of ["missing", "nonexecutable"]) {
   });
 }
 
-for (const [artifact, reason] of [["kernel", "artifact_invalid"], ["image", "artifact_invalid"],
-  ["sidecar", "artifact_invalid"], ["initrd", "preparation_required"]]) {
-  test(`whole preflight admits ${artifact} before probing native readiness`, t => {
+for (const artifact of ["kernel", "image"]) {
+  test(`host readiness checks ${artifact} shape while Runtime owns content verification`, t => {
     const f = fixture(t);
-    fs.unlinkSync(f.turn);
-    if (artifact === "kernel" || artifact === "image") {
-      // Keep the size so rejection must follow the content identity check.
-      fs.writeFileSync(f[artifact], Buffer.alloc(fs.statSync(f[artifact]).size, 0x78));
-    }
-    else fs.unlinkSync(f[artifact]);
+    fs.writeFileSync(f[artifact], Buffer.alloc(fs.statSync(f[artifact]).size, 0x78));
+    assert.deepEqual(probe(f, { envOverrides: { FIXTURE_FORBID_HASH: "1" } }), ready);
+  });
+}
+
+for (const [artifact, reason] of [["sidecar", "artifact_invalid"], ["initrd", "preparation_required"]]) {
+  test(`host readiness checks ${artifact} presence before native readiness`, t => {
+    const f = fixture(t);
+    fs.unlinkSync(f[artifact]);
     assert.deepEqual(probe(f), unavailable(reason));
     assert.equal(fs.existsSync(f.calls), false);
   });
 }
+
+for (const artifact of ["image", "sidecar", "kernel", "initrd"]) {
+  test(`host readiness checks ${artifact} read permission`, t => {
+    const f = fixture(t);
+    fs.chmodSync(f[artifact], 0o000);
+    assert.deepEqual(probe(f), unavailable(["kernel", "initrd"].includes(artifact)
+      ? "preparation_required" : "artifact_invalid"));
+  });
+}
+
+test("host readiness leaves guest image inspection to the artifact gate", t => {
+  const f = fixture(t), inspector = path.join(f.root, "debugfs"), calls = path.join(f.root, "guest-inspection");
+  fs.writeFileSync(inspector, `#!/bin/sh\nprintf x >> "${calls}"\nexit 1\n`, { mode: 0o755 });
+  assert.deepEqual(probe(f, { envOverrides: { ELASTOS_DEBUGFS_BIN: inspector, FIXTURE_FORBID_HASH: "1" } }), ready);
+  assert.equal(fs.existsSync(calls), false);
+});
+
+test("host readiness leaves all verification claims false even with a forged cache file", t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, "browser-vm/.elastos-verified-identity.json"),
+    JSON.stringify({ verified_sidecar: true, ok: true }));
+  const result = probe(f, { envOverrides: { FIXTURE_FORBID_HASH: "1" } });
+  assert.deepEqual(result, ready);
+  assert.equal(JSON.stringify(result).includes("verified"), false);
+});
 
 test("whole preflight validates image-set mode and configured image paths", t => {
   const f = fixture(t);
