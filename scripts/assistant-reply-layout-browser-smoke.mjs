@@ -187,6 +187,8 @@ try {
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   browser = await chromium.launch({ headless: true, ...(process.env.BRAVE_BIN ? { executablePath: process.env.BRAVE_BIN } : {}) });
   page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
   page.on("pageerror", error => pageErrors.push(`${stage}: ${error}`));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const room = page.frameLocator("iframe").frameLocator("iframe");
@@ -224,7 +226,17 @@ try {
   seen.status = await expectNewestAboveComposer(".agent-progress", "the status line");
   await typeLongFollowUp();
   seen.statusTyping = await expectNewestAboveComposer(".agent-progress", "the status line, while a follow-up is typed");
-  await input.fill("");
+
+  // Let layout clamp the scroll position between the stream's final pin
+  // and its idle Markdown render. A layout clamp is not a reader scrolling up.
+  await frame.evaluate(() => {
+    const scheduleIdle = window.requestIdleCallback;
+    window.requestIdleCallback = (callback, options) => {
+      window.requestIdleCallback = scheduleIdle;
+      window.__finishReply = () => scheduleIdle(callback, options);
+      return 0;
+    };
+  });
 
   stage = "streamed reply";
   fixture.events = [
@@ -233,7 +245,24 @@ try {
   ];
   await room.locator(".agent-msg-agent.is-streaming").waitFor({ state: "detached", timeout: 15000 });
   await room.locator(".agent-msg-agent").last().filter({ hasText: "Streamed step 25" }).waitFor({ timeout: 5000 });
+  await frame.waitForFunction(() => typeof window.__finishReply === "function", null, { timeout: 5000 });
+  const beforeShrink = await frame.evaluate(() => document.querySelector("#agent-harness-stream").scrollTop);
+  await page.setViewportSize({ width: 1280, height: 1600 });
+  await input.fill("");
+  await frame.waitForFunction((top) => {
+    const scroller = document.querySelector("#agent-harness-stream");
+    return scroller.scrollTop < top - 1 && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 1;
+  }, beforeShrink, { timeout: 5000 });
+  await frame.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
+  await frame.evaluate(() => { window.__finishReply(); delete window.__finishReply; });
+  await room.locator('.agent-msg-agent[data-stream-phase="presentation_done"]').last().waitFor({ timeout: 5000 });
   seen.reply = await expectNewestAboveComposer(".agent-msg-agent", "the newest reply");
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await frame.evaluate(() => {
+    const scroller = document.querySelector("#agent-harness-stream");
+    scroller.scrollTop = scroller.scrollHeight;
+  });
   await typeLongFollowUp();
   seen.replyTyping = await expectNewestAboveComposer(".agent-msg-agent", "the newest reply, while a follow-up is typed");
 
