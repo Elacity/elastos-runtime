@@ -504,14 +504,13 @@ for required in \
     "$SOURCE_DIR/scripts/browser-selkies-control-service.mjs" \
     "$SOURCE_DIR/scripts/browser-source-home-config.mjs" \
     "$SOURCE_DIR/scripts/browser-runtime-turn.mjs" \
-    "$SOURCE_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" \
+    "$SOURCE_DIR/scripts/installed-provider-verify.sh" \
     "$SOURCE_DIR/scripts/browser-vm-engine-preflight.sh" \
     "$SOURCE_DIR/scripts/browser-vm-artifact-preflight.sh" \
     "$SOURCE_DIR/scripts/browser-vm-target-preflight.sh" \
     "$SOURCE_DIR/scripts/browser-vm-engine-supervisor.mjs" \
     "$SOURCE_DIR/scripts/browser-vm-control-service.mjs" \
     "$SOURCE_DIR/scripts/browser-vm-remote-vz-launcher.mjs" \
-    "$SOURCE_DIR/scripts/browser-vm-local-crosvm-launcher.mjs" \
     "$SOURCE_DIR/scripts/browser-vm-linux-network.py"
 do
     if [[ ! -f "$required" ]]; then
@@ -543,6 +542,78 @@ if [[ "$DRIFT" == "1" ]]; then
     exit 1
 fi
 
+# Refresh preserves native binaries and their installed manifest. Runtime setup owns
+# admission and replacement; this command verifies the selected local dependencies.
+native_platform="$(uname -s)-$(uname -m)"
+selection="$("$NODE_BIN" --input-type=module - "$DATA_DIR" "$native_platform" <<'JS'
+import fs from "node:fs";
+import path from "node:path";
+const [data, host] = process.argv.slice(2);
+function localSelection(platform, transport) {
+    const names = ["browser-vz-engine-supervisor"];
+    if (platform === "linux-arm64") names.push("crosvm");
+    if (transport === "userspace-vsock") names.push("vhost-device-vsock");
+    const manifest = JSON.parse(fs.readFileSync(path.join(data, "components.json"), "utf8"));
+    for (const name of names) {
+        const component = manifest.external?.[name];
+        const entry = component?.platforms?.[platform] || component?.platforms?.[platform === "linux-arm64" ? "aarch64-linux" : "macos-arm64"];
+        // A direct binary is installed at bin/<name>; the executable of an
+        // archive package is reached through the bin/<name> link setup makes.
+        const selected = entry && (entry.install_path || component.install_path);
+        const bound = selected && (entry.extract_path
+            ? fs.realpathSync(path.join(data, "bin", name)) === fs.realpathSync(path.join(data, selected, entry.binary_path || component.binary_path || ""))
+            : selected === `bin/${name}`);
+        if (!bound) {
+            throw new Error(`Native component receipt must bind its selected path: ${name}`);
+        }
+    }
+    console.log(platform + (transport ? " " + transport : ""));
+}
+try {
+    const configPath = path.join(data, "config/browser-engine-adapter.json");
+    const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : {};
+    const launcher = config.adapters?.[0]?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER;
+    if (path.basename(String(launcher || "")).startsWith("browser-vm-remote-vz-launcher")) {
+        console.log("remote");
+    } else if (host === "Darwin-arm64") {
+        localSelection("darwin-arm64");
+    } else if (["Linux-aarch64", "Linux-arm64"].includes(host)) {
+        const receiptPath = `/run/elastos-browser/${process.getuid()}.json`;
+        for (let entry = receiptPath;; entry = path.dirname(entry)) {
+            const info = fs.lstatSync(entry);
+            if (info.uid !== 0 || (info.mode & 0o022) || info.isSymbolicLink()) {
+                throw new Error("Browser host setup requires an intact root-owned receipt path");
+            }
+            if (entry === "/") break;
+        }
+        const info = fs.statSync(receiptPath);
+        if (!info.isFile() || info.nlink !== 1 || info.size > 65536) throw new Error("Invalid Browser host setup receipt");
+        const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+        if (receipt.uid !== process.getuid() || receipt.boot_id !== fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()
+            || !["kernel-vsock", "userspace-vsock"].includes(receipt.transport)) {
+            throw new Error("Browser host setup requires repair for this user and boot");
+        }
+        localSelection("linux-arm64", receipt.transport);
+    } else {
+        throw new Error("This host uses an approved remote Browser Engine; the local guest requires ARM64 virtualization");
+    }
+} catch (error) {
+    console.error(error.message);
+    process.exit(1);
+}
+JS
+)"
+if [[ "$selection" != "remote" ]]; then
+    native_components=(browser-vz-engine-supervisor)
+    if [[ "$selection" == linux-arm64* ]]; then
+        native_components+=(crosvm)
+        [[ "$selection" != "linux-arm64 userspace-vsock" ]] || native_components+=(vhost-device-vsock)
+    fi
+    ELASTOS_DATA_DIR="$DATA_DIR" ELASTOS_COMPONENTS_JSON="$DATA_DIR/components.json" \
+        ELASTOS_SETUP_PLATFORM="${selection%% *}" \
+        "$SOURCE_DIR/scripts/installed-provider-verify.sh" --require-verified "${native_components[@]}"
+fi
+
 install_with_backup "$selkies_source" \
     "$DATA_DIR/scripts/browser-selkies-control-service.mjs" 644 \
     "browser-selkies-control-service.mjs"
@@ -552,9 +623,6 @@ install_with_backup "$SOURCE_DIR/scripts/browser-source-home-config.mjs" \
 install_with_backup "$SOURCE_DIR/scripts/browser-runtime-turn.mjs" \
     "$DATA_DIR/scripts/browser-runtime-turn.mjs" 755 \
     "browser-runtime-turn.mjs"
-install_with_backup "$SOURCE_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" \
-    "$DATA_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" 755 \
-    "browser-vm-prepare-rootfs-pool.mjs"
 install_with_backup "$SOURCE_DIR/scripts/browser-vm-engine-preflight.sh" \
     "$DATA_DIR/scripts/browser-vm-engine-preflight.sh" 755 \
     "browser-vm-engine-preflight.sh"
@@ -573,9 +641,6 @@ install_with_backup "$SOURCE_DIR/scripts/browser-vm-control-service.mjs" \
 install_with_backup "$SOURCE_DIR/scripts/browser-vm-remote-vz-launcher.mjs" \
     "$DATA_DIR/bin/browser-vm-remote-vz-launcher.mjs" 755 \
     "browser-vm-remote-vz-launcher.mjs"
-install_with_backup "$SOURCE_DIR/scripts/browser-vm-local-crosvm-launcher.mjs" \
-    "$DATA_DIR/bin/browser-vm-local-crosvm-launcher.mjs" 755 \
-    "browser-vm-local-crosvm-launcher.mjs"
 install_with_backup "$SOURCE_DIR/scripts/browser-vm-linux-network.py" \
     "$DATA_DIR/scripts/browser-vm-linux-network.py" 755 \
     "browser-vm-linux-network.py"
@@ -589,12 +654,6 @@ write_node_wrapper "$DATA_DIR/bin/browser-vm-control-service" \
 write_node_wrapper "$DATA_DIR/bin/browser-vm-remote-vz-launcher" \
     "$DATA_DIR/bin/browser-vm-remote-vz-launcher.mjs" \
     "browser-vm-remote-vz-launcher"
-write_node_wrapper "$DATA_DIR/bin/browser-vm-local-crosvm-launcher" \
-    "$DATA_DIR/bin/browser-vm-local-crosvm-launcher.mjs" \
-    "browser-vm-local-crosvm-launcher"
-write_node_wrapper "$DATA_DIR/bin/browser-vm-prepare-rootfs-pool" \
-    "$DATA_DIR/scripts/browser-vm-prepare-rootfs-pool.mjs" \
-    "browser-vm-prepare-rootfs-pool"
 
 if [[ "$VERIFY_ONLY" == "1" && "$DRIFT" == "1" ]]; then
     echo "[browser-vm-target-refresh] verify-only found drift"

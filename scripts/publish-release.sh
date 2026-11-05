@@ -863,15 +863,25 @@ build_supported_direct_assets() {
     cp "$archive" "$staged" || return
     updates_json=$(record_direct_asset "$updates_json" home-cli "$staged" "capsules/home-cli" "$release_path" home-cli) || return
 
-    if [[ "$setup_platform" == darwin-arm64 ]] && jq -e '.external["browser-vz-engine-supervisor"]' components.json >/dev/null; then
-        # The source Home and release use the same native supervisor and entitlement.
-        if [[ "$SKIP_BUILD" != true ]]; then
-            (cd elastos && cargo build --locked --release -p elastos-vz --bin browser-vz-engine-supervisor) >&2 || return
+    if jq -e --arg platform "$setup_platform" \
+        '.external["browser-vz-engine-supervisor"].platforms[$platform]' components.json >/dev/null; then
+        # Source Home and release share the native owner; Mac also needs its entitlement.
+        local supervisor_args=(build --locked --release -p elastos-vz --bin browser-vz-engine-supervisor)
+        local supervisor_output="${CARGO_TARGET_DIR:-elastos/target}"
+        if [[ -n "$target" ]]; then
+            supervisor_args+=(--target "$target")
+            supervisor_output="${supervisor_output}/${target}"
         fi
-        staged="$stage_dir/browser-vz-engine-supervisor-darwin-arm64"
-        cp "${CARGO_TARGET_DIR:-elastos/target}/release/browser-vz-engine-supervisor" "$staged" || return
-        scripts/dev/sign-elastos-vz/sign.sh "$staged" >&2 || return
-        updates_json=$(record_direct_asset "$updates_json" browser-vz-engine-supervisor "$staged" bin/browser-vz-engine-supervisor browser-vz-engine-supervisor-darwin-arm64) || return
+        if [[ "$SKIP_BUILD" != true ]]; then
+            (cd elastos && cargo "${supervisor_args[@]}") >&2 || return
+        fi
+        release_path="browser-vz-engine-supervisor-${setup_platform}"
+        staged="${stage_dir}/${release_path}"
+        cp "${supervisor_output}/release/browser-vz-engine-supervisor" "$staged" || return
+        if [[ "$setup_platform" == darwin-arm64 ]]; then
+            scripts/dev/sign-elastos-vz/sign.sh "$staged" >&2 || return
+        fi
+        updates_json=$(record_direct_asset "$updates_json" browser-vz-engine-supervisor "$staged" bin/browser-vz-engine-supervisor "$release_path") || return
     fi
 
     stamp_direct_assets "$setup_platform" "$updates_json"

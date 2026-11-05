@@ -82,8 +82,8 @@ env = {**os.environ, "ELASTOS_BROWSER_VM_PLATFORM": args.platform,
        "ELASTOS_BROWSER_VM_ROOTFS": str(plan[rootfs_rel]),
        "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST": str(plan[manifest_rel]),
        "ELASTOS_BROWSER_VM_KERNEL": str(plan["bin/vmlinux"]),
-       ("ELASTOS_BROWSER_VM_INITRAMFS" if args.platform == "darwin-arm64"
-        else "ELASTOS_BROWSER_VM_INITRD"): str(plan[initrd_rel])}
+       "ELASTOS_BROWSER_VM_INITRAMFS": str(plan[initrd_rel]),
+       "ELASTOS_BROWSER_VM_INITRD": str(plan[initrd_rel])}
 try:
     verified = subprocess.run([str(repo_root / "scripts/browser-vm-artifact-preflight.sh"),
                                "--verify-image-set"], env=env, capture_output=True, text=True,

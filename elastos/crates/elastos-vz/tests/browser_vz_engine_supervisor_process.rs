@@ -208,6 +208,7 @@ fn anonymous_private_stdin_pipe_reaches_preflight_without_any_effect() {
             },
             "transport_authority": authority,
             "transport_secret": secret,
+            "verified_rootfs": elastos_common::browser_vm_seed::BrowserVmSeedIdentity::read(&rootfs).unwrap(),
         },
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_browser-vz-engine-supervisor"))

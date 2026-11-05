@@ -105,6 +105,19 @@ SHA-256, plus successful evidence for each guest and audio dependency. When
 Staged directories use the build-time target check; installed ext4 images need
 the image receipt. Publisher authorization, host eligibility, control-service
 readiness and product media remain separate admission and qualification gates.
+Runtime hashes the installed image set in a background thread at Home start
+on local Browser hosts. Linux uses idle I/O priority and nice 19; macOS uses a
+plain background thread. Browser open shares that verification and waits for
+its remaining work. Runtime keeps the computed digests in process memory,
+bound to device, inode, size, mode, nanosecond modification and change times,
+plus the receipt and selected release. A changed identity requires a new hash.
+The artifact and `--verify-image-set` shell checks hash their inputs.
+`--host-readiness` checks presence, shape, permissions and host capability;
+it leaves image verification to Runtime and makes no verification claim.
+Runtime carries the verified seed identity in the launch request. The
+supervisor checks link and target identity again immediately before the Mac
+copy or Linux overlay creation. Adjacent cache files provide no authority.
+
 An image refresh must retain its source provenance and produce a matching
 receipt for the changed bytes before the image passes this check.
 
@@ -407,16 +420,23 @@ install -D -o root -g root -m 755 <reviewed-checkout>/scripts/browser-vm-linux-n
 python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user <home-user>
 ```
 
-The script lists the devices, addresses and policy, then asks for `y` before
-it changes the host. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
+Setup selects `kernel-vsock` when `/dev/vhost-vsock` is available, loading its
+module if needed. Otherwise it selects `userspace-vsock` when the root-owned
+`/usr/bin/bwrap` and admitted `bin/vhost-device-vsock` are present. Use
+`--data-dir <home-data-dir>` for a custom Home data directory. `--transport`
+provides an explicit override. Repair retains the saved transport.
+
+The script lists the selected transport, devices, addresses and policy, then
+asks for `y` before it creates network state. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
 tools (`setfacl`, `getfacl`), systemd and udev, plus `/dev/kvm` and `/dev/net/tun`.
 It creates TAPs owned by the numeric UID, adds their host addresses and
 confinement rules, grants that user read/write KVM access through a named ACL,
 and installs a KVM udev rule. An existing named KVM ACL is saved for removal.
 This gives `elastos-agent` KVM access without changing its groups.
 
-Root stores ACL state in `/var/lib/elastos-browser/<uid>.json`, copies the
-setup helper to `/usr/local/lib/elastos/browser-vm-linux-network.py`, and
+Root stores the ACL state and data directory in
+`/var/lib/elastos-browser/<uid>.json`, copies the setup helper to
+`/usr/local/lib/elastos/browser-vm-linux-network.py`, and
 enables `elastos-browser-network-<uid>.service`. This oneshot service restores
 the devices and rules after each boot, following host firewall services. The
 unit shares stop/restart and reload events with `nftables`, `firewalld`, `ufw`
@@ -535,11 +555,13 @@ generator/stager for:
 
 - `bin/browser-vm-engine-supervisor`
 - `bin/browser-vm-control-service`
-- `bin/browser-vm-local-crosvm-launcher`
 - `bin/browser-vm-remote-vz-launcher`
-- `bin/browser-vm-prepare-rootfs-pool`
-- `bin/browser-vz-engine-supervisor` on macOS after the VZ helper is built
+- `bin/browser-vz-engine-supervisor` for Linux ARM64 and macOS
 - verified links to an existing rootfs, kernel, initrd and matching build manifest
+
+Linux uses the native supervisor and a disposable qcow2 overlay for each
+launch. The installer removes the retired `browser-vm/rootfs-pool` image copies
+as their ordinary owner and reports the removed path.
 
 For already-provisioned targets, `scripts/browser-vm-target-refresh.sh` is the
 host-helper maintenance path. Guest drift requires a rebuilt image set. Runtime

@@ -430,7 +430,7 @@ fn list_launchable_browser_capsules_for(
         if !capsule_is_offered(data_dir, &manifest.name) {
             continue;
         }
-        if manifest.name == "browser" && !crate::setup::browser_available(platform) {
+        if manifest.name == "browser" && !crate::setup::home_browser_available(data_dir, platform) {
             continue;
         }
         let Ok(capsule) = resolve_browser_capsule(data_dir, &manifest.name) else {

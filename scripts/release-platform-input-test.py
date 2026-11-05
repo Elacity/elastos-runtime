@@ -268,6 +268,30 @@ class PlatformInputTest(unittest.TestCase):
                 self.assertFalse(staged.exists())
                 self.assertFalse(args.output.exists())
 
+    def test_checkout_image_rows_stage_one_guest_for_both_arm64_hosts(self):
+        # #90: the Jetson takes the Mac's guest bytes under its own release path;
+        # its fresh support refuses to prepare without the image input.
+        checkout = json.loads((Path(__file__).resolve().parents[1] / "components.json").read_bytes())
+        template = copy.deepcopy(self.template)
+        template["external"][inputs.BROWSER_IMAGE] = checkout["external"][inputs.BROWSER_IMAGE]
+        self.write_json(inputs.SOURCE_ROOT / "components.json", template)
+        package = self.browser_image_package()
+        for platform, release_path in (("aarch64-darwin", "browser-vm-image-arm64.tar.gz"),
+                                       ("aarch64-linux", "browser-vm-image-linux-arm64.tar.gz")):
+            with self.subTest(platform=platform):
+                stage = self.root / ("image-stage-" + platform)
+                (stage / "artifacts").mkdir(parents=True)
+                args = SimpleNamespace(root=stage, platform=platform, package="", sha256="",
+                                       output=stage / "overlay.json")
+                with self.assertRaisesRegex(ValueError, "Fresh support requires --browser-vm-image"):
+                    inputs.stage_browser_image(args)
+                args.package, args.sha256 = str(package), inputs.digest(package)
+                inputs.stage_browser_image(args)
+                setup_platform = inputs.PLATFORMS[platform][0]
+                info = json.loads(args.output.read_bytes())["external"][inputs.BROWSER_IMAGE]["platforms"][setup_platform]
+                self.assertEqual(info["release_path"], release_path)
+                self.assertEqual((stage / "artifacts" / release_path).read_bytes(), package.read_bytes())
+
     def test_browser_image_signed_input_keeps_install_strategy(self):
         for platform in self.bundles:
             setup_platform = inputs.PLATFORMS[platform][0]

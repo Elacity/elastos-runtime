@@ -576,15 +576,15 @@ async function waitForVmControlStatus(controlSocket, timeoutMs) {
   throw lastError || new Error("Browser VM control status did not become ready");
 }
 
-function localControlLauncherForPlatform({ dataDir, platform }) {
+export function localControlLauncherForPlatform({ dataDir, platform }) {
   if (process.env[CONTROL_LAUNCHER_ENV]) {
     return process.env[CONTROL_LAUNCHER_ENV];
   }
-  if (platform.startsWith("darwin-")) {
+  if (platform === "darwin-arm64") {
     return process.env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR || path.join(dataDir, "bin/browser-vz-engine-supervisor");
   }
-  if (platform.startsWith("linux-")) {
-    return path.join(dataDir, "bin/browser-vm-local-crosvm-launcher");
+  if (platform === "linux-arm64") {
+    return path.join(dataDir, "bin/browser-vz-engine-supervisor");
   }
   return "";
 }
@@ -944,6 +944,9 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
         root,
         fingerprints,
       })) {
+        if (!localControlLauncherForPlatform({ dataDir, platform })) {
+          throw launchError("host_unsupported", "Local Browser virtualization is unavailable on this host. Select an approved remote Browser Engine.");
+        }
         throw new Error("Browser VM control socket is unavailable");
       }
       await waitForMatchingVmControlStatus(controlSocket, fingerprints, 7000);
