@@ -12,6 +12,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Fixed
 
+- Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
 - Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.
 
 ## [2.0.0] - 2026-11-02

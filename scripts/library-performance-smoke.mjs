@@ -9,6 +9,7 @@ const require = createRequire(new URL("../elastos/tools/browser-playwright-engin
 const { chromium } = require("playwright");
 
 const capsuleRoot = path.resolve("capsules/library/browser");
+const homeNavigationClientPath = path.resolve("capsules/home/browser/home-navigation-client.js");
 const homeClipboardClientPath = path.resolve(
   "capsules/home/browser/home-clipboard-client.js",
 );
@@ -132,6 +133,11 @@ function createAppServer() {
       return;
     }
 
+    if (url.pathname === "/apps/home/home-navigation-client.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeNavigationClientPath).pipe(res);
+      return;
+    }
     if (url.pathname === "/apps/home/home-clipboard-client.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
       createReadStream(homeClipboardClientPath).pipe(res);

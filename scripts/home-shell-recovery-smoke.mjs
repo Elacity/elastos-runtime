@@ -353,7 +353,9 @@ assert(window.location.href === "/home/", "recovery reload fallback did not retu
 
 // Exercise the real event-channel functions with an isolated clock and transport.
 const hostSource = readFileSync(new URL("../capsules/home/browser/home-shell-host.js", import.meta.url), "utf8");
-const eventFunctions = hostSource.slice(hostSource.indexOf("function bindHomeEventLifecycle() {"));
+const renewalStart = hostSource.indexOf("function renewExpiringFrames() {");
+const eventFunctions = hostSource.slice(renewalStart, hostSource.indexOf("\n}", renewalStart) + 2)
+  + "\n" + hostSource.slice(hostSource.indexOf("function bindHomeEventLifecycle() {"));
 const eventConstants = hostSource.split("\n").filter(line => /^const HOME_EVENTS_/.test(line)).join("\n");
 const settleEventTasks = () => new Promise(resolve => setImmediate(resolve));
 
@@ -412,6 +414,8 @@ function eventFixture() {
 {
   const f = eventFixture();
   f.context.ensureHomeEventChannel();
+  const renewalRequests = [];
+  f.context.launchedAppContexts.set("expired-frame", { expiresAt: 0, source: { postMessage: data => { if (data.type === "elastos.home.authority.request/v1") renewalRequests.push(data); } } });
   const initial = f.streams[0];
   initial.onerror(new TypeError("Home is offline"));
   assert(initial.closed, "the failed event stream stayed open");
@@ -427,6 +431,8 @@ function eventFixture() {
   await f.fireNext();
   assert(f.counts().sessions === 1 && f.counts().summaries === 1, "recovery did not refresh the same signed session and summary");
   assert(f.state.homeEventsCursor === "same-session", "recovery lost the event cursor");
+  assert(renewalRequests.length === 1 && renewalRequests[0].homeToken === "expired-frame",
+    "event recovery did not renew the open frame");
   assert(f.streams.length === 2 && !f.streams[1].closed, "recovery did not restore the event stream");
   assert(f.streams[1].options.withCredentials === true, "recovery lost signed stream credentials");
   assert(f.deadlines.every(ms => ms === 10_000), "outage probes or recovery refreshes lost their request deadline", f.deadlines);

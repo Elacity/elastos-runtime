@@ -1079,12 +1079,46 @@ show_remote_open_hint() {
     printf '  ssh -L 8090:localhost:8090 %s@%s\n' "$(id -un)" "$host"
 }
 
+# The native launcher creates per-launch overlays. Retire the old copies as
+# their ordinary owner, before requesting any privileged host setup.
+retire_browser_rootfs_pool() {
+    /usr/bin/python3 -I - "$DATA_DIR" <<'PY_RETIRED_BROWSER_POOL'
+import os
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1])
+parent = root / 'browser-vm'
+if root.is_symlink() or parent.is_symlink():
+    sys.exit('Browser pool cleanup requires plain data and browser-vm directories')
+pool = parent / 'rootfs-pool'
+for path in (parent, pool):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if metadata.st_uid != os.geteuid():
+        sys.exit(f'{path} belongs to another user')
+if pool.is_symlink():
+    pool.unlink()
+elif pool.is_dir():
+    # removal-ok: exact retired image-copy folder, as its ordinary owner;
+    # parent links are refused and rmtree leaves internal link targets intact.
+    shutil.rmtree(pool)
+else:
+    sys.exit(0)
+print(f'Removed retired Browser rootfs pool: {pool}')
+PY_RETIRED_BROWSER_POOL
+}
+
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
 prepare_browser_linux_host() {
     BROWSER_LINUX_HOST_READY=false
     [[ "$(uname -s)" == Linux ]] || return 0
-    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user
+    retire_browser_rootfs_pool || return $?
+    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user check_result line
     # sudo runs only a root-owned copy, never the user-writable helper.
     local root_helper=/usr/local/lib/elastos/browser-vm-linux-network.py
     [[ -f "$helper" ]] || return 0
@@ -1093,18 +1127,23 @@ prepare_browser_linux_host() {
         return 0
     fi
     user="$(id -un)"
-    if /usr/bin/python3 -I "$helper" check >/dev/null 2>&1; then
+    if check_result="$(/usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" 2>&1)"; then
         info "Browser KVM and network access are ready."
     elif ( : </dev/tty ) 2>/dev/null && command -v sudo >/dev/null 2>&1; then
         info "Browser needs one-time administrator setup for KVM access and its private network devices."
         info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
         sudo install -D -o root -g root -m 755 "$helper" "$root_helper" </dev/tty || return $?
-        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" </dev/tty || return $?
-        /usr/bin/python3 -I "$helper" check >/dev/null 2>&1 || return $?
+        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" --data-dir "$DATA_DIR" </dev/tty || return $?
+        /usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" >/dev/null 2>&1 || return $?
     else
         info "Browser needs one-time administrator setup. Run from a terminal:"
         printf '  sudo install -D -o root -g root -m 755 %q %q\n' "$helper" "$root_helper"
-        printf '  sudo /usr/bin/python3 -I %q setup --user %q\n' "$root_helper" "$user"
+        while IFS= read -r line; do
+            case "$line" in
+                '/usr/bin/python3 -I '*) printf '  sudo %s\n' "$line" ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done <<<"$check_result"
         return 0
     fi
     BROWSER_LINUX_HOST_READY=true

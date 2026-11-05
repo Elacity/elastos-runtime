@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import stat
 import shutil
+import shlex
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -31,7 +32,8 @@ class NetworkTest(unittest.TestCase):
         self.uid = 1001
         self.pool = network.networks(self.uid)
         self.receipt = dict(uid=self.uid, boot_id='fixture-boot', networks=self.pool,
-                            policy=network.policy(self.pool), ifindices=list(range(10, 14)))
+                            policy=network.policy(self.pool), transport='kernel-vsock',
+                            ifindices=list(range(10, 14)))
         self.links = {}
         for n, index in zip(self.pool, self.receipt['ifindices']):
             device = network.SYSFS / n['tapName']
@@ -50,11 +52,16 @@ class NetworkTest(unittest.TestCase):
         self.stack.enter_context(patch.object(network, 'boot_id', return_value='fixture-boot'))
         real_stat = network.os.stat
         self.stack.enter_context(patch.object(network.os, 'stat', side_effect=lambda p, **kw:
-            SimpleNamespace(st_mode=stat.S_IFCHR) if str(p) in ['/dev/kvm', '/dev/net/tun'] else real_stat(p, **kw)))
+            SimpleNamespace(st_mode=stat.S_IFCHR) if str(p) in ['/dev/kvm', '/dev/vhost-vsock', '/dev/net/tun'] else real_stat(p, **kw)))
         self.access = self.stack.enter_context(patch.object(network.os, 'access', return_value=True))
+        real_exists = Path.exists
+        self.stack.enter_context(patch.object(Path, 'exists', lambda p:
+            True if str(p) == '/dev/vhost-vsock' else real_exists(p)))
 
     def run_command(self, *args, **kwargs):
         self.calls.append(args)
+        if args == ('modprobe', 'vhost_vsock') and getattr(self, 'missing_vsock_module', False):
+            raise RuntimeError('modprobe: module vhost_vsock not found')
         if args[:3] == ('ip', '-j', 'addr'):
             return SimpleNamespace(returncode=0, stdout=json.dumps([self.links[args[-1]]]))
         if args[:3] == ('ip', 'tuntap', 'show'):
@@ -121,7 +128,7 @@ class NetworkTest(unittest.TestCase):
         with patch.object(network.sys, 'argv', ['network', 'check']), patch.object(network.pwd, 'getpwuid', return_value=user), \
                 patch.object(network.os, 'getuid', return_value=self.uid), \
                 patch.object(network, 'check', side_effect=FileNotFoundError('missing TAP')):
-            with self.assertRaisesRegex(RuntimeError, r'As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent'):
+            with self.assertRaisesRegex(RuntimeError, r'As root, run:\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user elastos-agent'):
                 network.main()
 
     def test_down_tap_allows_repair_locks_without_reading_carrier(self):
@@ -175,12 +182,73 @@ class NetworkTest(unittest.TestCase):
             self.assertIn(('ip', 'link', 'set', n['tapName'], 'down'), self.calls)
 
     def test_repair_uses_only_a_trusted_root_helper(self):
-        user = SimpleNamespace(pw_name='elastos-agent')
-        with patch.object(network, 'trusted_path', side_effect=RuntimeError('user-writable helper')):
-            message = network.repair_command(user)
+        user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
+        with patch.object(network, 'trusted_path', side_effect=RuntimeError('user-writable helper')), \
+                patch.object(network.sys, 'argv', ['network', 'check']), \
+                patch.object(network.pwd, 'getpwuid', return_value=user), \
+                patch.object(network.os, 'getuid', return_value=self.uid), \
+                patch.object(network, 'check', side_effect=RuntimeError('fixture refusal')):
+            with self.assertRaises(RuntimeError) as refusal:
+                network.main()
+        message = str(refusal.exception)
         self.assertIn('Install the reviewed root-owned helper', message)
-        self.assertIn(f'As root, run: python3 {network.HELPER} setup --user elastos-agent', message)
+        self.assertIn(f'/usr/bin/python3 -I {network.HELPER} setup --user elastos-agent', message)
         self.assertNotIn(str(Path(network.__file__).parent), message)
+
+    def test_repair_command_is_pasteable_with_an_isolated_absolute_interpreter(self):
+        user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
+        data = network.RUN.parent / "Home's data"
+        with patch.object(network, 'STATE', network.RUN.parent / 'absent-state'):
+            command = network.repair_command(user, data)
+        self.assertEqual(shlex.split(command), ['/usr/bin/python3', '-I', str(network.HELPER),
+            'setup', '--user', user.pw_name, '--data-dir', str(data)])
+
+    def test_unusable_saved_kernel_transport_names_removal_before_automatic_setup(self):
+        user = SimpleNamespace(pw_name='elastos-agent', pw_uid=self.uid)
+        state = network.RUN.parent / 'state'
+        state.mkdir()
+        (state / f'{self.uid}.json').write_text('{}')
+        data = str(network.RUN.parent / "Home's saved data")
+        self.receipt['data_dir'] = data
+        real_stat = network.os.stat
+        for failure in ('missing', 'regular file', 'inaccessible'):
+            def device_stat(path, **kwargs):
+                if str(path) == '/dev/vhost-vsock':
+                    if failure == 'missing':
+                        raise FileNotFoundError(path)
+                    return SimpleNamespace(st_mode=stat.S_IFREG if failure == 'regular file' else stat.S_IFCHR)
+                return real_stat(path, **kwargs)
+            with self.subTest(failure=failure), patch.object(network, 'STATE', state), \
+                    patch.object(network.os, 'stat', side_effect=device_stat), \
+                    patch.object(network.os, 'access', return_value=failure != 'inaccessible'), \
+                    patch.object(network.sys, 'argv', ['network', 'check', '--data-dir', '/caller/data']), \
+                    patch.object(network.pwd, 'getpwuid', return_value=user), \
+                    patch.object(network.os, 'getuid', return_value=self.uid), \
+                    patch.object(network, 'check', side_effect=RuntimeError('kernel device unusable')):
+                with self.assertRaises(RuntimeError) as refusal:
+                    network.main()
+                commands = [shlex.split(line) for line in str(refusal.exception).splitlines()
+                            if line.startswith('/usr/bin/python3 -I ')]
+                self.assertEqual(commands, [
+                    ['/usr/bin/python3', '-I', str(network.HELPER), action,
+                     '--user', user.pw_name, '--data-dir', data] for action in ('remove', 'setup')])
+
+    def test_userspace_repair_and_removal_use_the_saved_transport(self):
+        self.receipt['transport'] = 'userspace-vsock'
+        user = SimpleNamespace(pw_uid=self.uid, pw_name='elastos-agent')
+        state = network.RUN.parent / 'state'
+        state.mkdir()
+        (state / f'{self.uid}.json').write_text('{}')
+        with patch.object(network, 'STATE', state), patch.object(network, 'trusted_path'):
+            self.assertIn('--transport userspace-vsock', network.repair_command(user))
+        with patch.object(network.sys, 'argv', ['network', 'remove', '--user', user.pw_name]), \
+                patch.object(network.pwd, 'getpwnam', return_value=user), patch.object(network.os, 'getuid', return_value=0), \
+                patch.object(network.sys, 'platform', 'linux'), patch('builtins.input', return_value='n'), \
+                patch.object(network, 'configure') as configure, contextlib.redirect_stdout(io.StringIO()) as output:
+            network.main()
+        configure.assert_not_called()
+        self.assertIn('KVM user ACLs', output.getvalue())
+        self.assertNotIn('vhost-vsock user ACLs', output.getvalue())
 
     def test_lease_skips_locked_and_orphaned_taps_then_releases(self):
         with open(network.RUN / f"{self.pool[0]['tapName']}.lock", 'r+') as held:
@@ -275,6 +343,7 @@ class NetworkTest(unittest.TestCase):
         with patch.object(network, 'write_json') as receipt, patch.object(network.os, 'chown'), patch.object(network, 'trusted_path'):
             network.restore(user)
         self.assertIn(('setfacl', '-m', 'u:1001:rw', '/dev/kvm'), self.calls)
+        self.assertIn(('setfacl', '-m', 'u:1001:rw', '/dev/vhost-vsock'), self.calls)
         for n in self.pool:
             self.assertIn(('ip', 'addr', 'add', f"{n['hostIp']}/30", 'dev', n['tapName']), self.calls)
             self.assertIn(('ip', 'link', 'set', n['tapName'], 'up'), self.calls)
@@ -293,6 +362,70 @@ class NetworkTest(unittest.TestCase):
             network.restore(user)
         for n in self.pool:
             self.assertIn(('ip', 'tuntap', 'add', 'dev', n['tapName'], 'mode', 'tap', 'user', '1001'), self.calls)
+
+    def test_boot_restore_loads_vsock_before_restoring_user_access(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid)
+        exists = Path.exists
+        with patch.object(Path, 'exists', lambda p:
+                False if str(p) == '/dev/vhost-vsock' else exists(p)), \
+                patch.object(network.shutil, 'which', return_value='/usr/sbin/modprobe'), \
+                patch.object(network, 'write_json'), patch.object(network.os, 'chown'), \
+                patch.object(network, 'trusted_path'):
+            network.restore(user)
+        module = self.calls.index(('modprobe', 'vhost_vsock'))
+        grant = self.calls.index(('setfacl', '-m', 'u:1001:rw', '/dev/vhost-vsock'))
+        self.assertLess(module, grant)
+
+    def test_userspace_boot_and_check_preserve_kvm_and_network_without_host_vsock(self):
+        self.receipt['transport'] = 'userspace-vsock'
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid)
+        lstat = Path.lstat
+        with patch.object(Path, 'lstat', lambda p: SimpleNamespace(st_mode=stat.S_IFREG | 0o755)
+                if str(p) == '/usr/bin/bwrap' else lstat(p)), \
+                patch.object(network, 'write_json') as receipt, patch.object(network.os, 'chown'), \
+                patch.object(network, 'trusted_path'), patch.object(network, 'prepare_vsock_device') as vsock:
+            network.restore(user)
+            self.assertEqual(network.check(self.uid), self.pool)
+            vsock.assert_not_called()
+        self.assertIn(('setfacl', '-m', 'u:1001:rw', '/dev/kvm'), self.calls)
+        self.assertNotIn(('setfacl', '-m', 'u:1001:rw', '/dev/vhost-vsock'), self.calls)
+        self.assertEqual(receipt.call_args.args[1]['transport'], 'userspace-vsock')
+        self.assertEqual(receipt.call_args.args[1]['policy'], network.policy(self.pool))
+
+    def test_failed_transport_preparation_leaves_setup_state_absent(self):
+        state = network.RUN.parent / 'new-setup-state'
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid, pw_name='fixture')
+        with patch.object(network, 'STATE', state), patch.object(network, 'trusted_path'), \
+                patch.object(network.shutil, 'which', return_value='/usr/bin/tool'), \
+                patch.object(network, 'prepare_transport', side_effect=RuntimeError('vhost_vsock is unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'vhost_vsock is unavailable'):
+                network.configure(user)
+        self.assertFalse(state.exists())
+        self.assertFalse(any(call[0] == 'setfacl' for call in self.calls))
+
+    def test_foreign_or_tun_devices_remain_untouched_on_restore_and_invalidate(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid)
+        device = network.SYSFS / self.pool[-1]['tapName']
+        for name, value in [('owner', str(self.uid + 1)), ('tun_flags', '0x1001')]:
+            file = device / name
+            previous = file.read_text()
+            file.write_text(value)
+            for action in [network.restore, network.invalidate]:
+                with self.subTest(field=name, action=action.__name__), \
+                        patch.object(network, 'trusted_path'), patch.object(network.os, 'chown'):
+                    self.calls.clear()
+                    with self.assertRaisesRegex(RuntimeError, 'not owned by this user'):
+                        action(user)
+                    self.assertFalse(any(call[0] in ['ip', 'iptables', 'ip6tables', 'setfacl'] for call in self.calls))
+            file.write_text(previous)
+
+    def test_transport_is_explicit_and_a_loaded_nondevice_is_refused(self):
+        self.receipt['transport'] = 'automatic'
+        with self.assertRaisesRegex(RuntimeError, 'transport is invalid'):
+            network.check(self.uid)
+        with patch.object(network.os, 'stat', return_value=SimpleNamespace(st_mode=stat.S_IFREG)):
+            with self.assertRaisesRegex(RuntimeError, 'character device'):
+                network.prepare_vsock_device()
 
     def test_receipt_requires_root_ownership_and_protected_paths(self):
         for uid, mode in [(0, stat.S_IFREG | 0o644), (1001, stat.S_IFREG | 0o644),
@@ -313,29 +446,128 @@ class NetworkTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             network.main()
             configure.assert_not_called()
-            self.assertIn('KVM user ACL', output.getvalue())
+            self.assertIn('KVM and vhost-vsock user ACLs', output.getvalue())
             self.assertIn(self.pool[0]['tapName'], output.getvalue())
 
     def test_setup_and_removal_manage_only_the_account_state(self):
+        self.assert_setup_and_removal('kernel-vsock', False)
+
+    def test_missing_kernel_device_and_run_directory_allow_partial_setup_removal(self):
+        self.assert_setup_and_removal('kernel-vsock', True)
+
+    def test_userspace_setup_and_removal_use_kvm_only(self):
+        self.assert_setup_and_removal('userspace-vsock', True)
+
+    def test_legacy_kvm_acl_setup_persists_transport_before_restore(self):
+        self.assert_setup_and_removal('kernel-vsock', False,
+                                      {'previous_kvm_acl': 'user:1001:r--'})
+
+    def test_legacy_kvm_and_vsock_acl_setup_persists_transport_before_restore(self):
+        self.assert_setup_and_removal('kernel-vsock', False,
+                                      {'previous_kvm_acl': 'user:1001:r--',
+                                       'previous_vsock_acl': 'user:1001:-w-'})
+
+    def test_automatic_setup_uses_userspace_without_kernel_vsock(self):
+        self.assert_setup_and_removal('userspace-vsock', True, automatic=True)
+
+    def test_automatic_setup_records_custom_data_directory_for_repair(self):
+        self.assert_setup_and_removal('userspace-vsock', True, automatic=True, custom_data=True)
+
+    def test_automatic_setup_keeps_kernel_vsock(self):
+        self.assert_setup_and_removal('kernel-vsock', False, automatic=True)
+
+    def test_automatic_setup_refuses_missing_userspace_prerequisites(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_name='fixture', pw_dir=str(network.RUN.parent))
+        lstat = Path.lstat
+        def missing_bwrap(path):
+            if str(path) == '/usr/bin/bwrap':
+                raise FileNotFoundError('/usr/bin/bwrap is missing')
+            return lstat(path)
+        with patch.object(network, 'STATE', network.RUN.parent / 'absent-state'), \
+                patch.object(Path, 'lstat', missing_bwrap), \
+                patch.object(network, 'prepare_vsock_device', side_effect=RuntimeError('module unavailable')):
+            with self.assertRaisesRegex(RuntimeError, r'Browser transport unavailable:.*vhost.*bwrap.*vhost-device-vsock'):
+                network.select_transport(user)
+        self.assertFalse((network.RUN.parent / 'absent-state').exists())
+
+    def test_automatic_selection_requires_backend_with_bwrap_present(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_name='fixture', pw_dir=str(network.RUN.parent))
+        with patch.object(network, 'STATE', network.RUN.parent / 'absent-state'), \
+                patch.object(network, 'prepare_vsock_device', side_effect=RuntimeError('module unavailable')), \
+                patch.object(network, 'prepare_transport'):
+            with self.assertRaisesRegex(RuntimeError, 'Install the admitted executable .*vhost-device-vsock'):
+                network.select_transport(user)
+
+    def test_explicit_transport_override_keeps_the_requested_transport(self):
+        user = SimpleNamespace(pw_uid=self.uid)
+        with patch.object(network, 'prepare_vsock_device') as kernel:
+            for transport in network.TRANSPORTS:
+                self.assertEqual(network.select_transport(user, transport), transport)
+            kernel.assert_not_called()
+
+    def test_fresh_repair_leaves_transport_to_automatic_setup(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_name='fixture')
+        with patch.object(network, 'STATE', network.RUN.parent / 'absent-state'):
+            message = network.repair_command(user)
+        self.assertNotIn('--transport', message)
+
+    def assert_setup_and_removal(self, transport, missing_vsock, legacy_state=None, automatic=False, custom_data=False):
         root = network.RUN.parent
         unit_dir, udev_dir = root / 'systemd', root / 'udev'
         unit_dir.mkdir()
         udev_dir.mkdir()
         state_dir, helper = root / 'state', root / 'lib/network.py'
-        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid, pw_name='elastos-agent')
+        state = state_dir / f'{self.uid}.json'
+        if legacy_state is not None:
+            state_dir.mkdir()
+            state.write_text(json.dumps(legacy_state))
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid, pw_name='elastos-agent', pw_dir=str(root / 'home'))
+        data = root / 'custom Home data' if custom_data else Path(user.pw_dir) / '.local/share/elastos'
+        backend = data / 'bin/vhost-device-vsock'
+        backend.parent.mkdir(parents=True)
+        backend.write_text('fixture backend')
+        backend.chmod(0o755)
+        legacy_rule = udev_dir / '70-elastos-browser-kvm-1001.rules'
+        legacy_rule.write_text('KERNEL=="kvm", RUN+="/usr/bin/setfacl -m u:1001:rw /dev/kvm"\n')
+        other_rule = udev_dir / '99-elastos-browser-kvm-1002.rules'
+        other_rule.write_text('other Home rule\n')
         def local_path(value):
             if str(value) == '/etc/systemd/system':
                 return unit_dir
             if str(value).startswith('/etc/udev/rules.d/'):
                 return udev_dir / Path(value).name
             return Path(value)
-        with patch.object(network, 'STATE', state_dir), patch.object(network, 'HELPER', helper), \
+        real_exists = Path.exists
+        real_lstat = Path.lstat
+        self.missing_vsock_module = automatic and missing_vsock
+        with patch.object(Path, 'exists', lambda path: not self.missing_vsock_module if str(path) == '/dev/vhost-vsock' else real_exists(path)), \
+                patch.object(Path, 'lstat', lambda path: SimpleNamespace(st_mode=stat.S_IFREG | 0o755)
+                    if str(path) == '/usr/bin/bwrap' else real_lstat(path)), \
+                patch.object(network, 'STATE', state_dir), patch.object(network, 'HELPER', helper), \
                 patch.object(network, 'Path', side_effect=local_path), patch.object(network, 'trusted_path'), \
+                patch.object(network.os, 'chown'), \
                 patch.object(network.shutil, 'which', side_effect=lambda command: f'/usr/bin/{command}'), \
-                patch.object(network, 'restore') as restore, \
                 patch.object(network, 'trusted_json', side_effect=lambda file: json.loads(file.read_text())):
-            network.configure(user)
-            restore.assert_not_called()
+            if legacy_state is not None:
+                before = state.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, 'before changing transport'):
+                    network.configure(user, transport='userspace-vsock')
+                self.assertEqual(state.read_bytes(), before)
+                self.assertFalse(helper.exists())
+                self.assertFalse(list(unit_dir.iterdir()))
+            if automatic:
+                argv = ['network', 'setup', '--user', user.pw_name]
+                if custom_data:
+                    argv += ['--data-dir', str(data)]
+                with patch.object(network.sys, 'argv', argv), \
+                        patch.object(network.pwd, 'getpwnam', return_value=user), \
+                        patch.object(network.os, 'getuid', return_value=0), \
+                        patch.object(network.sys, 'platform', 'linux'), patch('builtins.input', return_value='y'), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    network.main()
+                self.assertIn(f'transport: {transport}', output.getvalue())
+            else:
+                network.configure(user, transport=transport)
             self.assertIn(('systemctl', 'restart', 'elastos-browser-network-1001.service'), self.calls)
             unit = unit_dir / 'elastos-browser-network-1001.service'
             self.assertIn('restore --user elastos-agent', unit.read_text())
@@ -346,10 +578,47 @@ class NetworkTest(unittest.TestCase):
             self.assertIn('ExecStop=', unit.read_text())
             self.assertIn('ExecStopPost=', unit.read_text())
             self.assertIn('ExecReload=', unit.read_text())
-            self.assertIn('-m u:1001:rw /dev/kvm', next(udev_dir.iterdir()).read_text())
-            self.assertEqual(json.loads((state_dir / '1001.json').read_text()), {'previous_kvm_acl': None})
+            rule = udev_dir / '99-elastos-browser-kvm-1001.rules'
+            self.assertIn('-m u:1001:rw /dev/kvm', rule.read_text())
+            if transport == 'kernel-vsock':
+                self.assertIn('-m u:1001:rw /dev/vhost-vsock', rule.read_text())
+            else:
+                self.assertNotIn('/dev/vhost-vsock', rule.read_text())
+            self.assertGreater(rule.name, '73-seat-late.rules')
+            self.assertFalse(legacy_rule.exists())
+            self.assertEqual(other_rule.read_text(), 'other Home rule\n')
+            expected = {'previous_kvm_acl': None, **(legacy_state or {}), 'transport': transport, 'data_dir': str(data)}
+            if transport == 'kernel-vsock':
+                expected.setdefault('previous_vsock_acl', None)
+            # Exercise the real setup -> boot restore handoff using the saved
+            # state, rather than supplying the expected receipt to restore.
+            network.restore(user)
+            saved = json.loads(state.read_text())
+            receipt = network.RUN / f'{self.uid}.json'
+            live = json.loads(receipt.read_text())
+            self.assertEqual(saved.get('transport'), live['transport'])
+            self.assertEqual(saved, expected)
+            self.assertIn(f'--transport {transport}', network.repair_command(user))
+            self.assertIn(f'--data-dir {shlex.quote(str(data))}', network.repair_command(user))
+            with patch.object(network, 'prepare_vsock_device') as probe:
+                self.assertEqual(network.select_transport(user), transport)
+                probe.assert_not_called()
+            self.assertEqual(live, {**self.receipt, 'transport': transport})
+            before = (state.read_bytes(), receipt.read_bytes(), unit.read_bytes(), rule.read_bytes())
+            with self.assertRaisesRegex(RuntimeError, 'before changing transport'):
+                network.configure(user, transport='userspace-vsock' if transport == 'kernel-vsock' else 'kernel-vsock')
+            self.assertEqual((state.read_bytes(), receipt.read_bytes(), unit.read_bytes(), rule.read_bytes()), before)
+            self.assertEqual(('modprobe', 'vhost_vsock') in self.calls, automatic and missing_vsock)
             # Model setup failing after its state write but before unit write.
             unit.unlink()
+            # Setup can fail before boot restore creates any volatile state.
+            # Removal recreates only the trusted locks needed to retire it.
+            shutil.rmtree(network.RUN)
+            exists = Path.exists
+            if missing_vsock:
+                self.stack.enter_context(patch.object(Path, 'exists', lambda path:
+                    False if str(path) == '/dev/vhost-vsock' else exists(path)))
+            legacy_rule.write_text('KERNEL=="kvm", RUN+="/usr/bin/setfacl -m u:1001:rw /dev/kvm"\n')
             def missing_unit(*args, **kwargs):
                 if args[:3] == ('systemctl', 'disable', '--now') and not kwargs.get('optional'):
                     raise RuntimeError('Unit file does not exist')
@@ -362,9 +631,19 @@ class NetworkTest(unittest.TestCase):
                 return read_text(file, *args, **kwargs)
             with patch.object(network, 'run', side_effect=missing_unit), patch.object(Path, 'read_text', down_tap):
                 network.configure(user, remove=True)
-            self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
+            if expected['previous_kvm_acl'] is None:
+                self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
+            else:
+                self.assertIn(('setfacl', '-m', expected['previous_kvm_acl'], '/dev/kvm'), self.calls)
+            if transport == 'kernel-vsock' and not missing_vsock:
+                if expected['previous_vsock_acl'] is None:
+                    self.assertIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
+                else:
+                    self.assertIn(('setfacl', '-m', expected['previous_vsock_acl'], '/dev/vhost-vsock'), self.calls)
+            else:
+                self.assertNotIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
             self.assertFalse(unit.exists())
-            self.assertEqual(list(udev_dir.iterdir()), [])
+            self.assertEqual(list(udev_dir.iterdir()), [other_rule])
             self.assertEqual(list(state_dir.iterdir()), [])
             self.assertFalse(helper.exists())
             for n in self.pool:

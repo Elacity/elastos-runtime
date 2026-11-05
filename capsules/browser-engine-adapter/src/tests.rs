@@ -598,6 +598,7 @@ fn full_width_generation_omits_absent_viewport_from_private_vz_dispatch() {
     }))
     .unwrap();
     let context = LaunchContext {
+        verified_rootfs: None,
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -763,6 +764,7 @@ fn exact_vz_did_not_act_settlement_survives_supervisor_failure() {
     }))
     .unwrap();
     let context = LaunchContext {
+        verified_rootfs: None,
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -817,6 +819,7 @@ fn mismatched_vz_settlement_is_not_preserved() {
     }))
     .unwrap();
     let context = LaunchContext {
+        verified_rootfs: None,
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -953,6 +956,7 @@ fn launch_rejects_invalid_browser_profile_descriptor() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile,
@@ -972,6 +976,7 @@ fn launch_rejects_invalid_browser_profile_descriptor() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile,
@@ -995,6 +1000,7 @@ fn launch_rejects_unimplemented_product_display_modes() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1018,6 +1024,7 @@ fn launch_rejects_mismatched_guarantee_level() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1143,6 +1150,7 @@ fn launch_can_select_configured_adapter_id() {
     );
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -1194,6 +1202,7 @@ fn launch_rejects_unknown_or_unsafe_adapter_id() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://ela.city/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1209,6 +1218,7 @@ fn launch_rejects_unknown_or_unsafe_adapter_id() {
     );
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://ela.city/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1354,7 +1364,7 @@ fn supervisor_launch_clears_configured_prewarm_flag() {
 #[test]
 fn supervisor_launch_preserves_typed_resources_in_use_failure() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.launch-error/v1","code":"resources_in_use","message":"Browser profile disk is already attached to an active VM"}' >&2; exit 23"#;
+    let script = r#"printf '%s' "$ELASTOS_BROWSER_ENGINE_REQUEST" | grep -q '"verified_rootfs":{"fixture":"process-admitted-seed"}' || exit 22; printf '%s\n' '{"schema":"elastos.browser.engine.launch-error/v1","code":"resources_in_use","message":"Browser profile disk is already attached to an active VM"}' >&2; exit 23"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "mac-vm-product",
@@ -1371,6 +1381,7 @@ fn supervisor_launch_preserves_typed_resources_in_use_failure() {
 
     let stream = stream_receipt("adapter_ipc");
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: Some(json!({"fixture": "process-admitted-seed"})),
         url: "https://glidefinance.io/",
         stream_session: &stream,
         profile: test_browser_profile(),
@@ -1416,6 +1427,7 @@ fn native_adapter_can_declare_webrtc_display_mode() {
     );
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -1461,6 +1473,7 @@ fn webrtc_proof_surface_cannot_advertise_audio() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://youtube.com/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1495,6 +1508,7 @@ fn webrtc_product_compositor_can_advertise_audio() {
     assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://youtube.com/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -1540,6 +1554,7 @@ fn supervisor_launch_registers_page_scoped_control_session() {
     assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -1637,6 +1652,7 @@ fn launch_fails_closed_when_session_capacity_is_full() {
     assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
 
     let first = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -1658,6 +1674,7 @@ fn launch_fails_closed_when_session_capacity_is_full() {
 
     assert_eq!(
         error_code(provider.launch_with_viewport(LaunchContext {
+            verified_rootfs: None,
             url: "https://glidefinance.io/",
             stream_session: &stream_receipt("adapter_ipc"),
             profile: test_browser_profile(),
@@ -1835,6 +1852,7 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
     );
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://ela.city/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -3662,6 +3680,7 @@ fn hosted_remote_browser_can_declare_product_compositor() {
     assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://example.com/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),
@@ -3704,6 +3723,7 @@ fn native_adapter_can_declare_native_surface_display_mode() {
     assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
 
     let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        verified_rootfs: None,
         url: "https://glidefinance.io/",
         stream_session: &stream_receipt("adapter_ipc"),
         profile: test_browser_profile(),

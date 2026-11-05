@@ -91,7 +91,8 @@ verify_component() {
                       checksum: ($platform_info.checksum // ""),
                       extract_path: ($platform_info.extract_path // ""),
                       strategy: ($platform_info.strategy // ""),
-                      source: ($platform_info.source // "")
+                      source: ($platform_info.source // ""),
+                      binary_path: ($platform_info.binary_path // $component.binary_path // "")
                   }
                 end
             ' "$COMPONENTS_JSON" 2>/dev/null || true
@@ -121,6 +122,25 @@ verify_component() {
             echo "[installed-provider-verify] $name has no install_path" >&2
             return 1
         fi
+        return 0
+    fi
+
+    # An explicitly named archive package is verified by the artifact receipt
+    # setup wrote at extraction and by its executable.
+    if [[ -n "$extract_path" && "$explicit" == "1" && -d "$DATA_DIR/$install_path" ]]; then
+        local package="$DATA_DIR/$install_path" receipt binary_path
+        binary_path="$(jq -r '.binary_path' <<<"$info")"
+        receipt="$(tr -d '[:space:]' < "$package/.elastos-artifact-sha256" 2>/dev/null || true)"
+        if [[ ! "$checksum" =~ ^sha256:[0-9a-f]{64}$ || "sha256:${receipt#sha256:}" != "$checksum" ]]; then
+            echo "[installed-provider-verify] archive receipt for $name does not match its pin ($checksum)" >&2
+            return 1
+        fi
+        if [[ -z "$binary_path" || ! -f "$package/$binary_path" || ! -x "$package/$binary_path" ]]; then
+            echo "[installed-provider-verify] missing executable for $name: $package/${binary_path}" >&2
+            return 1
+        fi
+        echo "[installed-provider-verify] ok: $name archive ($checksum)"
+        VERIFY_COMPONENT_VERDICT="verified"
         return 0
     fi
 

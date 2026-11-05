@@ -165,6 +165,7 @@ pub(in crate::api) struct PasskeyStepUpEffectIdentity {
 struct IssuedPasskeyStepUp {
     token: String,
     step_up_id: String,
+    expires_at: u64,
 }
 
 pub(super) async fn passkey_step_up_begin(
@@ -709,7 +710,17 @@ fn issue_step_up_token(
         operation: pending.operation.clone(),
         request_sha256: pending.request_sha256.clone(),
         iat: issued_at,
-        exp: issued_at.saturating_add(PASSKEY_STEP_UP_TTL_SECS),
+        exp: gateway_home_token::grant_bound_token_expiry(
+            data_dir,
+            &HomeLaunchTokenContext {
+                principal_id: pending.principal_id.clone(),
+                session_id: pending.session_id.clone(),
+                proof_binding_id: Some(pending.proof_binding_id.clone()),
+                grant_id: pending.grant_id.clone(),
+            },
+            issued_at,
+            PASSKEY_STEP_UP_TTL_SECS,
+        )?,
         non_delegatable: true,
     };
     payload.validate(issued_at, PASSKEY_STEP_UP_TTL_SECS)?;
@@ -726,6 +737,7 @@ fn issue_step_up_token(
         signer_did,
     };
     Ok(IssuedPasskeyStepUp {
+        expires_at: envelope.payload.exp,
         token: URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?),
         step_up_id,
     })
@@ -741,7 +753,7 @@ fn complete_step_up(
     Ok(PasskeyStepUpCompleteResponse {
         schema: PASSKEY_STEP_UP_COMPLETE_RESULT_SCHEMA.to_string(),
         step_up_token: issued.token,
-        expires_at: completed_at.saturating_add(PASSKEY_STEP_UP_TTL_SECS),
+        expires_at: issued.expires_at,
     })
 }
 
@@ -1543,6 +1555,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn proof_bound_step_up_ends_with_the_grant() {
+        let fixture = fixture();
+        let now = now_ts();
+        let mut grant = crate::auth::load_active_session_grant(
+            fixture.data_dir.path(),
+            &fixture.context.session_id,
+            now,
+        )
+        .unwrap();
+        grant.expires_at = now + 30;
+        crate::auth::store_session_grant(fixture.data_dir.path(), grant.clone()).unwrap();
+        let pending = pending_for(&fixture, "ceremony:expiry".into(), now);
+        let completed = complete_step_up(fixture.data_dir.path(), &pending, now).unwrap();
+        let envelope: PasskeyStepUpEnvelope =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(completed.step_up_token).unwrap())
+                .unwrap();
+        assert_eq!(envelope.payload.exp, grant.expires_at);
+        assert_eq!(completed.expires_at, grant.expires_at);
+    }
+
     fn consumed_for(
         fixture: &StepUpFixture,
         step_up_id: String,
@@ -2332,14 +2365,25 @@ mod tests {
             format!("passkey:step-up:{}", gateway_home_token::uuid_like_token()),
             now,
         );
+        let issued = issue_step_up_token(fixture.data_dir.path(), &pending, now).unwrap();
         let auth_state = crate::auth::auth_state_path(fixture.data_dir.path()).unwrap();
         std::fs::remove_file(&auth_state).unwrap();
         std::fs::create_dir(&auth_state).unwrap();
 
-        let error = complete_step_up(fixture.data_dir.path(), &pending, now).unwrap_err();
+        let error = append_step_up_completion_audit(
+            fixture.data_dir.path(),
+            &pending,
+            &issued.step_up_id,
+            now,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("failed to persist passkey step-up completion audit"));
+        assert!(complete_step_up(fixture.data_dir.path(), &pending, now)
+            .unwrap_err()
+            .to_string()
+            .contains("auth session is not active"));
     }
 
     #[test]

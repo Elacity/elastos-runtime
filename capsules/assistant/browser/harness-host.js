@@ -10,10 +10,17 @@ import { migrateLegacyWorkspaces, mergeWorkspaceDocuments } from "./workspace-tr
    that needs Home is asked for by message; anything that needs Runtime goes
    through the launch token like every other capsule. */
 
-const homeToken = (() => {
+let homeToken = (() => {
   const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   return params.get("home_token") || "";
 })();
+
+const homeTokenListeners = new Set();
+export function onHomeTokenChanged(callback) { homeTokenListeners.add(callback); }
+export function setHomeGuiLaunchToken(token) {
+  homeToken = token;
+  for (const callback of homeTokenListeners) callback(token);
+}
 
 /* ---- shell-core ------------------------------------------------------------ */
 

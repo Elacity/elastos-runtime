@@ -823,7 +823,7 @@ class ReleasePolicyTests(unittest.TestCase):
     def test_release_builds_are_hermetic_with_fresh_outputs(self):
         source = (WORKFLOW.parent / "release-package.yml").read_text()
         validate_release_builds_are_hermetic(source)
-        for job in ("mac", "linux"):
+        for job, platform in (("mac", "aarch64-darwin"), ("linux", "aarch64-linux"), ("linux", "x86_64-linux")):
             job_steps = steps(job, jobs(source))
             parity, = [step for step in job_steps if step.startswith("name: check native versions, source and support parity\n")]
             for token in ('cmp "$inputs/N1/support-input.json" "$inputs/N/platform-input.json"',
@@ -832,7 +832,7 @@ class ReleasePolicyTests(unittest.TestCase):
             build, = [step for step in job_steps if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
             script = textwrap.dedent(build.split("        run: |\n", 1)[1])
             for existing in (None, "target", "build", "target-link", "build-link"):
-                with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(job=job, platform=platform, existing=existing), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     (root / "scripts").mkdir()
                     (root / "shims").mkdir()
@@ -869,7 +869,7 @@ class ReleasePolicyTests(unittest.TestCase):
                            "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls),
                            "BROWSER_IMAGE_CID": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                            "BROWSER_IMAGE_SHA256": "ab" * 32, "BROWSER_IMAGE_SIZE": "1024",
-                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "aarch64-linux"}
+                           "RELEASE_PLATFORM": platform}
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
@@ -879,10 +879,11 @@ class ReleasePolicyTests(unittest.TestCase):
                     else:
                         built = [json.loads(line) for line in calls.read_text().splitlines()]
                         self.assertEqual(len(built), 2)
-                        # Browser image input is Mac-only until #90.
+                        # Both ARM64 hosts (Mac and Jetson) take the one admitted guest
+                        # archive from the workflow inputs; x86-64 Linux takes none.
                         image = (['--browser-vm-image-cid', env['BROWSER_IMAGE_CID'],
                                   '--browser-vm-image-sha256', env['BROWSER_IMAGE_SHA256'],
-                                  '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']] if job == "mac" else [])
+                                  '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']] if platform != "x86_64-linux" else [])
                         self.assertEqual({item['target'] for item in built}, {str(target)})
                         self.assertEqual({item['build'] for item in built}, {str(build_dir)})
                         self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N'), *image])
@@ -1383,6 +1384,7 @@ class ReleasePolicyTests(unittest.TestCase):
         # files they package; the step itself reaches the workflow and the shell script.
         for entry in ("scripts/release-upstream-input.py", "scripts/release-upstream-recipes.json",
                       "scripts/browser-upstream-build.py", "scripts/build/licenses/libcap-LICENSE.txt",
+                      "scripts/build/crosvm-lifecycle-fds.patch",
                       "scripts/release-host-prerequisites.sh", ".github/workflows/ci.yml"):
             with self.subTest(removed=entry):
                 self.assertIn(entry, upstream)

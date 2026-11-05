@@ -663,7 +663,7 @@ async fn execute_browser_open(
         }
     };
     let resolved_adapter = if let Some(choice) = &remote_choice {
-        Ok(choice.1.clone())
+        Ok((choice.1.clone(), None))
     } else {
         resolve_browser_engine_adapter(
             registry.as_ref(),
@@ -675,7 +675,7 @@ async fn execute_browser_open(
         )
         .await
     };
-    let adapter_id = match resolved_adapter {
+    let (adapter_id, verified_rootfs) = match resolved_adapter {
         Ok(adapter_id) => adapter_id,
         Err(error) => {
             let mut body =
@@ -901,6 +901,9 @@ async fn execute_browser_open(
         "guarantee_level": guarantee_level,
         "adapter_id": adapter_id,
     });
+    if let Some(seed) = verified_rootfs {
+        engine_launch_request["verified_rootfs"] = serde_json::json!(seed);
+    }
     if let Some(transport) = vz_transport_launch.as_ref() {
         engine_launch_request["page_id"] = serde_json::json!(launch_reservation.page_id());
         engine_launch_request["vm_id"] = serde_json::json!(launch_reservation.vm_id());

@@ -403,7 +403,7 @@ function requireLinuxNetwork(scriptPath) {
   const { command, args } = linuxNetworkCommand(scriptPath, "check");
   const result = runSync(command, args, { ignoreFailure: true });
   if (result.error || result.status !== 0) {
-    throw new Error(result.stderr?.trim() || `Browser network setup is required. Install the reviewed root-owned helper first. As root, run: python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user ${os.userInfo().username}`);
+    throw new Error(result.stderr?.trim() || `Browser network setup is required. Install the reviewed root-owned helper first.\nAs root, run:\n/usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py setup --user ${os.userInfo().username}`);
   }
 }
 

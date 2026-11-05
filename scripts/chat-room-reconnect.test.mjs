@@ -33,7 +33,7 @@ function chatFixture() {
   const context = vm.createContext({ window, URL, URLSearchParams, Event, init() {},
     createHomeNavigationClient: options => createHomeNavigationClient({ ...options, windowRef: window }),
     createHomeClipboardClient(options) { const client = { token: options.homeToken, started: false, retired: false,
-      start() { this.started = true; }, teardown() { this.retired = true; },
+      start() { this.started = true; }, setHomeToken(token) { this.token = token; }, teardown() { this.retired = true; },
       writes: [], writeText(text, options) { this.writes.push({ text, purpose: options.purpose }); return Promise.resolve(); } };
       clipboard.push(client); return client; },
   });
@@ -65,11 +65,13 @@ test("Reconnect uses one visible action and only the Home response renews the sa
   f.respond(request.data.requestId, launched("fresh"));
   assert.equal(await pending, "fresh");
   assert.equal(f.context.elastosChatHomeToken(), "fresh");
-  assert.equal(f.clipboard[0].retired, true);
-  assert.equal(f.clipboard[1].token, "fresh");
-  assert.equal(f.clipboard[1].started, true);
+  assert.equal(f.clipboard.length, 1);
+  assert.equal(f.clipboard[0].retired, false);
+  assert.equal(f.clipboard[0].token, "fresh");
+  assert.equal(f.clipboard[0].started, true);
   assert.equal(f.timers.size, 0);
-  assert.equal(f.messages.at(-1).data.type, "home:app-ready");
+  assert.equal(f.messages.at(-1).data.type, "home:frame-authority-ready");
+  assert.equal(f.messages.some(({ data }) => data.type === "home:app-ready"), false);
   // The actual navigation client keeps its selector and document nonce while
   // requiring a new GUI probe under the renewed token.
   f.window.dispatchEvent({ type: "message", source: f.parent, origin: "null",
@@ -86,7 +88,7 @@ test("Expired Home and refused launches keep the old authority available for a u
     { result: { ...launched("fresh"), route: "https://evil.fixture/apps/chat-room/#home_token=fresh" } }]) {
     const f = chatFixture();
     const pending = f.context.elastosChatReconnect();
-    const rejection = assert.rejects(pending, /Sign in to Home|invalid Chat launch/);
+    const rejection = assert.rejects(pending, /Sign in to Home|invalid app launch/);
     f.respond(f.messages[0].data.requestId, reply.result, reply);
     await rejection;
     assert.equal(f.context.elastosChatHomeToken(), "old");
@@ -133,37 +135,37 @@ test("Home GUI accepts only the open Chat entry and keeps its iframe document", 
     hasExactKeys: (value, keys) => Object.keys(value).sort().join(",") === keys.sort().join(","),
   });
   const gui = read("capsules/home-gui/browser/home-gui.js");
-  for (const name of ["homeLaunchTokenFromRoute", "homeGuiWindowEntryForToken", "renewHomeGuiChatWindowAuthority"])
+  for (const name of ["homeLaunchTokenFromRoute", "homeGuiWindowEntryForToken", "renewHomeGuiFrameAuthority"])
     vm.runInContext(sourceFunction(gui, name), context);
   vm.runInContext(sourceFunction(read("capsules/home-gui/browser/home-gui-shell.js"), "handleGuiCommand"), context);
-  const command = { type: "home:gui-command", command: "renew-chat-authority", requestId: "renew-chat",
+  const command = { type: "home:gui-command", command: "renew-frame-authority", requestId: "renew-chat",
     phase: "prepare", homeToken: "old", launched: launched("fresh"), expiresAt: Date.now() + 1000 };
   assert.equal(context.handleGuiCommand({ ...command, expiresAt: Date.now() - 1 }), false);
   assert.equal(receipts.at(-1).ok, false);
   assert.equal(frame.dataset.route, oldRoute);
-  assert.equal(context.renewHomeGuiChatWindowAuthority("old", { ...launched("fresh"), target: "browser" }, homeOrigin), false);
-  assert.equal(context.renewHomeGuiChatWindowAuthority("old", { ...launched("fresh"), route: "https://evil.fixture/apps/chat-room/#home_token=fresh" }, homeOrigin), false);
+  assert.equal(context.renewHomeGuiFrameAuthority("old", { ...launched("fresh"), target: "browser" }, homeOrigin), false);
+  assert.equal(context.renewHomeGuiFrameAuthority("old", { ...launched("fresh"), route: "https://evil.fixture/apps/chat-room/#home_token=fresh" }, homeOrigin), false);
   assert.equal(context.handleGuiCommand(command), true);
   assert.equal(receipts.at(-1).ok, true);
   assert.equal(receipts.at(-1).freshHomeToken, "fresh");
   assert.equal(frame.dataset.route, oldRoute, "an unaccepted prepare receipt must preserve retry lookup");
   assert.equal(probes.length, 0);
   assert.equal(context.handleGuiCommand({ ...command, phase: "commit" }), true);
-  assert.equal(receipts.at(-1).type, "home:chat-authority-committed");
+  assert.equal(receipts.at(-1).type, "home:frame-authority-committed");
   assert.equal(receipts.at(-1).ok, true);
   assert.equal(frame.dataset.route, launched("fresh").route);
   assert.equal(frame.src, oldRoute, "renewal must retain the same iframe document and drafts");
   assert.equal(entry.homeNavigation, null);
   assert.equal(probes.length, 1);
-  assert.equal(context.renewHomeGuiChatWindowAuthority("old", launched("later"), homeOrigin), false);
+  assert.equal(context.renewHomeGuiFrameAuthority("old", launched("later"), homeOrigin), false);
   const closedCommand = { ...command, homeToken: "fresh", launched: launched("later") };
   assert.equal(context.handleGuiCommand(closedCommand), true);
-  assert.equal(receipts.at(-1).type, "home:chat-authority-renewed");
+  assert.equal(receipts.at(-1).type, "home:frame-authority-renewed");
   context.shellState.windows.clear();
   assert.equal(context.handleGuiCommand({ ...closedCommand, phase: "commit" }), false);
-  assert.equal(receipts.at(-1).type, "home:chat-authority-committed");
+  assert.equal(receipts.at(-1).type, "home:frame-authority-committed");
   assert.equal(receipts.at(-1).ok, false, "a closed Chat entry must refuse the commit");
-  assert.equal(context.renewHomeGuiChatWindowAuthority("fresh", launched("later"), homeOrigin), false);
+  assert.equal(context.renewHomeGuiFrameAuthority("fresh", launched("later"), homeOrigin), false);
 });
 
 test("Copy DID uses its own Home purpose and the renewed launch token", async () => {
@@ -175,6 +177,10 @@ test("Copy DID uses its own Home purpose and the renewed launch token", async ()
   f.respond(f.messages[0].data.requestId, launched("fresh"));
   await pending;
   await f.context.elastosChatCopyProfileId("did:key:zOther");
-  assert.equal(f.clipboard[0].writes.length, 1);
-  assert.deepEqual(f.clipboard[1].writes, [{ text: "did:key:zOther", purpose: "profile.id" }]);
+  assert.equal(f.clipboard.length, 1);
+  assert.equal(f.clipboard[0].token, "fresh");
+  assert.deepEqual(f.clipboard[0].writes, [
+    { text: "did:key:zProfile", purpose: "profile.id" },
+    { text: "did:key:zOther", purpose: "profile.id" },
+  ]);
 });

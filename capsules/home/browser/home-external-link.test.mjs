@@ -382,3 +382,29 @@ test('Home passes the cleaned name to Documents and Library and never lets it pi
   assert.equal(sharedFileName(' .\u001b.hidden '), 'hidden');
   assert.equal(sharedFileName(undefined), '');
 });
+
+
+test('frame renewal keeps a shown web link and its original click guard', () => {
+  const h = harness();
+  const id = h.prompt.begin({ homeToken: 'launch', appId: 'chat-room' });
+  h.prompt.show(id, { schema: 'elastos.home.external-link.result/v1', app_id: 'chat-room',
+    app_title: 'Chat', url: 'https://example.org/' });
+  h.prompt.transfer('launch', 'fresh');
+  h.prompt.retire('launch');
+  assert.equal(h.root.hidden, false);
+  h.click(); assert.equal(h.opened.length, 0);
+  h.tick(); h.click(); assert.equal(h.opened.length, 1);
+});
+
+test('frame renewal keeps an in-flight shared file and uses fresh authority for retry', async () => {
+  const h = harness(); let finish, signal, checkToken;
+  const id = h.begin({ get: (_id, s) => { signal = s; return new Promise(resolve => { finish = resolve; }); },
+    check: async (_signal, token) => { checkToken = token; return result(); } });
+  h.prompt.show(id, result()); h.tick(); h.click();
+  h.prompt.transfer('launch', 'fresh'); h.prompt.retire('launch');
+  assert.equal(signal.aborted, false);
+  finish({ state: 'sender_offline' }); await settle();
+  h.tick(); h.click(); await settle();
+  assert.equal(checkToken, 'fresh');
+  h.prompt.retire('fresh'); assert.equal(h.root.hidden, true);
+});

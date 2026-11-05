@@ -6,9 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 
-const preflight = fs.readFileSync(new URL("./browser-vm-artifact-preflight.sh", import.meta.url), "utf8");
-const hostReadiness = preflight.slice(preflight.indexOf('if mode == "--host-readiness":'),
-  preflight.indexOf("\nif launch_ready:"));
+import { fixture as imageFixture, probe as imageProbe } from "./lib/browser-vm-readiness-fixture.mjs";
+
 const control = fs.readFileSync(new URL("./browser-vm-control-service.mjs", import.meta.url), "utf8");
 const readiness = control.slice(control.indexOf("let readyHostReadiness ="),
   control.indexOf("const OPEN_REQUEST_ENV ="));
@@ -17,49 +16,24 @@ const unavailable = (reason = "preparation_required") => ({ ...ready, readiness:
 const turnKey = "ELASTOS_BROWSER_VM_TURN_PROGRAM";
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "browser-turn-readiness-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  for (const directory of ["bin", "browser-vm", "scripts"]) fs.mkdirSync(path.join(root, directory));
-  for (const file of ["bin/vmlinux", "bin/initrd", "browser-vm/initrd", "browser-vm/rootfs.ext4",
-    "browser-vm/browser-vm-rootfs-manifest.json", "scripts/browser-vm-artifact-preflight.sh", "bin/crosvm", "kvm"]) {
-    fs.writeFileSync(path.join(root, file), "disposable readiness identity fixture");
+  const f = imageFixture(t);
+  for (const file of ["scripts/browser-vm-artifact-preflight.sh", "kvm"]) {
+    fs.writeFileSync(path.join(f.root, file), "disposable readiness identity fixture");
   }
-  const launcher = path.join(root, "bin/browser-vz-engine-supervisor");
-  fs.writeFileSync(launcher, `#!/bin/sh\n[ "$1" = --host-capabilities ] || exit 99\nprintf '%s\\n' '{"schema":"elastos.browser.vm-host-capabilities/v1","available":true}'\n`, { mode: 0o755 });
-  const turn = path.join(root, "bin/turnserver");
-  // Readiness inspects this file; executing it would fail the test.
-  fs.writeFileSync(turn, "#!/bin/sh\nexit 99\n", { mode: 0o755 });
-  const env = { ELASTOS_BROWSER_VM_PLATFORM: "darwin-arm64", ELASTOS_BROWSER_VM_DATA_DIR: root,
-    ELASTOS_BROWSER_VM_VZ_SUPERVISOR: launcher, [turnKey]: turn };
-  return { root, launcher, turn, env };
+  const env = { ELASTOS_BROWSER_VM_PLATFORM: "darwin-arm64", ELASTOS_BROWSER_VM_DATA_DIR: f.root,
+    ELASTOS_BROWSER_VM_VZ_SUPERVISOR: f.launcher, [turnKey]: f.turn };
+  return { ...f, env };
 }
 
-function probe(env, imageReason = null, hostProbe = "ready") {
-  // Execute the actual host-readiness branch with real executable-file checks.
-  // Image hashing and the supervisor process are covered by the artifact smoke.
-  // Stub host eligibility so suite load cannot exhaust its two-second deadline.
-  const program = `import json, os, pathlib, platform as host_platform, subprocess, sys
-from types import SimpleNamespace
-host_platform.system = lambda: "Darwin"
-host_platform.machine = lambda: "arm64"
-platform = os.environ["ELASTOS_BROWSER_VM_PLATFORM"]
-mode = "--host-readiness"
-vz_supervisor = os.environ["ELASTOS_BROWSER_VM_VZ_SUPERVISOR"]
-def host_probe(command, **options):
-    assert command == [vz_supervisor, "--host-capabilities"]
-    assert options == dict(capture_output=True, text=True, timeout=2, check=True)
-    if sys.argv[2] == "timeout":
-        raise subprocess.TimeoutExpired(command, options["timeout"])
-    return SimpleNamespace(stdout=json.dumps({"schema": "elastos.browser.vm-host-capabilities/v1", "available": True}))
-subprocess.run = host_probe
-verify_image_set = lambda: json.loads(sys.argv[1])
-local_substrate_artifacts_ready = True
-${hostReadiness}`;
-  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason), hostProbe], {
-    env: { PATH: process.env.PATH, ...env }, encoding: "utf8", timeout: 5000,
+function probe(f, imageReason = null, hostProbe = "ready", env = f.env) {
+  return imageProbe(f, {
+    platform: env.ELASTOS_BROWSER_VM_PLATFORM, hostSystem: "Darwin", hostMachine: "arm64",
+    launcher: env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR, turn: env[turnKey] || "",
+    timeout: hostProbe === "timeout",
+    envOverrides: { ...env, ...(imageReason ? {
+      ELASTOS_BROWSER_VM_ROOTFS_MANIFEST: path.join(f.root, "missing-manifest"),
+    } : {}) },
   });
-  assert.equal(child.status, 0, child.stderr || String(child.error));
-  return JSON.parse(child.stdout);
 }
 
 for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "directory", "nonexecutable", "symlink", "dangling-symlink"]) {
@@ -75,33 +49,31 @@ for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "dir
       f.env[turnKey] = path.join(f.root, "turn-link");
       fs.symlinkSync(kind === "symlink" ? f.turn : path.join(f.root, "absent"), f.env[turnKey]);
     }
-    assert.deepEqual(probe(f.env), ["valid", "symlink"].includes(kind) ? ready : unavailable());
+    assert.deepEqual(probe(f), ["valid", "symlink"].includes(kind) ? ready : unavailable());
   });
 }
 
 test("a supervisor timeout keeps host readiness unavailable", t => {
   const f = fixture(t);
-  assert.deepEqual(probe(f.env, null, "timeout"), unavailable("readiness_unsupported"));
+  assert.deepEqual(probe(f, null, "timeout"), unavailable("readiness_unsupported"));
 });
 
-test("TURN readiness does not replace image integrity or host compatibility checks", t => {
+test("TURN readiness preserves image-shape and host compatibility checks", t => {
   const f = fixture(t);
-  assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
+  assert.deepEqual(probe(f, "artifact_invalid"), unavailable("artifact_invalid"));
   delete f.env[turnKey];
-  assert.deepEqual(probe(f.env, "artifact_invalid"), unavailable("artifact_invalid"));
+  assert.deepEqual(probe(f, "artifact_invalid"), unavailable("artifact_invalid"));
   f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
-  assert.deepEqual(probe(f.env), unavailable("host_unsupported"));
+  assert.deepEqual(probe(f), unavailable("host_unsupported"));
 });
 
 // The probe mock below reports ready unless the TURN or host checks refuse, so
 // the cache tests prove probe sharing and keying mechanics, not image admission.
-function controller(t, { linux = false, delayed = false } = {}) {
+function controller(t, { platform = "darwin-arm64", delayed = false } = {}) {
+  const linux = platform.startsWith("linux-");
   const f = fixture(t);
-  if (linux) {
-    f.env.ELASTOS_BROWSER_VM_PLATFORM = "linux-amd64";
-    delete f.env[turnKey];
-  }
-  const probes = [], stats = [], networkChecks = [], messages = [], events = [];
+  f.env.ELASTOS_BROWSER_VM_PLATFORM = platform;
+  const probes = [], stats = [], capabilityChecks = [], messages = [], events = [];
   const proc = { env: f.env, platform: linux ? "linux" : "darwin", arch: process.arch,
     stderr: { write: message => messages.push(message) } };
   const context = vm.createContext({ path, os, process: proc,
@@ -110,23 +82,29 @@ function controller(t, { linux = false, delayed = false } = {}) {
       stats.push(file);
       return fs.statSync(file === "/dev/kvm" ? path.join(f.root, "kvm") : file, options);
     }, accessSync: fs.accessSync, constants: fs.constants },
-    execFileSync(command, args) {
-      assert.equal(command, "python3");
-      assert.deepEqual(Array.from(args), [path.join(f.root, "scripts/browser-vm-linux-network.py"), "check"]);
-      networkChecks.push(args);
-      if (f.env.fixtureNetworkMissing) throw { stderr: Buffer.from("As root, run: python3 /fixture/browser-vm-linux-network.py setup --user fixture") };
+    execFileSync(command, args, options) {
+      assert.equal(command, f.launcher);
+      assert.deepEqual(Array.from(args), ["--host-capabilities"]);
+      assert.ok(options.timeout > 0 && options.timeout <= 5000);
+      capabilityChecks.push(args);
+      if (f.env.fixtureHostFailure) throw { stderr: Buffer.from("selected Linux transport requires repair") };
+      return f.env.fixtureHostCapabilities || JSON.stringify({
+        schema: "elastos.browser.vm-host-capabilities/v1", available: true,
+      });
     },
     execFile(script, args, options, done) {
       assert.equal(script, path.join(f.root, "scripts/browser-vm-artifact-preflight.sh"));
       assert.equal(args.join(), "--host-readiness");
-      const result = linux ? ready : probe(options.env);
+      assert.equal(options.env.ELASTOS_BROWSER_VM_VZ_SUPERVISOR, f.launcher);
+      const turn = options.env[turnKey];
+      const result = linux ? (turn && fs.existsSync(turn) ? ready : unavailable()) : probe(f, null, "ready", options.env);
       const finish = () => done(null, JSON.stringify(result));
-      probes.push({ finish });
+      probes.push({ finish, options });
       if (!delayed) finish();
     },
   });
   const api = vm.runInContext(`${readiness}\n({engineReadiness})`, context);
-  return { ...f, proc, probes, stats, networkChecks, messages, events,
+  return { ...f, proc, probes, stats, capabilityChecks, messages, events,
     read: async (launcher = f.launcher) => JSON.parse(JSON.stringify(await api.engineReadiness({ launcher_program: launcher }))),
   };
 }
@@ -136,7 +114,8 @@ test("unchanged TURN and image identities reuse successful readiness", async t =
   assert.deepEqual(await c.read(), ready);
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 1);
-  fs.writeFileSync(path.join(c.root, "bin/vmlinux"), "changed kernel identity");
+  const kernel = path.join(c.root, "bin/vmlinux");
+  fs.writeFileSync(kernel, Buffer.alloc(fs.statSync(kernel).size, 0x78));
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 2);
 });
@@ -319,27 +298,69 @@ test("TURN removal during a successful probe prevents publishing or caching read
   assert.equal(c.probes.length, 2);
 });
 
-test("Linux readiness retains KVM/crosvm identity and does not require VZ TURN", async t => {
-  const c = controller(t, { linux: true });
+test("ARM Linux readiness uses its native capability contract before cached image readiness", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
   assert.deepEqual(await c.read(), ready);
-  c.env[turnKey] = path.join(c.root, "absent");
   assert.deepEqual(await c.read(), ready);
   assert.equal(c.probes.length, 1);
-  assert.equal(c.networkChecks.length, 2);
+  assert.equal(c.capabilityChecks.length, 2);
   assert.ok(c.stats.includes("/dev/kvm"));
   assert.ok(c.stats.includes(path.join(c.root, "bin/crosvm")));
+  assert.ok(c.stats.includes(path.join(c.root, "bin/initrd")));
+  assert.ok(c.stats.includes(c.turn));
+  delete c.env[turnKey];
+  assert.deepEqual(await c.read(), unavailable());
+  assert.equal(c.probes.length, 2);
 });
 
-test("Linux cached image readiness refuses missing network setup with its repair command", async t => {
-  const c = controller(t, { linux: true });
+test("ARM Linux readiness survives a VM exit's /dev/kvm time change but not a device change", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  const kvm = path.join(c.root, "kvm");
   assert.deepEqual(await c.read(), ready);
-  c.env.fixtureNetworkMissing = "1";
-  const result = await c.read();
-  assert.equal(result.readiness.state, "unavailable");
-  assert.equal(result.readiness.reason, "preparation_required");
-  assert.match(c.messages[0], /As root, run: python3 .* setup --user fixture/);
-  assert.deepEqual(result, unavailable(), "host repair paths stay outside the strict Engine contract");
-  assert.equal(c.probes.length, 1);
+  // Every VM exit updates /dev/kvm's mtime and ctime (#90, Jetson).
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(kvm, later, later);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 1, "a VM exit must not re-hash the image");
+  fs.chmodSync(kvm, 0o600);
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes.length, 2, "changed device permissions probe again");
+});
+
+test("the structural host probe fits inside Runtime's twelve-second readiness budget", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  assert.deepEqual(await c.read(), ready);
+  assert.equal(c.probes[0].options.timeout, 10_000);
+});
+
+for (const capabilities of ["failure", "{", '{"available":true}',
+  '{"schema":"elastos.browser.vm-host-capabilities/v1","available":false}']) {
+  test(`ARM Linux cached readiness observes native capability loss: ${capabilities}`, async t => {
+    const c = controller(t, { platform: "linux-arm64" });
+    assert.deepEqual(await c.read(), ready);
+    if (capabilities === "failure") c.env.fixtureHostFailure = "1";
+    else c.env.fixtureHostCapabilities = capabilities;
+    assert.deepEqual(await c.read(), unavailable());
+    assert.equal(c.probes.length, 1);
+    assert.equal(c.capabilityChecks.length, 2);
+  });
+}
+
+test("ARM Linux readiness rejects retired and unowned local launchers before probing", async t => {
+  const c = controller(t, { platform: "linux-arm64" });
+  for (const launcher of [path.join(c.root, "bin/browser-vm-local-crosvm-launcher"),
+    "/other-home/bin/browser-vz-engine-supervisor"]) {
+    assert.deepEqual(await c.read(launcher), unavailable("readiness_unsupported"));
+  }
+  assert.equal(c.probes.length, 0);
+  assert.equal(c.capabilityChecks.length, 0);
+});
+
+test("Linux amd64 readiness stays hidden on the ARM qualification candidate", async t => {
+  const c = controller(t, { platform: "linux-amd64" });
+  assert.deepEqual(await c.read(), unavailable("host_unsupported"));
+  assert.equal(c.probes.length, 0);
+  assert.equal(c.capabilityChecks.length, 0);
 });
 
 test("remote VZ readiness remains unsupported without a local probe", async t => {
