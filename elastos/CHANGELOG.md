@@ -6,19 +6,31 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [2.0.1-rc.1] - 2026-11-06
+
 ### Added
 
-- System, About lets you choose Stable or test versions for updates.
+- Browser runs on a Jetson and other Linux ARM computers with KVM. Turn it on once with elastos setup --browser, which asks before its one-time administrator step, then restart Home.
+- System, About lets you choose Stable or Test versions for updates. Your passkey confirms the change, and switching never installs an older version.
+
+### Changed
+
+- On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.
+- On Linux, the install command no longer sets up Browser or downloads it. Browser is turned on when you choose it.
 
 ### Fixed
 
-- When Browser cannot open because the computer is short of space, it says how much space it needs.
-- On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.
-- On Linux, Browser is turned on when you choose it, not during install.
 - Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
-- The installer uses numeric process age to verify and stop a running Home with any time locale (#517).
-- The installer repairs group-writable files in an older Home that you own and gives one ownership repair command for root-owned installation files (#516).
-- Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.
+- Assistant keeps a finished answer in view, also while you type a longer question.
+- The install command repairs file permissions in an older Linux or Jetson Home that you own, and shows one command for files owned by the administrator.
+- The install command works whatever language the computer is set to.
+- Closing Browser no longer fails when another program uses a port Browser's media relay may need.
+- When an update check gets no answer, Home tries once more on a new connection.
+- When a Linux computer is short of free space, Browser says how much it needs to open.
+
+### Security
+
+- Community room access ends when your sign-in ends.
 
 ## [2.0.0] - 2026-11-02
 
