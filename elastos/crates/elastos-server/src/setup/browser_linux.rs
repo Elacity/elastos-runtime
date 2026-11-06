@@ -325,10 +325,12 @@ mod tests {
                 if program != "/usr/bin/sudo" {
                     checks += 1;
                     assert!(stdin.is_none() && quiet);
+                    if checks == 1 {
+                        // Replace the user path after capture, before the root handoff.
+                        std::fs::write(&helper, b"changed!").unwrap();
+                    }
                     return Ok(checks > 1);
                 }
-                // The same account swaps the user path during the sudo password wait.
-                std::fs::write(&helper, b"changed!").unwrap();
                 assert!(!quiet);
                 assert_eq!(args[0], "/usr/bin/python3");
                 assert_eq!(args[3], ROOT_BOOTSTRAP);

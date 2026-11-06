@@ -18,6 +18,39 @@ SPEC.loader.exec_module(ROOT)
 
 
 class RootHelperTests(unittest.TestCase):
+    def test_main_refuses_changed_stdin_before_tty_exec_or_root_write(self):
+        admitted = b'print("admitted")\n'
+        expected = hashlib.sha256(admitted).hexdigest()
+        verified_copy = ROOT.verified_copy
+        for label, payload in (
+                ('appended', admitted + b'print("extra")\n'),
+                ('prepended', b'print("extra")\n' + admitted),
+                ('different', b'print("changed!")\n')):
+            with self.subTest(payload=label), tempfile.TemporaryDirectory() as temporary:
+                directory = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    # Exercise the real copy with fixture ownership instead of root.
+                    def copy_as_fixture(fd, name, digest, contents, owner):
+                        self.assertEqual(owner, 0)
+                        self.assertEqual(digest, expected)
+                        return verified_copy(fd, name, digest, contents, os.getuid())
+                    with (patch.object(ROOT.os, 'geteuid', return_value=0),
+                          patch.object(ROOT, 'trusted_directory', return_value=os.dup(directory)),
+                          patch.object(ROOT, 'verified_copy', side_effect=copy_as_fixture),
+                          patch.object(sys, 'argv',
+                                       ['bootstrap', expected, 'fixture', temporary, 'setup']),
+                          patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(payload))),
+                          patch('builtins.open') as tty,
+                          patch('builtins.exec') as execute):
+                        with self.assertRaisesRegex(
+                                RuntimeError, '^Browser helper differs from its admitted SHA-256$'):
+                            ROOT.main()
+                        tty.assert_not_called()
+                        execute.assert_not_called()
+                    self.assertEqual(list(Path(temporary).iterdir()), [])
+                finally:
+                    os.close(directory)
+
     def test_setup_keeps_the_helper_confirmation_on_the_tty(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
