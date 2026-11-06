@@ -816,7 +816,7 @@ async fn attach_secret_matches(
     attach_secret: &str,
 ) -> bool {
     if attach_secret.is_empty() {
-        return true;
+        return false;
     }
 
     client
@@ -1737,6 +1737,43 @@ mod tests {
         }
         server.abort();
         assert!(ready.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_runtime_coords_rejects_an_empty_attach_secret() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/health",
+            get(|| async { Json(serde_json::json!({"status": "ok"})) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let temp_dir = tempfile::tempdir().unwrap();
+        let coords_path = temp_dir.path().join("runtime-coords.json");
+        std::fs::write(
+            &coords_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "api_url": format!("http://{addr}"),
+                "attach_secret": "",
+                "pid": std::process::id(),
+                "runtime_kind": RUNTIME_KIND_OPERATOR,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let coords = read_runtime_coords(&coords_path).await;
+        server.abort();
+        assert!(
+            coords.is_none(),
+            "an empty attach secret is not this runtime"
+        );
+        assert!(
+            !coords_path.exists(),
+            "a blank secret does not stay as proof"
+        );
     }
 
     #[test]
