@@ -1,4 +1,5 @@
 //! The Linux owner explicitly grants Browser host access before image acquisition.
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -7,6 +8,8 @@ pub(crate) const SETUP_MESSAGE: &str =
     "Browser is available on this computer. To turn it on, run: elastos setup --browser. Then close Home and start it again with elastos home --browser.";
 pub(crate) const KVM_MESSAGE: &str =
     "Browser needs KVM on this computer. After KVM is available, run: elastos setup --browser. Then close Home and start it again with elastos home --browser.";
+const ROOT_BOOTSTRAP: &str = include_str!("browser_linux_root.py");
+const MAX_HELPER_BYTES: u64 = 1024 * 1024;
 const ROOT_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
 
 /// Keep ordinary Home setup and Browser open free of administrator operations.
@@ -34,25 +37,12 @@ pub(super) async fn enable(data: &Path, platform: &str) -> anyhow::Result<()> {
         super::FirstPartyCarrierContext::Setup,
     )
     .await?;
-    let helper = data.join("scripts/browser-vm-linux-network.py");
-    super::verify_installed_component_binary(data, "browser-vm-linux-network", &helper)?;
-    let user = Command::new("id").arg("-un").output()?;
+    let (checksum, payload) = read_admitted_helper(data, platform)?;
+    let user = Command::new("/usr/bin/id").arg("-un").output()?;
     anyhow::ensure!(user.status.success(), "Could not identify the Home user");
     let user = String::from_utf8(user.stdout)?;
     enable_with(
-        || {
-            setup_host_with(data, user.trim(), |program, args, quiet| {
-                let mut command = Command::new(program);
-                command.args(args);
-                if quiet {
-                    command
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null());
-                }
-                Ok(command.status()?.success())
-            })
-        },
+        || setup_host_with(data, user.trim(), &checksum, &payload, run_host_command),
         || async {
             super::browser_config::require_linux_host(data)?;
             println!("Preparing Browser Engine image...");
@@ -134,10 +124,81 @@ where
     prepare_image().await
 }
 
+/// The expected digest belongs to the admitted release, independently of the
+/// user-owned helper. Capture bounded bytes once, before sudo can prompt.
+fn read_admitted_helper(data: &Path, platform: &str) -> anyhow::Result<(String, Vec<u8>)> {
+    let admitted = super::admit_installed_components(data, super::FirstPartyCarrierContext::Setup)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Browser administrator setup requires an installed signed release")
+        })?;
+    let name = "browser-vm-linux-network";
+    let component =
+        admitted.manifest.external.get(name).ok_or_else(|| {
+            anyhow::anyhow!("Signed release is missing the Browser network helper")
+        })?;
+    let info = super::resolve_platform_info(component, platform).ok_or_else(|| {
+        anyhow::anyhow!("Signed release has no Browser network helper for {platform}")
+    })?;
+    anyhow::ensure!(
+        info.extract_path.is_none(),
+        "Browser network helper requires a signed plain file"
+    );
+    let row = admitted.admission.row(name, info)?;
+    let checksum = row
+        .info()
+        .checksum
+        .as_deref()
+        .and_then(|checksum| checksum.strip_prefix("sha256:"))
+        .ok_or_else(|| anyhow::anyhow!("Browser network helper requires an admitted SHA-256"))?;
+    let mut payload = Vec::new();
+    std::fs::File::open(data.join("scripts/browser-vm-linux-network.py"))?
+        .take(MAX_HELPER_BYTES + 1)
+        .read_to_end(&mut payload)?;
+    anyhow::ensure!(
+        payload.len() as u64 <= MAX_HELPER_BYTES,
+        "Browser network helper exceeds its size limit"
+    );
+    super::verify_checksum(name, &payload, row.info())?;
+    Ok((checksum.to_owned(), payload))
+}
+
+fn run_host_command(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    payload: Option<&[u8]>,
+    quiet: bool,
+) -> anyhow::Result<bool> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if quiet {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    if let Some(payload) = payload {
+        // sudo keeps its default controlling-tty password prompt. Its stdin
+        // carries only the captured data to the fixed, embedded bootstrap.
+        let mut child = command.stdin(Stdio::piped()).spawn()?;
+        let written = child
+            .stdin
+            .take()
+            .expect("piped helper input")
+            .write_all(payload);
+        let status = child.wait()?;
+        written?;
+        Ok(status.success())
+    } else {
+        Ok(command.status()?.success())
+    }
+}
+
 fn setup_host_with(
     data: &Path,
     user: &str,
-    mut run: impl FnMut(&str, &[&std::ffi::OsStr], bool) -> anyhow::Result<bool>,
+    checksum: &str,
+    payload: &[u8],
+    mut run: impl FnMut(&str, &[&std::ffi::OsStr], Option<&[u8]>, bool) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     let helper = data.join("scripts/browser-vm-linux-network.py");
@@ -148,47 +209,33 @@ fn setup_host_with(
         OsStr::new("--data-dir"),
         data.as_os_str(),
     ];
-    if run("/usr/bin/python3", &check, true)? {
-        return Ok(());
+    let needs_setup = !run("/usr/bin/python3", &check, None, true)?;
+    if needs_setup {
+        println!(
+            "Browser needs one-time administrator setup for KVM and its private network devices."
+        );
+        println!("The setup shows its changes and asks for confirmation. Runtime then runs as your user.");
     }
-    println!("Browser needs one-time administrator setup for KVM and its private network devices.");
-    println!(
-        "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
-    );
+    // Always replace/verify the root copy, including an already prepared host:
+    // the printed removal command and boot service use only this owned file.
     let install = [
-        OsStr::new("install"),
-        OsStr::new("-D"),
-        OsStr::new("-o"),
-        OsStr::new("root"),
-        OsStr::new("-g"),
-        OsStr::new("root"),
-        OsStr::new("-m"),
-        OsStr::new("755"),
-        helper.as_os_str(),
-        OsStr::new(ROOT_HELPER),
-    ];
-    anyhow::ensure!(
-        run("sudo", &install, false)?,
-        "Browser helper installation stopped. Retry with {ENABLE_COMMAND}"
-    );
-    let setup = [
         OsStr::new("/usr/bin/python3"),
         OsStr::new("-I"),
-        OsStr::new(ROOT_HELPER),
-        OsStr::new("setup"),
-        OsStr::new("--user"),
+        OsStr::new("-c"),
+        OsStr::new(ROOT_BOOTSTRAP),
+        OsStr::new(checksum),
         OsStr::new(user),
-        OsStr::new("--data-dir"),
         data.as_os_str(),
+        OsStr::new(if needs_setup { "setup" } else { "install" }),
     ];
     anyhow::ensure!(
-        run("sudo", &setup, false)?,
+        run("/usr/bin/sudo", &install, Some(payload), false)?,
         "Browser administrator setup stopped. Retry with {ENABLE_COMMAND}"
     );
     // The helper returns success when confirmation is declined. Prove access
     // before downloading an image, including that declined case.
     anyhow::ensure!(
-        run("/usr/bin/python3", &check, true)?,
+        run("/usr/bin/python3", &check, None, true)?,
         "Browser host access still needs setup. Run {ENABLE_COMMAND} and confirm its changes"
     );
     Ok(())
@@ -257,14 +304,68 @@ mod tests {
         assert!(!data.exists());
     }
 
+    #[test]
+    fn privileged_handoff_refuses_user_path_replacement() {
+        use sha2::Digest as _;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let helper = data.join("scripts/browser-vm-linux-network.py");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(&helper, b"admitted").unwrap();
+        let payload = std::fs::read(&helper).unwrap();
+        let expected = format!("{:x}", sha2::Sha256::digest(&payload));
+        let mut checks = 0;
+        let mut privileged = Vec::new();
+        setup_host_with(
+            data,
+            "home-user",
+            &expected,
+            &payload,
+            |program, args, stdin, quiet| {
+                if program != "/usr/bin/sudo" {
+                    checks += 1;
+                    assert!(stdin.is_none() && quiet);
+                    return Ok(checks > 1);
+                }
+                // The same account swaps the user path during the sudo password wait.
+                std::fs::write(&helper, b"changed!").unwrap();
+                assert!(!quiet);
+                assert_eq!(args[0], "/usr/bin/python3");
+                assert_eq!(args[3], ROOT_BOOTSTRAP);
+                assert!(!args.contains(&helper.as_os_str()));
+                let received = stdin.unwrap();
+                let digest = format!("{:x}", sha2::Sha256::digest(received));
+                if Some(digest.as_str()) != args[4].to_str() {
+                    return Ok(false);
+                }
+                privileged.extend_from_slice(received);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(helper).unwrap(), b"changed!");
+        assert_eq!(privileged, b"admitted");
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn privileged_handoff_requires_signed_release_instead_of_local_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("components.json"), b"{}").unwrap();
+        assert!(read_admitted_helper(temp.path(), "linux-arm64")
+            .unwrap_err()
+            .to_string()
+            .contains("requires an installed signed release"));
+    }
+
     #[tokio::test]
     async fn explicit_browser_setup_runs_root_helper_before_image_and_checks_decline() {
         for (statuses, prepares) in [
-            (vec![true], true),
-            (vec![false, true, true, true], true),
+            (vec![true, true, true], true),
+            (vec![false, true, true], true),
             (vec![false, false], false),
+            (vec![true, false], false),
             (vec![false, true, false], false),
-            (vec![false, true, true, false], false),
         ] {
             let calls = RefCell::new(Vec::new());
             let mut results = statuses.into_iter();
@@ -273,10 +374,23 @@ mod tests {
                     setup_host_with(
                         Path::new("/fixture/home with spaces"),
                         "home-user",
-                        |program, args, quiet| {
-                            calls
-                                .borrow_mut()
-                                .push(format!("{program} {:?} quiet={quiet}", args));
+                        &"a".repeat(64),
+                        b"admitted",
+                        |program, args, stdin, quiet| {
+                            if program == "/usr/bin/sudo" {
+                                assert_eq!(args[0], "/usr/bin/python3");
+                                assert_eq!(args[1], "-I");
+                                assert_eq!(args[2], "-c");
+                                assert_eq!(args[3], ROOT_BOOTSTRAP);
+                                assert!(ROOT_BOOTSTRAP.contains(ROOT_HELPER));
+                                assert_eq!(args[4], "a".repeat(64).as_str());
+                                assert_eq!(args[5], "home-user");
+                                assert_eq!(args[6], "/fixture/home with spaces");
+                                assert!(args[7] == "setup" || args[7] == "install");
+                                assert_eq!(stdin, Some(b"admitted".as_slice()));
+                                assert!(!quiet);
+                            }
+                            calls.borrow_mut().push(program.to_owned());
                             Ok(results.next().unwrap())
                         },
                     )
@@ -290,18 +404,8 @@ mod tests {
             assert_eq!(result.is_ok(), prepares);
             let calls = calls.into_inner();
             assert_eq!(calls.last().unwrap() == "image", prepares);
-            if calls.len() == 5 {
-                assert!(calls[1].starts_with("sudo [\"install\", \"-D\""));
-                assert!(calls[1]
-                    .contains("/fixture/home with spaces/scripts/browser-vm-linux-network.py"));
-                assert!(calls[2].starts_with(&format!(
-                    "sudo [\"/usr/bin/python3\", \"-I\", \"{ROOT_HELPER}\", \"setup\""
-                )));
-                assert!(calls[2].contains(
-                    "\"--user\", \"home-user\", \"--data-dir\", \"/fixture/home with spaces\""
-                ));
-                assert!(calls[3].starts_with("/usr/bin/python3"));
-            }
+            assert_eq!(calls[0], "/usr/bin/python3");
+            assert_eq!(calls[1], "/usr/bin/sudo");
         }
     }
 }
