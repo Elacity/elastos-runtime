@@ -182,7 +182,11 @@ fn installer_candidate_refuses_mismatched_source_channel() {
             );
             let allowed = subscription == signed_channel
                 || (subscription == "canary" && signed_channel == "stable");
-            assert_eq!(result.is_ok(), allowed, "{subscription} -> {signed_channel}");
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{subscription} -> {signed_channel}"
+            );
             if !allowed {
                 assert!(result.unwrap_err().to_string().contains("subscription"));
             }
