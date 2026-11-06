@@ -518,7 +518,7 @@ fn managed_runtime_coord_path(data_dir: &Path, runtime_kind: &str) -> PathBuf {
     runtime_coord_path(data_dir)
 }
 
-pub(crate) fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
+pub fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("home-runtime-coords.json")
 }
 
