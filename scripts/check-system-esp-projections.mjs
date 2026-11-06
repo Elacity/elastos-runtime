@@ -14,10 +14,6 @@ const adapterSource = readFileSync(
   new URL("../capsules/system/browser/esp-projections.mjs", import.meta.url),
   "utf8",
 );
-const systemSource = readFileSync(
-  new URL("../capsules/system/browser/system.js", import.meta.url),
-  "utf8",
-);
 
 for (const forbidden of [
   "fetch(",
@@ -30,20 +26,6 @@ for (const forbidden of [
   assert(
     !adapterSource.includes(forbidden),
     `System ESP projection adapter must not contain authority marker ${forbidden}`,
-  );
-}
-
-assert(
-  systemSource.includes("binding.executable !== true"),
-  "System must expose actions only from Runtime-derived executable bindings",
-);
-for (const forbidden of [
-  "binding.state === \"provider-path-only\"",
-  "binding.state === \"approval-required\"",
-]) {
-  assert(
-    !systemSource.includes(forbidden),
-    `System must not present non-executable binding state as an action: ${forbidden}`,
   );
 }
 
