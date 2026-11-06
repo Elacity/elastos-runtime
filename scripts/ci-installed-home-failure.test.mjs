@@ -1,6 +1,49 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { publicJourneyFailure } from "./ci-installed-home-failure.mjs";
+import { assertJourneyEqual, publicJourneyFailure } from "./ci-installed-home-failure.mjs";
+
+test("Stop failures name the exact assertion and bounded observed values", () => {
+  for (const [check, actual, expected] of [
+    ["stop_terminal_status", "completed", "cancelled"],
+    ["stop_create_terminal", true, false], ["stop_cancel_http_ok", false, true],
+    ["stop_whole_engine_exit", false, true], ["stop_runtime_unchanged", false, true],
+    ["create_token_cap", 16, 1024], ["create_http_ok", false, true],
+    ["create_request_id", false, true], ["create_authority", false, true],
+    ["create_status", "error", "ok"], ["create_run_id", false, true],
+    ["events_http_ok", false, true], ["engine_running_status", "failed", "passed"],
+    ["engine_stopped_status", "failed", "passed"],
+  ]) {
+    assert.throws(() => assertJourneyEqual(check, actual, expected), error => {
+      assert.deepEqual(publicJourneyFailure(error, "model_stop_get_different", "stop_real_stream"), {
+        failure_stage: "model_stop_get_different", failure: "assertion_failed", failure_check: "stop_real_stream",
+        failure_assertion: check, observed: actual, expected,
+      });
+      return true;
+    });
+    assertJourneyEqual(check, expected, expected);
+  }
+});
+
+test("assertion observations exclude tokens, arbitrary strings, objects and inherited names", () => {
+  const secret = "home_token=fixture-secret\n/private/operator/home";
+  for (const actual of [secret, { token: secret }, [secret], undefined, null, Infinity, -1, 1000001]) {
+    assert.throws(() => assertJourneyEqual("create_token_cap", actual, 1024), error => {
+      const failure = publicJourneyFailure(error, "model_stop_get_different", "stop_real_stream");
+      assert.equal(failure.observed, "invalid");
+      assert(!JSON.stringify(failure).includes(secret));
+      return true;
+    });
+  }
+  for (const check of [secret, "constructor", "__proto__", "toString"]) {
+    const failure = publicJourneyFailure({ name: "AssertionError", journeyAssertion: check,
+      journeyActual: secret, journeyExpected: secret }, "model_stop_get_different", "stop_real_stream");
+    assert.equal(failure.failure_assertion, undefined);
+  }
+  const failure = publicJourneyFailure({ name: "AssertionError", journeyAssertion: "stop_terminal_status",
+    journeyActual: secret, journeyExpected: secret }, "model_stop_get_different", "stop_real_stream");
+  assert.equal(failure.observed, "invalid");
+  assert.equal(failure.expected, "invalid");
+});
 
 test("public browser failure keeps launch authority and operator paths private", () => {
   const message = "frame.waitForURL: timeout at http://localhost:123/apps/marketplace/#home_token=fixture-secret\n/private/operator/home";
