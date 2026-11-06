@@ -158,9 +158,7 @@ fn remove_expected_file(
     expected: FileIdentity,
 ) -> io::Result<Option<bool>> {
     let mut random = [0_u8; 16];
-    if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    fill_random(&mut random)?;
     let holding = CString::new(format!(".elastos-remove-{}", hex::encode(random))).unwrap();
     if unsafe { libc::mkdirat(parent.as_raw_fd(), holding.as_ptr(), 0o700) } != 0 {
         return Err(io::Error::last_os_error());
@@ -217,6 +215,27 @@ fn remove_expected_file(
             holding.to_string_lossy()
         ))),
     }
+}
+
+fn fill_random(bytes: &mut [u8; 16]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if read as usize != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short random byte read",
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn open_directory(at: Option<&OwnedFd>, name: &CStr) -> io::Result<OwnedFd> {

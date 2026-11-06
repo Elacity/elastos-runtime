@@ -642,6 +642,55 @@ def validate_release_builds_are_hermetic(source):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_musl_gate_covers_both_native_linux_release_sets(self):
+        root = WORKFLOW.parents[2]
+        for job in ("source-home-linux", "source-home-linux-arm64"):
+            gate, = [step for step in steps(job) if "name: check native musl release crates" in step]
+            self.assertIn("X64) target=x86_64-unknown-linux-musl", gate)
+            self.assertIn("ARM64) target=aarch64-unknown-linux-musl", gate)
+            self.assertIn('bash scripts/check-release-musl.sh "$target"', gate)
+            self.assertIn("timeout-minutes: 30", gate)
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            log = fixture / "commands.jsonl"
+            for tool in ("cargo", "rustup"):
+                shim = fixture / tool
+                shim.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, pathlib, sys\n"
+                    "with open(os.environ['MUSL_FIXTURE_LOG'], 'a') as out:\n"
+                    " out.write(json.dumps([pathlib.Path(sys.argv[0]).name, str(pathlib.Path.cwd()), sys.argv[1:]]) + '\\n')\n"
+                )
+                shim.chmod(0o755)
+            for target, platform in (("x86_64-unknown-linux-musl", "linux-amd64"),
+                                     ("aarch64-unknown-linux-musl", "linux-arm64")):
+                for mode in ("check", "build"):
+                    with self.subTest(target=target, mode=mode):
+                        log.write_text("")
+                        result = subprocess.run(
+                            ["bash", "scripts/check-release-musl.sh", target, mode], cwd=root,
+                            env={**os.environ, "PATH": f"{fixture}:{os.environ['PATH']}",
+                                 "MUSL_FIXTURE_LOG": str(log)}, capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(f"musl {mode} PASS: {target}", result.stdout)
+                        commands = [json.loads(line) for line in log.read_text().splitlines()]
+                        self.assertEqual(commands[0][2], ["target", "add", target])
+                        builds = [command for command in commands if command[0] == "cargo"]
+                        self.assertEqual(builds[0][2], [mode, "--locked", "--release", "--target",
+                                                           target, "-p", "elastos-server", "--bin", "elastos"])
+                        # Compare to the producer's actual lock-prerequisite selection.
+                        producer = (root / "scripts/publish-release.sh").read_text()
+                        names = re.search(r"SUPPORT_BINARY_ASSETS=\((.*?)\)", producer, re.S)[1].split()
+                        integrity = runpy.run_path(str(root / "scripts/components-release-integrity-check.py"))
+                        external = json.loads((root / "components.json").read_text())["external"]
+                        expected = {name for name in names + ["home-cli"]
+                                    if integrity["resolve_platform_info"](external[name], platform)[1] is not None}
+                        self.assertEqual({Path(command[1]).name for command in builds[1:]}, expected)
+                        self.assertEqual(len(builds), len(expected) + 1)
+                        for command in builds[1:]:
+                            self.assertEqual(command[2], [mode, "--locked", "--release", "--target", target])
+
     def test_source_home_missing_linux_engine_bundle_refuses_before_tools_or_writes(self):
         for arch, platform, variable in (("x86_64", "linux-amd64", "ELASTOS_LLAMA_AMD64_BUNDLE"),
                                           ("aarch64", "linux-arm64", "ELASTOS_LLAMA_ARM64_BUNDLE")):

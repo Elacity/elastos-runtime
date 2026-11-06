@@ -813,6 +813,15 @@ jobs:
         id: apt-prerequisites
         timeout-minutes: 13
         run: bash scripts/ci-apt-prerequisites.sh
+      - name: check native musl release crates
+        timeout-minutes: 30
+        run: |
+          case "${{ runner.arch }}" in
+            X64) target=x86_64-unknown-linux-musl ;;
+            ARM64) target=aarch64-unknown-linux-musl ;;
+            *) exit 1 ;;
+          esac
+          bash scripts/check-release-musl.sh "$target"
       - name: save Ubuntu prerequisite archives
         if: env.CI_USE_CACHE == 'true' && env.CI_SAVE_CACHE == 'true' && steps.apt-prerequisites.outputs.changed == 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
