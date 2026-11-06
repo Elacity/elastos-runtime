@@ -13,9 +13,8 @@ import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import { chromium } from "./system-uiux-fixture.mjs";
 
-const { chromium } = createRequire(import.meta.url)(process.env.BROWSER_OPERATOR_PLAYWRIGHT_CORE || "playwright");
 const cpuRate = process.env.ASSISTANT_LAYOUT_CPU_RATE ? Number(process.env.ASSISTANT_LAYOUT_CPU_RATE) : null;
 assert.ok(cpuRate === null || [1, 4, 6].includes(cpuRate), "CPU rate is 1, 4 or 6");
 
