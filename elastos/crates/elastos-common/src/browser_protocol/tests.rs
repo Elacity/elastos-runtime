@@ -261,3 +261,24 @@ fn readiness_accepts_only_the_declared_state_and_reason_fields() {
         assert!(serde_json::from_value::<BrowserEngineReadiness>(value).is_err());
     }
 }
+
+#[test]
+fn launch_refusal_accepts_only_known_codes_and_safe_byte_counts() {
+    let good = json!({"code": "insufficient_free_space", "required_bytes": 8589934592_u64, "available_bytes": 8589934591_u64});
+    assert_eq!(
+        serde_json::to_value(BrowserLaunchRefusal::from_value(&good).unwrap()).unwrap(),
+        good
+    );
+    for (key, value) in [
+        ("code", json!("unknown")),
+        ("required_bytes", json!("8589934592")),
+        ("available_bytes", json!(-1)),
+        ("available_bytes", json!(8589934592_u64)),
+        ("required_bytes", json!(1_u64 << 53)),
+        ("message", json!("private")),
+    ] {
+        let mut bad = good.clone();
+        bad[key] = value;
+        assert!(BrowserLaunchRefusal::from_value(&bad).is_none());
+    }
+}

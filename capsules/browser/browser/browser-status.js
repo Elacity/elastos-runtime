@@ -65,6 +65,20 @@ export function friendlyOpenError(error) {
     return "Browser session expired. Reopening from Home...";
   }
   const outcome = runtimeOpenOutcome(error);
+  const refusal = error?.payload?.refusal;
+  if (
+    ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"].includes(outcome?.state) &&
+    outcome.effects.page_acquired === false && outcome.effects.vm_acquired === false &&
+    outcome.effects.stream_acquired === false &&
+    refusal && Object.keys(refusal).length === 3 &&
+    refusal.code === "insufficient_free_space" &&
+    Number.isSafeInteger(refusal.required_bytes) && Number.isSafeInteger(refusal.available_bytes) &&
+    refusal.available_bytes >= 0 && refusal.available_bytes < refusal.required_bytes
+  ) {
+    const required = (Math.ceil(refusal.required_bytes / 100_000_000) / 10).toFixed(1);
+    const available = (Math.floor(refusal.available_bytes / 100_000_000) / 10).toFixed(1);
+    return `Browser needs ${required} GB free on this computer to open; ${available} GB are free. Free some space, then open Browser again.`;
+  }
   if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "viewer_compatibility") {
     return error.payload.code === "unsupported_viewer_display_mode"
       ? "This Browser view needs a streamed display. Open Browser from Home with its default display."

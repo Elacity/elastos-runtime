@@ -1388,6 +1388,10 @@ fn gateway_provider_error_response(scheme: &str, err: anyhow::Error) -> Response
 }
 
 fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode, String) {
+    (gateway_provider_error_status(scheme, &err), err.to_string())
+}
+
+fn gateway_provider_error_status(scheme: &str, err: &anyhow::Error) -> StatusCode {
     let text = err.to_string();
     let unavailable = format!("{scheme} provider unavailable");
     let forbidden = text.contains("home launch token")
@@ -1397,7 +1401,7 @@ fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode
         || text.contains("private host blocked")
         || text.contains("private IP blocked")
         || text.contains("private network");
-    let status = if forbidden {
+    if forbidden {
         StatusCode::FORBIDDEN
     } else if text.contains(&unavailable) {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1412,8 +1416,7 @@ fn gateway_provider_error_tuple(scheme: &str, err: anyhow::Error) -> (StatusCode
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (status, text)
+    }
 }
 
 fn inbox_error_response(err: anyhow::Error) -> Response {

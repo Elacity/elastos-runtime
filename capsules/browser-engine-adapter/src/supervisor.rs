@@ -25,6 +25,7 @@ pub(super) struct SupervisorLaunchError {
     pub(super) code: String,
     pub(super) message: String,
     pub(super) launch_settlement_result: Option<Value>,
+    pub(super) refusal: Option<elastos_common::browser_protocol::BrowserLaunchRefusal>,
 }
 
 impl SupervisorLaunchError {
@@ -33,6 +34,7 @@ impl SupervisorLaunchError {
             code: "engine_process_unavailable".to_string(),
             message: message.into(),
             launch_settlement_result: None,
+            refusal: None,
         }
     }
 }
@@ -45,6 +47,8 @@ struct TypedSupervisorLaunchError {
     message: String,
     #[serde(default)]
     launch_settlement_result: Option<Value>,
+    #[serde(default)]
+    refusal: Option<Value>,
 }
 
 fn supervisor_launch_error(
@@ -67,6 +71,10 @@ fn supervisor_launch_error(
             code: error.code,
             message: error.message,
             launch_settlement_result,
+            refusal: error
+                .refusal
+                .as_ref()
+                .and_then(elastos_common::browser_protocol::BrowserLaunchRefusal::from_value),
         };
     }
     SupervisorLaunchError::process(format!(
@@ -844,5 +852,41 @@ mod private_request_tests {
             .contains("private request write failed"));
         assert!(child.try_wait().unwrap().is_some());
         let _ = fs::remove_file(marker);
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_space_refusal_reaches_the_adapter_response() {
+        use std::os::unix::process::ExitStatusExt;
+        let adapter: AdapterConfig = serde_json::from_value(json!({
+            "id": "browser-vm-product", "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+        }))
+        .unwrap();
+        for (code, available, valid) in [
+            ("insufficient_free_space", json!(8589934591_u64), true),
+            ("unknown", json!(8589934591_u64), false),
+            ("insufficient_free_space", json!(-1), false),
+        ] {
+            let refusal = json!({"code": code, "required_bytes": 8589934592_u64, "available_bytes": available});
+            let stderr = json!({
+                "schema": "elastos.browser.engine.launch-error/v1", "code": "launch_refused",
+                "message": "private engine text", "refusal": refusal,
+            })
+            .to_string();
+            let error =
+                supervisor_launch_error(std::process::ExitStatus::from_raw(42 << 8), &stderr, None);
+            let response =
+                serde_json::to_value(Response::supervisor_error(&adapter, error)).unwrap();
+            if valid {
+                assert_eq!(response["refusal"], refusal);
+            } else {
+                assert!(response.get("refusal").is_none());
+            }
+        }
     }
 }

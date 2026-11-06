@@ -155,6 +155,8 @@ enum Response {
         adapter: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         launch_settlement_result: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refusal: Option<elastos_common::browser_protocol::BrowserLaunchRefusal>,
     },
 }
 
@@ -173,6 +175,7 @@ impl Response {
             message: message.into(),
             adapter: None,
             launch_settlement_result: None,
+            refusal: None,
         }
     }
 
@@ -182,6 +185,7 @@ impl Response {
             message: error.message,
             adapter: Some(adapter.id.clone()),
             launch_settlement_result: error.launch_settlement_result,
+            refusal: error.refusal,
         }
     }
 }

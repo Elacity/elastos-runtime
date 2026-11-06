@@ -18,6 +18,32 @@ pub const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-
 pub const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
 pub const MAX_BROWSER_ENGINE_ADAPTERS: usize = 64;
 
+/// Person-actionable launch refusals. Runtime exposes only this closed set;
+/// engine diagnostics stay with the Engine.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserLaunchRefusal {
+    InsufficientFreeSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+}
+
+impl BrowserLaunchRefusal {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let refusal: Self = serde_json::from_value(value.clone()).ok()?;
+        match refusal {
+            Self::InsufficientFreeSpace {
+                required_bytes,
+                available_bytes,
+            } if available_bytes < required_bytes && required_bytes < (1_u64 << 53) => {
+                Some(refusal)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserDisplayMode {

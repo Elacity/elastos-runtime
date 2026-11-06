@@ -53,15 +53,34 @@ pub(in crate::api::gateway) fn browser_provider_resource_call(
     })
 }
 
+#[derive(Debug)]
+pub(in crate::api::gateway) struct BrowserProviderResourceFailure {
+    pub(in crate::api::gateway) status: StatusCode,
+    pub(in crate::api::gateway) diagnostic: anyhow::Error,
+    response_message: String,
+}
+
 pub(in crate::api::gateway) async fn browser_provider_resource_response(
     state: &GatewayState,
     call: BrowserProviderResourceCall,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
+    browser_provider_resource_result(state, call)
+        .await
+        .map_err(|failure| (failure.status, failure.response_message))
+}
+
+// Keep the original cause until the operation chooses its public projection.
+pub(in crate::api::gateway) async fn browser_provider_resource_result(
+    state: &GatewayState,
+    call: BrowserProviderResourceCall,
+) -> Result<serde_json::Value, BrowserProviderResourceFailure> {
     let registry = state.provider_registry.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("{} provider unavailable", call.scheme),
-        )
+        let response_message = format!("{} provider unavailable", call.scheme);
+        BrowserProviderResourceFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            diagnostic: anyhow::anyhow!(response_message.clone()),
+            response_message,
+        }
     })?;
     if call.scheme == "browser-engine"
         && (call.request.get("page_id").is_some()
@@ -71,34 +90,40 @@ pub(in crate::api::gateway) async fn browser_provider_resource_response(
             Ok(Some(binding)) => {
                 return gateway_browser_remote::dispatch_consumer(state, &binding, &call.request)
                     .await
-                    .map_err(|_| {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Remote Runtime Engine operation is unavailable or pending settlement"
-                                .into(),
-                        )
+                    .map_err(|diagnostic| {
+                        let message =
+                            "Remote Runtime Engine operation is unavailable or pending settlement";
+                        BrowserProviderResourceFailure {
+                            status: StatusCode::SERVICE_UNAVAILABLE,
+                            diagnostic: diagnostic.context(message),
+                            response_message: message.into(),
+                        }
                     })
             }
             Ok(None) => {}
-            Err(_) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Remote Runtime Engine ownership is unavailable".into(),
-                ))
+            Err(diagnostic) => {
+                let message = "Remote Runtime Engine ownership is unavailable";
+                return Err(BrowserProviderResourceFailure {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    diagnostic: diagnostic.context(message),
+                    response_message: message.into(),
+                });
             }
         }
     }
     registry
         .send_raw(call.scheme, &call.request)
         .await
-        .map_err(|err| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "{} provider unavailable for {}: {}",
-                    call.scheme, call.resource, err
-                ),
-            )
+        .map_err(|diagnostic| BrowserProviderResourceFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            response_message: format!(
+                "{} provider unavailable for {}: {}",
+                call.scheme, call.resource, diagnostic
+            ),
+            diagnostic: anyhow::anyhow!(diagnostic).context(format!(
+                "{} provider unavailable for {}",
+                call.scheme, call.resource
+            )),
         })
 }
 

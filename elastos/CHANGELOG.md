@@ -12,6 +12,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Fixed
 
+- When Browser cannot open because the computer is short of space, it says how much space it needs.
 - On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.
 - On Linux, Browser is turned on when you choose it, not during install.
 - Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
