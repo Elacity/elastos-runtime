@@ -6,10 +6,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- System, About lets you choose Stable or test versions for updates.
+
 ### Fixed
 
 - When Browser cannot open because the computer is short of space, it says how much space it needs.
+- On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.
 - Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
+- The installer uses numeric process age to verify and stop a running Home with any time locale (#517).
+- The installer repairs group-writable files in an older Home that you own and gives one ownership repair command for root-owned installation files (#516).
 - Closing Browser no longer fails after a minute when another program happens to use a port Browser's media relay may need.
 
 ## [2.0.0] - 2026-11-02

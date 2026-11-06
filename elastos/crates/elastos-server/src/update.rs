@@ -35,7 +35,8 @@ pub(crate) fn on_heap<F: Future>(build: impl FnOnce() -> F) -> Pin<Box<F>> {
 }
 
 /// Async callback for attempting P2P release discovery.
-/// An unavailable connection returns None; discovery errors remain terminal.
+/// `run_update*` allows it `DISCOVERY_DEADLINE` in total, connection setup included;
+/// past that, the source counts as not answering. Discovery errors remain terminal.
 pub type TryP2pFn = Box<
     dyn Fn(
             TrustedSource,
@@ -74,6 +75,34 @@ pub async fn discover_carrier_release_head(
         }
     })
     .await
+}
+
+/// Total time for Carrier release discovery, connection setup and retry included.
+pub const DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+/// Time one discovery attempt gets before the single retry.
+pub const DISCOVERY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run one discovery attempt and, when the source gave no answer, one more.
+///
+/// No answer means the first attempt timed out after `DISCOVERY_ATTEMPT_TIMEOUT`,
+/// returned nothing, or failed with `UpdateSourceUnavailable`. Every other error,
+/// such as an unauthenticated or inconsistent head, is returned at once. `attempt`
+/// must dial a new Carrier connection on each call, so the retry never reuses the
+/// connection that just failed. The caller bounds the total time.
+pub async fn discover_with_one_retry<F, Fut>(
+    mut attempt: F,
+) -> anyhow::Result<Option<DiscoveredHead>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<DiscoveredHead>>>,
+{
+    match tokio::time::timeout(DISCOVERY_ATTEMPT_TIMEOUT, attempt()).await {
+        Ok(Ok(Some(head))) => return Ok(Some(head)),
+        Ok(Err(error)) if !error.is::<UpdateSourceUnavailable>() => return Err(error),
+        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+    }
+    println!("  No answer yet. Trying again...");
+    attempt().await
 }
 
 async fn resolve_discovered_head<F, Fut>(
@@ -183,6 +212,19 @@ pub fn verify_source_channel(source: &TrustedSource, signed_channel: &str) -> an
         quoted_channel = crate::install_transaction::shell_quote(signed_channel)
     );
     Ok(())
+}
+
+/// Installed files keep their signed channel when the subscription changes.
+/// Callers separately verify their exact version, head CID and publisher pins.
+/// The retired board channel remains valid for its already installed release.
+pub fn verify_installed_channel(
+    source: &TrustedSource,
+    signed_channel: &str,
+) -> anyhow::Result<()> {
+    if crate::sources::ALLOWED_RELEASE_CHANNELS.contains(&signed_channel) {
+        return Ok(());
+    }
+    verify_source_channel(source, signed_channel)
 }
 
 /// install.sh is the explicit way off a non-public channel such as the retired
@@ -703,7 +745,7 @@ enum ApplyMode {
 }
 
 #[derive(Debug)]
-pub(crate) struct UpdateSourceUnavailable;
+pub struct UpdateSourceUnavailable;
 impl std::fmt::Display for UpdateSourceUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("update source unavailable")
@@ -949,7 +991,7 @@ async fn run_update_with_restart(
                 println!("  Bootstrap: direct publisher ticket configured");
             }
             resolved = match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
+                DISCOVERY_DEADLINE,
                 p2p_fn(source.clone(), primary_publisher.clone()),
             )
             .await
@@ -2390,6 +2432,26 @@ mod tests {
     }
 
     #[test]
+    fn installed_channels_follow_pins_while_offers_follow_subscription() {
+        for subscription in ["stable", "canary", "jetson-test"] {
+            let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                "name":"fixture", "publisher_dids":["did:key:fixture"], "channel":subscription
+            }))
+            .unwrap();
+            for installed_channel in ["stable", "canary", "jetson-test"] {
+                verify_installed_channel(&source, installed_channel).unwrap();
+                assert_eq!(
+                    verify_source_channel(&source, installed_channel).is_ok(),
+                    subscription == installed_channel
+                        || (subscription == "canary" && installed_channel == "stable")
+                );
+            }
+            assert!(verify_installed_channel(&source, "").is_err());
+            assert!(verify_installed_channel(&source, "unknown").is_err());
+        }
+    }
+
+    #[test]
     fn channel_hint_command_keeps_each_name_one_shell_word() {
         let source: TrustedSource = serde_json::from_value(serde_json::json!({
             "name": "team releases", "publisher_dids": ["did:key:fixture"], "channel": "stable"
@@ -2683,6 +2745,123 @@ mod tests {
             err.to_string(),
             "Signed envelope signature verification failed"
         );
+    }
+
+    /// A discovery whose attempt `n` (from 0) ends as `outcome(n)`; `None` never answers.
+    fn scripted_discovery(
+        outcome: impl Fn(usize) -> Option<anyhow::Result<Option<DiscoveredHead>>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (TryP2pFn, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let outcome = std::sync::Arc::new(outcome);
+        let discovery: TryP2pFn = Box::new(move |_, _| {
+            let (counter, outcome) = (counter.clone(), outcome.clone());
+            Box::pin(async move {
+                discover_with_one_retry(|| {
+                    let result = outcome(counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                    async move {
+                        match result {
+                            Some(result) => result,
+                            None => std::future::pending().await,
+                        }
+                    }
+                })
+                .await
+            })
+        });
+        (discovery, attempts)
+    }
+
+    async fn check_with(discovery: &TryP2pFn) -> anyhow::Result<()> {
+        let (source, _, release) = discovery_fixture();
+        let data = tempfile::tempdir().unwrap();
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(data.path(), &sources).unwrap();
+        let fetch: FetchFn = Box::new(move |_| Box::pin(std::future::ready(Ok(release.clone()))));
+        run_update_for_data_dir(
+            data.path(),
+            &fetch,
+            Some(discovery),
+            true,
+            None,
+            "0.7.0",
+            true,
+            false,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_without_an_answer_retries_once_with_a_new_attempt() {
+        let (_, head, _) = discovery_fixture();
+        let answer = DiscoveredHead {
+            head_cid: None,
+            bytes: head,
+        };
+        // A silent first attempt, or one whose connection closed, recovers on the next.
+        for first_closes in [false, true] {
+            let answer = answer.clone();
+            let (discovery, attempts) = scripted_discovery(move |attempt| match attempt {
+                0 if first_closes => Some(Err(
+                    anyhow::Error::new(UpdateSourceUnavailable).context("connection closed")
+                )),
+                0 => None,
+                _ => Some(Ok(Some(answer.clone()))),
+            });
+            let started = tokio::time::Instant::now();
+            check_with(&discovery).await.unwrap();
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let waited = if first_closes {
+                std::time::Duration::ZERO
+            } else {
+                DISCOVERY_ATTEMPT_TIMEOUT
+            };
+            assert_waited(started, waited);
+        }
+    }
+
+    /// Paused tokio time lands timers on whole milliseconds.
+    fn assert_waited(started: tokio::time::Instant, expected: std::time::Duration) {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= expected && elapsed < expected + std::time::Duration::from_millis(5),
+            "waited {elapsed:?}, expected {expected:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_without_two_answers_fails_within_one_deadline() {
+        let (discovery, attempts) = scripted_discovery(|_| None);
+        let started = tokio::time::Instant::now();
+        let error = check_with(&discovery).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Could not discover updates: the trusted release source did not answer over Carrier. Check the network (ElastOS needs outgoing UDP to port 4433), then try again."
+        );
+        assert_waited(started, DISCOVERY_DEADLINE);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_refusal_is_not_retried() {
+        let (discovery, attempts) = scripted_discovery(|_| {
+            Some(Err(anyhow::anyhow!(
+                "Signed envelope signature verification failed"
+            )))
+        });
+        let started = tokio::time::Instant::now();
+        let error = check_with(&discovery).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Signed envelope signature verification failed"
+        );
+        assert_waited(started, std::time::Duration::ZERO);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

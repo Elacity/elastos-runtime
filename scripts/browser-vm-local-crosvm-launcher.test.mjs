@@ -6,8 +6,41 @@ import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import vm from "node:vm";
 import test from "node:test";
+import { browserVmVcpus } from "./browser-vm-local-crosvm-launcher.mjs";
 
 const source = fs.readFileSync(new URL("./browser-vm-local-crosvm-launcher.mjs", import.meta.url), "utf8");
+
+test("Linux vCPUs reserve host capacity", () => {
+  assert.deepEqual([1, 2, 4, 6, 8, 16].map(cpus => browserVmVcpus("linux", cpus)),
+    ["1", "2", "2", "4", "4", "4"]);
+});
+
+test("Mac vCPUs stay at two", () => {
+  for (const cpus of [1, 2, 4, 6, 8, 16]) {
+    assert.equal(browserVmVcpus("darwin", cpus), "2", `Mac CPUs: ${cpus}`);
+  }
+});
+
+test("explicit vCPUs win and invalid values are rejected", () => {
+  for (const platform of ["linux", "darwin"]) {
+    for (const cpus of [1, 2, 4, 6, 8, 16]) {
+      assert.equal(browserVmVcpus(platform, cpus, "5"), "5");
+    }
+  }
+  for (const value of ["", "0", "-1", "1.5", "two", "256", "258", "4294967295"]) {
+    assert.throws(() => browserVmVcpus("linux", 6, value), /integer in 1\.\.255/);
+  }
+});
+
+test("the launcher entry point also runs through a symlink", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "browser-vcpu-entry-"));
+  const link = path.join(root, "launcher.mjs");
+  t.after(() => { fs.unlinkSync(link); fs.rmdirSync(root); });
+  fs.symlinkSync(new URL("./browser-vm-local-crosvm-launcher.mjs", import.meta.url), link);
+  const result = spawnSync(process.execPath, [link], { input: "{", encoding: "utf8", timeout: 5000 });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /request is invalid JSON/);
+});
 
 test("Linux launcher uses ordinary commands for launch and cleanup", () => {
   assert.doesNotMatch(source, /sudo/i);
@@ -62,13 +95,13 @@ test("crosvm command consumes the prepared TAP and addresses", () => {
   const child = { once() {} };
   const context = vm.createContext({ path, os: { arch: () => "arm64" }, process: { env: {} },
     fs: { openSync: () => 10, mkdirSync() {} }, hasTurnServer: () => true, iceBootConfigHex: () => "",
-    profileKey: () => "profile", defaultVmVcpus: () => "4",
+    profileKey: () => "profile",
     spawnTracked(command, args, options) { calls.push([command, args, options]); return child; },
   });
   const start = source.indexOf("function startCrosvm(");
   const end = source.indexOf("\nfunction tailFile(", start);
   const startCrosvm = vm.runInContext(`${source.slice(start, end)}\nstartCrosvm`, context);
-  startCrosvm({ crosvm: "/fixture/crosvm", kernel: "/fixture/kernel", initrd: "/fixture/initrd",
+  startCrosvm({ crosvm: "/fixture/crosvm", vcpus: browserVmVcpus("linux", 6), kernel: "/fixture/kernel", initrd: "/fixture/initrd",
     rootfs: "/fixture/rootfs", sessionDir: "/fixture/session", profile: { profileKey: "profile", diskPath: "/fixture/profile.ext4", initialize: true, lockFd: 42 }, iceConfig: {},
     launch: { display_mode: "webrtc_remote_display" },
     network: { tapName: "ebv3e9s0", hostIp: "192.168.200.1", guestIp: "192.168.200.2", prefix: 30, mac: "02:eb:00:03:e9:00" } });
@@ -76,6 +109,7 @@ test("crosvm command consumes the prepared TAP and addresses", () => {
   assert.deepEqual(JSON.parse(JSON.stringify(calls[0][2].stdio)), ["ignore", 10, 10, 42]);
   assert.equal(calls[0][0], "/fixture/crosvm");
   const args = calls[0][1];
+  assert.equal(args[args.indexOf("--cpus") + 1], "4");
   assert.equal(args[args.indexOf("--net") + 1], "tap-name=ebv3e9s0,mac=02:eb:00:03:e9:00");
   assert.deepEqual(Array.from(args.entries()).filter(([, v]) => v === "--block").map(([i]) => args[i + 1]), ["path=/fixture/rootfs,root=true", "path=/fixture/profile.ext4"]);
   assert.match(args[args.indexOf("-p") + 1], /elastos.browser_profile_disk=required/);

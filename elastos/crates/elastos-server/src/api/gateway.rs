@@ -778,6 +778,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
+            "/api/apps/system/update-channel",
+            post(system_source_switch_channel).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
             "/api/apps/system/appearance/preferences",
             post(system_appearance_preferences_update),
         )

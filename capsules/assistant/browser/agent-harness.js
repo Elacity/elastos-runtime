@@ -380,7 +380,7 @@ function trackComposerGeometry(durationMs) {
   cancelAnimationFrame(composerGeometryTrackRaf);
   const until = performance.now() + durationMs;
   const tick = () => {
-    syncComposerGeometry({ tracking: true });
+    syncComposerGeometry();
     composerGeometryTrackRaf = performance.now() < until ? requestAnimationFrame(tick) : 0;
   };
   composerGeometryTrackRaf = requestAnimationFrame(tick);
@@ -406,14 +406,10 @@ let lastComposerClearance = -1;
 let composerColumnFrozen = false;
 let composerGeometryRoRaf = 0;
 let composerGeometrySyncing = false;
-let composerGeometryBurstAt = 0;
-let composerGeometryBurst = 0;
 
-/* `tracking`: a bounded per-frame follow of a CSS ease (the rail collapse);
-   it is not a ResizeObserver feedback loop, so the burst guard stands aside.
-   `clearanceOnly`: during a turn only the stream's bottom clearance follows
+/* `clearanceOnly`: during a turn only the stream's bottom clearance follows
    the composer (a follow-up being typed grows it). */
-function syncComposerGeometry({ tracking = false, clearanceOnly = false } = {}) {
+function syncComposerGeometry({ clearanceOnly = false } = {}) {
   const taskbar = document.querySelector(".taskbar");
   const main = document.querySelector(".agent-harness-main");
   if (!taskbar || !main || !document.body.classList.contains("agent-harness-active")) {
@@ -435,18 +431,6 @@ function syncComposerGeometry({ tracking = false, clearanceOnly = false } = {}) 
   if (composerGeometrySyncing) {
     return;
   }
-  if (!tracking) {
-    const now = performance.now();
-    if (now - composerGeometryBurstAt > 250) {
-      composerGeometryBurstAt = now;
-      composerGeometryBurst = 0;
-    }
-    composerGeometryBurst += 1;
-    if (composerGeometryBurst > 8) {
-      stopDockGeometryObserver();
-      return;
-    }
-  }
   const dock = taskbar.getBoundingClientRect();
   const clearance = Math.max(96, Math.round(window.innerHeight - dock.top));
   let width = 0;
@@ -461,6 +445,7 @@ function syncComposerGeometry({ tracking = false, clearanceOnly = false } = {}) 
     left = snap(dock.left - band.left);
     columnKey = `${width}|${left}`;
   }
+  // Unchanged notifications are harmless. Keep observing future composer growth.
   if (columnKey === lastComposerColumnKey && clearance === lastComposerClearance) {
     return;
   }
