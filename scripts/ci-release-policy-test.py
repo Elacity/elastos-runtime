@@ -679,11 +679,17 @@ class ReleasePolicyTests(unittest.TestCase):
                         builds = [command for command in commands if command[0] == "cargo"]
                         self.assertEqual(builds[0][2], [mode, "--locked", "--release", "--target",
                                                            target, "-p", "elastos-server", "--bin", "elastos"])
+                        external = json.loads((root / "components.json").read_text())["external"]
+                        if platform in external["browser-vz-engine-supervisor"]["platforms"]:
+                            supervisor = builds.pop()
+                            self.assertEqual(Path(supervisor[1]), root / "elastos")
+                            self.assertEqual(supervisor[2], [mode, "--locked", "--release", "-p",
+                                                            "elastos-vz", "--bin", "browser-vz-engine-supervisor",
+                                                            "--target", target])
                         # Compare to the producer's actual lock-prerequisite selection.
                         producer = (root / "scripts/publish-release.sh").read_text()
                         names = re.search(r"SUPPORT_BINARY_ASSETS=\((.*?)\)", producer, re.S)[1].split()
                         integrity = runpy.run_path(str(root / "scripts/components-release-integrity-check.py"))
-                        external = json.loads((root / "components.json").read_text())["external"]
                         expected = {name for name in names + ["home-cli"]
                                     if integrity["resolve_platform_info"](external[name], platform)[1] is not None}
                         self.assertEqual({Path(command[1]).name for command in builds[1:]}, expected)

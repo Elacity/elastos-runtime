@@ -40,4 +40,11 @@ while IFS= read -r name; do
     directory=$(resolve_capsule_dir "$name")
     (cd "$directory" && cargo "$mode" --locked --release --target "$target")
 done <<< "$selected"
+
+# This native Browser owner is a separate producer after the support list.
+if jq -e --arg platform "$platform" \
+    '.external["browser-vz-engine-supervisor"].platforms[$platform]' components.json >/dev/null; then
+    (cd elastos && cargo "$mode" --locked --release -p elastos-vz \
+        --bin browser-vz-engine-supervisor --target "$target")
+fi
 echo "musl $mode PASS: $target ($((SECONDS - started))s)"

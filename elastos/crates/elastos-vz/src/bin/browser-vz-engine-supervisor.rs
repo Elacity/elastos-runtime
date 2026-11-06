@@ -2598,14 +2598,12 @@ fn validate_private_stdin_descriptor(fd: RawFd) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn is_linux_pipefs_descriptor(fd: RawFd) -> bool {
-    const PIPEFS_MAGIC: libc::c_long = 0x5049_5045;
-
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
         return false;
     }
     let stat = unsafe { stat.assume_init() };
-    stat.f_type == PIPEFS_MAGIC
+    stat.f_type == 0x5049_5045 // PIPEFS_MAGIC; f_type's signedness depends on libc.
 }
 
 fn is_anonymous_unix_stream_socket(fd: RawFd) -> bool {
@@ -5069,8 +5067,8 @@ fn set_file_socket_timeout(
     timeout: Duration,
 ) -> Result<(), String> {
     let timeval = libc::timeval {
-        tv_sec: timeout.as_secs().min(i64::MAX as u64) as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        tv_sec: timeout.as_secs().min(i64::MAX as u64) as _,
+        tv_usec: timeout.subsec_micros() as _,
     };
     let result = unsafe {
         libc::setsockopt(
