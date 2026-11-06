@@ -10084,6 +10084,11 @@ async fn test_browser_operator_inspection_fill_bootstrap_and_detach_scope() {
 
 #[tokio::test]
 async fn test_browser_open_provider_transport_preserves_remote_cause() {
+    use crate::api::gateway::gateway_browser::{
+        browser_provider_resource_response, browser_provider_resource_result,
+        BrowserProviderResourceCall,
+    };
+
     let dir = tempfile::tempdir().unwrap();
     let state = browser_engine_attached_test_state(dir.path()).await;
     let call = || BrowserProviderResourceCall {
