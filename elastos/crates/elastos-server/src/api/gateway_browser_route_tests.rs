@@ -1438,7 +1438,7 @@ async fn test_browser_open_returns_forbidden_when_exit_policy_blocks_host() {
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"url":"https://whatismyip.com/","reason":"check exit IP","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+                    r#"{"url":"https://fixture-user:fixture-password@whatismyip.com/fixture-path?token=fixture-query","reason":"check exit IP","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
                 ))
                 .unwrap(),
         )
@@ -1451,6 +1451,17 @@ async fn test_browser_open_returns_forbidden_when_exit_policy_blocks_host() {
     let message = String::from_utf8(body.to_vec()).unwrap();
     assert!(message.contains("whatismyip.com"));
     assert!(message.contains("direct host networking"));
+    for private in [
+        "fixture-user",
+        "fixture-password",
+        "fixture-path",
+        "fixture-query",
+    ] {
+        assert!(
+            !message.contains(private),
+            "private URL parts in public error: {message}"
+        );
+    }
 }
 
 #[tokio::test]

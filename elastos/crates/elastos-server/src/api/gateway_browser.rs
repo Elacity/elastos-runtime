@@ -110,7 +110,7 @@ enum BrowserOpenFailureBody {
     Compatibility(BrowserCompatibilityError),
     Refused(elastos_common::browser_protocol::BrowserLaunchRefusal),
     ExitPolicy {
-        url: String,
+        host: String,
     },
 }
 
@@ -353,9 +353,9 @@ impl BrowserOpenFailure {
                 "message": "Browser cannot open.",
                 "refusal": refusal,
             }),
-            BrowserOpenFailureBody::ExitPolicy { url } => serde_json::json!({
+            BrowserOpenFailureBody::ExitPolicy { host } => serde_json::json!({
                 "code": "exit_policy_blocked",
-                "message": format!("Browser Exit policy blocked {url}. Runtime keeps direct host networking disabled."),
+                "message": format!("Browser Exit policy blocked {host}. Runtime keeps direct host networking disabled."),
             }),
         };
         let code = value["code"]
@@ -892,7 +892,11 @@ async fn execute_browser_open(
     let lifecycle = BrowserLaunchLifecycle {
         owner_launch_id: authority.verified_context().launch_id().to_string(),
         browser_instance: browser_instance.clone(),
-        url: url.clone(),
+        host: url::Url::parse(&url)
+            .expect("validated Browser URL")
+            .host_str()
+            .expect("validated Browser host")
+            .to_owned(),
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
         engine_route_provider: engine_route_provider.clone(),
         selected_engine_adapter: Some(adapter_id.clone()),
