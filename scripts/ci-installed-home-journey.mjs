@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { appendFileSync, readFileSync, statfsSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { applyRunEventsPage, terminalOutputText } from "../capsules/assistant/browser/model-contract.js";
-import { publicJourneyFailure } from "./ci-installed-home-failure.mjs";
+import { assertJourneyEqual, publicJourneyFailure } from "./ci-installed-home-failure.mjs";
 import { openInstalledApp, openInstalledAssistant, reopenInstalledAssistant, resizeInstalledHome, returnInstalledHome } from "./ci-installed-home-navigation.mjs";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -48,7 +48,8 @@ async function resourceAction(action) {
     try { response = JSON.parse(readFileSync(join(resourceControl, "response.json"), "utf8")); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
     if (response?.id === id) {
-      assert.equal(response.status, "passed", "owned finite-resource stage passes");
+      if (["engine_running", "engine_stopped"].includes(action)) assertJourneyEqual(`${action}_status`, response.status, "passed");
+      else assert.equal(response.status, "passed", "owned finite-resource stage passes");
       return response;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -86,15 +87,15 @@ async function startResourceTurn(assistant, offer, prompt, tokens) {
   }, { timeout: 30000 });
   response.catch(() => {});
   const created = response.then(async accepted => {
-    assert(accepted.ok());
+    assertJourneyEqual("create_http_ok", accepted.ok(), true);
     const body = accepted.request().postDataJSON();
-    assert.equal(body.input?.max_output_tokens, tokens);
-    assert(/^model-v1:[1-9][0-9]*:[A-Za-z0-9_.:-]{1,128}$/.test(body.request_id));
+    assertJourneyEqual("create_token_cap", body.input?.max_output_tokens, tokens);
+    assertJourneyEqual("create_request_id", /^model-v1:[1-9][0-9]*:[A-Za-z0-9_.:-]{1,128}$/.test(body.request_id), true);
     const token = await assistant.evaluate(() => new URLSearchParams(location.hash.slice(1)).get("home_token"));
-    assert(token && accepted.request().headers()["x-elastos-home-token"] === token);
+    assertJourneyEqual("create_authority", Boolean(token && accepted.request().headers()["x-elastos-home-token"] === token), true);
     const value = await accepted.json();
-    assert.equal(value.status, "ok");
-    assert(value.data?.run_id);
+    assertJourneyEqual("create_status", value.status, "ok");
+    assertJourneyEqual("create_run_id", Boolean(value.data?.run_id), true);
     return value.data;
   });
   created.catch(() => {});
@@ -107,7 +108,7 @@ async function startResourceTurn(assistant, offer, prompt, tokens) {
       const run = await created;
       const request = response.request().postDataJSON();
       if (request?.run_id !== run.run_id) return;
-      assert(response.ok());
+      assertJourneyEqual("events_http_ok", response.ok(), true);
       const body = await response.json();
       const final = applyRunEventsPage(body.data, request.after_sequence).terminal;
       if (final) resolve(final);
@@ -238,17 +239,18 @@ async function repairJourney(assistant, offer) {
   await configureTokens(assistant, 1024);
   const owner = await startResourceTurn(assistant, offer,
     "Write a numbered list from 1 to 1000. Each item must say hello and give one detail. Continue the list without an introduction or conclusion.", 1024);
-  assert(!owner.run.terminal);
+  assertJourneyEqual("stop_create_terminal", Boolean(owner.run.terminal), false);
   await resourceAction("engine_running");
   await assistant.waitForFunction(() => /\S/.test([...document.querySelectorAll(".agent-msg-agent .agent-msg-body")].at(-1)?.innerText ?? ""), null, { timeout: 60000 });
   const cancelled = page.waitForResponse(response => response.url().endsWith("/api/provider/model/runs_cancel") &&
     response.request().frame() === assistant && response.request().postDataJSON()?.run_id === owner.run.run_id, { timeout: 30000 });
   cancelled.catch(() => {});
   await assistant.locator('#agent-composer-send[data-mode="stop"]').click();
-  assert((await cancelled).ok());
-  assert.equal((await owner.terminal).status, "cancelled");
+  assertJourneyEqual("stop_cancel_http_ok", (await cancelled).ok(), true);
+  assertJourneyEqual("stop_terminal_status", (await owner.terminal).status, "cancelled");
   const closed = await resourceAction("engine_stopped");
-  assert(closed.whole_engine_exit && closed.runtime_unchanged);
+  assertJourneyEqual("stop_whole_engine_exit", closed.whole_engine_exit, true);
+  assertJourneyEqual("stop_runtime_unchanged", closed.runtime_unchanged, true);
   modelRepair.stop = { run_id: owner.run.run_id, status: "cancelled", production_guard: true, whole_engine_exit: true };
   await page.screenshot({ path: join(evidence, "repair-stop.png"), fullPage: true });
   subcheck = "get_other_model";
@@ -632,7 +634,7 @@ try {
   writeFileSync(join(data, "journey-browser.private.log"), String(error?.stack ?? error), { mode: 0o600 });
   writeFileSync(join(evidence, "home-journey.json"), JSON.stringify({ results, disk, resource_turns: resourceTurns, ...(mode === "--model-repair" ? { model_repair: modelRepair } : {}), ...failure }, null, 2));
   await page?.screenshot({ path: join(evidence, "home-failure.png"), fullPage: true }).catch(() => {});
-  throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}${failure.failure_check ? ` check=${failure.failure_check}` : ""}`);
+  throw new Error(`Installed Home journey failed: stage=${failure.failure_stage} code=${failure.failure}${failure.failure_check ? ` check=${failure.failure_check}` : ""}${failure.failure_assertion ? ` assert=${failure.failure_assertion} observed=${JSON.stringify(failure.observed)} expected=${JSON.stringify(failure.expected)}` : ""}`);
 } finally {
   try { await closeBrowser(); }
   catch (error) {
