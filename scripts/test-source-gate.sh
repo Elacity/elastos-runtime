@@ -17,6 +17,9 @@ prepush() {
 
 product_ui() {
   node --version
+  node scripts/check-system-esp-projections.mjs
+  node scripts/marketplace-product-behavior-smoke.mjs
+  bash scripts/browser-source-home-config-smoke.sh
   node scripts/check-chat-ui-artifacts.mjs check
   node scripts/home-shell-regression-smoke.mjs
   node scripts/home-shell-bridge-smoke.mjs

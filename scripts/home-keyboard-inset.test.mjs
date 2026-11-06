@@ -40,6 +40,19 @@ test("the viewport tag ships as the base tag and takes the phone variant only th
   assert.equal(content, BASE_VIEWPORT);
 });
 
+test("phone source keeps the template viewport, dynamic heights and blur budget", () => {
+  const template = readFileSync(new URL("../capsules/home-gui/browser/home-gui-template.html", import.meta.url), "utf8");
+  const metas = [...template.matchAll(/<meta\s+name="viewport"\s+content="([^"]*)"/g)];
+  assert.ok(metas.length <= 1);
+  for (const [, content] of metas) assert.equal(content, BASE_VIEWPORT);
+
+  const css = readFileSync(new URL("../capsules/home-gui/browser/style.css", import.meta.url), "utf8");
+  for (const line of css.split("\n").filter(line => line.includes("100vh"))) {
+    assert.ok(css.includes(line.replace("100vh", "100dvh").trim()), `dynamic viewport twin: ${line}`);
+  }
+  assert.ok((css.match(/backdrop-filter\s*:/g) || []).length <= 38, "shell backdrop-filter budget");
+});
+
 function listenerTarget() {
   const listeners = new Map();
   return {

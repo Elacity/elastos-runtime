@@ -212,12 +212,13 @@ EOF
   --platform linux-arm64 \
   --out-dir "$tmp_dir/linux-turn-config" >/dev/null
 
-"$node_bin" - "$tmp_dir/vm-config/browser-engine-adapter.json" "$tmp_dir/vm-config/exit-provider.json" "$tmp_dir/vm-config/browser-local-exit.json" "$tmp_dir/mac-vm-config/browser-engine-adapter.json" "$tmp_dir/mac-vm-config/browser-vz-vsock-transport.json" "$tmp_dir/linux-remote-vz-config/browser-engine-adapter.json" "$tmp_dir/linux-remote-vz-config/browser-vz-vsock-transport.json" "$tmp_dir/default-mac-config/browser-engine-adapter.json" "$tmp_dir/default-mac-config/browser-vz-vsock-transport.json" "$tmp_dir/turn-config/browser-engine-adapter.json" "$tmp_dir/linux-turn-config/browser-engine-adapter.json" "$tmp_dir/preserve-config/exit-provider.json" "$preserve_out" <<'NODE'
+"$node_bin" - "$tmp_dir/vm-config/browser-engine-adapter.json" "$tmp_dir/vm-config/exit-provider.json" "$tmp_dir/vm-config/browser-local-exit.json" "$tmp_dir/vm-config/browser-vz-vsock-transport.json" "$tmp_dir/mac-vm-config/browser-engine-adapter.json" "$tmp_dir/mac-vm-config/browser-vz-vsock-transport.json" "$tmp_dir/linux-remote-vz-config/browser-engine-adapter.json" "$tmp_dir/linux-remote-vz-config/browser-vz-vsock-transport.json" "$tmp_dir/default-mac-config/browser-engine-adapter.json" "$tmp_dir/default-mac-config/browser-vz-vsock-transport.json" "$tmp_dir/turn-config/browser-engine-adapter.json" "$tmp_dir/linux-turn-config/browser-engine-adapter.json" "$tmp_dir/preserve-config/exit-provider.json" "$preserve_out" <<'NODE'
 const fs = require("node:fs");
-const [vmAdapterPath, vmExitPath, vmLocalExitPath, macVmAdapterPath, macVzTransportPath, linuxRemoteVmAdapterPath, linuxRemoteVzTransportPath, defaultMacVmAdapterPath, defaultMacVzTransportPath, turnAdapterPath, linuxTurnAdapterPath, preserveExitPath, preserveOutPath] = process.argv.slice(2);
+const [vmAdapterPath, vmExitPath, vmLocalExitPath, linuxTransportPath, macVmAdapterPath, macVzTransportPath, linuxRemoteVmAdapterPath, linuxRemoteVzTransportPath, defaultMacVmAdapterPath, defaultMacVzTransportPath, turnAdapterPath, linuxTurnAdapterPath, preserveExitPath, preserveOutPath] = process.argv.slice(2);
 const vmAdapter = JSON.parse(fs.readFileSync(vmAdapterPath, "utf8"));
 const vmExit = JSON.parse(fs.readFileSync(vmExitPath, "utf8"));
 const vmLocalExit = JSON.parse(fs.readFileSync(vmLocalExitPath, "utf8"));
+const linuxTransport = JSON.parse(fs.readFileSync(linuxTransportPath, "utf8"));
 const macVmAdapter = JSON.parse(fs.readFileSync(macVmAdapterPath, "utf8"));
 const macVzTransport = JSON.parse(fs.readFileSync(macVzTransportPath, "utf8"));
 const linuxRemoteVmAdapter = JSON.parse(fs.readFileSync(linuxRemoteVmAdapterPath, "utf8"));
@@ -228,7 +229,7 @@ const turnAdapter = JSON.parse(fs.readFileSync(turnAdapterPath, "utf8"));
 const linuxTurnAdapter = JSON.parse(fs.readFileSync(linuxTurnAdapterPath, "utf8"));
 const preserveExit = JSON.parse(fs.readFileSync(preserveExitPath, "utf8"));
 const preserveReceipt = JSON.parse(fs.readFileSync(preserveOutPath, "utf8"));
-function assertNoRemoteVzLocalTurnEnv(env, label) {
+function assertNoLocalTurnEnv(env, label) {
   for (const key of [
     "ELASTOS_BROWSER_VM_ICE_SERVER",
     "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON",
@@ -301,47 +302,43 @@ if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS !== "0") {
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS !== "0") {
   throw new Error("Linux VM adapter must fail closed on profile-keyed idle VM reuse");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0") {
-  throw new Error("Linux source-home Browser config must not claim VZ hibernation");
-}
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE !== "1") {
   throw new Error("VM adapter must prewarm the Browser VM control service during Runtime startup");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-local-crosvm-launcher")) {
-  throw new Error("Linux source-home Browser config must default to the local crosvm VM control launcher");
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vz-engine-supervisor")) {
+  throw new Error("Linux source-home Browser config must select the native Browser supervisor");
 }
-if (!adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR?.endsWith("/vm-data/browser-vm/rootfs-pool")) {
-  throw new Error("Linux source-home Browser config must use a prepared rootfs pool");
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_INITRAMFS !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/browser-vm/initrd")) {
+  throw new Error("Linux native Browser supervisor must receive the installed initramfs");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE !== "pool-required") {
-  throw new Error("Linux source-home Browser config must require prepared rootfs pool copies");
+for (const legacyKey of [
+  "ELASTOS_BROWSER_VM_HIBERNATION",
+  "ELASTOS_BROWSER_VM_HIBERNATION_DIR",
+  "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES",
+  "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS",
+  "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR",
+  "ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE",
+  "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT",
+  "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT",
+]) {
+  if (legacyKey in (adapter?.supervisor?.env || {})) {
+    throw new Error(`Linux native Browser config must omit ${legacyKey}`);
+  }
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "1") {
-  throw new Error("Linux source-home Browser config must keep one prepared rootfs spare for bounded update capacity");
+// Native transport issues per-session TURN authority instead of shared credentials.
+assertNoLocalTurnEnv(adapter?.supervisor?.env, "Linux native Browser config");
+if (linuxTransport.schema !== "elastos.browser.vz-transport-config/v1" ||
+    linuxTransport.enabled !== true ||
+    linuxTransport.turn_listen_host !== "127.0.0.1" ||
+    linuxTransport.turn_advertised_host !== "127.0.0.1" ||
+    linuxTransport.guest_turn_host !== "127.0.0.1" ||
+    new Set([linuxTransport.bootstrap_vsock_port, linuxTransport.egress_vsock_port,
+      linuxTransport.media_vsock_port]).size !== 3) {
+  throw new Error("Linux native Browser must use isolated Runtime vsock transport");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-prepare-rootfs-pool")) {
-  throw new Error("Linux source-home Browser config must point at the rootfs pool refill wrapper");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_SERVER !== "turn:turn.example.invalid:3478?transport=tcp") {
-  throw new Error("VM source-home config must carry operator TURN relay config to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_USERNAME !== "source-home-user") {
-  throw new Error("VM source-home config must carry TURN usernames to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_CREDENTIAL !== "source-home-secret") {
-  throw new Error("VM source-home config must carry TURN credentials to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY !== "relay") {
-  throw new Error("VM source-home config must keep WebRTC on relay-only ICE policy");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4 !== "10.44.0.1") {
-  throw new Error("VM source-home config must carry operator media relay host IPv4 to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4 !== "10.44.0.2") {
-  throw new Error("VM source-home config must carry operator media relay guest IPv4 to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX !== "24") {
-  throw new Error("VM source-home config must carry operator media relay prefix to the supervisor env");
+if ((fs.statSync(linuxTransportPath).mode & 0o077) !== 0 ||
+    fs.readFileSync(linuxTransportPath, "utf8").includes("source-home-secret")) {
+  throw new Error("Linux native transport config must be owner-only with per-session credentials");
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_TRACE !== "1") {
   throw new Error("VM source-home config must carry operator diagnostic trace to the supervisor env");
@@ -351,9 +348,6 @@ if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS !== "60000") {
   throw new Error("VM source-home config must carry open-error debug hold diagnostics to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_TURNSERVER_BIN !== "/tmp/elastos-test-turnserver") {
-  throw new Error("VM source-home config must carry the canonical turnserver binary env to the supervisor env");
 }
 if (vmExit.backends?.[0]?.adapter_ipc?.kind !== "unix_socket") throw new Error("VM missing adapter_ipc socket");
 if (vmExit.backends?.[0]?.relay_ipc?.kind !== "unix_socket") throw new Error("VM missing relay_ipc socket");
@@ -449,7 +443,7 @@ if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS !==
 if (Object.prototype.hasOwnProperty.call(macAdapter?.supervisor?.env || {}, "ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS")) {
   throw new Error("Remote VZ source-home Browser config must let the remote launcher derive an inner guest-ready margin");
 }
-assertNoRemoteVzLocalTurnEnv(macAdapter?.supervisor?.env, "Remote VZ source-home Browser config");
+assertNoLocalTurnEnv(macAdapter?.supervisor?.env, "Remote VZ source-home Browser config");
 const linuxRemoteAdapter = linuxRemoteVmAdapter.adapters?.[0];
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PLATFORM !== "linux-arm64") {
   throw new Error("Linux remote VZ source-home Browser config must preserve the local host platform");
@@ -459,9 +453,6 @@ if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !==
 }
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOT !== "/tmp/evzs") {
   throw new Error("Linux remote VZ source-home Browser config must use the remote VZ VM root");
-}
-if (Object.prototype.hasOwnProperty.call(linuxRemoteAdapter?.supervisor?.env || {}, "ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR")) {
-  throw new Error("Linux remote VZ source-home Browser config must not inherit local crosvm rootfs-pool env");
 }
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS !== "180000") {
   throw new Error("Linux remote VZ source-home Browser config must pin the remote launcher budget instead of inheriting ambient env");
@@ -481,7 +472,7 @@ if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUES
 if (Object.prototype.hasOwnProperty.call(linuxRemoteAdapter?.supervisor?.env || {}, "ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS")) {
   throw new Error("Linux remote VZ source-home Browser config must let the remote launcher derive an inner guest-ready margin");
 }
-assertNoRemoteVzLocalTurnEnv(linuxRemoteAdapter?.supervisor?.env, "Linux remote VZ source-home Browser config");
+assertNoLocalTurnEnv(linuxRemoteAdapter?.supervisor?.env, "Linux remote VZ source-home Browser config");
 if (
   linuxRemoteVzTransport.schema !==
     "elastos.browser.vz-transport-config/v1" ||
@@ -516,23 +507,12 @@ if (
   throw new Error("Local Mac source-home Browser config must use no-NIC VZ transport by default");
 }
 const turnEnv = turnAdapter.adapters?.[0]?.supervisor?.env || {};
-assertNoRemoteVzLocalTurnEnv(
+assertNoLocalTurnEnv(
   turnEnv,
   "Local Mac no-NIC VZ source-home Browser config",
 );
 const linuxTurnEnv = linuxTurnAdapter.adapters?.[0]?.supervisor?.env || {};
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("{host_ip}")) {
-  throw new Error("Linux source-home Browser config must preserve per-session TURN host placeholder");
-}
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("{turn_port}")) {
-  throw new Error("Linux source-home Browser config must preserve per-session TURN port placeholder");
-}
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("linux-runtime-turn-user")) {
-  throw new Error("Linux source-home Browser config must load runtime TURN credentials from data dir");
-}
-if (linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY !== "relay") {
-  throw new Error("Linux source-home Browser config must carry relay-only ICE policy from runtime TURN credentials");
-}
+assertNoLocalTurnEnv(linuxTurnEnv, "Linux native Browser Runtime TURN boundary");
 if (preserveExit.backends?.length !== 1) {
   throw new Error("source-home config must refresh the local Exit backend while preserving remote grants");
 }
