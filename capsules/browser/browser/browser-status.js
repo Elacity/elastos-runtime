@@ -85,6 +85,9 @@ export function friendlyOpenError(error) {
       : "This browser cannot show the Browser session. Use a supported browser or enable WebRTC.";
   }
   if (outcome?.state === "terminal_pre_effect_failure" && error?.payload?.stage === "engine_readiness") {
+    if (error?.payload?.code === "browser_host_setup_required") {
+      return sanitizedErrorText({ message: error.payload.message || text });
+    }
     switch (error?.payload?.reason) {
       case "artifact_invalid":
         return "Browser Engine files need repair. Prepare this Engine or choose another approved Engine.";

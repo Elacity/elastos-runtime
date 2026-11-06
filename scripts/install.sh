@@ -1186,6 +1186,21 @@ show_login_profile_lines() {
     done
 }
 
+# Browser's one-time setup grants a per-user device ACL. Other open failures
+# (for example a host/container restriction) need host support, not that ACL.
+browser_kvm_access_available() {
+    [[ -c /dev/kvm ]] || return 1
+    python3 - <<'PY_BROWSER_KVM'
+import errno, os
+try:
+    device = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
+except OSError as error:
+    raise SystemExit(0 if error.errno == errno.EACCES else 1)
+else:
+    os.close(device)
+PY_BROWSER_KVM
+}
+
 show_ready() {
     local runtime_bin="$1" command elapsed
     command="$(runtime_command "$runtime_bin")"
@@ -1194,6 +1209,9 @@ show_ready() {
     echo -e "  ${GREEN}${BOLD}ElastOS ${RELEASE_VERSION:-} is ready${NC} ${DIM}(took ${elapsed})${NC}"
     printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
     printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
+    if [[ "${EXISTING_INSTALL:-false}" == false && "$(uname -s)" == Linux && "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && browser_kvm_access_available; then
+        printf '    Browser is available on this computer. To turn it on, run: %s setup --browser\n' "$command"
+    fi
     if [[ "$command" != elastos ]]; then
         local label="Add to PATH"
         # New terminals already read the profile line; only this one needs it.
@@ -1217,78 +1235,6 @@ show_remote_open_hint() {
     printf '  ssh -L 8090:localhost:8090 %s@%s\n' "$(id -un)" "$host"
 }
 
-# The native launcher creates per-launch overlays. Retire the old copies as
-# their ordinary owner, before requesting any privileged host setup.
-retire_browser_rootfs_pool() {
-    /usr/bin/python3 -I - "$DATA_DIR" <<'PY_RETIRED_BROWSER_POOL'
-import os
-from pathlib import Path
-import shutil
-import sys
-
-root = Path(sys.argv[1])
-parent = root / 'browser-vm'
-if root.is_symlink() or parent.is_symlink():
-    sys.exit('Browser pool cleanup requires plain data and browser-vm directories')
-pool = parent / 'rootfs-pool'
-for path in (parent, pool):
-    try:
-        metadata = os.lstat(path)
-    except FileNotFoundError:
-        continue
-    if metadata.st_uid != os.geteuid():
-        sys.exit(f'{path} belongs to another user')
-if pool.is_symlink():
-    pool.unlink()
-elif pool.is_dir():
-    # removal-ok: exact retired image-copy folder, as its ordinary owner;
-    # parent links are refused and rmtree leaves internal link targets intact.
-    shutil.rmtree(pool)
-else:
-    sys.exit(0)
-print(f'Removed retired Browser rootfs pool: {pool}')
-PY_RETIRED_BROWSER_POOL
-}
-
-# Setup leaves the curl pipe unread. Browser Home runs in the controlling
-# terminal; non-interactive provisioning prints the command for a later launch.
-prepare_browser_linux_host() {
-    BROWSER_LINUX_HOST_READY=false
-    [[ "$(uname -s)" == Linux ]] || return 0
-    retire_browser_rootfs_pool || return $?
-    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user check_result line
-    # sudo runs only a root-owned copy, never the user-writable helper.
-    local root_helper=/usr/local/lib/elastos/browser-vm-linux-network.py
-    [[ -f "$helper" ]] || return 0
-    if [[ ! -e /dev/kvm ]]; then
-        info "Browser virtualization is unavailable: this host has no /dev/kvm device."
-        return 0
-    fi
-    user="$(id -un)"
-    if check_result="$(/usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" 2>&1)"; then
-        info "Browser KVM and network access are ready."
-    elif ( : </dev/tty ) 2>/dev/null && command -v sudo >/dev/null 2>&1; then
-        info "Browser needs one-time administrator setup for KVM access and its private network devices."
-        info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
-        sudo install -D -o root -g root -m 755 "$helper" "$root_helper" </dev/tty || return $?
-        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" --data-dir "$DATA_DIR" </dev/tty || return $?
-        /usr/bin/python3 -I "$helper" check --data-dir "$DATA_DIR" >/dev/null 2>&1 || return $?
-    else
-        info "Browser needs one-time administrator setup. Run from a terminal:"
-        printf '  sudo install -D -o root -g root -m 755 %q %q\n' "$helper" "$root_helper"
-        while IFS= read -r line; do
-            case "$line" in
-                '/usr/bin/python3 -I '*) printf '  sudo %s\n' "$line" ;;
-                *) printf '%s\n' "$line" ;;
-            esac
-        done <<<"$check_result"
-        return 0
-    fi
-    BROWSER_LINUX_HOST_READY=true
-    info "To remove Browser host access after closing Browser:"
-    printf '  sudo /usr/bin/python3 -I %q remove --user %q\n' "$root_helper" "$user"
-}
-
 finish_install() {
     local runtime_bin="${INSTALL_DIR}/elastos"
     if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
@@ -1308,12 +1254,6 @@ finish_install() {
         warn "If the reason above is a network that blocks UDP port 4433 (some office, school and hotel networks do), connect to another network, such as a phone hotspot."
         warn "Then run: $(runtime_command "$runtime_bin") ${setup_args[*]}"
         return "$status"
-    fi
-    if ! prepare_browser_linux_host; then
-        warn "Browser host preparation is incomplete. Home is ready. Run the installer from a terminal to complete Browser host access, then run elastos setup."
-    elif [[ "${BROWSER_LINUX_HOST_READY:-false}" == true ]]; then
-        # Resume image preparation with the same Community choice.
-        "$runtime_bin" "${setup_args[@]}" </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
     fi
     show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
@@ -1448,6 +1388,10 @@ uninstall_installation() {
         return 0
     fi
     command -v python3 &>/dev/null || die "Required tool not found: python3"
+    if [[ "$(uname -s)" == Linux ]]; then
+        info "If you turned Browser on, close Browser and remove its host access before uninstalling:"
+        printf '  sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user %q\n' "$(id -un)"
+    fi
     uninstall_files check "$install_dir" "$data_dir" "$remove_data" \
         || die "Nothing was stopped or removed"
     info "Stopping this installation's verified Runtime processes..."
