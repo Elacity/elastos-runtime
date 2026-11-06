@@ -19,6 +19,8 @@ uses crosvm/KVM and macOS uses Apple Virtualization.framework, but both
 substrates must boot the same Browser VM target contract and expose the same
 Runtime-facing control, media, and Exit relay surfaces.
 
+With `ELASTOS_BROWSER_VM_VCPUS` unset, Linux uses `min(N, max(2, min(4, N - 2)))` vCPUs, where `N` is the host's online CPUs available to the process, while macOS keeps 2 and memory stays at 2048 MiB; on a six-core Jetson Orin Nano, three-run median scrolling rose from 4.92 to 9.16 fps at 4 vCPUs, with little further gain at 5 (9.50 fps).
+
 The source-home Browser display path is WebRTC-only. It runs inside the
 per-launch Browser VM and uses Runtime-owned Exit/control/wallet boundaries; it
 is not a host-browser fallback. Runtime-frame display is not a source-home
