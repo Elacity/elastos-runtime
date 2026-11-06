@@ -153,3 +153,7 @@ scripts/dev/dkms-docker/shared
 
 # Local rehearsal and review output; never part of the repository.
 /output/
+
+# Verification-skill evidence. Transcripts stay on disk after cleanup and are not source.
+/artifacts/verify-elastos/
+/artifacts/verify-localhost-authority/
