@@ -38,6 +38,7 @@ release() {
   python3 scripts/release-platform-input-test.py
   python3 scripts/prepare-release-platform-test.py
   python3 scripts/browser-vm-linux-network.test.py
+  python3 scripts/browser-root-helper.test.py
   python3 scripts/owned-removal-test.py
   python3 scripts/setup-source-home-native-browser-test.py
   bash scripts/setup-source-home-browser-artifacts-smoke.sh

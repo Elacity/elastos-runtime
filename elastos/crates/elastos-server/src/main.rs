@@ -459,6 +459,10 @@ enum Commands {
 
     /// Install Home
     Setup {
+        /// Turn on Browser on a supported Linux host (asks for administrator access)
+        #[arg(long, conflicts_with_all = ["profile", "with", "without", "list", "prerequisites_only", "media_tools_dir", "isolated"])]
+        browser: bool,
+
         /// Developer: install a named components.json profile instead of `home`
         #[arg(long, hide = true)]
         profile: Option<String>,
@@ -1586,6 +1590,7 @@ async fn run() -> anyhow::Result<()> {
         }
 
         Commands::Setup {
+            browser,
             profile,
             with,
             without,
@@ -1594,6 +1599,10 @@ async fn run() -> anyhow::Result<()> {
             media_tools_dir,
             isolated,
         } => {
+            if browser {
+                setup::enable_browser().await?;
+                return Ok(());
+            }
             if isolated {
                 setup::choose_isolated_collaboration()?;
             }
@@ -2597,6 +2606,25 @@ mod tests {
         let mut approved_rotation = args.to_vec();
         approved_rotation.push("--allow-signer-rotation");
         assert!(super::Cli::try_parse_from(approved_rotation).is_ok());
+    }
+
+    #[test]
+    fn linux_browser_opt_in_is_an_explicit_setup_command() {
+        let cli = super::Cli::try_parse_from(["elastos", "setup", "--browser"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Setup { browser: true, .. })
+        ));
+        for option in [
+            "--list",
+            "--isolated",
+            "--prerequisites-only",
+            "--profile=home",
+            "--with=browser",
+            "--without=browser",
+        ] {
+            assert!(super::Cli::try_parse_from(["elastos", "setup", "--browser", option]).is_err());
+        }
     }
 
     #[test]

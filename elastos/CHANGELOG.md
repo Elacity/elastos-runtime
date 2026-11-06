@@ -13,6 +13,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 ### Fixed
 
 - On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.
+- On Linux, Browser is turned on when you choose it, not during install.
 - Open apps, including Chat, stay connected while Home runs, and reconnect by themselves after a network drop or a restart.
 - The installer uses numeric process age to verify and stop a running Home with any time locale (#517).
 - The installer repairs group-writable files in an older Home that you own and gives one ownership repair command for root-owned installation files (#516).
