@@ -6,6 +6,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- System, About lets you choose Stable or test versions for updates.
+
 ### Fixed
 
 - On a Jetson, Browser uses more of the processor, so scrolling is about twice as smooth.

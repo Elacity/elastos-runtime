@@ -122,6 +122,15 @@ pub struct OperatorNodeStatus {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateVersionStatus {
+    #[default]
+    Current,
+    Available,
+    InstalledNewer,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OperatorUpdateCheck {
     pub source_name: String,
@@ -129,6 +138,8 @@ pub struct OperatorUpdateCheck {
     pub current_version: String,
     pub latest_version: String,
     pub update_available: bool,
+    #[serde(default)]
+    pub version_status: UpdateVersionStatus,
     pub discovery: String,
     #[serde(default)]
     pub head_cid: Option<String>,
@@ -690,21 +701,19 @@ fn verified_update_check(
             changes
         }
     };
-    let update_available =
+    let version_status =
         match crate::update::compare_release_versions(&source.installed_version, latest_version)? {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Equal => false,
-            std::cmp::Ordering::Less => anyhow::bail!(
-                "Signed release {latest_version} is older than installed release {}",
-                source.installed_version
-            ),
+            std::cmp::Ordering::Greater => UpdateVersionStatus::Available,
+            std::cmp::Ordering::Equal => UpdateVersionStatus::Current,
+            std::cmp::Ordering::Less => UpdateVersionStatus::InstalledNewer,
         };
     Ok(OperatorUpdateCheck {
         source_name: source.name.clone(),
         channel: channel.to_owned(),
         current_version: source.installed_version.clone(),
         latest_version: latest_version.to_owned(),
-        update_available,
+        update_available: version_status == UpdateVersionStatus::Available,
+        version_status,
         discovery: "Carrier".to_string(),
         head_cid: discovered.head_cid.clone(),
         release_cid: Some(release_cid.to_owned()),
@@ -2125,6 +2134,21 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.publisher_did.is_empty() && legacy.changes.is_empty());
+    }
+
+    #[test]
+    fn signed_update_check_reports_older_release_without_an_offer() {
+        let (mut source, head, release) = signed_check_fixture(|_| {}, |_| {});
+        source.installed_version = "0.8.0-rc.1".into();
+        let check = verified_update_check(&source, &head, &release).unwrap();
+        assert!(!check.update_available);
+        assert_eq!(check.version_status, UpdateVersionStatus::InstalledNewer);
+        assert_eq!(
+            serde_json::to_value(&check).unwrap()["version_status"],
+            "installed_newer"
+        );
+        assert_eq!(check.latest_version, "0.7.2");
+        assert_eq!(check.head_cid, head.head_cid);
     }
 
     #[test]

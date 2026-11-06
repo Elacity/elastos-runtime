@@ -159,6 +159,42 @@ impl Fixture {
 }
 
 #[test]
+fn installer_candidate_refuses_mismatched_source_channel() {
+    for signed_channel in ["stable", "canary"] {
+        let mut fixture = Fixture::new();
+        let mut release: Value = serde_json::from_slice(&fixture.release).unwrap();
+        release["payload"]["channel"] = json!(signed_channel);
+        fixture.release = signed(release["payload"].take(), "elastos.release.v1", 71);
+        let mut head: Value = serde_json::from_slice(&fixture.head).unwrap();
+        head["payload"]["channel"] = json!(signed_channel);
+        head["payload"]["latest_release_cid"] = json!(raw_cid(&fixture.release));
+        head["payload"]["release_sha256"] = json!(hex::encode(Sha256::digest(&fixture.release)));
+        fixture.head = signed(head["payload"].take(), "elastos.release.head.v1", 71);
+        fixture.source.head_cid = raw_cid(&fixture.head);
+        for subscription in ["stable", "canary", "jetson-test"] {
+            fixture.source.channel = subscription.into();
+            let result = admit_candidate(
+                &fixture.binary,
+                &fixture.source,
+                &fs::read(&fixture.binary).unwrap(),
+                &fixture.head,
+                &fixture.release,
+            );
+            let allowed = subscription == signed_channel
+                || (subscription == "canary" && signed_channel == "stable");
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "{subscription} -> {signed_channel}"
+            );
+            if !allowed {
+                assert!(result.unwrap_err().to_string().contains("subscription"));
+            }
+        }
+    }
+}
+
+#[test]
 fn migration_preserves_publisher_and_consumed_pair_remains_authoritative() {
     let fixture = Fixture::new();
     let result = fixture.load().unwrap();
@@ -253,7 +289,10 @@ fn complete_pair_admission_refuses_every_changed_binding_before_migration() {
             "release signer" => {
                 fixture.release = signed(release["payload"].take(), "elastos.release.v1", 72)
             }
-            "channel" => fixture.source.channel = "jetson-test".into(),
+            "channel" => {
+                head["payload"]["channel"] = json!("canary");
+                fixture.head = signed(head["payload"].take(), "elastos.release.head.v1", 71);
+            }
             "version" => fixture.source.installed_version = "0.7.1".into(),
             "head cid" => fixture.source.head_cid = raw_cid(b"other head"),
             "release cid" => {
