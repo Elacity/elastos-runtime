@@ -87,7 +87,7 @@ pub(super) struct BrowserProviderResourceCall {
 }
 
 #[derive(Debug)]
-struct BrowserOpenFailure {
+pub(in crate::api::gateway) struct BrowserOpenFailure {
     status: StatusCode,
     body: BrowserOpenFailureBody,
     outcome: serde_json::Value,
@@ -194,7 +194,7 @@ impl BrowserOpenFailure {
         (status, Json(self.status_value())).into_response()
     }
 
-    fn status_value(&self) -> serde_json::Value {
+    pub(in crate::api::gateway) fn status_value(&self) -> serde_json::Value {
         let mut value = match &self.body {
             BrowserOpenFailureBody::Text(message) => serde_json::json!({
                 "schema": "elastos.browser.open-error/v1",
@@ -459,6 +459,7 @@ pub(super) async fn browser_app_open(
                     input,
                     home_token,
                     request_origin,
+                    &crate::setup::detect_platform(),
                 )
                 .await
                 {
@@ -485,6 +486,7 @@ pub(super) async fn browser_app_open(
         input,
         home_token,
         request_origin,
+        &crate::setup::detect_platform(),
     )
     .await
     {
@@ -561,13 +563,34 @@ fn browser_open_status_value(open_id: &str, snapshot: BrowserOpenJobSnapshot) ->
     }
 }
 
-async fn execute_browser_open(
+fn browser_host_setup_failure(
+    data: &std::path::Path,
+    platform: &str,
+    adapter_id: Option<&str>,
+) -> Option<BrowserOpenFailure> {
+    if adapter_id.is_some_and(|id| id != "browser-vm-product") {
+        return None;
+    }
+    crate::setup::linux_host_setup_message(data, platform).map(|message| {
+        BrowserOpenFailure::json(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "code": "browser_host_setup_required",
+                "stage": "engine_readiness",
+                "message": message,
+            }),
+        )
+    })
+}
+
+pub(in crate::api::gateway) async fn execute_browser_open(
     state: &GatewayState,
     context: HomeLaunchTokenContext,
     authority: RuntimeWalletAuthority,
     input: BrowserOpenRequest,
     home_token: Option<String>,
     request_origin: Option<String>,
+    platform: &str,
 ) -> Result<serde_json::Value, BrowserOpenFailure> {
     let BrowserOpenRequest {
         url: requested_url,
@@ -595,6 +618,23 @@ async fn execute_browser_open(
             err.to_string(),
         ));
     }
+    let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
+        Ok(value) => value,
+        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+    };
+    if requested_adapter_id
+        .as_deref()
+        .is_none_or(|id| id == "browser-vm-product")
+    {
+        crate::setup::repair_browser_host_components_for_open(&state.data_dir, platform)
+            .await
+            .map_err(|error| BrowserOpenFailure::provider("browser-engine", error))?;
+    }
+    if let Some(failure) =
+        browser_host_setup_failure(&state.data_dir, platform, requested_adapter_id.as_deref())
+    {
+        return Err(failure);
+    }
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
         None => {
@@ -611,10 +651,6 @@ async fn execute_browser_open(
     let open_request_id = browser_effect_request_id("open", &url);
     let stream_nonce = browser_stream_nonce(&open_request_id);
     let remote_exit_id = match browser_remote_exit_id(remote_exit_id) {
-        Ok(value) => value,
-        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
-    };
-    let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
         Ok(value) => value,
         Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
     };
@@ -4626,6 +4662,27 @@ fn browser_display_error_response(error: BrowserDisplayError) -> Response {
 #[cfg(test)]
 mod browser_open_outcome_tests {
     use super::*;
+
+    #[test]
+    fn unprepared_linux_browser_open_explains_setup_and_restart_before_acquiring_effects() {
+        let data = tempfile::tempdir().unwrap();
+        for adapter in [None, Some("browser-vm-product")] {
+            let failure = browser_host_setup_failure(data.path(), "linux-arm64", adapter).unwrap();
+            assert_eq!(failure.status, StatusCode::CONFLICT);
+            let body = failure.status_value();
+            assert_eq!(body["code"], "browser_host_setup_required");
+            assert_eq!(body["stage"], "engine_readiness");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("elastos setup --browser"));
+            assert!(message.contains("close Home and start it again with elastos home --browser"));
+            assert_eq!(body["outcome"]["effects"]["vm_acquired"], false);
+        }
+        assert!(
+            browser_host_setup_failure(data.path(), "linux-arm64", Some("remote-engine")).is_none()
+        );
+        assert!(browser_host_setup_failure(data.path(), "darwin-arm64", None).is_none());
+        assert!(std::fs::read_dir(data.path()).unwrap().next().is_none());
+    }
 
     #[test]
     fn failed_open_serializes_cleanup_pending_separately_from_pre_effect_failure() {

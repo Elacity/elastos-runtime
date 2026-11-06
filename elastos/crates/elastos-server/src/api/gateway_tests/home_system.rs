@@ -1688,7 +1688,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(wallet["attach_kind"], "iframe");
     assert_eq!(wallet["target_kind"], "app");
     let browser = targets.iter().find(|target| target["target"] == "browser");
-    if crate::setup::home_browser_available(dir.path(), &crate::setup::detect_platform()) {
+    if crate::setup::browser_available(&crate::setup::detect_platform()) {
         let browser = browser.expect("browser target");
         assert_eq!(browser["role"], "app");
         assert_eq!(browser["title"], "Browser");
@@ -1699,7 +1699,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     } else {
         assert!(
             browser.is_none(),
-            "Browser is hidden on hosts without a local Engine"
+            "Browser is hidden on unsupported platforms"
         );
     }
     assert!(targets
