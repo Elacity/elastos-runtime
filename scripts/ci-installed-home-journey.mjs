@@ -5,6 +5,7 @@ import { appendFileSync, readFileSync, statfsSync, writeFileSync, renameSync } f
 import { join } from "node:path";
 import { applyRunEventsPage, terminalOutputText } from "../capsules/assistant/browser/model-contract.js";
 import { assertJourneyEqual, publicJourneyFailure } from "./ci-installed-home-failure.mjs";
+import { stopInstalledModelRun } from "./ci-installed-home-model-stop.mjs";
 import { openInstalledApp, openInstalledAssistant, reopenInstalledAssistant, resizeInstalledHome, returnInstalledHome } from "./ci-installed-home-navigation.mjs";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -237,20 +238,8 @@ async function repairJourney(assistant, offer) {
   subcheck = "stop_real_stream";
   await assistant.locator("#agent-harness-new-chat").click();
   await configureTokens(assistant, 1024);
-  const owner = await startResourceTurn(assistant, offer,
-    "Write a numbered list from 1 to 1000. Each item must say hello and give one detail. Continue the list without an introduction or conclusion.", 1024);
-  assertJourneyEqual("stop_create_terminal", Boolean(owner.run.terminal), false);
-  await resourceAction("engine_running");
-  await assistant.waitForFunction(() => /\S/.test([...document.querySelectorAll(".agent-msg-agent .agent-msg-body")].at(-1)?.innerText ?? ""), null, { timeout: 60000 });
-  const cancelled = page.waitForResponse(response => response.url().endsWith("/api/provider/model/runs_cancel") &&
-    response.request().frame() === assistant && response.request().postDataJSON()?.run_id === owner.run.run_id, { timeout: 30000 });
-  cancelled.catch(() => {});
-  await assistant.locator('#agent-composer-send[data-mode="stop"]').click();
-  assertJourneyEqual("stop_cancel_http_ok", (await cancelled).ok(), true);
-  assertJourneyEqual("stop_terminal_status", (await owner.terminal).status, "cancelled");
-  const closed = await resourceAction("engine_stopped");
-  assertJourneyEqual("stop_whole_engine_exit", closed.whole_engine_exit, true);
-  assertJourneyEqual("stop_runtime_unchanged", closed.runtime_unchanged, true);
+  const owner = await stopInstalledModelRun({ assistant, resourceAction, startTurn: () => startResourceTurn(assistant, offer,
+    "Write a numbered list from 1 to 1000. Each item must say hello and give one detail. Continue the list without an introduction or conclusion.", 1024) });
   modelRepair.stop = { run_id: owner.run.run_id, status: "cancelled", production_guard: true, whole_engine_exit: true };
   await page.screenshot({ path: join(evidence, "repair-stop.png"), fullPage: true });
   subcheck = "get_other_model";
