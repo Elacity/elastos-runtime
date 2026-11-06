@@ -487,23 +487,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         .merge(capsule_mgmt_routes)
         .layer(cors.clone());
 
-    // Add test endpoints in debug builds
-    #[cfg(debug_assertions)]
-    {
-        use crate::api::handlers::test_helpers::{create_test_session, TestState};
-
-        let test_state = TestState {
-            session_registry: session_registry.clone(),
-        };
-
-        let test_routes = Router::new()
-            .route("/api/test/create-session", post(create_test_session))
-            .with_state(test_state);
-
-        app = app.merge(test_routes);
-        tracing::info!("Test endpoints enabled (debug build)");
-    }
-
     app = attach_public_capsule_data(app, data_dir.as_deref());
 
     // Add static file serving for web capsules if directory is provided
