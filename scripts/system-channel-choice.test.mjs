@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chromium, brave, jsonResponse, makeAppearanceRecord, makeSystemSummary, startSystemFixtureServer } from "./system-uiux-fixture.mjs";
+import { chromium, jsonResponse, makeAppearanceRecord, makeSystemSummary, startSystemFixtureServer } from "./system-uiux-fixture.mjs";
 
 test("System channel choice confirms the exact owner intent, refreshes offers and keeps a test install", async () => {
   let channel = "canary", role = "admin", reads = 0, refuse = false, phase = "ready";
@@ -39,7 +39,7 @@ test("System channel choice confirms the exact owner intent, refreshes offers an
       return false;
     },
   });
-  const browser = await chromium.launch({ executablePath:brave, headless:true });
+  const browser = await chromium.launch({ headless:true });
   try {
     const page = await browser.newPage({viewport:{width:390,height:844}});
     async function open(busy = false) {
