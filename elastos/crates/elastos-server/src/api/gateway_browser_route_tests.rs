@@ -9748,3 +9748,134 @@ async fn test_browser_operator_inspection_fill_bootstrap_and_detach_scope() {
         );
     }
 }
+
+#[tokio::test]
+async fn browser_open_repairs_missing_helpers_after_viewer_load() {
+    browser_open_repairs_helpers_after_viewer_load(false, true, None).await;
+}
+
+#[tokio::test]
+async fn browser_open_repairs_stale_helpers_after_viewer_load() {
+    browser_open_repairs_helpers_after_viewer_load(true, true, Some("browser-vm-product")).await;
+}
+
+#[tokio::test]
+async fn browser_open_fresh_linux_home_refuses_before_helper_acquisition() {
+    browser_open_repairs_helpers_after_viewer_load(false, false, None).await;
+}
+
+#[tokio::test]
+async fn browser_open_fresh_linux_home_refuses_before_helper_acquisition_with_padded_adapter() {
+    browser_open_repairs_helpers_after_viewer_load(false, false, Some(" browser-vm-product "))
+        .await;
+}
+
+async fn browser_open_repairs_helpers_after_viewer_load(
+    stale: bool,
+    enabled: bool,
+    adapter_id: Option<&str>,
+) {
+    use sha2::Digest as _;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(data.join("config")).unwrap();
+    std::fs::write(
+        data.join("config/browser-engine-adapter.json"),
+        serde_json::to_vec(
+            &json!({"adapters":[{"kind":"chromium_microvm","supervisor":{
+                "program":data.join("bin/browser-vz-engine-supervisor")
+            }}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let helpers = [
+        ("browser-vz-engine-supervisor", "bin/browser-vz-engine-supervisor",
+         b"#!/bin/sh\nprintf '%s' '{\"schema\":\"elastos.browser.vm-host-capabilities/v1\",\"available\":false}'\n".as_slice()),
+        ("browser-vm-linux-network", "scripts/browser-vm-linux-network.py", b"# admitted network helper\n".as_slice()),
+    ];
+    let mut manifest = json!({"schema":"elastos.components/v1", "capsules":{},
+        "profiles":{"browser-host":{"components":["browser-vz-engine-supervisor","browser-vm-linux-network"]}},
+        "external":{}});
+    let mut artifacts = HashMap::new();
+    for (name, relative, bytes) in helpers {
+        let digest = Sha256::digest(bytes);
+        let cid = cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap(),
+        )
+        .to_string();
+        manifest["external"][name] = json!({"install_path":relative,"platforms":{"*":{
+            "release_path":name,"checksum":format!("sha256:{digest:x}"),"size":bytes.len(),"cid":cid
+        }}});
+        artifacts.insert(cid, bytes.to_vec());
+        let path = data.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        data.join("components.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let source = serde_json::from_value(json!({"name":"fixture",
+        "publisher_dids":[elastos_identity::derive_did(&[217;32]).1],
+        "connect_ticket":"", "publisher_node_id":""}))
+    .unwrap();
+    let (_, server, serving) =
+        crate::setup::tests::carrier_cid_source(&data, &source, artifacts).await;
+    let owner = passkey_authority_with_name(&data, Some("helper-repair"));
+    // The viewer already holds its launch token. Open must repair independently
+    // of the capsule's earlier Home launch preparation.
+    let token = app_token_for_authority(&data, BROWSER_CAPSULE_ID, &owner);
+    let authority = runtime_wallet_authority_for_app_token(&data, BROWSER_CAPSULE_ID, &token);
+    let state = browser_engine_attached_test_state(&data).await;
+    for (_, relative, bytes) in helpers {
+        if stale {
+            std::fs::write(data.join(relative), vec![b'x'; bytes.len()]).unwrap();
+        } else {
+            std::fs::remove_file(data.join(relative)).unwrap();
+        }
+    }
+    if !enabled {
+        std::fs::remove_file(data.join("config/browser-engine-adapter.json")).unwrap();
+    }
+    let input = serde_json::from_value(
+        json!({"url":"https://example.com/", "adapter_id":adapter_id,
+        "display_mode":"webrtc_remote_display", "guarantee_level":"operator_rbi"}),
+    )
+    .unwrap();
+    let result = super::super::gateway_browser::execute_browser_open(
+        &state,
+        authority.home_launch_context(),
+        authority,
+        input,
+        Some(token),
+        Some("null".into()),
+        "linux-arm64",
+    )
+    .await;
+    // This fixture deliberately has no host capability. Repair must finish
+    // before that refusal, while image acquisition and VM effects stay gated.
+    let failure = result.unwrap_err();
+    assert_eq!(
+        failure.status_value()["code"],
+        "browser_host_setup_required"
+    );
+    for (_, relative, bytes) in helpers {
+        if enabled {
+            assert_eq!(
+                std::fs::read(data.join(relative)).ok().as_deref(),
+                Some(bytes),
+                "Open must repair {relative}"
+            );
+        } else {
+            assert!(!data.join(relative).exists());
+        }
+    }
+    assert!(!data.join("browser-vm").exists());
+    server.close().await;
+    assert_eq!(serving.await.unwrap().len(), if enabled { 2 } else { 0 });
+}

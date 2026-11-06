@@ -87,7 +87,7 @@ pub(super) struct BrowserProviderResourceCall {
 }
 
 #[derive(Debug)]
-struct BrowserOpenFailure {
+pub(in crate::api::gateway) struct BrowserOpenFailure {
     status: StatusCode,
     body: BrowserOpenFailureBody,
     outcome: serde_json::Value,
@@ -194,7 +194,7 @@ impl BrowserOpenFailure {
         (status, Json(self.status_value())).into_response()
     }
 
-    fn status_value(&self) -> serde_json::Value {
+    pub(in crate::api::gateway) fn status_value(&self) -> serde_json::Value {
         let mut value = match &self.body {
             BrowserOpenFailureBody::Text(message) => serde_json::json!({
                 "schema": "elastos.browser.open-error/v1",
@@ -459,6 +459,7 @@ pub(super) async fn browser_app_open(
                     input,
                     home_token,
                     request_origin,
+                    &crate::setup::detect_platform(),
                 )
                 .await
                 {
@@ -485,6 +486,7 @@ pub(super) async fn browser_app_open(
         input,
         home_token,
         request_origin,
+        &crate::setup::detect_platform(),
     )
     .await
     {
@@ -581,13 +583,14 @@ fn browser_host_setup_failure(
     })
 }
 
-async fn execute_browser_open(
+pub(in crate::api::gateway) async fn execute_browser_open(
     state: &GatewayState,
     context: HomeLaunchTokenContext,
     authority: RuntimeWalletAuthority,
     input: BrowserOpenRequest,
     home_token: Option<String>,
     request_origin: Option<String>,
+    platform: &str,
 ) -> Result<serde_json::Value, BrowserOpenFailure> {
     let BrowserOpenRequest {
         url: requested_url,
@@ -615,11 +618,21 @@ async fn execute_browser_open(
             err.to_string(),
         ));
     }
-    if let Some(failure) = browser_host_setup_failure(
-        &state.data_dir,
-        &crate::setup::detect_platform(),
-        adapter_id.as_deref(),
-    ) {
+    let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
+        Ok(value) => value,
+        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+    };
+    if requested_adapter_id
+        .as_deref()
+        .is_none_or(|id| id == "browser-vm-product")
+    {
+        crate::setup::repair_browser_host_components_for_open(&state.data_dir, platform)
+            .await
+            .map_err(|error| BrowserOpenFailure::provider("browser-engine", error))?;
+    }
+    if let Some(failure) =
+        browser_host_setup_failure(&state.data_dir, platform, requested_adapter_id.as_deref())
+    {
         return Err(failure);
     }
     let registry = match state.provider_registry.as_ref().cloned() {
@@ -638,10 +651,6 @@ async fn execute_browser_open(
     let open_request_id = browser_effect_request_id("open", &url);
     let stream_nonce = browser_stream_nonce(&open_request_id);
     let remote_exit_id = match browser_remote_exit_id(remote_exit_id) {
-        Ok(value) => value,
-        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
-    };
-    let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
         Ok(value) => value,
         Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
     };

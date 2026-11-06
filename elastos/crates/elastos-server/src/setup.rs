@@ -17,6 +17,7 @@ use std::process::Command;
 mod browser_config;
 pub use browser_config::browser_available;
 pub(crate) use browser_config::linux_host_setup_message;
+pub(crate) use browser_config::repair_browser_host_components_for_open;
 mod browser_linux;
 mod browser_vm_image;
 pub(crate) use browser_vm_image::start_background_verification as start_browser_image_verification;

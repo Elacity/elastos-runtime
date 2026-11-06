@@ -13,6 +13,30 @@ const CONFIG_FILES: [&str; 4] = [
 ];
 const RETIRED_SELECTION: &[u8] = b"{\"adapters\": []}\n";
 
+/// A loaded viewer can Open again after a helper was removed or updated.
+/// An existing local selection grants repair; a fresh Home keeps its opt-in gate.
+pub(crate) async fn repair_browser_host_components_for_open(
+    data: &Path,
+    platform: &str,
+) -> anyhow::Result<()> {
+    if !local_vm_configured(data, platform)? {
+        return Ok(());
+    }
+    let bytes = match fs::read(data.join("components.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest = serde_json::from_slice(&bytes)?;
+    ensure_host_components(
+        data,
+        &manifest,
+        platform,
+        super::FirstPartyCarrierContext::Runtime,
+    )
+    .await
+}
+
 /// Opening Browser admits its host support files from the installed signed release.
 /// The base Home profile stays small; each helper keeps the normal checksum gate.
 pub(super) async fn ensure_host_components(
