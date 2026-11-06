@@ -1,7 +1,10 @@
 use super::*;
 
 fn home_projection_token_error(err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
-    if err.to_string() == "home launch token auth session is not active" {
+    if err
+        .downcast_ref::<gateway_home_token::HomeLaunchSessionInactive>()
+        .is_some()
+    {
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "invalid or expired session" })),
@@ -1941,6 +1944,20 @@ mod tests {
             home_projection_token_error(anyhow::anyhow!("failed to load signing key"));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"], "failed to load signing key");
+    }
+
+    #[test]
+    fn home_token_projection_error_mapping_is_type_based() {
+        // The mapping must key off the marker type, not the message string.
+        let (status, Json(body)) = home_projection_token_error(
+            anyhow::Error::new(gateway_home_token::HomeLaunchSessionInactive)
+                .context("some different wording"),
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid or expired session");
+
+        let (status, _) = home_projection_token_error(anyhow::anyhow!("unrelated failure"));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
