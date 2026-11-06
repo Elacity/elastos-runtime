@@ -1,7 +1,194 @@
 use super::*;
 
+fn browser_open_response_consumers(status: StatusCode, body: &[u8]) -> serde_json::Value {
+    use std::io::Write;
+    let mut child = std::process::Command::new("node")
+        .args([
+            "--input-type=module",
+            "-e",
+            r#"
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const root = process.argv[1];
+const { friendlyOpenError, isAuthoritySessionError, runtimeOpenOutcome } =
+  await import(pathToFileURL(`${root}/capsules/browser/browser/browser-status.js`));
+const { browserOpenResponseEvidence } =
+  await import(pathToFileURL(`${root}/scripts/lib/browser-open-failure.mjs`));
+const { createRuntimeApi } =
+  await import(pathToFileURL(`${root}/capsules/browser/browser/browser-runtime-api.js`));
+const { status, body } = JSON.parse(readFileSync(0, 'utf8'));
+globalThis.fetch = async () => new Response(body, { status });
+let error;
+try { await createRuntimeApi({}).fetchJson('/api/apps/browser/open'); }
+catch (failure) { error = failure; }
+console.log(JSON.stringify({
+  authority: isAuthoritySessionError(error), message: friendlyOpenError(error),
+  outcome: runtimeOpenOutcome(error),
+  evidence: await browserOpenResponseEvidence({
+    json: async () => JSON.parse(body), text: async () => body,
+  }),
+}));
+"#,
+        ])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"status": status.as_u16(), "body": std::str::from_utf8(body).unwrap()})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn test_browser_open_expired_token_reopens_from_home_without_engine_warning() {
+    let Some(log) = browser_open_route_log(
+        "test_browser_open_expired_token_reopens_from_home_without_engine_warning",
+    ) else {
+        return;
+    };
+    for after_admission in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = passkey_authority(dir.path());
+        let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+        let context =
+            runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &token)
+                .home_launch_context();
+        let (app, token) = if after_admission {
+            (gateway_router(test_state(dir.path())), token)
+        } else {
+            // Mount the route itself: the outer admission gate deliberately
+            // gives an already-expired token a generic refusal.
+            (
+                axum::Router::new()
+                    .route(
+                        "/api/apps/browser/open",
+                        axum::routing::post(gateway_browser::browser_app_open),
+                    )
+                    .with_state(test_state(dir.path())),
+                issue_expired_home_launch_token_with_context(
+                    dir.path(),
+                    BROWSER_CAPSULE_ID,
+                    &context,
+                )
+                .unwrap(),
+            )
+        };
+        let data_dir = dir.path().to_path_buf();
+        let body = Body::from_stream(futures_lite::stream::unfold(
+            Some((data_dir, context)),
+            move |state| async move {
+                let (data_dir, context) = state?;
+                if after_admission {
+                    // Real gateway admission passes first. Expire sign-in when
+                    // JSON extraction reads the body, before the handler checks it.
+                    let now = crate::auth::now_ts();
+                    let mut grant =
+                        crate::auth::load_active_session_grant(&data_dir, &context.session_id, now)
+                            .unwrap();
+                    grant.expires_at = now;
+                    crate::auth::store_session_grant(&data_dir, grant).unwrap();
+                }
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                br#"{"url":"https://example.com/","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","async_open":true}"#,
+            )), None))
+            },
+        ));
+        let response = app
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 32768)
+            .await
+            .unwrap();
+        let consumer = browser_open_response_consumers(status, &body);
+        assert_eq!(
+            consumer["authority"],
+            true,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            consumer["message"],
+            "Browser session expired. Reopening from Home..."
+        );
+    }
+    assert!(!String::from_utf8(log.lock().unwrap().clone())
+        .unwrap()
+        .contains("Browser Engine open failed"));
+}
+
 #[derive(Clone)]
 struct BrowserOpenLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[tokio::test]
+async fn test_browser_open_validation_errors_do_not_warn_about_engine_failure() {
+    let Some(log) = browser_open_route_log(
+        "test_browser_open_validation_errors_do_not_warn_about_engine_failure",
+    ) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let app = gateway_router(test_state(dir.path()));
+    for mut input in [
+        json!({"url":"file:///private/browser"}),
+        json!({"url":"https://example.com/", "display_mode":"native_surface"}),
+        json!({"url":"https://example.com/", "async_open":true, "browser_instance":"invalid"}),
+    ] {
+        input
+            .as_object_mut()
+            .unwrap()
+            .entry("display_mode")
+            .or_insert(json!("webrtc_remote_display"));
+        input["guarantee_level"] = json!("operator_rbi");
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/browser/open")
+                    .header("x-elastos-home-token", token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(input.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let captured = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(
+        !captured.contains("Browser Engine open failed"),
+        "{captured}"
+    );
+}
 
 impl std::io::Write for BrowserOpenLogWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2213,14 +2400,16 @@ async fn test_browser_async_open_rejects_second_owner_for_same_browser_instance(
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
         .await
         .unwrap();
-    let conflict: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-    assert_eq!(conflict["schema"], "elastos.browser.open-error/v1");
-    assert_eq!(conflict["code"], "runtime_error");
-    assert_eq!(conflict["http_status"], 409);
-    assert_eq!(conflict["outcome"]["state"], "terminal_pre_effect_failure");
     assert_eq!(
-        conflict["message"],
+        std::str::from_utf8(&second_body).unwrap(),
         "Browser instance already owns an active or in-flight open"
+    );
+    let consumer = browser_open_response_consumers(StatusCode::CONFLICT, &second_body);
+    assert_eq!(consumer["outcome"], serde_json::Value::Null);
+    assert_eq!(consumer["authority"], false);
+    assert_eq!(
+        consumer["evidence"]["admission_reason"],
+        "instance_open_in_flight"
     );
 
     for _ in 0..20 {

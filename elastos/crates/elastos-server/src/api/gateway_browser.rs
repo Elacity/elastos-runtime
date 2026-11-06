@@ -299,9 +299,26 @@ impl BrowserOpenFailure {
             "exit" => Self::message(
                 status,
                 BrowserOpenFailureCode::ProviderError,
-                "exit provider unavailable. No Browser Exit provider is configured.",
+                match diagnostic.to_string().as_str() {
+                    "Remote Carrier Exit is not permitted for this principal" =>
+                        "Remote Carrier Exit is not permitted for this principal",
+                    "Remote Carrier Exit active stream quota is exhausted" =>
+                        "Remote Carrier Exit active stream quota is exhausted",
+                    "Remote Carrier Exit grant is expired" =>
+                        "Remote Carrier Exit grant is expired",
+                    "No Browser Exit backend is configured for open_stream; exit-provider refuses direct host networking" =>
+                        "No Browser Exit backend is configured for open_stream; exit-provider refuses direct host networking",
+                    _ => "exit provider unavailable.",
+                },
                 diagnostic,
             ),
+            "browser" if diagnostic.to_string() == "Runtime viewer ingress capacity unavailable" =>
+                Self::message(
+                    status,
+                    BrowserOpenFailureCode::RuntimeError,
+                    "Runtime viewer ingress capacity unavailable",
+                    diagnostic,
+                ),
             _ => Self::message(
                 status,
                 BrowserOpenFailureCode::ProviderError,
@@ -361,12 +378,19 @@ impl BrowserOpenFailure {
         let code = value["code"]
             .as_str()
             .expect("closed Browser open failure code");
-        tracing::warn!(
-            status = status.as_u16(),
+        if matches!(
             code,
-            error = %format!("{:#}", self.diagnostic),
-            "Browser Engine open failed"
-        );
+            "request_rejected" | "runtime_error" | "profile_transfer_required"
+        ) {
+            tracing::debug!(status = status.as_u16(), code, "Browser open rejected");
+        } else {
+            tracing::warn!(
+                status = status.as_u16(),
+                code,
+                error = %format!("{:#}", self.diagnostic),
+                "Browser Engine open failed"
+            );
+        }
         value["schema"] = serde_json::json!("elastos.browser.open-error/v1");
         value["ok"] = serde_json::json!(false);
         value["outcome"] = outcome;
@@ -575,7 +599,7 @@ pub(super) async fn browser_app_open(
     let authority =
         match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
             Ok(authority) => authority,
-            Err(err) => return BrowserOpenFailure::provider("browser", err).into_response(),
+            Err(err) => return gateway_provider_error_response("browser", err),
         };
     let context = authority.home_launch_context();
     let home_token = home_launch_token_header(&headers);
@@ -608,9 +632,7 @@ pub(super) async fn browser_app_open(
         .await
         {
             Ok(reservation) => reservation,
-            Err((status, message)) => {
-                return BrowserOpenFailure::runtime(status, message).into_response()
-            }
+            Err((status, message)) => return (status, message).into_response(),
         };
         let job = reservation.handle;
         let open_id = job.id.clone();
@@ -1006,7 +1028,6 @@ async fn execute_browser_open(
             &profile, &stream_session, &serde_json::json!({"url":url,"viewport":viewport,"display_mode":display_mode,"guarantee_level":guarantee_level,
                 "owner_launch_id":authority.verified_context().launch_id(),"browser_instance":browser_instance})).await
             .map(|(transport, viewer)| {remote_viewer = Some(viewer); Some(transport)})
-            .map_err(|error| error.to_string())
     } else {
         prepare_browser_vz_transport_launch(
             &state.data_dir,
@@ -1023,10 +1044,11 @@ async fn execute_browser_open(
                     .unwrap_or_default(),
             },
         )
+        .map_err(anyhow::Error::msg)
     };
     let vz_transport_launch = match prepared_transport {
         Ok(launch) => launch,
-        Err(message) => {
+        Err(error) => {
             let outcome = release_browser_open_resources(
                 state,
                 &launch_reservation,
@@ -1034,10 +1056,7 @@ async fn execute_browser_open(
                 false,
             )
             .await;
-            return Err(
-                BrowserOpenFailure::provider("browser", anyhow::anyhow!(message))
-                    .with_outcome(outcome),
-            );
+            return Err(BrowserOpenFailure::provider("browser", error).with_outcome(outcome));
         }
     };
     if let Some(transport) = vz_transport_launch.as_ref() {
@@ -4844,6 +4863,40 @@ fn browser_display_error_response(error: BrowserDisplayError) -> Response {
 #[cfg(test)]
 mod browser_open_outcome_tests {
     use super::*;
+
+    #[test]
+    fn runtime_viewer_ingress_capacity_copy_keeps_its_cause_private() {
+        let diagnostic = anyhow::anyhow!("private listener configuration")
+            .context("Runtime viewer ingress capacity unavailable");
+        let failure = BrowserOpenFailure::provider("browser", diagnostic);
+        assert_eq!(failure.diagnostic.chain().count(), 2);
+        let public = failure.status_value();
+        assert_eq!(
+            public["message"],
+            "Runtime viewer ingress capacity unavailable"
+        );
+        assert!(!public
+            .to_string()
+            .contains("private listener configuration"));
+    }
+
+    #[test]
+    fn exit_failure_copy_preserves_each_known_reason_and_keeps_diagnostics_private() {
+        for message in [
+            "Remote Carrier Exit is not permitted for this principal",
+            "Remote Carrier Exit active stream quota is exhausted",
+            "Remote Carrier Exit grant is expired",
+            "No Browser Exit backend is configured for open_stream; exit-provider refuses direct host networking",
+        ] {
+            let public = BrowserOpenFailure::provider("exit", anyhow::anyhow!(message)).status_value();
+            assert_eq!(public["message"], message);
+        }
+        let public = BrowserOpenFailure::provider("exit", anyhow::anyhow!(
+            "exit provider unavailable: No Browser Exit provider is configured for stream; /private/exit/socket failed"
+        )).status_value();
+        assert_eq!(public["message"], "exit provider unavailable.");
+        assert!(!public.to_string().contains("/private/exit/socket"));
+    }
 
     #[tokio::test]
     async fn engine_provider_constructor_keeps_all_diagnostics_out_of_response_bodies() {
