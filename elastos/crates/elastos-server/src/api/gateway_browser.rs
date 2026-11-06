@@ -308,6 +308,9 @@ impl BrowserOpenFailure {
                         "Remote Carrier Exit grant is expired",
                     "No Browser Exit backend is configured for open_stream; exit-provider refuses direct host networking" =>
                         "No Browser Exit backend is configured for open_stream; exit-provider refuses direct host networking",
+                    text if text.starts_with("Selected Browser Exit node does not allow host ")
+                        && text.ends_with("; exit-provider refuses direct host networking") =>
+                        "Selected Browser Exit node does not allow this host; exit-provider refuses direct host networking",
                     _ => "exit provider unavailable.",
                 },
                 diagnostic,
@@ -378,11 +381,17 @@ impl BrowserOpenFailure {
         let code = value["code"]
             .as_str()
             .expect("closed Browser open failure code");
-        if matches!(
-            code,
-            "request_rejected" | "runtime_error" | "profile_transfer_required"
-        ) {
+        if matches!(code, "request_rejected" | "profile_transfer_required") {
             tracing::debug!(status = status.as_u16(), code, "Browser open rejected");
+        } else if code == "runtime_error"
+            && value["message"] != "Browser could not open. Try again."
+        {
+            tracing::debug!(
+                status = status.as_u16(),
+                code,
+                error = %format!("{:#}", self.diagnostic),
+                "Browser open rejected"
+            );
         } else {
             tracing::warn!(
                 status = status.as_u16(),
@@ -4898,6 +4907,19 @@ mod browser_open_outcome_tests {
         assert!(!public.to_string().contains("/private/exit/socket"));
     }
 
+    #[test]
+    fn selected_exit_host_refusal_keeps_specific_public_copy() {
+        let diagnostic = anyhow::anyhow!("private Exit configuration").context(
+            "Selected Browser Exit node does not allow host example.com; exit-provider refuses direct host networking"
+        );
+        let public = BrowserOpenFailure::provider("exit", diagnostic).status_value();
+        assert_eq!(
+            public["message"],
+            "Selected Browser Exit node does not allow this host; exit-provider refuses direct host networking"
+        );
+        assert!(!public.to_string().contains("private Exit configuration"));
+    }
+
     #[tokio::test]
     async fn engine_provider_constructor_keeps_all_diagnostics_out_of_response_bodies() {
         for message in [
@@ -4964,7 +4986,7 @@ mod browser_open_outcome_tests {
         let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = LogWriter(std::sync::Arc::clone(&output));
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .without_time()
             .with_writer(move || writer.clone())
@@ -4993,6 +5015,57 @@ mod browser_open_outcome_tests {
             1,
             "{log}"
         );
+
+        for (status, message, outcome, level) in [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Browser effect audit failed: audit storage unavailable",
+                browser_terminal_pre_effect_outcome(),
+                "WARN",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Browser effect audit failed: audit storage unavailable",
+                browser_terminal_post_effect_outcome(),
+                "WARN",
+            ),
+            (
+                StatusCode::CONFLICT,
+                "Browser lifecycle already owns a different open intent",
+                browser_terminal_pre_effect_outcome(),
+                "DEBUG",
+            ),
+        ] {
+            output.lock().unwrap().clear();
+            let mut failure =
+                BrowserOpenFailure::runtime(status, message).with_outcome(outcome.clone());
+            failure.diagnostic = failure.diagnostic.context("private Runtime fault context");
+            assert!(output.lock().unwrap().is_empty());
+            let public = failure.status_value();
+            assert_eq!(public["http_status"], status.as_u16());
+            assert_eq!(public["outcome"], outcome);
+            assert!(!public.to_string().contains("private Runtime fault context"));
+            if level == "WARN" {
+                assert_eq!(public["message"], "Browser could not open. Try again.");
+                assert!(!public.to_string().contains(message));
+            } else {
+                assert_eq!(public["message"], message);
+            }
+            let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert_eq!(log.lines().count(), 1, "{log}");
+            assert!(log.contains(level), "{log}");
+            assert!(log.contains("code=\"runtime_error\""), "{log}");
+            assert!(log.contains("error="), "{log}");
+            assert_eq!(log.matches(message).count(), 1, "{log}");
+            assert_eq!(
+                log.matches("private Runtime fault context").count(),
+                1,
+                "{log}"
+            );
+            if level == "DEBUG" {
+                assert!(!log.contains("WARN"), "{log}");
+            }
+        }
     }
 
     #[test]
