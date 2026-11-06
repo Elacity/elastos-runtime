@@ -342,6 +342,13 @@ where
         _ => false,
     };
     let available = !refused && check.is_some_and(|check| check.update_available);
+    if let Some(check) = check {
+        if let Err(error) =
+            crate::update_check_status::record_home_check(data_dir, check, available)
+        {
+            tracing::warn!("update check status was not recorded: {error:#}");
+        }
+    }
     let can_apply = available
         && require_admin_principal(data_dir, context).is_ok()
         && check.is_some_and(|check| check.head_cid.is_some() && check.release_cid.is_some())

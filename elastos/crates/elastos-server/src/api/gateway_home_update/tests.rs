@@ -605,6 +605,70 @@ async fn system_offers_a_canary_home_its_signers_stable_release_and_binds_that_c
 }
 
 #[tokio::test]
+async fn system_update_summary_posts_one_inbox_notice_for_the_offered_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let _state = test_state(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let context = HomeLaunchTokenContext {
+        principal_id: owner.principal_id,
+        session_id: owner.session_id,
+        proof_binding_id: Some(owner.proof_binding_id),
+        grant_id: owner.grant_id,
+    };
+    configure_update_summary(dir.path());
+    let offer = cached_offer();
+    let cache = tokio::sync::Mutex::new(UpdateCheckCache::default());
+    let mut pending = Some(offer.clone());
+    let summary = loop {
+        let next = pending.take();
+        let summary = system_runtime_update_summary_with_cache(
+            dir.path(),
+            &context,
+            &cache,
+            |_, _, _| async move { next },
+        )
+        .await
+        .unwrap();
+        if summary["checking"] == false {
+            break summary;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(summary["available"], true);
+    let summary = crate::notifications::load_summary(dir.path()).unwrap();
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(
+        summary.entries[0].id,
+        format!("signed-release:{}", offer.release_cid.as_deref().unwrap())
+    );
+    assert_eq!(summary.entries[0].source_app, "system");
+
+    let again =
+        system_runtime_update_summary_with_cache(dir.path(), &context, &cache, |_, _, _| {
+            unexpected_check()
+        })
+        .await
+        .unwrap();
+    assert_eq!(again["available"], true);
+    assert_eq!(
+        crate::notifications::load_summary(dir.path())
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    let status: crate::update_check_status::UpdateCheckStatus = serde_json::from_slice(
+        &std::fs::read(crate::update_check_status::status_path(dir.path())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        status.outcome,
+        crate::update_check_status::UpdateCheckOutcome::UpdateAvailable
+    );
+    assert!(status.offered);
+}
+
+#[tokio::test]
 async fn system_update_summary_explains_newer_test_install_without_offer() {
     for (subscription, current_version, expected_message) in [
         ("stable", "2.1.0-rc.1", "Home has a newer test version than the latest stable release. The next newer stable release will be offered."),

@@ -73,5 +73,6 @@ pub mod supervisor;
 #[cfg(all(test, unix))]
 mod test_support;
 pub mod update;
+pub mod update_check_status;
 pub mod update_controller;
 pub mod vm_provider;

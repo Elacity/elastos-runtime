@@ -1159,6 +1159,31 @@ fn join_release_network(
     Ok(outcome)
 }
 
+fn note_checked_release(
+    data_dir: &Path,
+    outcome: crate::update_check_status::UpdateCheckOutcome,
+    current_version: &str,
+    latest_version: &str,
+    publisher_did: &str,
+    release_cid: Option<&str>,
+    head_cid: Option<&str>,
+    offered: bool,
+) {
+    let status = crate::update_check_status::UpdateCheckStatus {
+        schema: crate::update_check_status::SCHEMA.to_string(),
+        outcome,
+        current_version: current_version.to_string(),
+        latest_version: latest_version.to_string(),
+        publisher_did: publisher_did.to_string(),
+        release_cid: release_cid.map(str::to_string),
+        head_cid: head_cid.map(str::to_string),
+        offered,
+    };
+    if let Err(error) = crate::update_check_status::record_update_check(data_dir, &status) {
+        tracing::warn!("update check status was not recorded: {error:#}");
+    }
+}
+
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -1299,9 +1324,29 @@ async fn run_upgrade_with_restart(
             }
             println!();
             println!("  Installed release is up to date.");
+            note_checked_release(
+                data_dir,
+                crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                &installed_version,
+                version,
+                &signer_did,
+                Some(release_cid),
+                resolved_head_cid,
+                false,
+            );
             return Ok(());
         }
         Ordering::Less if !force => {
+            note_checked_release(
+                data_dir,
+                crate::update_check_status::UpdateCheckOutcome::InstalledNewer,
+                &installed_version,
+                version,
+                &signer_did,
+                Some(release_cid),
+                resolved_head_cid,
+                false,
+            );
             return refused(Err(anyhow::anyhow!(
                 "Signed release {version} is older than installed release {installed_version}; use an explicit rollback command if intended"
             )));
@@ -1351,6 +1396,20 @@ async fn run_upgrade_with_restart(
     if check_only {
         println!();
         println!("  Run `elastos update` to install.");
+        let offered = resolved_head_cid.is_some_and(|head| {
+            crate::update_controller::release_refused(data_dir, head, release_cid).ok()
+                == Some(false)
+        });
+        note_checked_release(
+            data_dir,
+            crate::update_check_status::UpdateCheckOutcome::UpdateAvailable,
+            &installed_version,
+            version,
+            &signer_did,
+            Some(release_cid),
+            resolved_head_cid,
+            offered,
+        );
         return Ok(());
     }
 
@@ -1719,6 +1778,16 @@ async fn run_upgrade_with_restart(
         transaction.commit_checked(|| Ok(()))?;
 
         println!();
+        note_checked_release(
+            data_dir,
+            crate::update_check_status::UpdateCheckOutcome::UpToDate,
+            version,
+            version,
+            &signer_did,
+            Some(release_cid),
+            resolved_head_cid,
+            false,
+        );
         println!("  ElastOS {} installed successfully!", version);
         // A terminal update replaces the binary under any running host, which
         // then exits; nothing restarts Home from here.
@@ -1956,11 +2025,31 @@ async fn run_upgrade_with_restart(
         }
         finish_ready_restart(&transaction)?;
         transaction.finish_restart()?;
+        note_checked_release(
+            data_dir,
+            crate::update_check_status::UpdateCheckOutcome::UpToDate,
+            version,
+            version,
+            &signer_did,
+            Some(release_cid),
+            resolved_head_cid,
+            false,
+        );
         return Ok(());
     }
     activation?;
 
     println!();
+    note_checked_release(
+        data_dir,
+        crate::update_check_status::UpdateCheckOutcome::UpToDate,
+        version,
+        version,
+        &signer_did,
+        Some(release_cid),
+        resolved_head_cid,
+        false,
+    );
     println!(
         "  Runtime {} files are installed. Start Home to check the update.",
         version
