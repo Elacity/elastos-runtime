@@ -4134,10 +4134,13 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
         let backend = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            let mut idle_since = Instant::now();
-            while idle_since.elapsed() < Duration::from_millis(500) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "fixture backend did not finish");
                 match listener.accept() {
                     Ok((mut socket, _)) => {
                         let headers = read_bounded_fixture_headers(&mut socket);
@@ -4151,7 +4154,6 @@ mod tests {
                             .as_bytes(),
                         );
                         let _ = socket.write_all(body);
-                        idle_since = Instant::now();
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
@@ -4164,6 +4166,7 @@ mod tests {
         let read = provider.cat("bafkreimissing", None, None);
         let listed = provider.ls("bafkreimissing");
         let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let requests = backend.join().unwrap();
         assert!(matches!(read, Response::Error { ref code, .. } if code == "cat_failed"));
         assert!(matches!(listed, Response::Error { ref code, .. } if code == "ls_failed"));
