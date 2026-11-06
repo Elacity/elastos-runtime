@@ -577,8 +577,6 @@ pub(crate) fn sync_community_message_notification(
     Ok(unread)
 }
 
-/// One signed release Home can install. A later check for the same release
-/// keeps the existing entry, including a dismissal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignedReleaseOffer {
     Available {

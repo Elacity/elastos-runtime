@@ -1,8 +1,5 @@
-//! The last completed signed-release check, for a supervisor and for Inbox.
-//!
 //! `elastos update --check` exits 0 both when the installed release is current
 //! and when a newer signed release exists. This file is the distinction.
-//! Inbox reads the same record and keeps one notice for the offered release.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -38,8 +35,7 @@ pub struct UpdateCheckStatus {
     pub release_cid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_cid: Option<String>,
-    /// The owner can install this release from System. A refused release stays
-    /// `update_available` and is not offered.
+    /// A refused release stays `update_available` and is not offered.
     pub offered: bool,
 }
 
@@ -80,8 +76,6 @@ pub fn status_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(FILE_NAME)
 }
 
-/// Writes the check and reconciles the Inbox notice. A repeat with the same
-/// bytes leaves the file and the notice unchanged.
 pub fn record_update_check(data_dir: &Path, status: &UpdateCheckStatus) -> anyhow::Result<()> {
     let path = status_path(data_dir);
     let mut bytes = serde_json::to_vec_pretty(status).context("update check status")?;
