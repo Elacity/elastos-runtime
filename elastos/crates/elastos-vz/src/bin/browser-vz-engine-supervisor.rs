@@ -2406,7 +2406,11 @@ impl LaunchPaths {
                 DEFAULT_CONTROL_PORT,
             )?,
             memory_mib: env_u32("ELASTOS_BROWSER_VM_MEMORY_MIB", 2048)?,
-            vcpu_count: env_u32("ELASTOS_BROWSER_VM_VCPUS", 2)? as u8,
+            vcpu_count: browser_vm_vcpu_count(
+                std::env::var("ELASTOS_BROWSER_VM_VCPUS").ok().as_deref(),
+                std::env::consts::OS,
+                thread::available_parallelism().map_or(1, |cpus| cpus.get()),
+            )?,
         })
     }
 }
@@ -3109,6 +3113,24 @@ fn browser_data_dir() -> PathBuf {
 
 fn data_dir_from(selected: Option<PathBuf>) -> PathBuf {
     selected.unwrap_or_else(default_data_dir)
+}
+
+fn browser_vm_vcpu_count(
+    value: Option<&str>,
+    platform: &str,
+    host_cpus: usize,
+) -> Result<u8, String> {
+    match value {
+        Some(value) => value
+            .parse::<u8>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| "ELASTOS_BROWSER_VM_VCPUS must be an integer in 1..255".to_string()),
+        None if platform == "linux" => {
+            Ok(host_cpus.min(host_cpus.saturating_sub(2).clamp(2, 4)) as u8)
+        }
+        None => Ok(2),
+    }
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32, String> {
@@ -5481,6 +5503,46 @@ mod tests {
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn browser_vm_vcpus_linux_reserves_host_capacity() {
+        let actual =
+            [1, 2, 4, 6, 8, 16].map(|cpus| browser_vm_vcpu_count(None, "linux", cpus).unwrap());
+        assert_eq!(actual, [1, 2, 2, 4, 4, 4]);
+        for (host_cpus, expected) in [(1, 1), (2, 2), (4, 2), (6, 4), (8, 4), (16, 4)] {
+            let count = browser_vm_vcpu_count(None, "linux", host_cpus).unwrap();
+            assert_eq!(count, expected, "host CPUs: {host_cpus}");
+            let manifest = browser_vm_manifest(2048, count);
+            assert_eq!(manifest.microvm.unwrap().vcpu_count, Some(expected));
+            assert_eq!(manifest.resources.memory_mb, 2048);
+        }
+    }
+
+    #[test]
+    fn browser_vm_vcpus_macos_keeps_two() {
+        for host_cpus in [1, 2, 4, 6, 8, 16] {
+            assert_eq!(browser_vm_vcpu_count(None, "macos", host_cpus), Ok(2));
+        }
+    }
+
+    #[test]
+    fn browser_vm_vcpus_explicit_value_wins() {
+        for platform in ["linux", "macos"] {
+            for host_cpus in [1, 2, 4, 6, 8, 16] {
+                assert_eq!(browser_vm_vcpu_count(Some("5"), platform, host_cpus), Ok(5));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_vm_vcpus_rejects_invalid_explicit_values() {
+        for value in ["", "0", "-1", "1.5", "two", "256", "258", "4294967295"] {
+            assert!(
+                browser_vm_vcpu_count(Some(value), "linux", 6).is_err(),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn stage_trace_format_preserves_monotonic_microseconds_and_details() {
