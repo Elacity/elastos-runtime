@@ -2,7 +2,7 @@
 //!
 //! This provider capsule gives controlled access to localhost resources.
 //! Storage operations require capability tokens and are scoped to allowed paths.
-//! When an encryption key is provided, files are encrypted at rest with AES-256-GCM.
+//! When an encryption key is provided, files are encrypted at rest with AES-256-GCM, except `Public` and `MyWebSite`.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};

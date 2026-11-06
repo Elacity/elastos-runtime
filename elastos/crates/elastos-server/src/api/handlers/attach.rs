@@ -1,9 +1,3 @@
-//! Attach endpoint — exchanges a local secret for a short-lived session token.
-//!
-//! Callers read the `attach_secret` from the chmod-600 runtime-coords.json file,
-//! then POST it here to receive a bearer token.  This keeps long-lived secrets
-//! off the wire and out of persistent storage.
-
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -38,9 +32,7 @@ pub struct AttachResponse {
 
 /// POST /api/auth/attach
 ///
-/// Validates the attach secret and returns a short-lived session token.
-/// The secret is local-only (localhost, chmod 600 file) so timing attacks
-/// are not a realistic threat; we use a simple equality check.
+/// Compares the posted secret with the process secret and returns a session token.
 pub async fn attach(
     State(state): State<AttachState>,
     Json(body): Json<AttachRequest>,
