@@ -10081,3 +10081,34 @@ async fn test_browser_operator_inspection_fill_bootstrap_and_detach_scope() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_browser_open_provider_transport_preserves_remote_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let call = || BrowserProviderResourceCall {
+        scheme: "browser-engine",
+        resource: "elastos://browser-engine/launch".to_string(),
+        request: json!({"op": "launch", "lifecycle_generation": "test-generation"}),
+    };
+    // The real remote-binding validator rejects this missing requester before
+    // dispatch. Its private cause must survive the adapter's public message.
+    let failure = browser_provider_resource_result(&state, call())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+    let diagnostic = format!("{:#}", failure.diagnostic);
+    assert!(
+        diagnostic.contains("Browser requester required"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("Remote Runtime Engine ownership is unavailable"),
+        "{diagnostic}"
+    );
+    let (status, message) = browser_provider_resource_response(&state, call())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(message, "Remote Runtime Engine ownership is unavailable");
+}

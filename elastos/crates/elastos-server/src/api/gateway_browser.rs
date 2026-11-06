@@ -1143,9 +1143,10 @@ async fn execute_browser_open(
             );
         }
     }
-    let engine_response = match browser_provider_resource_response(state, engine_call).await {
+    let engine_response = match browser_provider_resource_result(state, engine_call).await {
         Ok(value) => value,
-        Err((status, message)) => {
+        Err(failure) => {
+            let message = format!("{:#}", failure.diagnostic);
             let outcome = reconcile_dispatched_browser_launch_failure(
                 state,
                 &launch_reservation,
@@ -1157,7 +1158,8 @@ async fn execute_browser_open(
             )
             .await;
             return Err(
-                BrowserOpenFailure::engine(status, anyhow::anyhow!(message)).with_outcome(outcome)
+                BrowserOpenFailure::engine(failure.status, failure.diagnostic)
+                    .with_outcome(outcome),
             );
         }
     };
