@@ -2213,8 +2213,13 @@ async fn test_browser_async_open_rejects_second_owner_for_same_browser_instance(
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
         .await
         .unwrap();
+    let conflict: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(conflict["schema"], "elastos.browser.open-error/v1");
+    assert_eq!(conflict["code"], "runtime_error");
+    assert_eq!(conflict["http_status"], 409);
+    assert_eq!(conflict["outcome"]["state"], "terminal_pre_effect_failure");
     assert_eq!(
-        String::from_utf8(second_body.to_vec()).unwrap(),
+        conflict["message"],
         "Browser instance already owns an active or in-flight open"
     );
 
