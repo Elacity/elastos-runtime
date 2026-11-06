@@ -187,6 +187,7 @@ impl BrowserOpenFailure {
     fn provider(scheme: &str, err: anyhow::Error) -> Self {
         let (status, message) = gateway_provider_error_tuple(scheme, err);
         if scheme == "browser-engine" {
+            tracing::warn!(status = status.as_u16(), error = %message, "Browser Engine open failed");
             Self::json(
                 status,
                 serde_json::json!({
@@ -658,7 +659,17 @@ async fn execute_browser_open(
     .await
     {
         Ok(choice) => choice,
-        Err(error) => return Err(BrowserOpenFailure::provider("browser-engine", error)),
+        Err(error) => {
+            if let Some(transfer) =
+                error.downcast_ref::<gateway_browser_remote::ProfileTransferRequired>()
+            {
+                return Err(BrowserOpenFailure::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    transfer.to_string(),
+                ));
+            }
+            return Err(BrowserOpenFailure::provider("browser-engine", error));
+        }
     };
     let engine_route_provider = if let Some(choice) = &remote_choice {
         choice.2.clone()
@@ -4676,6 +4687,7 @@ mod browser_open_outcome_tests {
             "invalid engine reply: /private/engine/rootfs.img",
             "page not found: /private/engine/rootfs.img",
             "engine failed: /private/engine/rootfs.img",
+            "This Browser profile requires an approved transfer: /private/engine/rootfs.img",
         ] {
             let expected_status =
                 gateway_provider_error_tuple("browser-engine", anyhow::anyhow!(message)).0;
@@ -4693,6 +4705,61 @@ mod browser_open_outcome_tests {
             );
             assert_eq!(payload["code"], "provider_error");
         }
+    }
+
+    #[test]
+    fn engine_provider_constructor_logs_private_diagnostics() {
+        // Parallel route tests use this callsite too. Keep the capture in a
+        // fresh process with one subscriber and one selected test.
+        const CHILD: &str = "ELASTOS_TEST_BROWSER_OPEN_LOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let qualified = concat!(
+                module_path!(),
+                "::engine_provider_constructor_logs_private_diagnostics"
+            );
+            let name = qualified.split_once("::").unwrap().1;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--color", "never"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[derive(Clone)]
+        struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogWriter(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let message = "browser-engine provider unavailable: /private/engine/rootfs.img";
+        let failure = BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message));
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!failure.status_value().to_string().contains(message));
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("Browser Engine open failed"), "{log}");
+        assert!(log.contains("status=503"), "{log}");
+        assert!(log.contains(message), "{log}");
     }
 
     #[test]

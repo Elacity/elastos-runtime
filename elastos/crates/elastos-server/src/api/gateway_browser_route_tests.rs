@@ -3415,6 +3415,51 @@ async fn test_browser_launch_response_loss_reconciles_and_closes_exact_effect() 
 }
 
 #[tokio::test]
+async fn test_browser_open_preserves_profile_transfer_instruction() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let placements = dir
+        .path()
+        .join("Runtime/BrowserLifecycle/remote-engine-profiles");
+    std::fs::create_dir_all(&placements).unwrap();
+    std::fs::write(
+        placements.join("foreign.json"),
+        json!({"principal_id": authority.principal_id, "peer": "runtime-b"}).to_string(),
+    )
+    .unwrap();
+    let response = gateway_router(state)
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://placement.invalid/","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), 32768)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["message"],
+        "This Browser profile requires an approved transfer from its owning Runtime"
+    );
+    assert_eq!(payload["outcome"]["state"], "terminal_pre_effect_failure");
+    assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["stream_acquired"], false);
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
 async fn test_browser_malformed_success_reconciles_instead_of_releasing_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
