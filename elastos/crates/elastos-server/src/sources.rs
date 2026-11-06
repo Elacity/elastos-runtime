@@ -7,7 +7,7 @@ use elastos_common::localhost::installation_release_head_path;
 
 use crate::ownership;
 
-const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
+pub(crate) const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
 /// Default data directory: `$XDG_DATA_HOME/elastos` or `$HOME/.local/share/elastos`.
 pub fn default_data_dir() -> PathBuf {

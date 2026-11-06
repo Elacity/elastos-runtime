@@ -606,10 +606,13 @@ async fn system_offers_a_canary_home_its_signers_stable_release_and_binds_that_c
 
 #[tokio::test]
 async fn system_update_summary_explains_newer_test_install_without_offer() {
-    for (current_version, expected_message) in [
-        ("2.1.0-rc.1", "Home has a newer test version than the latest stable release. The next newer stable release will be offered."),
-        ("2.1.0", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
-        ("2.1.0+test-build", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+    for (subscription, current_version, expected_message) in [
+        ("stable", "2.1.0-rc.1", "Home has a newer test version than the latest stable release. The next newer stable release will be offered."),
+        ("canary", "2.1.0-rc.1", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("stable", "2.1.0", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("canary", "2.1.0", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("stable", "2.1.0+test-build", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("canary", "2.1.0+test-build", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let _state = test_state(dir.path());
@@ -622,6 +625,7 @@ async fn system_update_summary_explains_newer_test_install_without_offer() {
         };
         configure_update_summary(dir.path());
         let mut sources = crate::sources::load_trusted_sources(dir.path()).unwrap();
+        sources.sources[0].channel = subscription.into();
         sources.sources[0].installed_version = current_version.into();
         crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
         let mut offer = serde_json::to_value(cached_offer()).unwrap();
@@ -648,7 +652,10 @@ async fn system_update_summary_explains_newer_test_install_without_offer() {
         };
         assert_eq!(summary["available"], false);
         assert_eq!(summary["can_apply"], false);
-        assert_eq!(summary["message"], expected_message);
+        assert_eq!(
+            summary["message"], expected_message,
+            "{subscription}: {current_version}"
+        );
     }
 }
 

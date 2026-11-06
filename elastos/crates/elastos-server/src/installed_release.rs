@@ -355,6 +355,10 @@ pub(crate) fn admit_candidate(
     release_bytes: &[u8],
 ) -> Result<()> {
     let release = admit_pair(source, head_bytes, release_bytes, false)?;
+    crate::update::verify_source_channel(
+        source,
+        release["payload"]["channel"].as_str().unwrap_or(""),
+    )?;
     anyhow::ensure!(
         Path::new(&source.install_path) == binary,
         "Installer source binary path differs from its writer"

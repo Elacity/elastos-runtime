@@ -37,9 +37,8 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "model-provider",
 ];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
-const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
-
 pub(crate) use crate::sources::source_discovery_uri;
+use crate::sources::ALLOWED_RELEASE_CHANNELS;
 
 fn validate_release_channel(channel: &str) -> anyhow::Result<()> {
     if ALLOWED_RELEASE_CHANNELS.contains(&channel) {

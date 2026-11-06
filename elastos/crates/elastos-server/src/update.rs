@@ -192,7 +192,7 @@ pub fn verify_installed_channel(
     source: &TrustedSource,
     signed_channel: &str,
 ) -> anyhow::Result<()> {
-    if matches!(signed_channel, "stable" | "canary" | "jetson-test") {
+    if crate::sources::ALLOWED_RELEASE_CHANNELS.contains(&signed_channel) {
         return Ok(());
     }
     verify_source_channel(source, signed_channel)
