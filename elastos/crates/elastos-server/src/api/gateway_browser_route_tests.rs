@@ -116,9 +116,11 @@ async fn browser_open_failure_log_route(
                 )
                 .await
                 .unwrap();
+            let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 32768)
                 .await
                 .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
             payload = serde_json::from_slice(&body).unwrap();
             if payload["status"] == "failed" {
                 payload = payload["error"].take();

@@ -3497,7 +3497,6 @@ async fn release_browser_page_and_stream_for_principal(
     let _ =
         release_browser_page_for_principal(&state.data_dir, page_id, principal_id, owner_launch_id)
             .await;
-    forget_browser_open_job_for_owner(&state.data_dir, principal_id, owner_launch_id).await;
     cleanup_result
 }
 
@@ -4224,6 +4223,11 @@ pub(super) async fn browser_app_page_close(
     } else {
         close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
     };
+    // Explicit close owns result retirement. Automatic open-failure cleanup
+    // keeps the job so its pending callback can publish the public error.
+    forget_browser_open_job_for_owner(&state.data_dir, &principal_id, &cleanup_owner_launch_id)
+        .await;
+
     let terminal = if engine_result.is_ok() && stream_result.is_ok() {
         commit_browser_terminal_cleanup(
             &state,
