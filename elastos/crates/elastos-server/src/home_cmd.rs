@@ -2411,9 +2411,26 @@ fn gather_capsule_actions(catalog: &serde_json::Value) -> Vec<ActionInfo> {
     actions
 }
 
+/// The local runtime to report: an operator runtime (`elastos serve`), else the
+/// managed runtime that runs Browser Home's capsules, else Browser Home's gateway.
+async fn live_runtime_coords(data_dir: &Path) -> Option<runtime_control::RuntimeCoords> {
+    for path in [
+        runtime_control::runtime_coord_path(data_dir),
+        runtime_control::home_runtime_coord_path(data_dir),
+    ] {
+        if let Some(coords) = runtime_control::read_runtime_coords(&path).await {
+            return Some(coords);
+        }
+    }
+    runtime_control::read_attachable_runtime_coords(
+        data_dir,
+        runtime_control::AttachableRuntimeKind::Gateway,
+    )
+    .await
+}
+
 async fn gather_runtime_status(data_dir: &Path) -> RuntimeStatus {
-    let coords_path = runtime_control::runtime_coord_path(data_dir);
-    let Some(coords) = runtime_control::read_runtime_coords(&coords_path).await else {
+    let Some(coords) = live_runtime_coords(data_dir).await else {
         return RuntimeStatus {
             running: false,
             kind: None,
@@ -2459,6 +2476,11 @@ async fn gather_runtime_status(data_dir: &Path) -> RuntimeStatus {
         running_capsules: Vec::new(),
         note: None,
     };
+    // The gateway serves Home; it runs no capsules and has no peer capability.
+    if coords.is_gateway_runtime() {
+        status.note = Some(format!("Home is open at {}", coords.home_url));
+        return status;
+    }
 
     let client_token = match attach_client(&client, &coords).await {
         Ok(token) => token,
@@ -4815,6 +4837,71 @@ mod tests {
             clear_intent(&access, &session).await.unwrap();
             assert!(read_intent(&access, &session).await.unwrap().is_none());
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_status_reports_a_serving_browser_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = HOME_CMD_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let _coords = ScopedEnvVar::set(
+            "ELASTOS_RUNTIME_COORDS_FILE",
+            temp.path().join("missing-runtime-coords.json"),
+        );
+        let app = axum::Router::new()
+            .route(
+                "/api/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"status": "ok", "version": "2.0.1-test"}))
+                }),
+            )
+            .route(
+                "/api/auth/attach",
+                axum::routing::post(|| async { axum::Json(serde_json::json!({"token": "t"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let coords = |kind: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "api_url": format!("http://{addr}"), "attach_secret": "secret",
+                "pid": std::process::id(), "runtime_kind": kind,
+                "home_url": "http://localhost:8090/home/"
+            }))
+            .unwrap()
+        };
+
+        let stopped = gather_runtime_status(temp.path()).await;
+        assert!(!stopped.running);
+        assert_eq!(
+            stopped.note.as_deref(),
+            Some("No active local ElastOS service")
+        );
+
+        // Browser Home publishes only its gateway coordinates until its runtime starts.
+        let gateway = temp.path().join("gateway-runtime-coords.json");
+        std::fs::write(&gateway, coords("gateway")).unwrap();
+        std::fs::set_permissions(&gateway, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let serving = gather_runtime_status(temp.path()).await;
+        assert!(serving.running);
+        assert_eq!(serving.kind.as_deref(), Some("gateway"));
+        assert_eq!(serving.version.as_deref(), Some("2.0.1-test"));
+        assert_eq!(
+            serving.note.as_deref(),
+            Some("Home is open at http://localhost:8090/home/")
+        );
+
+        // Its managed runtime, which runs the capsules, is reported once it is live.
+        std::fs::write(
+            temp.path().join("home-runtime-coords.json"),
+            coords("managed-home"),
+        )
+        .unwrap();
+        let managed = gather_runtime_status(temp.path()).await;
+        assert!(managed.running);
+        assert_eq!(managed.kind.as_deref(), Some("managed-home"));
         server.abort();
     }
 }

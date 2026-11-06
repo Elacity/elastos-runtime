@@ -754,9 +754,17 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
     });
 
     let carrier_for_discovery = session.client.clone();
+    // One attempt on the session's connection; a retry needs a new connection.
     let try_p2p: crate::update::TryP2pFn = Box::new(move |source, _publisher_did| {
         let client = carrier_for_discovery.clone();
-        Box::pin(async move { try_operator_p2p_discovery(&client, &source).await })
+        Box::pin(async move {
+            tokio::time::timeout(
+                crate::update::DISCOVERY_ATTEMPT_TIMEOUT,
+                try_operator_p2p_discovery(&client, &source),
+            )
+            .await
+            .unwrap_or(Ok(None))
+        })
     });
 
     let result = crate::update::run_update_for_data_dir_in_context(

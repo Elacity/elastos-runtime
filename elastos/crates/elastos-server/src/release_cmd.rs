@@ -79,25 +79,29 @@ async fn run_update_command_for_data_dir(
     if !force {
         update::installed_release_version(&source_config.installed_version)?;
     }
-    let carrier_client = Arc::new(
-        elastos_server::carrier::CarrierClient::connect_trusted_source(&source_config, 10)
-            .await
-            .map_err(|e| anyhow::anyhow!("Carrier connection failed: {:#}", e))?,
-    );
-
-    let carrier_for_fetch = carrier_client.clone();
-    let fetch_fn: update::FetchFn = Box::new(move |cid| {
-        let client = carrier_for_fetch.clone();
-        Box::pin(async move { client.fetch_content(&cid, None).await })
+    let carrier = Arc::new(SourceCarrier {
+        source: source_config,
+        client: tokio::sync::Mutex::new(None),
     });
 
-    let carrier_for_discovery = carrier_client.clone();
+    let carrier_for_fetch = carrier.clone();
+    let fetch_fn: update::FetchFn = Box::new(move |cid| {
+        let carrier = carrier_for_fetch.clone();
+        Box::pin(async move { carrier.current().await?.fetch_content(&cid, None).await })
+    });
+
+    let carrier_for_discovery = carrier.clone();
     let try_p2p: update::TryP2pFn = Box::new(move |source, _publisher_did| {
-        let client = carrier_for_discovery.clone();
+        let carrier = carrier_for_discovery.clone();
         Box::pin(async move {
-            update::discover_carrier_release_head(&client, &source)
-                .await
-                .map(Some)
+            let (carrier, source) = (&carrier, &source);
+            update::discover_with_one_retry(move || async move {
+                let client = carrier.reconnect().await?;
+                update::discover_carrier_release_head(&client, source)
+                    .await
+                    .map(Some)
+            })
+            .await
         })
     });
 
@@ -115,8 +119,58 @@ async fn run_update_command_for_data_dir(
         force,
     )
     .await;
-    carrier_client.close().await;
+    carrier.close().await;
     result
+}
+
+/// The update command's Carrier connection to its trusted source. Each
+/// discovery attempt dials a new one; downloads use the one that answered.
+struct SourceCarrier {
+    source: elastos_server::sources::TrustedSource,
+    client: tokio::sync::Mutex<Option<Arc<elastos_server::carrier::CarrierClient>>>,
+}
+
+impl SourceCarrier {
+    /// Drop the current connection, which closes in the background, and dial a new one.
+    async fn reconnect(&self) -> anyhow::Result<Arc<elastos_server::carrier::CarrierClient>> {
+        let mut client = self.client.lock().await;
+        client.take();
+        let fresh = self.dial().await?;
+        *client = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// The current connection, dialed on first use.
+    async fn current(&self) -> anyhow::Result<Arc<elastos_server::carrier::CarrierClient>> {
+        let mut client = self.client.lock().await;
+        if let Some(current) = client.as_ref() {
+            return Ok(current.clone());
+        }
+        let fresh = self.dial().await?;
+        *client = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    async fn dial(&self) -> anyhow::Result<Arc<elastos_server::carrier::CarrierClient>> {
+        match elastos_server::carrier::CarrierClient::connect_trusted_source(&self.source, 10).await
+        {
+            Ok(client) => Ok(Arc::new(client)),
+            // Only an unreachable source is marked unavailable, so discovery dials
+            // once more; a refused source configuration or identity is final.
+            Err(error) if elastos_server::carrier::is_trusted_source_unreachable(&error) => {
+                Err(anyhow::Error::new(update::UpdateSourceUnavailable)
+                    .context(format!("Carrier connection failed: {error:#}")))
+            }
+            Err(error) => Err(anyhow::anyhow!("Carrier connection failed: {error:#}")),
+        }
+    }
+
+    async fn close(&self) {
+        let client = self.client.lock().await.take();
+        if let Some(client) = client {
+            client.close().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +193,7 @@ mod tests {
         WrongSignature,
         ContentFailure,
         SilentDiscovery,
+        ClosedFirstConnection,
     }
 
     fn signed_envelope(payload: serde_json::Value, domain: &str) -> Vec<u8> {
@@ -209,6 +264,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn update_command_does_not_retry_a_refused_carrier_identity() {
+        let configured = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let other = iroh::EndpointAddr::from(iroh::SecretKey::from_bytes(&[2; 32]).public())
+            .with_addrs([iroh::TransportAddr::Ip(([127, 0, 0, 1], 9).into())]);
+        let mut ticket = data_encoding::BASE32_NOPAD.encode(
+            &serde_json::to_vec(&serde_json::json!({"topic": null, "endpoints": [other]})).unwrap(),
+        );
+        ticket.make_ascii_lowercase();
+        let fixture = tempfile::tempdir().unwrap();
+        let source: TrustedSource = serde_json::from_value(serde_json::json!({
+            "name": "fixture", "publisher_dids": ["did:key:fixture"], "channel": "stable",
+            "installed_version": "0.7.1", "publisher_node_id": configured.to_string(),
+            "connect_ticket": ticket
+        }))
+        .unwrap();
+        let mut sources = TrustedSourcesConfig::empty();
+        sources.upsert_source(source);
+        save_trusted_sources(fixture.path(), &sources).unwrap();
+        let error =
+            run_update_command_for_data_dir(fixture.path(), true, None, true, None, false, "0.7.1")
+                .await
+                .unwrap_err();
+        // Not marked as an unanswered source, so discovery returns it without a retry.
+        assert!(!error.is::<update::UpdateSourceUnavailable>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(
+                "Carrier connection failed: trusted source ticket routes do not match the configured Carrier identity"
+            ),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
@@ -285,23 +373,35 @@ mod tests {
         let accepted_by_server = accepted.clone();
         let requests_by_server = requests.clone();
         let server_endpoint = server.clone();
+        // Only a discovery that got no answer may dial a second connection.
+        let connections = match reply {
+            Reply::SilentDiscovery | Reply::ClosedFirstConnection => 2,
+            _ => 1,
+        };
         let mut serving = tokio::spawn(async move {
-            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let mut connection = server_endpoint.accept().await.unwrap().await.unwrap();
             accepted_by_server.fetch_add(1, Ordering::SeqCst);
             let mut silent_streams = Vec::new();
             loop {
                 tokio::select! {
                     biased;
-                    closed = connection.closed() => break closed,
-                    incoming = server_endpoint.accept() => {
-                        let _extra = incoming.unwrap().await.unwrap();
+                    closed = connection.closed() => {
+                        if accepted_by_server.load(Ordering::SeqCst) == connections {
+                            break closed;
+                        }
+                        connection = server_endpoint.accept().await.unwrap().await.unwrap();
                         accepted_by_server.fetch_add(1, Ordering::SeqCst);
-                        panic!("update opened a second Carrier connection");
+                    }
+                    incoming = server_endpoint.accept() => {
+                        let next = incoming.unwrap().await.unwrap();
+                        let opened = accepted_by_server.fetch_add(1, Ordering::SeqCst) + 1;
+                        assert!(opened <= connections, "update opened an extra Carrier connection");
+                        connection = next;
                     }
                     stream = connection.accept_bi() => {
                         let (mut send, recv) = match stream {
                             Ok(stream) => stream,
-                            Err(_) => break connection.closed().await,
+                            Err(_) => continue,
                         };
                         let mut reader = BufReader::new(recv);
                         let mut line = String::new();
@@ -312,6 +412,13 @@ mod tests {
                         match op {
                             "release_head" if matches!(reply, Reply::SilentDiscovery) => {
                                 silent_streams.push(send);
+                                continue;
+                            }
+                            "release_head"
+                                if matches!(reply, Reply::ClosedFirstConnection)
+                                    && accepted_by_server.load(Ordering::SeqCst) == 1 =>
+                            {
+                                connection.close(0u32.into(), b"fixture drops the first connection");
                                 continue;
                             }
                             "release_head" => {
@@ -344,8 +451,9 @@ mod tests {
                 }
             }
         });
+        let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_secs(30),
+            Duration::from_secs(60),
             run_update_command_for_data_dir(
                 fixture.path(),
                 true,
@@ -371,7 +479,7 @@ mod tests {
             remote_close,
             iroh::endpoint::ConnectionError::ApplicationClosed(_)
         ));
-        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), connections);
         assert_eq!(
             std::fs::read(fixture.path().join("sources.json")).unwrap(),
             sources_before
@@ -411,7 +519,23 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("Could not discover updates"));
-                vec!["release_head"]
+                // One overall deadline covers both connections and both attempts.
+                let elapsed = started.elapsed();
+                assert!(elapsed >= update::DISCOVERY_ATTEMPT_TIMEOUT, "{elapsed:?}");
+                assert!(
+                    elapsed < update::DISCOVERY_DEADLINE + Duration::from_secs(3),
+                    "{elapsed:?}"
+                );
+                vec!["release_head", "release_head"]
+            }
+            Reply::ClosedFirstConnection => {
+                result.unwrap();
+                vec![
+                    "release_head",
+                    "release_head",
+                    "content_fetch",
+                    "content_fetch",
+                ]
             }
         };
         assert_eq!(*requests.lock().unwrap(), expected_requests);
@@ -541,7 +665,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_discovery_timeout_closes_its_only_carrier_connection() {
+    async fn update_discovery_timeout_retries_once_on_a_new_connection_within_the_deadline() {
         update_cleanup_case(Reply::SilentDiscovery).await;
+    }
+
+    #[tokio::test]
+    async fn update_discovery_recovers_on_a_new_connection_after_the_first_closes() {
+        update_cleanup_case(Reply::ClosedFirstConnection).await;
     }
 }

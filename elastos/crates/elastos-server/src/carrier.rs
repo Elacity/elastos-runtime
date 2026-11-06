@@ -1921,6 +1921,14 @@ pub const DEFAULT_CARRIER_BIND_ADDR: &str = "0.0.0.0:4433";
 /// keeps the per-route errors.
 pub(crate) const TRUSTED_SOURCE_UNREACHABLE: &str = "Could not reach the trusted release source over Carrier. ElastOS needs outgoing UDP to port 4433 for setup and updates; check the firewall or network, then try again.";
 
+/// True when no route to the trusted source answered, as opposed to a source
+/// whose configuration or Carrier identity was refused.
+pub fn is_trusted_source_unreachable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<&'static str>()
+        .is_some_and(|message| *message == TRUSTED_SOURCE_UNREACHABLE)
+}
+
 pub async fn start_carrier_node_with_registry(
     signing_key: &ed25519_dalek::SigningKey,
     did: &str,
@@ -18521,6 +18529,7 @@ pub(crate) mod tests {
             .err()
             .expect("no Carrier listener answers on the closed loopback port");
         assert_eq!(error.to_string(), TRUSTED_SOURCE_UNREACHABLE);
+        assert!(is_trusted_source_unreachable(&error));
         assert!(format!("{error:#}").contains("trusted source Carrier connection failed"));
     }
 
