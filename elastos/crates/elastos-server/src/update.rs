@@ -3541,7 +3541,54 @@ mod tests {
                 } else {
                     assert_eq!(result.is_ok(), *matching, "{name}/{mode}: {result:?}");
                 }
-                assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+                if *matching && mode != "install" {
+                    let mut names = std::fs::read_dir(data.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    assert_eq!(
+                        names,
+                        vec![crate::update_check_status::FILE_NAME.to_string()],
+                        "{name}/{mode}"
+                    );
+                    let status: crate::update_check_status::UpdateCheckStatus =
+                        serde_json::from_slice(
+                            &std::fs::read(data.path().join(crate::update_check_status::FILE_NAME))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(status.schema, crate::update_check_status::SCHEMA);
+                    assert!(!status.offered, "{name}/{mode}");
+                    assert_eq!(status.release_cid.as_deref(), Some(release_cid.as_str()));
+                    let (outcome, current) = if mode == "same-version" {
+                        (
+                            crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                            "0.7.1",
+                        )
+                    } else {
+                        (
+                            crate::update_check_status::UpdateCheckOutcome::UpdateAvailable,
+                            "0.7.0",
+                        )
+                    };
+                    assert_eq!(status.outcome, outcome, "{name}/{mode}");
+                    assert_eq!(status.current_version, current, "{name}/{mode}");
+                    assert_eq!(status.latest_version, "0.7.1", "{name}/{mode}");
+                    assert!(
+                        crate::notifications::load_summary(data.path())
+                            .unwrap()
+                            .entries
+                            .is_empty(),
+                        "{name}/{mode}"
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read_dir(data.path()).unwrap().count(),
+                        0,
+                        "{name}/{mode}"
+                    );
+                }
             }
         }
     }

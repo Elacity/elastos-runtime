@@ -590,6 +590,12 @@ pub fn reconcile_signed_release_notice(
     data_dir: &Path,
     offer: SignedReleaseOffer,
 ) -> anyhow::Result<()> {
+    if let SignedReleaseOffer::NoneAvailable = &offer {
+        let path = notifications_path(data_dir)?;
+        if !path.exists() {
+            return Ok(());
+        }
+    }
     let _store = lock_store(data_dir)?;
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
