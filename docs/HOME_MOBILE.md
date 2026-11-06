@@ -168,10 +168,18 @@ WebKit is required for the release lane because iPhone Safari is the phone
 engine. If the WebKit build for the bundled Playwright is missing, run
 `npx playwright install webkit` inside `elastos/tools/browser-playwright-engine`.
 
-Source truths that the smoke measures are also pinned by
-`scripts/home-entropy-check.mjs` in `just verify`, one assertion per truth,
-so a phone contract cannot drift without a gate going red even on a machine
-without browsers.
+`just verify` runs the shared source gate, including
+`scripts/check-product-data.mjs` for shipped product data.
+`scripts/test-behaviour.sh` runs `scripts/check-product-data.test.mjs` for
+its refusal cases.
+Phone source contracts run in `scripts/home-keyboard-inset.test.mjs`: the
+base viewport tags and phone-only rewrite, the template viewport, a
+`100dvh` twin for each `100vh` declaration, and the shell's backdrop-filter
+budget. `scripts/home-form-factor.test.mjs` checks the phone CSS size class
+against the JavaScript classifier. The phone tests run without browsers in
+`just verify` and `scripts/test-behaviour.sh`. The layout smoke checks target
+size, text size, overflow, safe areas and gestures in Chromium and WebKit for
+the release lane.
 
 ## Bar and Dock (M2)
 

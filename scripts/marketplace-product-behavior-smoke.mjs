@@ -14,6 +14,12 @@ const js = readFileSync(resolve("capsules/marketplace/browser/marketplace.js"), 
 const css = readFileSync(resolve("capsules/marketplace/browser/marketplace.css"), "utf8");
 const vendorScript = readFileSync(resolve("scripts/vendor-ui-tokens.sh"), "utf8");
 
+// Runtime supplies executable bindings; Marketplace projects only those actions.
+assert(
+  js.includes("if (binding?.executable !== true) {\n          continue;"),
+  "Marketplace must expose actions only from Runtime-derived executable bindings.",
+);
+
 const letterSpacingValues = [...css.matchAll(/letter-spacing:\s*([^;]+);/g)].map((match) => match[1].trim());
 
 assert(
