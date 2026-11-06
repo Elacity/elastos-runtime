@@ -63,6 +63,8 @@ const deviceDidCopyButton = document.querySelector("#device-did-copy");
 const runtimeUpdateNode = document.querySelector("#runtime-update");
 const runtimeUpdateButton = document.querySelector("#runtime-update-apply");
 const runtimeUpdateStatusNode = document.querySelector("#runtime-update-status");
+const sourceChannelChoice = document.querySelector("#source-channel-choice");
+const sourceChannelStatus = document.querySelector("#source-channel-status");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
@@ -112,6 +114,8 @@ let technicalInspectEntries = [];
 let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
+let currentSource = {};
+let sourceChannelBusy = false;
 let currentProfileName = "";
 let pendingRecoveryImport = null;
 let activeShellName = "";
@@ -3689,10 +3693,12 @@ function setRuntimeState(runtime) {
   setHiddenFields("runtime-status", version.length === 0);
 }
 
-const SOURCE_CHANNEL_NAMES = { canary: "Test", stable: "Stable" };
+const TEST_CHANNEL_LABEL = "Test versions";
+const SOURCE_CHANNEL_NAMES = { canary: TEST_CHANNEL_LABEL, stable: "Stable", "jetson-test": "Retired test channel" };
 const SOURCE_SIGNED_TEXT = "Home installs only updates signed by its configured publisher.";
 
 function setSourceState(source) {
+  currentSource = source || {};
   const configured = Boolean(source && source.configured);
   const channelId = readText(source && source.channel);
   const channel = SOURCE_CHANNEL_NAMES[channelId] || channelId;
@@ -3710,9 +3716,63 @@ function setSourceState(source) {
           : SOURCE_SIGNED_TEXT);
   setTextFields("source-channel", configured ? channel : "None");
   setTextFields("source-installed-version", readText(source && source.installed_version) || "unknown");
+  if (sourceChannelChoice) {
+    sourceChannelChoice.querySelector('[value="canary"]').textContent = TEST_CHANNEL_LABEL;
+    sourceChannelChoice.hidden = !configured || !hasShellAccess() || currentAccess.role !== "admin";
+    refreshSourceChannelChoiceDisabled();
+    if (!sourceChannelBusy) sourceChannelChoice.value = channelId;
+    setHiddenFields("source-status", !sourceChannelChoice.hidden && ["stable", "canary"].includes(channelId));
+    if (channelId === "jetson-test" && !sourceChannelChoice.hidden && !sourceChannelBusy && !sourceChannelStatus.textContent) {
+      sourceChannelStatus.textContent = `This channel has ended. Choose Stable or ${TEST_CHANNEL_LABEL}.`;
+    }
+  }
+}
+
+async function onSourceChannelChange() {
+  const channel = sourceChannelChoice.value;
+  if (sourceChannelBusy || runtimeUpdateBusy || runtimeUpdatePending || runtimeUpdateControllerBusy() || currentAccess.role !== "admin"
+    || !hasShellAccess() || !currentSource.configured || !["stable", "canary"].includes(channel)
+    || channel === currentSource.channel) {
+    sourceChannelChoice.value = currentSource.channel;
+    return;
+  }
+  const intent = { source_name: currentSource.name, channel };
+  sourceChannelBusy = true;
+  sourceChannelChoice.disabled = true;
+  renderRuntimeUpdate(runtimeUpdate);
+  sourceChannelStatus.textContent = `Verify your passkey to choose ${SOURCE_CHANNEL_NAMES[channel]}.`;
+  let saved = false;
+  try {
+    const stepUpToken = await requestPasskeyStepUp("system.source.switch-channel", intent);
+    if (!runtimeUpdateActive) return;
+    await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ ...intent, step_up_token: stepUpToken }) }, "/api/apps/system/update-channel");
+    saved = true;
+    // Drain a summary captured before the change, then read the new policy.
+    await systemSummaryInFlight?.catch(() => {});
+    currentSource = { ...currentSource, channel };
+    runtimeUpdateFeedback = "";
+    renderRuntimeUpdate(null);
+    await refreshSystemSummary();
+    sourceChannelStatus.textContent = channel === "stable"
+      ? "Stable selected. Home keeps its installed version. The next stable release newer than it will be offered."
+      : `${TEST_CHANNEL_LABEL} selected. Home receives test versions and stable releases.`;
+  } catch {
+    sourceChannelStatus.textContent = saved
+      ? "Channel saved. Update status is unavailable. Open System again to check for updates."
+      : "The update channel could not be confirmed. Open System again to check the current channel and try again.";
+  } finally {
+    sourceChannelBusy = false;
+    if (runtimeUpdateActive) {
+      setSourceState(currentSource);
+      renderRuntimeUpdate(runtimeUpdate);
+      scheduleRuntimeUpdateRefresh(0);
+    }
+  }
 }
 
 function configureRuntimeUpdate() {
+  sourceChannelChoice?.addEventListener("change", onSourceChannelChange);
   runtimeUpdateButton?.addEventListener("click", onRuntimeUpdateApply);
   window.addEventListener("pagehide", () => {
     runtimeUpdateActive = false;
@@ -3754,6 +3814,18 @@ function updateNoteItems(notes) {
   }).filter((item) => item.text);
 }
 
+function refreshSourceChannelChoiceDisabled() {
+  if (sourceChannelChoice) {
+    sourceChannelChoice.disabled = sourceChannelBusy || sourceChannelChoice.hidden || runtimeUpdateBusy
+      || Boolean(runtimeUpdatePending) || runtimeUpdateControllerBusy();
+  }
+}
+
+function runtimeUpdateControllerBusy() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  return Boolean(phase) && !["ready", "updated", "restored", "failed"].includes(phase);
+}
+
 function renderRuntimeUpdate(update) {
   runtimeUpdate = update && typeof update === "object" ? update : null;
   if (!runtimeUpdateNode || !runtimeUpdateButton) return;
@@ -3770,6 +3842,7 @@ function renderRuntimeUpdate(update) {
     runtimeUpdatePending = null;
     runtimeUpdateReconnects = 0;
   }
+  refreshSourceChannelChoiceDisabled();
   if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
     // An update running now (from any page) replaces this page's older result.
     runtimeUpdateFeedback = "";
@@ -3797,7 +3870,7 @@ function renderRuntimeUpdate(update) {
   setUpdateNotes(changes);
   const actionable = runtimeUpdateCanApply();
   runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
-  runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
+  runtimeUpdateButton.disabled = !actionable || sourceChannelBusy || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
   const progress = runtimeUpdateProgressPhase();
   runtimeUpdateButton.textContent = runtimeUpdatePending
     ? runtimeUpdatePending.dispatched ? "Update in progress" : "Waiting for update status"
@@ -3949,7 +4022,7 @@ async function fetchRuntimeUpdateJson(init, url = "/api/apps/system/summary") {
 }
 
 async function onRuntimeUpdateApply() {
-  if (runtimeUpdateBusy || runtimeUpdatePending || !runtimeUpdateCanApply()) return;
+  if (sourceChannelBusy || runtimeUpdateBusy || runtimeUpdatePending || !runtimeUpdateCanApply()) return;
   runtimeUpdateFeedback = "";
   const intent = { action: "apply", request_id: window.crypto.randomUUID().replaceAll("-", "") };
   for (const field of ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]) {

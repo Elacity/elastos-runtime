@@ -1651,7 +1651,7 @@ fn admit_release_digest(signed: &[u8], source: &TrustedSource) -> Result<String>
             && payload["version"].as_str() == Some(source.installed_version.as_str()),
         "Installed signed release version is incompatible."
     );
-    crate::update::verify_source_channel(source, payload["channel"].as_str().unwrap_or(""))?;
+    crate::update::verify_installed_channel(source, payload["channel"].as_str().unwrap_or(""))?;
     let expected = payload["platforms"][crate::update::detect_release_platform()]["binary"]
         ["sha256"]
         .as_str()
@@ -2439,4 +2439,4 @@ fn valid_hash(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

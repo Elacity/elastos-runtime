@@ -355,6 +355,10 @@ pub(crate) fn admit_candidate(
     release_bytes: &[u8],
 ) -> Result<()> {
     let release = admit_pair(source, head_bytes, release_bytes, false)?;
+    crate::update::verify_source_channel(
+        source,
+        release["payload"]["channel"].as_str().unwrap_or(""),
+    )?;
     anyhow::ensure!(
         Path::new(&source.install_path) == binary,
         "Installer source binary path differs from its writer"
@@ -398,7 +402,7 @@ fn admit_pair(
         .context("Installed release CID is missing")?;
     crate::update::verify_release_metadata_cid(release_cid, release_bytes)?;
     crate::update::verify_release_binding(&head, release_bytes, &release)?;
-    crate::update::verify_source_channel(
+    crate::update::verify_installed_channel(
         source,
         head["payload"]["channel"].as_str().unwrap_or(""),
     )?;

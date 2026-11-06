@@ -574,7 +574,7 @@ function updateFixture(overrides = {}) {
   const context = vm.createContext({
     AbortController,
     runtimeUpdateNode: panel, runtimeUpdateButton: button, runtimeUpdateStatusNode: status,
-    runtimeUpdate: undefined, runtimeUpdatePending: null, runtimeUpdateBusy: false,
+    runtimeUpdate: undefined, runtimeUpdatePending: null, runtimeUpdateBusy: false, sourceChannelBusy: false, sourceChannelChoice: null,
     runtimeUpdateActive: true, runtimeUpdateTimer: 0, runtimeUpdateReconnects: 0,
     runtimeUpdateRequests: new Set(), runtimeUpdateInProgressSeen: false, runtimeUpdateFeedback: "",
     RUNTIME_UPDATE_RESTART_TEXT: source.match(/RUNTIME_UPDATE_RESTART_TEXT = "([^"]+)"/)?.[1],

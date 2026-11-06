@@ -9,6 +9,267 @@ use super::*;
 const UPDATE_APPLY_ROUTE: &str = "/api/apps/system/summary";
 const UPDATE_APPLY_OPERATION: &str = "system.update.apply";
 
+const CHANNEL_ROUTE: &str = "/api/apps/system/update-channel";
+const CHANNEL_OPERATION: &str = "system.source.switch-channel";
+
+#[tokio::test]
+async fn system_channel_choice_requires_owner_and_exact_fresh_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    configure_update_summary(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let intent = json!({"source_name":"update-fixture", "channel":"canary"});
+    for refusal in [
+        "guest",
+        "wrong capsule",
+        "unknown",
+        "retired",
+        "missing",
+        "expired",
+        "wrong operation",
+        "changed channel",
+        "changed source",
+    ] {
+        let approval = match refusal {
+            "missing" => String::new(),
+            "expired" => stale_step_up_token_for_app_context(
+                dir.path(),
+                SYSTEM_CAPSULE_ID,
+                &owner.system_token,
+                CHANNEL_OPERATION,
+                &intent,
+            ),
+            _ => step_up_token_for_app_context(
+                dir.path(),
+                SYSTEM_CAPSULE_ID,
+                &owner.system_token,
+                if refusal == "wrong operation" {
+                    UPDATE_APPLY_OPERATION
+                } else {
+                    CHANNEL_OPERATION
+                },
+                &intent,
+            ),
+        };
+        let mut body = intent.clone();
+        body["step_up_token"] = json!(approval);
+        match refusal {
+            "unknown" => body["channel"] = json!("nightly"),
+            "retired" => body["channel"] = json!("jetson-test"),
+            "changed channel" => body["channel"] = json!("stable"),
+            "changed source" => body["source_name"] = json!("another source"),
+            _ => {}
+        }
+        let token = match refusal {
+            "guest" => &guest.system_token,
+            "wrong capsule" => &owner.people_token,
+            _ => &owner.system_token,
+        };
+        let before = std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap();
+        let (status, _) = home_test_post_json(&app, CHANNEL_ROUTE, token, "null", body).await;
+        let expected = match refusal {
+            "guest" | "missing" | "expired" | "wrong operation" | "changed channel"
+            | "changed source" => StatusCode::FORBIDDEN,
+            "wrong capsule" => StatusCode::UNAUTHORIZED,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        assert_eq!(status, expected, "{refusal}");
+        assert_eq!(
+            std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap(),
+            before,
+            "{refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_channel_choice_changes_admission_preserves_install_and_retires_jetson() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    configure_update_summary(dir.path());
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let mut config = crate::sources::load_trusted_sources(dir.path()).unwrap();
+    let source = config.source_named_mut(None).unwrap();
+    source.channel = "jetson-test".into();
+    source.installed_version = "2.1.0-rc.1".into();
+    source.discovery_uri = "elastos://source/jetson-test/fixture".into();
+    crate::sources::save_trusted_sources(dir.path(), &config).unwrap();
+    let original = config.default_source().unwrap().clone();
+    assert!(crate::update::verify_source_channel(&original, "canary").is_err());
+    {
+        let _writer = crate::install_transaction::InstallationGuard::acquire(dir.path()).unwrap();
+        let intent = json!({"source_name":"update-fixture", "channel":"canary"});
+        let approval = step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            CHANNEL_OPERATION,
+            &intent,
+        );
+        let mut body = intent;
+        body["step_up_token"] = json!(approval);
+        let before = std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap();
+        let (status, _) =
+            home_test_post_json(&app, CHANNEL_ROUTE, &owner.system_token, "null", body).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an installation writer owns the release state"
+        );
+        assert_eq!(
+            std::fs::read(crate::sources::trusted_sources_path(dir.path())).unwrap(),
+            before
+        );
+    }
+    for channel in ["canary", "stable"] {
+        let intent = json!({"source_name":"update-fixture", "channel":channel});
+        let approval = step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            CHANNEL_OPERATION,
+            &intent,
+        );
+        let mut body = intent;
+        body["step_up_token"] = json!(approval);
+        let (status, payload) = home_test_post_json(
+            &app,
+            CHANNEL_ROUTE,
+            &owner.system_token,
+            "null",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let config = crate::sources::load_trusted_sources(dir.path()).unwrap();
+        let source = config.default_source().unwrap();
+        assert_eq!(source.channel, channel);
+        assert_eq!(source.installed_version, original.installed_version);
+        assert_eq!(source.install_path, original.install_path);
+        assert_eq!(source.publisher_dids, original.publisher_dids);
+        assert!(source
+            .discovery_uri
+            .starts_with(&format!("elastos://source/{channel}/")));
+        assert_eq!(
+            crate::update::verify_source_channel(source, "canary").is_ok(),
+            channel == "canary"
+        );
+        let mut offer = cached_offer();
+        offer.channel = "canary".into();
+        offer.current_version = source.installed_version.clone();
+        assert_eq!(check_matches_source(source, &offer), channel == "canary");
+        crate::update::verify_source_channel(source, "stable").unwrap();
+        assert_eq!(
+            crate::update::compare_release_versions(&source.installed_version, "2.0.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            crate::update::compare_release_versions(&source.installed_version, "2.1.0").unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_update_stays_unqueued(dir.path());
+        let (status, _) =
+            home_test_post_json(&app, CHANNEL_ROUTE, &owner.system_token, "null", body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "approval replay");
+    }
+}
+
+#[tokio::test]
+async fn system_channel_choice_preserves_signed_install_and_home_start() {
+    use crate::update_controller::tests::PrivateFixture;
+    for (installed_channel, subscription) in [
+        ("canary", "stable"),
+        ("jetson-test", "stable"),
+        ("jetson-test", "canary"),
+    ] {
+        let fixture = PrivateFixture::new();
+        let app = gateway_router(test_state(&fixture.data));
+        let owner = passkey_authority_with_name(&fixture.data, Some("owner"));
+        let components_path = fixture.data.join("components.json");
+        let mut components: Value =
+            serde_json::from_slice(&std::fs::read(&components_path).unwrap()).unwrap();
+        components["schema"] = json!("elastos.components/v1");
+        let components = serde_json::to_vec(&components).unwrap();
+        std::fs::write(&components_path, &components).unwrap();
+        let original = fixture.publish_installed_release_on_channel(
+            &components,
+            json!({}),
+            installed_channel,
+            "2.1.0-rc.1",
+        );
+        crate::installed_release::read_without_migration(&fixture.data, &fixture.binary, &original)
+            .unwrap();
+        let intent = json!({"source_name":original.name, "channel":subscription});
+        let approval = step_up_token_for_app_context(
+            &fixture.data,
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            CHANNEL_OPERATION,
+            &intent,
+        );
+        let mut body = intent;
+        body["step_up_token"] = json!(approval);
+        let (status, payload) =
+            home_test_post_json(&app, CHANNEL_ROUTE, &owner.system_token, "null", body).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let config = crate::sources::load_trusted_sources(&fixture.data).unwrap();
+        let source = config.default_source().unwrap();
+        assert_eq!(source.channel, subscription);
+        assert_eq!(source.installed_version, original.installed_version);
+        assert_eq!(source.head_cid, original.head_cid);
+        assert_eq!(source.publisher_dids, original.publisher_dids);
+        let installed = crate::installed_release::read_without_migration(
+            &fixture.data,
+            &fixture.binary,
+            source,
+        )
+        .unwrap();
+        {
+            let writer = crate::install_transaction::InstallationGuard::acquire(
+                fixture.binary.parent().unwrap(),
+            )
+            .unwrap();
+            let loaded = crate::installed_release::load_or_migrate(
+                &fixture.data,
+                &fixture.binary,
+                source,
+                &writer,
+            )
+            .unwrap();
+            assert_eq!(loaded.head, installed.head);
+            assert_eq!(loaded.release, installed.release);
+        }
+        fixture.assert_home_start(source);
+        // Pin failures still refuse the installed set after a subscription change.
+        for field in ["installed_version", "head_cid", "publisher_dids"] {
+            let mut bad = serde_json::to_value(source).unwrap();
+            bad[field] = match field {
+                "installed_version" => json!("2.1.0-rc.2"),
+                "head_cid" => json!(TEST_CIDV1),
+                _ => json!(["did:key:wrong-publisher"]),
+            };
+            let bad = serde_json::from_value(bad).unwrap();
+            let mut config = config.clone();
+            config.sources[0] = bad;
+            crate::sources::save_trusted_sources(&fixture.data, &config).unwrap();
+            assert!(
+                crate::installed_release::read_without_migration(
+                    &fixture.data,
+                    &fixture.binary,
+                    &config.sources[0],
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+}
+
 fn update_intent() -> Value {
     json!({
         "action": "apply", "request_id": "c".repeat(32),
@@ -37,6 +298,7 @@ fn cached_offer() -> crate::operator_control::OperatorUpdateCheck {
         current_version: intent["current_version"].as_str().unwrap().into(),
         latest_version: intent["new_version"].as_str().unwrap().into(),
         update_available: true,
+        version_status: crate::operator_control::UpdateVersionStatus::Available,
         discovery: "Carrier".into(),
         head_cid: Some(intent["head_cid"].as_str().unwrap().into()),
         release_cid: Some(intent["release_cid"].as_str().unwrap().into()),
@@ -340,6 +602,61 @@ async fn system_offers_a_canary_home_its_signers_stable_release_and_binds_that_c
     assert!(!crate::update_controller::owner_choice_matches_source(
         &request, &jetson
     ));
+}
+
+#[tokio::test]
+async fn system_update_summary_explains_newer_test_install_without_offer() {
+    for (subscription, current_version, expected_message) in [
+        ("stable", "2.1.0-rc.1", "Home has a newer test version than the latest stable release. The next newer stable release will be offered."),
+        ("canary", "2.1.0-rc.1", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("stable", "2.1.0", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("canary", "2.1.0", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("stable", "2.1.0+test-build", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+        ("canary", "2.1.0+test-build", "Home has a newer version than the latest release on this channel. The next newer release will be offered."),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let _state = test_state(dir.path());
+        let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+        let context = HomeLaunchTokenContext {
+            principal_id: owner.principal_id,
+            session_id: owner.session_id,
+            proof_binding_id: Some(owner.proof_binding_id),
+            grant_id: owner.grant_id,
+        };
+        configure_update_summary(dir.path());
+        let mut sources = crate::sources::load_trusted_sources(dir.path()).unwrap();
+        sources.sources[0].channel = subscription.into();
+        sources.sources[0].installed_version = current_version.into();
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let mut offer = serde_json::to_value(cached_offer()).unwrap();
+        offer["current_version"] = json!(current_version);
+        offer["latest_version"] = json!("2.0.1");
+        offer["update_available"] = json!(false);
+        offer["version_status"] = json!("installed_newer");
+        let mut pending = Some(serde_json::from_value(offer).unwrap());
+        let cache = tokio::sync::Mutex::new(UpdateCheckCache::default());
+        let summary = loop {
+            let next = pending.take();
+            let summary = system_runtime_update_summary_with_cache(
+                dir.path(),
+                &context,
+                &cache,
+                |_, _, _| async move { next },
+            )
+            .await
+            .unwrap();
+            if summary["checking"] == false {
+                break summary;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(summary["available"], false);
+        assert_eq!(summary["can_apply"], false);
+        assert_eq!(
+            summary["message"], expected_message,
+            "{subscription}: {current_version}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -943,6 +1260,7 @@ fn system_update_choice_matches_every_signed_offer_field() {
         current_version: request.current_version.clone(),
         latest_version: request.new_version.clone(),
         update_available: true,
+        version_status: crate::operator_control::UpdateVersionStatus::Available,
         discovery: "Carrier".into(),
         head_cid: Some(request.head_cid.clone()),
         release_cid: Some(request.release_cid.clone()),
