@@ -23,6 +23,8 @@ const DIRECT_MESSAGE_KIND: &str = "direct_message";
 const DIRECT_MESSAGE_ID_PREFIX: &str = "direct-message:";
 const COMMUNITY_MESSAGE_KIND: &str = "community_message";
 const COMMUNITY_MESSAGE_ID_PREFIX: &str = "community-message:";
+const SIGNED_RELEASE_KIND: &str = "signed_release_available";
+const SIGNED_RELEASE_ID_PREFIX: &str = "signed-release:";
 const NOTIFICATION_EVENTS_SCHEMA: &str = "elastos.notification-events/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -573,6 +575,100 @@ pub(crate) fn sync_community_message_notification(
         write_json_atomic(&path, &store)?;
     }
     Ok(unread)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignedReleaseOffer {
+    Available {
+        release_cid: String,
+        version: String,
+    },
+    NoneAvailable,
+}
+
+pub fn reconcile_signed_release_notice(
+    data_dir: &Path,
+    offer: SignedReleaseOffer,
+) -> anyhow::Result<()> {
+    if let SignedReleaseOffer::NoneAvailable = &offer {
+        let path = notifications_path(data_dir)?;
+        if !path.exists() {
+            return Ok(());
+        }
+    }
+    let _store = lock_store(data_dir)?;
+    let path = notifications_path(data_dir)?;
+    let mut store = read_json_or_default::<NotificationStore>(&path)?;
+    if store.schema.trim().is_empty() {
+        store.schema = NOTIFICATIONS_SCHEMA.to_string();
+    }
+    match offer {
+        SignedReleaseOffer::NoneAvailable => {
+            let before = store.entries.len();
+            store
+                .entries
+                .retain(|entry| entry.kind != SIGNED_RELEASE_KIND);
+            if store.entries.len() != before {
+                write_json_atomic(&path, &store)?;
+            }
+            Ok(())
+        }
+        SignedReleaseOffer::Available {
+            release_cid,
+            version,
+        } => {
+            let id = format!("{SIGNED_RELEASE_ID_PREFIX}{release_cid}");
+            let removed_other = store
+                .entries
+                .iter()
+                .any(|entry| entry.kind == SIGNED_RELEASE_KIND && entry.id != id);
+            store
+                .entries
+                .retain(|entry| entry.kind != SIGNED_RELEASE_KIND || entry.id == id);
+            if store.entries.iter().any(|entry| entry.id == id) {
+                if removed_other {
+                    write_json_atomic(&path, &store)?;
+                }
+                return Ok(());
+            }
+            let title = "A signed update is available".to_string();
+            let body = format!("Version {version} is signed and ready. Open System to install it.");
+            let created_at = now_ts();
+            store.entries.push(NotificationEntryRecord {
+                id: id.clone(),
+                source_app: "system".to_string(),
+                kind: SIGNED_RELEASE_KIND.to_string(),
+                title: title.clone(),
+                body: body.clone(),
+                action_ref: None,
+                created_at,
+                expires_at: None,
+                severity: NotificationSeverity::Info,
+                read: false,
+                acted: false,
+                dismissed: false,
+                owner_profile_did: None,
+                message_seq: None,
+                dismissed_at: None,
+            });
+            record_event(
+                data_dir,
+                NotificationEventRecord {
+                    id: format!("appeared:{id}"),
+                    notification_id: id,
+                    source_app: "system".to_string(),
+                    title,
+                    body,
+                    action_ref: None,
+                    created_at,
+                    disposition: NotificationEventDisposition::Appeared,
+                    resolution: None,
+                    owner_profile_did: None,
+                },
+            )?;
+            write_json_atomic(&path, &store)
+        }
+    }
 }
 
 /// The Home-wide entries. Entries owned by one account, such as direct
@@ -1447,6 +1543,49 @@ mod tests {
         );
 
         assert!(dismiss_external_http_request(tmp.path(), "wallet-prices").unwrap());
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_signed_release_notice_stays_one_entry_until_the_release_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = SignedReleaseOffer::Available {
+            release_cid: "cid-1".into(),
+            version: "2.0.1".into(),
+        };
+        reconcile_signed_release_notice(tmp.path(), first.clone()).unwrap();
+        let created = load_summary(tmp.path()).unwrap().entries[0].created_at;
+        reconcile_signed_release_notice(tmp.path(), first).unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1);
+        assert_eq!(summary.entries[0].id, "signed-release:cid-1");
+        assert_eq!(summary.entries[0].created_at, created);
+        assert_eq!(summary.entries[0].source_app, "system");
+
+        assert!(dismiss(tmp.path(), None, "signed-release:cid-1").unwrap());
+        reconcile_signed_release_notice(
+            tmp.path(),
+            SignedReleaseOffer::Available {
+                release_cid: "cid-1".into(),
+                version: "2.0.1".into(),
+            },
+        )
+        .unwrap();
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+
+        reconcile_signed_release_notice(
+            tmp.path(),
+            SignedReleaseOffer::Available {
+                release_cid: "cid-2".into(),
+                version: "2.0.2".into(),
+            },
+        )
+        .unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1);
+        assert_eq!(summary.entries[0].id, "signed-release:cid-2");
+
+        reconcile_signed_release_notice(tmp.path(), SignedReleaseOffer::NoneAvailable).unwrap();
         assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
     }
 }

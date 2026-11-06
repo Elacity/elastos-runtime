@@ -1159,6 +1159,32 @@ fn join_release_network(
     Ok(outcome)
 }
 
+struct CheckedRelease<'a> {
+    outcome: crate::update_check_status::UpdateCheckOutcome,
+    current_version: &'a str,
+    latest_version: &'a str,
+    publisher_did: &'a str,
+    release_cid: Option<&'a str>,
+    head_cid: Option<&'a str>,
+    offered: bool,
+}
+
+fn note_checked_release(data_dir: &Path, release: CheckedRelease<'_>) {
+    let status = crate::update_check_status::UpdateCheckStatus {
+        schema: crate::update_check_status::SCHEMA.to_string(),
+        outcome: release.outcome,
+        current_version: release.current_version.to_string(),
+        latest_version: release.latest_version.to_string(),
+        publisher_did: release.publisher_did.to_string(),
+        release_cid: release.release_cid.map(str::to_string),
+        head_cid: release.head_cid.map(str::to_string),
+        offered: release.offered,
+    };
+    if let Err(error) = crate::update_check_status::record_update_check(data_dir, &status) {
+        tracing::warn!("update check status was not recorded: {error:#}");
+    }
+}
+
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -1299,9 +1325,33 @@ async fn run_upgrade_with_restart(
             }
             println!();
             println!("  Installed release is up to date.");
+            note_checked_release(
+                data_dir,
+                CheckedRelease {
+                    outcome: crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                    current_version: &installed_version,
+                    latest_version: version,
+                    publisher_did: &signer_did,
+                    release_cid: Some(release_cid),
+                    head_cid: resolved_head_cid,
+                    offered: false,
+                },
+            );
             return Ok(());
         }
         Ordering::Less if !force => {
+            note_checked_release(
+                data_dir,
+                CheckedRelease {
+                    outcome: crate::update_check_status::UpdateCheckOutcome::InstalledNewer,
+                    current_version: &installed_version,
+                    latest_version: version,
+                    publisher_did: &signer_did,
+                    release_cid: Some(release_cid),
+                    head_cid: resolved_head_cid,
+                    offered: false,
+                },
+            );
             return refused(Err(anyhow::anyhow!(
                 "Signed release {version} is older than installed release {installed_version}; use an explicit rollback command if intended"
             )));
@@ -1351,6 +1401,22 @@ async fn run_upgrade_with_restart(
     if check_only {
         println!();
         println!("  Run `elastos update` to install.");
+        let offered = resolved_head_cid.is_some_and(|head| {
+            crate::update_controller::release_refused(data_dir, head, release_cid).ok()
+                == Some(false)
+        });
+        note_checked_release(
+            data_dir,
+            CheckedRelease {
+                outcome: crate::update_check_status::UpdateCheckOutcome::UpdateAvailable,
+                current_version: &installed_version,
+                latest_version: version,
+                publisher_did: &signer_did,
+                release_cid: Some(release_cid),
+                head_cid: resolved_head_cid,
+                offered,
+            },
+        );
         return Ok(());
     }
 
@@ -1719,6 +1785,18 @@ async fn run_upgrade_with_restart(
         transaction.commit_checked(|| Ok(()))?;
 
         println!();
+        note_checked_release(
+            data_dir,
+            CheckedRelease {
+                outcome: crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                current_version: version,
+                latest_version: version,
+                publisher_did: &signer_did,
+                release_cid: Some(release_cid),
+                head_cid: resolved_head_cid,
+                offered: false,
+            },
+        );
         println!("  ElastOS {} installed successfully!", version);
         // A terminal update replaces the binary under any running host, which
         // then exits; nothing restarts Home from here.
@@ -1956,11 +2034,35 @@ async fn run_upgrade_with_restart(
         }
         finish_ready_restart(&transaction)?;
         transaction.finish_restart()?;
+        note_checked_release(
+            data_dir,
+            CheckedRelease {
+                outcome: crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                current_version: version,
+                latest_version: version,
+                publisher_did: &signer_did,
+                release_cid: Some(release_cid),
+                head_cid: resolved_head_cid,
+                offered: false,
+            },
+        );
         return Ok(());
     }
     activation?;
 
     println!();
+    note_checked_release(
+        data_dir,
+        CheckedRelease {
+            outcome: crate::update_check_status::UpdateCheckOutcome::UpToDate,
+            current_version: version,
+            latest_version: version,
+            publisher_did: &signer_did,
+            release_cid: Some(release_cid),
+            head_cid: resolved_head_cid,
+            offered: false,
+        },
+    );
     println!(
         "  Runtime {} files are installed. Start Home to check the update.",
         version
@@ -3439,7 +3541,54 @@ mod tests {
                 } else {
                     assert_eq!(result.is_ok(), *matching, "{name}/{mode}: {result:?}");
                 }
-                assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+                if *matching && mode != "install" {
+                    let mut names = std::fs::read_dir(data.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    assert_eq!(
+                        names,
+                        vec![crate::update_check_status::FILE_NAME.to_string()],
+                        "{name}/{mode}"
+                    );
+                    let status: crate::update_check_status::UpdateCheckStatus =
+                        serde_json::from_slice(
+                            &std::fs::read(data.path().join(crate::update_check_status::FILE_NAME))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(status.schema, crate::update_check_status::SCHEMA);
+                    assert!(!status.offered, "{name}/{mode}");
+                    assert_eq!(status.release_cid.as_deref(), Some(release_cid.as_str()));
+                    let (outcome, current) = if mode == "same-version" {
+                        (
+                            crate::update_check_status::UpdateCheckOutcome::UpToDate,
+                            "0.7.1",
+                        )
+                    } else {
+                        (
+                            crate::update_check_status::UpdateCheckOutcome::UpdateAvailable,
+                            "0.7.0",
+                        )
+                    };
+                    assert_eq!(status.outcome, outcome, "{name}/{mode}");
+                    assert_eq!(status.current_version, current, "{name}/{mode}");
+                    assert_eq!(status.latest_version, "0.7.1", "{name}/{mode}");
+                    assert!(
+                        crate::notifications::load_summary(data.path())
+                            .unwrap()
+                            .entries
+                            .is_empty(),
+                        "{name}/{mode}"
+                    );
+                } else {
+                    assert_eq!(
+                        std::fs::read_dir(data.path()).unwrap().count(),
+                        0,
+                        "{name}/{mode}"
+                    );
+                }
             }
         }
     }
