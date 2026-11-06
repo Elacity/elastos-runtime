@@ -11454,6 +11454,61 @@ mod tests {
     }
 
     #[test]
+    fn auth_state_publish_is_atomic_rename_and_never_torn() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 3);
+        let path = auth_state_path(data).unwrap();
+        let before = observe_optional_regular_file_identity(&path, "auth state")
+            .unwrap()
+            .unwrap_or_else(|| panic!("auth state fixture was never written"));
+
+        // The write hook runs inside `write_secret_bytes_atomic` immediately after
+        // the temp file is renamed over the state file, i.e. at the earliest instant
+        // a concurrent reader could observe the new bytes. A plain in-place
+        // `std::fs::write` has no such single publish point: a reader could land on a
+        // truncated, partially-written document. Capture those bytes to prove a reader
+        // never sees a torn state.
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        AUTH_STATE_WRITE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(
+                path.clone(),
+                Box::new(move |path| {
+                    *captured.lock().unwrap() = std::fs::read(path)?;
+                    Ok(())
+                }),
+            );
+
+        append_audit_event(data, test_audit_event(4)).unwrap();
+
+        let after = observe_optional_regular_file_identity(&path, "auth state")
+            .unwrap()
+            .unwrap_or_else(|| panic!("auth state disappeared after save"));
+        #[cfg(unix)]
+        assert_ne!(
+            (before.dev, before.ino),
+            (after.dev, after.ino),
+            "auth state rewrites must swap the file in via atomic rename, not truncate in place"
+        );
+
+        let bytes = observed.lock().unwrap().clone();
+        assert!(!bytes.is_empty(), "reader observed an empty auth state");
+        let parsed: AuthState = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("reader observed a torn auth state: {error}"));
+        assert!(
+            parsed
+                .audit
+                .iter()
+                .any(|event| event.event_id == "audit:test:4"),
+            "published auth state is missing the appended audit event"
+        );
+    }
+
+    #[test]
     fn write_race_replacement_and_in_place_write_are_not_cached() {
         for replace in [false, true] {
             let root = tempfile::tempdir().unwrap();
