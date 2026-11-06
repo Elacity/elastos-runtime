@@ -892,11 +892,7 @@ async fn execute_browser_open(
     let lifecycle = BrowserLaunchLifecycle {
         owner_launch_id: authority.verified_context().launch_id().to_string(),
         browser_instance: browser_instance.clone(),
-        host: url::Url::parse(&url)
-            .expect("validated Browser URL")
-            .host_str()
-            .expect("validated Browser host")
-            .to_owned(),
+        url: url.clone(),
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
         engine_route_provider: engine_route_provider.clone(),
         selected_engine_adapter: Some(adapter_id.clone()),
@@ -953,7 +949,13 @@ async fn execute_browser_open(
                 release_browser_launch(&launch_reservation).await;
                 let mut failure = BrowserOpenFailure::provider(provider, err);
                 if failure.public.status == StatusCode::FORBIDDEN {
-                    failure.public.body = BrowserOpenFailureBody::ExitPolicy { url: url.clone() };
+                    failure.public.body = BrowserOpenFailureBody::ExitPolicy {
+                        host: url::Url::parse(&url)
+                            .expect("validated Browser URL")
+                            .host_str()
+                            .expect("validated Browser host")
+                            .to_owned(),
+                    };
                 }
                 return Err(failure);
             }
