@@ -99,6 +99,7 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
 
 ## Releases
 
+- The next release is `2.0.1`.
 - Test releases (`X.Y.Z-alpha.N`, or `X.Y.Z-rc.N` for a candidate; canary channel) are built from a
   `develop` merge commit through `.github/workflows/release-package.yml`
   (dispatched from `develop`) and published with `scripts/release-publish.sh`
