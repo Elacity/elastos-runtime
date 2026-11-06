@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 
 product_data() {
   node scripts/check-product-data.mjs
+  node scripts/check-elastos-bus-wit.mjs
+  node scripts/check-capsule-templates.mjs
+  node scripts/carrier-dependency-generation-check.mjs
 }
 
 prepush() {

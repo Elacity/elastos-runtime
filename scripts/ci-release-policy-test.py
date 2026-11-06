@@ -1356,6 +1356,10 @@ class ReleasePolicyTests(unittest.TestCase):
         # A filter error fails the required job; the decision step has the default success guard.
         self.assertNotIn("continue-on-error", filter_step)
         self.assertNotIn("if:", decision)
+        self.assertIn(
+            "elastos/crates/elastos-server/src/identity_cmd.rs",
+            custody_filter(SOURCE),
+        )
 
     def test_path_filters_cover_every_input_their_jobs_call(self):
         validate_filter_inputs(WORKFLOW, SOURCE, "custody-harness-smoke", custody_filter(SOURCE))
