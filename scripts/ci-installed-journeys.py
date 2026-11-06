@@ -675,6 +675,16 @@ class FiniteRuntime:
             current[pid] = self.known[pid]
         for pid, fd in self.fds.items():
             if pid not in current and not pidfd_exited(fd):
+                try:
+                    stat = bounded_text(Path("/proc") / str(pid) / "stat", 4096)
+                    fields = stat[stat.rfind(")") + 2:].split()
+                    # Exited children leave cgroup.procs before their parent
+                    # reaps them. Bind state and birth to this one stat sample;
+                    # keep the pidfd for the whole-unit exit check in finish().
+                    if fields[0] == "Z" and int(fields[19]) == self.known.get(pid, {}).get("start_ticks"):
+                        continue
+                except (OSError, RuntimeError, ValueError, IndexError):
+                    pass
                 self.record_census_gap(pid, fd)
                 raise RuntimeError("finite journey live child left its unit census")
         if require_runtime and self.pid not in current:

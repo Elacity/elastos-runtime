@@ -2926,6 +2926,67 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         owner.observe_once()
 
+    def test_finite_census_omitted_child_accepts_only_same_birth_zombie(self):
+        for state, ticks in (("Z", 803), ("S", 803), ("Z", 804)):
+            with self.subTest(state=state, ticks=ticks), tempfile.TemporaryDirectory() as temp:
+                owner, values = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                for row in rows.values():
+                    row["uid"] = os.getuid()
+                proc = Path(temp) / "proc"
+                child = self.proc_process(proc, pid=103, ticks=ticks, state=state, parent=102)
+                (child / "cmdline").write_text("" if state == "Z" else "llama-server\0")
+                (child / "cgroup").write_text("0::" + (owner.binding["ControlGroup"] if state == "Z" else "/outside") + "\n")
+                read = self.journey["bounded_text"]
+                with self.observations(owner, rows), \
+                        mock.patch.object(os, "pidfd_open", side_effect=lambda pid, flags: pid + 1000, create=True):
+                    owner.observe_once()
+                    retained = owner.known[103]
+                    fd = owner.fds[103]
+                    rows.pop(103)
+                    observe = self.globals["bounded_text"]
+                    stat_reads = []
+
+                    def observation(path, limit):
+                        path = Path(path)
+                        if path.parent == Path("/proc/103"):
+                            if path.name == "stat":
+                                stat_reads.append(path)
+                                # A later read sees a reused PID. State and birth
+                                # must come from the same bounded stat sample.
+                                if len(stat_reads) > 1:
+                                    self.proc_process(proc, pid=103, ticks=804, state="Z", parent=102)
+                            return read(child / path.name, limit)
+                        return observe(path, limit)
+
+                    self.globals["bounded_text"] = observation
+                    if state != "Z" or ticks != 803:
+                        with self.assertRaisesRegex(RuntimeError, "live child left its unit census"):
+                            owner.observe_once()
+                        self.assertIsNotNone(owner.census_gap)
+                        continue
+                    self.assertNotIn(103, owner.observe_once())
+                    self.assertIsNone(owner.census_gap)
+                    self.assertEqual(len(stat_reads), 1)
+                    self.assertIs(owner.known[103], retained)
+                    self.assertEqual(owner.fds[103], fd)
+
+                    # The census exception does not waive whole-unit exit.
+                    self.globals["bounded_text"] = lambda path, limit: (
+                        read(child / Path(path).name, limit) if Path(path).parent == Path("/proc/103")
+                        else observe(path, limit))
+                    rows.clear()
+                    rows[99] = owner.known[99]
+                    owner.metric_fds = {name: index + 2000 for index, name in enumerate(values)}
+                    self.journey["private_json"](owner.control / "runtime-stopped.json", {"reaped": True})
+                    self.globals["pidfd_exited"] = lambda descriptor: descriptor not in (1099, fd)
+                    with mock.patch.object(os, "close"):
+                        receipt = owner.finish()
+                    self.assertEqual(receipt["status"], "failed")
+                    self.assertEqual(receipt["failure_phase"], "native_cleanup")
+                    self.assertIsNone(owner.census_gap)
+                    owner.command.assert_called_once_with("systemctl", "stop", owner.unit)
+
     def test_finite_census_accepts_same_birth_exec_and_never_rebinds_an_exited_pidfd(self):
         with tempfile.TemporaryDirectory() as temp:
             owner, _ = self.finite_owner(Path(temp))
@@ -2958,7 +3019,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                         if observation in ("gone", "denied"):
                             raise (FileNotFoundError if observation == "gone" else PermissionError)("private detail")
                         if Path(path).name == "stat":
-                            fields = ["Z", "102", "103"] + ["0"] * 17
+                            fields = ["Z" if observation == "reused" else "S", "102", "103"] + ["0"] * 17
                             fields[19] = "999" if observation == "reused" else "803"
                             return "103 (private name) " + " ".join(fields)
                         if Path(path).name == "cmdline":
@@ -2977,7 +3038,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                     self.assertEqual(detail["expected_cgroup"], owner.binding["ControlGroup"])
                     if observation in ("present", "reused"):
                         self.assertEqual(detail["observed"]["ppid"], 102)
-                        self.assertEqual(detail["observed"]["state"], "Z")
+                        self.assertEqual(detail["observed"]["state"], "Z" if observation == "reused" else "S")
                         self.assertEqual(detail["same_start_ticks"], observation == "present")
                         self.assertEqual(detail["observed"]["cmdline"],
                                          ["llama-server", "<redacted>", "<redacted>", "init"])
