@@ -13,7 +13,11 @@ import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium } from "./system-uiux-fixture.mjs";
+import { createRequire } from "node:module";
+
+const { chromium } = createRequire(import.meta.url)(process.env.BROWSER_OPERATOR_PLAYWRIGHT_CORE || "playwright");
+const cpuRate = process.env.ASSISTANT_LAYOUT_CPU_RATE ? Number(process.env.ASSISTANT_LAYOUT_CPU_RATE) : null;
+assert.ok(cpuRate === null || [1, 4, 6].includes(cpuRate), "CPU rate is 1, 4 or 6");
 
 const root = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const schema = "elastos.assistant.workspace/v2";
@@ -178,33 +182,43 @@ function newestClearance(selector) {
     text: newest.textContent.trim().slice(-40),
     abovePx: Math.round(composer.getBoundingClientRect().top - newest.getBoundingClientRect().bottom),
     atEnd: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 1,
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+    clientHeight: scroller.clientHeight,
+    composerHeight: composer.getBoundingClientRect().height,
+    composerTop: composer.getBoundingClientRect().top,
+    clearance: getComputedStyle(document.documentElement).getPropertyValue("--harness-composer-clearance"),
+    t: Math.round(performance.now()),
   };
 }
 
-let browser, page, stage = "launch";
+let browser, page, frame, stage = "launch";
+let beforeClamp;
 const pageErrors = [];
 try {
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   browser = await chromium.launch({ headless: true, ...(process.env.BRAVE_BIN ? { executablePath: process.env.BRAVE_BIN } : {}) });
   page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const cdp = await page.context().newCDPSession(page);
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuRate ?? 4 });
   page.on("pageerror", error => pageErrors.push(`${stage}: ${error}`));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const room = page.frameLocator("iframe").frameLocator("iframe");
   await room.locator(".agent-msg").nth(history.length - 1).waitFor({ state: "attached" });
-  const frame = page.frames().find(candidate => candidate.url().includes("/apps/assistant/"));
+  frame = page.frames().find(candidate => candidate.url().includes("/apps/assistant/"));
 
   const input = room.locator("#agent-composer-input");
   // Polls until the newest block is at the end and fully above the composer,
   // for up to 5 s; then asserts on the last measurement.
   const expectNewestAboveComposer = async (selector, label) => {
+    const started = Date.now();
     const deadline = Date.now() + 5000;
     let seen = await frame.evaluate(newestClearance, selector);
     while (!(seen.newest && seen.atEnd && seen.abovePx >= 0) && Date.now() < deadline) {
       await page.waitForTimeout(50);
       seen = await frame.evaluate(newestClearance, selector);
     }
+    seen.elapsedMs = Date.now() - started;
     assert.ok(seen.newest && seen.atEnd, `${label} is the newest block, at the end: ${JSON.stringify(seen)}`);
     assert.ok(seen.abovePx >= 0, `${label} sits fully above the composer: ${JSON.stringify(seen)}`);
     return seen.abovePx;
@@ -246,7 +260,8 @@ try {
   await room.locator(".agent-msg-agent.is-streaming").waitFor({ state: "detached", timeout: 15000 });
   await room.locator(".agent-msg-agent").last().filter({ hasText: "Streamed step 25" }).waitFor({ timeout: 5000 });
   await frame.waitForFunction(() => typeof window.__finishReply === "function", null, { timeout: 5000 });
-  const beforeShrink = await frame.evaluate(() => document.querySelector("#agent-harness-stream").scrollTop);
+  beforeClamp = await frame.evaluate(newestClearance, ".agent-msg-agent");
+  const beforeShrink = beforeClamp.scrollTop;
   await page.setViewportSize({ width: 1280, height: 1600 });
   await input.fill("");
   await frame.waitForFunction((top) => {
@@ -257,11 +272,14 @@ try {
   await frame.evaluate(() => { window.__finishReply(); delete window.__finishReply; });
   await room.locator('.agent-msg-agent[data-stream-phase="presentation_done"]').last().waitFor({ timeout: 5000 });
   seen.reply = await expectNewestAboveComposer(".agent-msg-agent", "the newest reply");
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuRate ?? 1 });
   await page.setViewportSize({ width: 1280, height: 800 });
   await frame.evaluate(() => {
     const scroller = document.querySelector("#agent-harness-stream");
     scroller.scrollTop = scroller.scrollHeight;
+    // Unchanged geometry notifications from queue rendering and resize can
+    // arrive in a burst. They must keep observing the next composer growth.
+    for (let i = 0; i < 9; i += 1) window.dispatchEvent(new Event("resize"));
   });
   await typeLongFollowUp();
   seen.replyTyping = await expectNewestAboveComposer(".agent-msg-agent", "the newest reply, while a follow-up is typed");
@@ -441,6 +459,10 @@ try {
   console.log(`PASS Assistant reply layout: px above the composer, longest ms behind a streaming reply ${JSON.stringify(seen)}; list markers whole (${markers.map(list => `${list.items} items, ${list.worstRoomPx}px spare`).join("; ")})`);
 } catch (error) {
   console.error(`Assistant reply layout smoke failed at ${stage}`);
+  if (frame) {
+    const geometry = await frame.evaluate(newestClearance, ".agent-msg-agent").catch(probeError => ({ error: String(probeError) }));
+    console.error(`Failure geometry: ${JSON.stringify({ beforeClamp, atFailure: geometry })}`);
+  }
   console.error(JSON.stringify({ errors, pageErrors }, null, 1));
   throw error;
 } finally {
