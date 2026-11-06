@@ -86,8 +86,16 @@ pub(super) struct BrowserProviderResourceCall {
     pub(super) request: serde_json::Value,
 }
 
+// Diagnostics stay private until the failure is consumed by status_value.
+// Public messages accept only static copy or closed, typed public errors.
 #[derive(Debug)]
 struct BrowserOpenFailure {
+    diagnostic: anyhow::Error,
+    public: BrowserOpenPublicFailure,
+}
+
+#[derive(Debug)]
+struct BrowserOpenPublicFailure {
     status: StatusCode,
     body: BrowserOpenFailureBody,
     outcome: serde_json::Value,
@@ -95,8 +103,49 @@ struct BrowserOpenFailure {
 
 #[derive(Debug)]
 enum BrowserOpenFailureBody {
-    Text(String),
-    Json(serde_json::Value),
+    Message {
+        code: BrowserOpenFailureCode,
+        message: &'static str,
+    },
+    Compatibility(BrowserCompatibilityError),
+    Refused(elastos_common::browser_protocol::BrowserLaunchRefusal),
+    ExitPolicy {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BrowserOpenFailureCode {
+    RequestRejected,
+    RuntimeError,
+    ProviderError,
+    ProfileTransferRequired,
+    BrowserCapacityUnavailable,
+    ResourcesInUse,
+    ProfileRecoveryRequired,
+}
+
+impl BrowserOpenFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestRejected => "request_rejected",
+            Self::RuntimeError => "runtime_error",
+            Self::ProviderError => "provider_error",
+            Self::ProfileTransferRequired => "profile_transfer_required",
+            Self::BrowserCapacityUnavailable => "browser_capacity_unavailable",
+            Self::ResourcesInUse => "resources_in_use",
+            Self::ProfileRecoveryRequired => "profile_recovery_required",
+        }
+    }
+
+    fn capacity(code: &str) -> Option<Self> {
+        match code {
+            "browser_capacity_unavailable" => Some(Self::BrowserCapacityUnavailable),
+            "resources_in_use" => Some(Self::ResourcesInUse),
+            "profile_recovery_required" => Some(Self::ProfileRecoveryRequired),
+            _ => None,
+        }
+    }
 }
 
 fn browser_open_outcome(
@@ -163,40 +212,102 @@ fn browser_launch_reconciliation_pending_outcome() -> serde_json::Value {
 }
 
 impl BrowserOpenFailure {
-    fn text(status: StatusCode, message: impl Into<String>) -> Self {
+    fn new(status: StatusCode, public: BrowserOpenFailureBody, diagnostic: anyhow::Error) -> Self {
         Self {
-            status,
-            body: BrowserOpenFailureBody::Text(message.into()),
-            outcome: browser_terminal_pre_effect_outcome(),
+            diagnostic,
+            public: BrowserOpenPublicFailure {
+                status,
+                body: public,
+                outcome: browser_terminal_pre_effect_outcome(),
+            },
         }
     }
 
-    fn json(status: StatusCode, body: serde_json::Value) -> Self {
-        Self {
+    fn message(
+        status: StatusCode,
+        code: BrowserOpenFailureCode,
+        message: &'static str,
+        diagnostic: anyhow::Error,
+    ) -> Self {
+        Self::new(
             status,
-            body: BrowserOpenFailureBody::Json(body),
-            outcome: browser_terminal_pre_effect_outcome(),
-        }
+            BrowserOpenFailureBody::Message { code, message },
+            diagnostic,
+        )
+    }
+
+    fn request(message: &'static str, diagnostic: anyhow::Error) -> Self {
+        Self::message(
+            StatusCode::BAD_REQUEST,
+            BrowserOpenFailureCode::RequestRejected,
+            message,
+            diagnostic,
+        )
+    }
+
+    fn runtime(status: StatusCode, diagnostic: impl Into<String>) -> Self {
+        let diagnostic = diagnostic.into();
+        // Preserve Runtime admission guidance as fixed public copy. Even an
+        // unexpected engine diagnostic here can only select a fixed message.
+        let message = match diagnostic.as_str() {
+            "Browser lifecycle already owns a different open intent" =>
+                "Browser lifecycle already owns a different open intent",
+            "Browser instance already owns an active or in-flight open" =>
+                "Browser instance already owns an active or in-flight open",
+            "Browser instance already owns an active or launching lifecycle" =>
+                "Browser instance already owns an active or launching lifecycle",
+            "Browser lifecycle is already active or launching for this verified launch" =>
+                "Browser lifecycle is already active or launching for this verified launch",
+            "Browser cleanup is pending for this account; no replacement page may open before terminal provider closure" =>
+                "Browser cleanup is pending for this account; wait for cleanup, then open Browser again.",
+            text if text.starts_with("Browser capacity unavailable:") =>
+                "Browser capacity is full. Close an unused Browser page, then try again.",
+            _ => "Browser could not open. Try again.",
+        };
+        Self::message(
+            status,
+            BrowserOpenFailureCode::RuntimeError,
+            message,
+            anyhow::anyhow!(diagnostic),
+        )
+    }
+
+    fn engine(status: StatusCode, diagnostic: anyhow::Error) -> Self {
+        Self::message(
+            status,
+            BrowserOpenFailureCode::ProviderError,
+            "Browser Engine failed to start cleanly.",
+            diagnostic,
+        )
     }
 
     fn with_outcome(mut self, outcome: serde_json::Value) -> Self {
-        self.outcome = outcome;
+        self.public.outcome = outcome;
         self
     }
 
-    fn provider(scheme: &str, err: anyhow::Error) -> Self {
-        let (status, message) = gateway_provider_error_tuple(scheme, err);
-        if scheme == "browser-engine" {
-            tracing::warn!(status = status.as_u16(), error = %message, "Browser Engine open failed");
-            Self::json(
+    fn provider(scheme: &str, diagnostic: anyhow::Error) -> Self {
+        let status = gateway_provider_error_status(scheme, &diagnostic);
+        match scheme {
+            "browser-engine" => Self::engine(status, diagnostic),
+            "net" => Self::message(
                 status,
-                serde_json::json!({
-                    "code": "provider_error",
-                    "message": "Browser Engine failed to start cleanly.",
-                }),
-            )
-        } else {
-            Self::text(status, message)
+                BrowserOpenFailureCode::ProviderError,
+                "net provider unavailable.",
+                diagnostic,
+            ),
+            "exit" => Self::message(
+                status,
+                BrowserOpenFailureCode::ProviderError,
+                "exit provider unavailable. No Browser Exit provider is configured.",
+                diagnostic,
+            ),
+            _ => Self::message(
+                status,
+                BrowserOpenFailureCode::ProviderError,
+                "Browser could not open. Try again.",
+                diagnostic,
+            ),
         }
     }
 
@@ -205,32 +316,61 @@ impl BrowserOpenFailure {
     }
 
     fn into_response(self) -> Response {
-        let status = self.status;
+        let status = self.public.status;
         (status, Json(self.status_value())).into_response()
     }
 
-    fn status_value(&self) -> serde_json::Value {
-        let mut value = match &self.body {
-            BrowserOpenFailureBody::Text(message) => serde_json::json!({
-                "schema": "elastos.browser.open-error/v1",
-                "ok": false,
+    // This consuming projection is the single diagnostic boundary for both
+    // direct HTTP failures and background open-job results. Polling reuses only
+    // the public value, so it cannot log the diagnostic again.
+    fn status_value(self) -> serde_json::Value {
+        let BrowserOpenPublicFailure {
+            status,
+            body,
+            outcome,
+        } = self.public;
+        let mut value = match body {
+            BrowserOpenFailureBody::Message { code, message } => serde_json::json!({
+                "code": code.as_str(),
                 "message": message,
             }),
-            BrowserOpenFailureBody::Json(body) => body.clone(),
+            BrowserOpenFailureBody::Compatibility(error) => {
+                let mut body =
+                    serde_json::to_value(&error).expect("Browser compatibility error serializes");
+                body["message"] = serde_json::json!(error.to_string());
+                body["stage"] = serde_json::json!(if matches!(
+                    error,
+                    BrowserCompatibilityError::EngineNotReady { .. }
+                ) {
+                    "engine_readiness"
+                } else {
+                    "engine_compatibility"
+                });
+                body
+            }
+            BrowserOpenFailureBody::Refused(refusal) => serde_json::json!({
+                "code": "launch_refused",
+                "message": "Browser cannot open.",
+                "refusal": refusal,
+            }),
+            BrowserOpenFailureBody::ExitPolicy { url } => serde_json::json!({
+                "code": "exit_policy_blocked",
+                "message": format!("Browser Exit policy blocked {url}. Runtime keeps direct host networking disabled."),
+            }),
         };
-        if let Some(object) = value.as_object_mut() {
-            object
-                .entry("schema".to_string())
-                .or_insert_with(|| serde_json::json!("elastos.browser.open-error/v1"));
-            object
-                .entry("ok".to_string())
-                .or_insert_with(|| serde_json::json!(false));
-            object.insert("outcome".to_string(), self.outcome.clone());
-            object.insert(
-                "http_status".to_string(),
-                serde_json::json!(self.status.as_u16()),
-            );
-        }
+        let code = value["code"]
+            .as_str()
+            .expect("closed Browser open failure code");
+        tracing::warn!(
+            status = status.as_u16(),
+            code,
+            error = %format!("{:#}", self.diagnostic),
+            "Browser Engine open failed"
+        );
+        value["schema"] = serde_json::json!("elastos.browser.open-error/v1");
+        value["ok"] = serde_json::json!(false);
+        value["outcome"] = outcome;
+        value["http_status"] = serde_json::json!(status.as_u16());
         value
     }
 }
@@ -435,19 +575,27 @@ pub(super) async fn browser_app_open(
     let authority =
         match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
             Ok(authority) => authority,
-            Err(err) => return gateway_provider_error_response("browser", err),
+            Err(err) => return BrowserOpenFailure::provider("browser", err).into_response(),
         };
     let context = authority.home_launch_context();
     let home_token = home_launch_token_header(&headers);
     let request_origin = match browser_request_origin(&headers) {
         Ok(origin) => Some(origin),
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid gateway origin").into_response(),
+        Err(err) => {
+            return BrowserOpenFailure::request("invalid gateway origin", err).into_response()
+        }
     };
     if input.async_open {
         let owner_launch_id = authority.verified_context().launch_id();
         let browser_instance = match browser_instance_id(input.browser_instance.clone()) {
             Ok(value) => value,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+            Err(message) => {
+                return BrowserOpenFailure::request(
+                    "invalid Browser instance binding",
+                    anyhow::anyhow!(message),
+                )
+                .into_response()
+            }
         };
         let intent_hash = browser_open_intent_hash(&input);
         let reservation = match create_browser_open_job(
@@ -460,7 +608,9 @@ pub(super) async fn browser_app_open(
         .await
         {
             Ok(reservation) => reservation,
-            Err((status, message)) => return (status, message).into_response(),
+            Err((status, message)) => {
+                return BrowserOpenFailure::runtime(status, message).into_response()
+            }
         };
         let job = reservation.handle;
         let open_id = job.id.clone();
@@ -597,17 +747,15 @@ async fn execute_browser_open(
     } = input;
     let (url, target) = match browser_url_to_stream_target(&requested_url) {
         Ok(value) => value,
-        Err(err) => {
-            return Err(BrowserOpenFailure::text(
-                StatusCode::BAD_REQUEST,
-                err.to_string(),
-            ))
-        }
+        Err(err) => return Err(BrowserOpenFailure::request(
+            "Only http and https addresses with a host and known port can be opened by Browser.",
+            err,
+        )),
     };
     if let Err(err) = validate_browser_launch_contract(display_mode, guarantee_level) {
-        return Err(BrowserOpenFailure::text(
-            StatusCode::BAD_REQUEST,
-            err.to_string(),
+        return Err(BrowserOpenFailure::request(
+            "Choose a supported display_mode and guarantee_level; operator_rbi requires webrtc_remote_display.",
+            err,
         ));
     }
     let registry = match state.provider_registry.as_ref().cloned() {
@@ -627,23 +775,38 @@ async fn execute_browser_open(
     let stream_nonce = browser_stream_nonce(&open_request_id);
     let remote_exit_id = match browser_remote_exit_id(remote_exit_id) {
         Ok(value) => value,
-        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+        Err(message) => {
+            return Err(BrowserOpenFailure::request(
+                "invalid remote_exit_id",
+                anyhow::anyhow!(message),
+            ))
+        }
     };
     let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
         Ok(value) => value,
-        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+        Err(message) => {
+            return Err(BrowserOpenFailure::request(
+                "invalid adapter_id",
+                anyhow::anyhow!(message),
+            ))
+        }
     };
     let browser_instance = match browser_instance_id(browser_instance) {
         Ok(value) => value,
-        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+        Err(message) => {
+            return Err(BrowserOpenFailure::request(
+                "invalid Browser instance binding",
+                anyhow::anyhow!(message),
+            ))
+        }
     };
     let viewport = match viewport {
         Some(viewport) => match browser_viewport_value(viewport) {
             Ok(value) => Some(value),
             Err(err) => {
-                return Err(BrowserOpenFailure::text(
-                    StatusCode::BAD_REQUEST,
-                    err.to_string(),
+                return Err(BrowserOpenFailure::request(
+                    "Browser viewport must be within 320x240 and 3840x2160.",
+                    err,
                 ))
             }
         },
@@ -663,9 +826,16 @@ async fn execute_browser_open(
             if let Some(transfer) =
                 error.downcast_ref::<gateway_browser_remote::ProfileTransferRequired>()
             {
-                return Err(BrowserOpenFailure::text(
+                return Err(BrowserOpenFailure::message(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    transfer.to_string(),
+                    BrowserOpenFailureCode::ProfileTransferRequired,
+                    match transfer {
+                        gateway_browser_remote::ProfileTransferRequired::OwningRuntime =>
+                            "This Browser profile requires an approved transfer from its owning Runtime",
+                        gateway_browser_remote::ProfileTransferRequired::BeforeRemotePlacement =>
+                            "This Browser profile requires an approved transfer before remote placement",
+                    },
+                    error,
                 ));
             }
             return Err(BrowserOpenFailure::provider("browser-engine", error));
@@ -703,18 +873,11 @@ async fn execute_browser_open(
     let (adapter_id, verified_rootfs) = match resolved_adapter {
         Ok(adapter_id) => adapter_id,
         Err(error) => {
-            let mut body =
-                serde_json::to_value(&error).expect("Browser compatibility error serializes");
-            body["message"] = serde_json::json!(error.to_string());
-            body["stage"] = serde_json::json!(if matches!(
-                error,
-                BrowserCompatibilityError::EngineNotReady { .. }
-            ) {
-                "engine_readiness"
-            } else {
-                "engine_compatibility"
-            });
-            return Err(BrowserOpenFailure::json(StatusCode::BAD_REQUEST, body));
+            return Err(BrowserOpenFailure::new(
+                StatusCode::BAD_REQUEST,
+                BrowserOpenFailureBody::Compatibility(error.clone()),
+                error.into(),
+            ));
         }
     };
     let (_, profile) =
@@ -750,7 +913,7 @@ async fn execute_browser_open(
     let launch_reservation =
         match reserve_browser_launch(&state.data_dir, &context.principal_id, lifecycle).await {
             Ok(reservation) => reservation,
-            Err((status, message)) => return Err(BrowserOpenFailure::text(status, message)),
+            Err((status, message)) => return Err(BrowserOpenFailure::runtime(status, message)),
         };
     if let Err((status, message)) = append_browser_effect_audit_or_500(
         &state.data_dir,
@@ -768,7 +931,7 @@ async fn execute_browser_open(
         },
     ) {
         release_browser_launch(&launch_reservation).await;
-        return Err(BrowserOpenFailure::text(status, message));
+        return Err(BrowserOpenFailure::runtime(status, message));
     }
     mark_browser_launch_preparing_image(&launch_reservation).await;
     let stream_request = serde_json::json!({
@@ -784,7 +947,11 @@ async fn execute_browser_open(
             Ok(receipt) => receipt,
             Err((provider, err)) => {
                 release_browser_launch(&launch_reservation).await;
-                return Err(BrowserOpenFailure::provider(provider, err));
+                let mut failure = BrowserOpenFailure::provider(provider, err);
+                if failure.public.status == StatusCode::FORBIDDEN {
+                    failure.public.body = BrowserOpenFailureBody::ExitPolicy { url: url.clone() };
+                }
+                return Err(failure);
             }
         };
     let stream_cleanup = browser_stream_cleanup(&stream_session);
@@ -952,7 +1119,7 @@ async fn execute_browser_open(
                 false,
             )
             .await;
-            return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
+            return Err(BrowserOpenFailure::runtime(status, message).with_outcome(outcome));
         }
     };
     if vz_transport_launch.is_some() {
@@ -989,11 +1156,9 @@ async fn execute_browser_open(
                 &message,
             )
             .await;
-            return Err(BrowserOpenFailure::text(
-                status,
-                "Browser Engine failed to start cleanly.".to_string(),
-            )
-            .with_outcome(outcome));
+            return Err(
+                BrowserOpenFailure::engine(status, anyhow::anyhow!(message)).with_outcome(outcome)
+            );
         }
     };
     if engine_response
@@ -1036,15 +1201,10 @@ async fn execute_browser_open(
                     .await
                 }
             };
-            return Err(BrowserOpenFailure::json(
+            return Err(BrowserOpenFailure::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "schema": "elastos.browser.open-error/v1",
-                    "ok": false,
-                    "code": "launch_refused",
-                    "message": "Browser cannot open.",
-                    "refusal": refusal,
-                }),
+                BrowserOpenFailureBody::Refused(refusal),
+                anyhow::anyhow!(message.to_string()),
             )
             .with_outcome(outcome));
         }
@@ -1072,10 +1232,7 @@ async fn execute_browser_open(
             ))
             .with_outcome(outcome));
         }
-        if matches!(
-            code,
-            "browser_capacity_unavailable" | "resources_in_use" | "profile_recovery_required"
-        ) {
+        if let Some(public_code) = BrowserOpenFailureCode::capacity(code) {
             let outcome = match exact_did_not_act {
                 Some(outcome) => outcome,
                 None => {
@@ -1091,14 +1248,11 @@ async fn execute_browser_open(
                     .await
                 }
             };
-            return Err(BrowserOpenFailure::json(
+            return Err(BrowserOpenFailure::message(
                 StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({
-                    "schema": "elastos.browser.open-error/v1",
-                    "ok": false,
-                    "code": code,
-                    "message": "Browser launch refused.",
-                }),
+                public_code,
+                "Browser launch refused.",
+                anyhow::anyhow!(message.to_string()),
             )
             .with_outcome(outcome));
         }
@@ -1467,7 +1621,7 @@ async fn execute_browser_open(
             true,
         )
         .await;
-        return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
+        return Err(BrowserOpenFailure::runtime(status, message).with_outcome(outcome));
     }
     Ok(serde_json::json!({
         "schema": "elastos.browser.open-result/v1",
@@ -4708,14 +4862,14 @@ mod browser_open_outcome_tests {
     }
 
     #[test]
-    fn engine_provider_constructor_logs_private_diagnostics() {
+    fn engine_failure_projection_logs_private_error_chain_once() {
         // Parallel route tests use this callsite too. Keep the capture in a
         // fresh process with one subscriber and one selected test.
         const CHILD: &str = "ELASTOS_TEST_BROWSER_OPEN_LOG_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let qualified = concat!(
                 module_path!(),
-                "::engine_provider_constructor_logs_private_diagnostics"
+                "::engine_failure_projection_logs_private_error_chain_once"
             );
             let name = qualified.split_once("::").unwrap().1;
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -4752,14 +4906,46 @@ mod browser_open_outcome_tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
         let message = "browser-engine provider unavailable: /private/engine/rootfs.img";
-        let failure = BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message));
-        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        let failure = BrowserOpenFailure::provider(
+            "browser-engine",
+            anyhow::anyhow!(message)
+                .context("browser-engine provider unavailable: open request failed"),
+        );
+        assert_eq!(failure.public.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "constructors keep diagnostics for the projection"
+        );
         assert!(!failure.status_value().to_string().contains(message));
         let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(log.contains("WARN"), "{log}");
         assert!(log.contains("Browser Engine open failed"), "{log}");
         assert!(log.contains("status=503"), "{log}");
         assert!(log.contains(message), "{log}");
+        assert!(log.contains("open request failed"), "{log}");
+        assert_eq!(
+            log.matches("Browser Engine open failed").count(),
+            1,
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn runtime_admission_copy_keeps_diagnostic_text_private() {
+        let conflict = "Browser lifecycle already owns a different open intent";
+        assert_eq!(
+            BrowserOpenFailure::runtime(StatusCode::CONFLICT, conflict).status_value()["message"],
+            conflict,
+        );
+        for diagnostic in [
+            format!("{conflict}: /private/engine/rootfs.img"),
+            "Browser capacity unavailable: /private/engine/rootfs.img".to_string(),
+            "/private/engine/rootfs.img".to_string(),
+        ] {
+            let public = BrowserOpenFailure::runtime(StatusCode::SERVICE_UNAVAILABLE, diagnostic)
+                .status_value();
+            assert!(!public.to_string().contains("/private/engine/rootfs.img"));
+        }
     }
 
     #[test]
@@ -4781,7 +4967,7 @@ mod browser_open_outcome_tests {
             ("private diagnostic", StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let failure = BrowserOpenFailure::engine_provider(message);
-            assert_eq!(failure.status, status);
+            assert_eq!(failure.public.status, status);
             assert_eq!(
                 failure.status_value()["message"],
                 "Browser Engine failed to start cleanly."
@@ -4791,13 +4977,13 @@ mod browser_open_outcome_tests {
 
     #[test]
     fn failed_open_serializes_cleanup_pending_separately_from_pre_effect_failure() {
-        let pending = BrowserOpenFailure::text(
+        let pending = BrowserOpenFailure::runtime(
             StatusCode::SERVICE_UNAVAILABLE,
             "Browser cleanup remains owned by Runtime",
         )
         .with_outcome(browser_cleanup_pending_outcome(true, true, false))
         .status_value();
-        let pre_effect = BrowserOpenFailure::text(
+        let pre_effect = BrowserOpenFailure::runtime(
             StatusCode::SERVICE_UNAVAILABLE,
             "Browser VM was not acquired",
         )
