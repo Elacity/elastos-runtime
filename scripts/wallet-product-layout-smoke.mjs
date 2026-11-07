@@ -182,8 +182,8 @@ async function readBody(request) {
   return textValue ? JSON.parse(textValue) : {};
 }
 
-function fixtureHtml(baseUrl, mode) {
-  const homeToken = mode === "locked" ? "" : "wallet-home-token";
+function fixtureHtml(baseUrl, mode, token = "wallet-home-token") {
+  const homeToken = mode === "locked" ? "" : token;
   const search = new URLSearchParams({
     home_origin: baseUrl,
     ...(mode === "rail" ? { presentation: "rail" } : {}),
@@ -289,6 +289,16 @@ function fixtureHtml(baseUrl, mode) {
 
 async function startServer() {
   const state = defaultState();
+  // Separate principal records on the same fixture Home; these are UI fixtures,
+  // not proof of Runtime authorization or real key creation.
+  const principals = new Map(["first", "second"].map((name) => [name, {
+    token: `wallet-fresh-${name}-token`,
+    address: `0x${(name === "first" ? "3" : "4").repeat(40)}`,
+    accounts: [],
+    defaultAccounts: [],
+    approvals: [],
+    createBodies: [],
+  }]));
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", "http://127.0.0.1");
@@ -308,7 +318,8 @@ async function startServer() {
       }
       if (url.pathname === "/fixture-host.html") {
         const baseUrl = `http://127.0.0.1:${server.address().port}`;
-        const html = fixtureHtml(baseUrl, url.searchParams.get("mode") || "window");
+        const principal = principals.get(url.searchParams.get("principal"));
+        const html = fixtureHtml(baseUrl, url.searchParams.get("mode") || "window", principal?.token);
         response.writeHead(200, {
           "cache-control": "no-store",
           "content-length": Buffer.byteLength(html),
@@ -332,11 +343,37 @@ async function startServer() {
       if (url.pathname === "/api/apps/wallet/wallet/summary" && request.method === "GET") {
         state.summaryCalls += 1;
         const token = request.headers["x-elastos-home-token"];
-        if (token !== "wallet-home-token") {
+        const wallet = token === "wallet-home-token"
+          ? state
+          : [...principals.values()].find((principal) => principal.token === token);
+        if (!wallet) {
           json(response, 401, { error: "fixture token rejected" });
           return;
         }
-        json(response, 200, summaryResponse(state));
+        json(response, 200, summaryResponse(wallet));
+        return;
+      }
+      if (url.pathname === "/api/apps/wallet/wallet/managed" && request.method === "POST") {
+        const principal = [...principals.values()].find((item) => item.token === request.headers["x-elastos-home-token"]);
+        if (!principal) {
+          json(response, 401, { error: "fixture token rejected" });
+          return;
+        }
+        const body = await readBody(request);
+        principal.createBodies.push(body);
+        assert(body.chain_namespace === "eip155:20" && body.create_new === true && body.label, "Unexpected fresh-account create request.", body);
+        assert(principal.accounts.length === 0, "Fresh-account fixture expects one create per principal.");
+        const account = {
+          account_id: `acc-${principal.token}`,
+          chain_namespace: body.chain_namespace,
+          address: principal.address,
+          label: body.label,
+          proof_type: "managed_evm",
+          signing_status: "managed_key_available",
+          signing_available: true,
+        };
+        principal.accounts.push(account);
+        json(response, 200, account);
         return;
       }
       if (url.pathname === "/api/wallet/prices" && request.method === "GET") {
@@ -360,6 +397,10 @@ async function startServer() {
         }
         if (body.network === "base-mainnet" && body.address === groupAddress) {
           json(response, 200, { status: "ok", data: { balance_hex: hexUnits(1.5, 18) } });
+          return;
+        }
+        if (body.network === "esc-mainnet" && [...principals.values()].some((principal) => principal.address === body.address)) {
+          json(response, 200, { status: "ok", data: { balance_hex: "0x0" } });
           return;
         }
         json(response, 200, { status: "error", message: "Unknown fixture balance target" });
@@ -442,6 +483,7 @@ async function startServer() {
   return {
     baseUrl: `http://127.0.0.1:${server.address().port}`,
     state,
+    principals,
     async close() {
       await new Promise((resolvePromise, rejectPromise) =>
         server.close((error) => (error ? rejectPromise(error) : resolvePromise())),
@@ -533,6 +575,67 @@ async function openAccountMenu(frame) {
     .waitFor({ state: "visible", timeout: 5000 });
 }
 
+async function freshAccountRails(browser, server, tempDir) {
+  const shots = [];
+  for (const [name, principal] of server.principals) {
+    const label = `${name} principal wallet`;
+    const page = await browser.newPage({ viewport: { width: 640, height: 900 } });
+    const consoleOutput = [];
+    page.__pageErrors = [];
+    page.__consoleErrors = [];
+    page.__requestFailures = [];
+    page.on("pageerror", (error) => page.__pageErrors.push(String(error.message || error)));
+    page.on("console", (message) => {
+      consoleOutput.push(`${message.type()}: ${message.text()}`);
+      if (message.type() === "error") page.__consoleErrors.push(message.text());
+    });
+    page.on("requestfailed", (request) => page.__requestFailures.push(request.url()));
+    try {
+      await page.goto(`${server.baseUrl}/fixture-host.html?mode=rail&principal=${name}`, { waitUntil: "networkidle", timeout: 5000 });
+      const frame = await walletFrame(page);
+      await frame.locator("#wallet-create-cta").waitFor({ state: "visible", timeout: 5000 });
+      assert(await frame.evaluate(() => document.documentElement.dataset.walletPresentation) === "rail", `${name}: fresh account must use the rail.`);
+      const balanceState = frame.locator("#wallet-balance-state");
+      assert(await balanceState.isVisible() && await balanceState.textContent() === "This account has no wallet yet.", `${name}: fresh rail must show the no-wallet hero message.`);
+      assert(await frame.locator("#wallet-create-cta").textContent() === "Create account", `${name}: fresh rail must offer Create account.`);
+      assert(await frame.locator(".wallet-account").count() === 0, `${name}: fresh rail must have zero account cards.`);
+      assert(await frame.getByText("first principal wallet", { exact: true }).count() === 0, `${name}: fresh rail must keep the first principal's account private.`);
+      assert(principal.createBodies.length === 0, `${name}: opening the rail must leave account creation to the user.`);
+      const emptyShot = join(tempDir, `wallet-fresh-${name}-empty.png`);
+      await screenshot(frame, emptyShot);
+      shots.push(emptyShot);
+
+      await frame.locator("#wallet-create-cta").click();
+      await frame.getByRole("button", { name: /^EVM/ }).click();
+      await frame.locator('input[name="label"]').fill(label);
+      await frame.getByRole("button", { name: "Create", exact: true }).click();
+      await frame.locator(".wallet-account .wallet-card-name").filter({ hasText: label }).waitFor({ state: "visible", timeout: 5000 });
+      assert(await frame.locator(".wallet-account .wallet-card-name").textContent() === label, `${name}: created rail must show the new account name.`);
+      assert(principal.createBodies.length === 1 && principal.createBodies[0].label === label, `${name}: Create must submit the named account to this principal's fixture.`, principal.createBodies);
+      assert(await frame.locator(".wallet-account").count() === 1, `${name}: created rail must show exactly one account.`);
+      assert(await frame.getByText("This account has no wallet yet.", { exact: false }).count() === 0, `${name}: created rail must clear the no-wallet text.`);
+      assert(!await frame.locator("#wallet-create-cta").isVisible(), `${name}: created rail must leave the initial create step.`);
+      if (name === "second") {
+        assert(await frame.getByText("first principal wallet", { exact: true }).count() === 0, "Second principal must see only its own account after creation.");
+        const first = server.principals.get("first");
+        assert(first.accounts.length === 1 && first.accounts[0].label === "first principal wallet" && first.createBodies.length === 1, "Second principal creation must preserve the first principal's account.");
+      }
+      const createdShot = join(tempDir, `wallet-fresh-${name}-created.png`);
+      await screenshot(frame, createdShot);
+      shots.push(createdShot);
+      await assertNoErrors(page, server, `fresh-${name}`);
+    } catch (error) {
+      const failureShot = join(tempDir, `wallet-fresh-${name}-failure.png`);
+      await page.screenshot({ path: failureShot, fullPage: true });
+      console.error(`fresh-${name}: FAIL\n${failureShot}\n${JSON.stringify({ consoleOutput, pageErrors: page.__pageErrors, requestFailures: page.__requestFailures, serverErrors: server.state.requestErrors }, null, 2)}`);
+      throw error;
+    } finally {
+      await page.close();
+    }
+  }
+  return shots;
+}
+
 async function run() {
   const server = await startServer();
   const tempDir = await mkdtemp(join(tmpdir(), "wallet-uiux-"));
@@ -543,6 +646,7 @@ async function run() {
     headless: true,
   });
 
+  let failed = false;
   try {
     const lockedPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     lockedPage.__pageErrors = [];
@@ -859,11 +963,15 @@ async function run() {
     await assertNoErrors(railPage, server, "rail");
     await railPage.close();
 
-    console.log(`wallet-product-layout-smoke: OK\n${desktopShot}\n${narrowShot}`);
+    const freshShots = await freshAccountRails(browser, server, tempDir);
+    console.log(`wallet-product-layout-smoke: OK\n${desktopShot}\n${narrowShot}\n${freshShots.join("\n")}`);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     await browser.close().catch(() => {});
     await server.close().catch(() => {});
-    if (process.env.KEEP_WALLET_UIUX_SMOKE_TMP !== "1") {
+    if (!failed && process.env.KEEP_WALLET_UIUX_SMOKE_TMP !== "1") {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
