@@ -43,3 +43,6 @@ pub(crate) use model_provider_config::{
 pub mod routes;
 pub mod server;
 pub mod viewer_gateway;
+
+#[cfg(test)]
+mod debug_session_route;

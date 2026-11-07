@@ -586,6 +586,7 @@ jobs:
               - 'elastos/crates/elastos-server/src/server_infra.rs'
               - 'elastos/crates/elastos-server/src/node_cmd.rs'
               - 'elastos/crates/elastos-server/src/protected_content_config.rs'
+              - 'elastos/crates/elastos-server/src/identity_cmd.rs'
       - id: should-run
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ steps.filter.outputs.custody }}" = "true" ]; then

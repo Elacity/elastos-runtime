@@ -29,7 +29,7 @@ it when it starts. A command must not silently start a competing host.
 | Command | Class | Actual behavior |
 | --- | --- | --- |
 | `elastos`, `elastos home` | Managed user lane | Opens Home. `elastos home` starts or reuses the managed Home runtime. It does not attach to an operator runtime that already owns the same home. |
-| `elastos home --status`, `elastos home --json` | Self-contained | Reads and prints a Home-state probe. It does not start Home. |
+| `elastos home --status`, `elastos home --json` | Self-contained | Reads runtime coordinates to see whether a runtime is live, and prints that Home-state probe. A coordinate file that fails the live check is removed. It does not start Home. |
 | `elastos run <path>` or `elastos run --cid <cid>`, `type=data` | Self-contained | Materializes the capsule, creates an in-process Runtime and preview server, opens the browser, and remains active until stopped. It does not attach to `elastos serve`. |
 | `elastos run <path>` or `elastos run --cid <cid>`, Component | Operator lane | Accepts only `type=wasm` with `runtime_abi="elastos.component/v1"`. It attaches to the operator runtime for Bus authorization, then executes the Component locally. |
 | `elastos run <path>` or `elastos run --cid <cid>`, microVM | Operator lane | Uses the operator runtime supervisor to launch and stop the microVM. |

@@ -12,11 +12,9 @@
 //! └── apps/editor/         →  elastos://Qm789...
 //! ```
 //!
-//! When a user accesses `localhost://Public/photos/vacation.jpg`:
-//! 1. Look up path in namespace → get CID
-//! 2. Check local cache for CID
-//! 3. If not cached, fetch from IPFS/peers
-//! 4. Return content (verified by hash)
+//! `resolve("localhost://Public/photos/vacation.jpg")` looks up the map key
+//! `photos/vacation.jpg` and returns that CID entry.
+//! `NamespaceStore::read_content` fetches the bytes for the CID.
 
 use std::collections::BTreeMap;
 

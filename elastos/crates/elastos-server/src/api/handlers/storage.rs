@@ -797,6 +797,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_capsule_public_write_requires_capability_token() {
+        let state = State(make_state(Some(make_capability_manager())));
+        let session = Extension(make_session(SessionType::Capsule));
+        let result = write_file(
+            state,
+            session,
+            HeaderMap::new(),
+            Path("Public/verify-note.txt".to_string()),
+            Bytes::from_static(b"Release checklist"),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(StorageApiError::PermissionDenied(message))
+                    if message.contains("missing X-Capability-Token")
+            ),
+            "a capsule write of Public without a capability token must be denied"
+        );
+    }
+
+    #[tokio::test]
     async fn test_public_storage_rejects_users_root_without_principal_context() {
         let state = State(make_state(None));
         let session = Extension(make_session(SessionType::Shell));
